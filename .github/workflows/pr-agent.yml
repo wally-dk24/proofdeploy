@@ -6,7 +6,7 @@ name: pr-agent
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
 
 permissions:
@@ -34,5 +34,5 @@ jobs:
           OPENAI__API_BASE: "https://api.groq.com/openai/v1"
           # Must be a model on the account; verified 2026-10-08 via /openai/v1/models.
           CONFIG__MODEL: "groq/openai/gpt-oss-120b"
-          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "6000"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
