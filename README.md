@@ -57,10 +57,12 @@ env:
 
 ## Status
 
-**Working now:** the agent skill (authoring draft) — install it from the
-marketplace below, point your coding session at a diff, and get back a change
-model plus `probes.json`. CI (ruff, mypy, pytest, 80% coverage floor) and an
-agent reviewer run on every PR; branch protection requires both.
+**Working now:** the agent skill (authoring draft) — unlisted from the
+marketplace until the runner exists; author from
+`plugins/proofdeploy/skills/proofdeploy/SKILL.md` directly. Point your coding
+session at a diff, and get back a change model plus `probes.json`. CI (ruff,
+mypy, pytest, 80% coverage floor) and an agent reviewer run on every PR;
+branch protection requires both.
 
 **Under construction:** the deterministic runner (`proofdeploy verify
 --probes`), the diff reader, the provisioner, and the verdict renderer.
@@ -71,13 +73,10 @@ no amber states, ever.
 
 ## Claude Code marketplace
 
-This repo is its own plugin marketplace. To install the `proofdeploy` skill in
-Claude Code:
-
-```
-/plugin marketplace add wally-dk24/proofdeploy
-/plugin install proofdeploy@wally-dk24
-```
+> **Unlisted until the runner exists.** The `proofdeploy` plugin is developed
+> in this repo (`plugins/proofdeploy/`) but is not currently listed in the
+> marketplace — the skill is authoring-only and the deterministic runner
+> isn't built yet. It will be re-listed when WAL-58 (the runner) lands.
 
 The plugin ships the skill (`plugins/proofdeploy/skills/`) and the
 `/proofdeploy` slash command. Hooks that auto-verify after edits land with the
