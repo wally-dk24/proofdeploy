@@ -36,3 +36,14 @@ jobs:
           CONFIG__MODEL: "groq/openai/gpt-oss-120b"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "6000"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Free-tier TPM budget (8000/min) fits one LLM call per trigger,
+          # not three. Auto-run only the review; /describe and /improve stay
+          # available as manual issue-comment commands.
+          CONFIG__GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
+          CONFIG__GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
+          CONFIG__GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "false"
+          # The workflow fires on synchronize (pushes), but pr-agent skips
+          # event types not listed here. Keep the two halves in sync.
+          CONFIG__GITHUB_ACTION_CONFIG__PR_ACTIONS: '["opened", "reopened", "ready_for_review", "synchronize"]'
+
+
