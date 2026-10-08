@@ -1,4 +1,9 @@
-"""Loader for the proofdeploy.yml repo contract (PRD FR-7)."""
+"""Loader for the proofdeploy.yml repo contract (PRD FR-7).
+
+Contract (frozen 2026-10-08, PR #17): build, start, readiness are required.
+migrate is optional (database-backed apps only), seed is optional (only when
+probes need pre-existing data), env is optional non-secret config.
+"""
 
 from __future__ import annotations
 
@@ -7,16 +12,17 @@ from pathlib import Path
 
 import yaml
 
-REQUIRED_KEYS = ("build", "migrate", "seed", "start", "readiness")
+REQUIRED_KEYS = ("build", "start", "readiness")
+OPTIONAL_KEYS = ("migrate", "seed")
 
 
 @dataclass
 class RepoContract:
     build: str
-    migrate: str
-    seed: str
     start: str
     readiness: str
+    migrate: str | None = None
+    seed: str | None = None
     env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -34,10 +40,10 @@ class RepoContract:
             raise ValueError("proofdeploy.yml 'env' must be a mapping of strings")
         return cls(
             build=data["build"],
-            migrate=data["migrate"],
-            seed=data["seed"],
             start=data["start"],
             readiness=data["readiness"],
+            migrate=data.get("migrate"),
+            seed=data.get("seed"),
             env=dict(env),
         )
 

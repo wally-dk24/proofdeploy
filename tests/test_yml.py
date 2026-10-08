@@ -29,6 +29,24 @@ def test_load_valid(tmp_path):
     assert c.env == {"ASPNETCORE_ENVIRONMENT": "Verification"}
 
 
+MINIMAL = """\
+build: "pip install -r requirements.txt"
+start: "uvicorn main:app --host 127.0.0.1 --port 8000"
+readiness: "http://localhost:8000/health"
+"""
+
+
+def test_minimal_file_without_migrate_seed_loads(tmp_path):
+    """migrate/seed are optional (PR #17 contract): a minimal file must load."""
+    c = load_contract(write(tmp_path, MINIMAL))
+    assert c.build == "pip install -r requirements.txt"
+    assert c.start == "uvicorn main:app --host 127.0.0.1 --port 8000"
+    assert c.readiness == "http://localhost:8000/health"
+    assert c.migrate is None
+    assert c.seed is None
+    assert c.env == {}
+
+
 def test_missing_keys_rejected(tmp_path):
     with pytest.raises(ValueError, match="missing required keys"):
         load_contract(write(tmp_path, 'build: "x"\n'))
