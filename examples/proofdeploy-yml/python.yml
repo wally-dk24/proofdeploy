@@ -1,0 +1,14 @@
+# proofdeploy.yml — Python (FastAPI) + PostgreSQL + Alembic
+#
+# The repo contract: six fields telling the runner how to build, migrate,
+# seed, and start your app, plus where to wait for readiness. Non-secret
+# environment only — the runner provisions the disposable database and
+# injects its connection details itself; never put credentials here.
+
+build: "pip install -r requirements.txt"
+migrate: "alembic upgrade head"
+seed: "python scripts/seed.py"
+start: "uvicorn app.main:app --host 127.0.0.1 --port 8000"
+readiness: "http://localhost:8000/health"
+env:
+  APP_ENV: verification

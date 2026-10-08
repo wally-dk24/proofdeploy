@@ -1,0 +1,14 @@
+diff --git a/shop/pricing.py b/shop/pricing.py
+index 3f2a1b0..7c9d4e2 100644
+--- a/shop/pricing.py
++++ b/shop/pricing.py
+@@ -12,7 +12,7 @@
+     return 0.0
+ 
+ 
+ def discount_rate(quantity: int) -> float:
+     """Bulk discount rate for an order line. 15% at 10+ items."""
+-    if quantity >= 10:
++    if quantity > 10:
+         return 0.15
+     return 0.0

@@ -1,0 +1,175 @@
+{
+  "$defs": {
+    "dbProbe": {
+      "properties": {
+        "expect": {
+          "properties": {
+            "rows": {
+              "items": {
+                "type": "array"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows"
+          ],
+          "type": "object"
+        },
+        "params": {
+          "type": "array"
+        },
+        "query": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "query",
+        "expect"
+      ],
+      "type": "object"
+    },
+    "httpProbe": {
+      "properties": {
+        "expect": {
+          "anyOf": [
+            {
+              "required": [
+                "json"
+              ]
+            },
+            {
+              "required": [
+                "contains"
+              ]
+            }
+          ],
+          "properties": {
+            "contains": {
+              "type": "string"
+            },
+            "json": {
+              "type": "object"
+            },
+            "status": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        "request": {
+          "properties": {
+            "body": true,
+            "headers": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "method": {
+              "enum": [
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+                "HEAD"
+              ]
+            },
+            "path": {
+              "pattern": "^/",
+              "type": "string"
+            }
+          },
+          "required": [
+            "method",
+            "path"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "request",
+        "expect"
+      ],
+      "type": "object"
+    },
+    "probe": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "http"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/httpProbe"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "db"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/dbProbe"
+          }
+        }
+      ],
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "http",
+            "db"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "description"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/wally-dk24/proofdeploy/blob/main/examples/validating-probes/probe-schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Draft. Mirrors plugins/proofdeploy/skills/proofdeploy/references/probe-schema.md v0. The runner validates strictly against the frozen schema; until WAL-57 freezes it, treat this as the authoring target. Malformed files fail verification, never degrade silently.",
+  "properties": {
+    "probes": {
+      "description": "Non-empty array. Order is execution order.",
+      "items": {
+        "$ref": "#/$defs/probe"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "version": {
+      "const": "0",
+      "description": "Schema version the file was authored against."
+    }
+  },
+  "required": [
+    "version",
+    "probes"
+  ],
+  "title": "ProofDeploy probes file (draft v0)",
+  "type": "object"
+}
