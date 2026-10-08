@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proofdeploy"
+version = "0.1.0"
+description = "Diff in, verified out: probe what changed, render verdicts."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["pyyaml>=6.0"]
+
+[project.scripts]
+proofdeploy = "proofdeploy.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
