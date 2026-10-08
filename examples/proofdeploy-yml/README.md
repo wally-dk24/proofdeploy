@@ -1,16 +1,19 @@
 # Setting up proofdeploy.yml
 
 `proofdeploy.yml` lives at your repo root. It is the contract between your
-repo and the runner: six fields, no secrets.
+repo and the runner: what it needs to build, start, and probe your app.
 
-| Field       | What it is | Example |
-|-------------|------------|---------|
-| `build`     | One command that produces a runnable app | `npm ci && npm run build` |
-| `migrate`   | Brings the disposable database to the change's schema | `alembic upgrade head` |
-| `seed`      | Loads the minimum data probes need | `python scripts/seed.py` |
-| `start`     | Launches the app in the foreground | `uvicorn app.main:app --port 8000` |
-| `readiness` | HTTP endpoint the runner polls until the app is up | `http://localhost:8000/health` |
-| `env`       | Non-secret environment for the run | `APP_ENV: verification` |
+| Field       | Required | What it is |
+|-------------|----------|------------|
+| `build`     | yes | One command that produces a runnable app |
+| `start`     | yes | Launches the app in the foreground |
+| `readiness` | yes | HTTP endpoint the runner polls until the app is up |
+| `migrate`   | no  | Brings the disposable database to the change's schema (DB-backed apps only) |
+| `seed`      | no  | Loads the minimum data probes need (only if probes need pre-existing data) |
+| `env`       | no  | Non-secret environment for the run |
+
+The minimal file is three lines: `build`, `start`, `readiness`. Add the rest
+only if your app needs them.
 
 **Secrets rule.** `env` carries configuration, never credentials. The runner
 provisions a disposable database per run and injects the connection details
