@@ -1,10 +1,15 @@
 ---
 name: proofdeploy
-description: Verify behavior-changing code edits with change-aware probes. Use after making backend code edits and before considering the work done, or when asked to verify a diff. Guides authoring a change model and probes from the diff; a deterministic runner executes them and reports PASS/FAIL verdicts.
+description: Author change-aware probes that verify behavior-changing code edits. Use after making backend code edits and before considering the work done, or when asked to verify a diff. Guides authoring a change model and probes from the diff; execution by a deterministic runner is planned but not built yet.
 license: MIT
 ---
 
 # ProofDeploy
+
+> **Experimental — authoring only.** This skill authors probes from diffs.
+> The deterministic runner is not built yet, so nothing here executes
+> anything. Emit `probes.json` and stop. Do not present this skill as
+> end-to-end verification until the runner lands.
 
 ProofDeploy catches the breaks your test suite misses. The loop is
 **diff → probes → verdicts**: from a code diff, author small targeted probes
@@ -69,19 +74,20 @@ the spec, the ticket, the PR description — before anything runs. This is the
 load-bearing discipline. An expected result copied from observed output is
 not verification; it is transcription.
 
-### 4. Execute (runner)
+### 4. Execute (runner — not built yet)
 
 The deterministic runner is under construction. Today, emit the authored
 probes as `probes.json` conforming to `references/probe-schema.md` (schema
-v0, draft). Execution will be:
+v0, draft) and stop there. The intended execution interface will be:
 
 ```bash
 proofdeploy verify --probes probes.json
 ```
 
-Do not invent another execution path. When the runner lands, it provisions a
-disposable instance and database, runs every probe, and compares against the
-expected results byte-for-byte where it matters.
+That flag does not exist yet — do not run it, do not tell the user to run
+it, and do not invent another execution path. When the runner lands, it
+provisions a disposable instance and database, runs every probe, and compares
+against the expected results byte-for-byte where it matters.
 
 ### 5. Read verdicts and fix the code, not the probes
 
@@ -104,26 +110,27 @@ diff in hand
     asserting the state the request should have produced
 ```
 
-## Worked example
+## Worked example (fictional)
 
-Change: a CMS patch alters how gift-link invitations resolve member history.
-The diff touches the invitation-accept handler and the history query.
+Change: a patch to a fictional parcel-tracking service alters how released
+parcels appear in the pickup queue. The diff touches the release handler and
+the queue query.
 
-Change model: 2 behavior hunks (handler logic, history query); 1 refactor hunk
+Change model: 2 behavior hunks (handler logic, queue query); 1 refactor hunk
 (variable rename — no probe).
 
 Probes:
 
-1. **http** `POST /api/invitations/accept` with a gift-link token →
-   expect 200 and a member object with `status: "active"`.
-2. **http** `GET /api/members/{id}/history` after accepting →
-   expect the history list to contain the invitation event with resolved
-   resource data (not a null/dangling reference).
-3. **db** `SELECT * FROM members WHERE id = ?` → expect `status = 'active'`.
+1. **http** `POST /api/parcels/{id}/release` →
+   expect 200 and a parcel object with `status: "released"`.
+2. **http** `GET /api/queue/pickup` after releasing →
+   expect the queue list to contain the parcel with an assigned bay
+   (not a null bay).
+3. **db** `SELECT * FROM parcels WHERE id = ?` → expect `status = 'released'`.
 
-The real bug this pattern catches: the handler set the member active but the
-history query returned a dangling reference — health check green, test suite
-green, behavior broken. Probe 2 fails. That is the whole product.
+The bug this pattern catches: the handler marked the parcel released but the
+queue query returned a null bay — health check green, test suite green,
+behavior broken. Probe 2 fails. That is the whole product.
 
 ## Common pitfalls
 
@@ -142,7 +149,7 @@ green, behavior broken. Probe 2 fails. That is the whole product.
   author didn't re-check.
 - Keep probes independent: no probe depends on another probe's side effects.
   Order them setup → act → assert explicitly instead.
-- Name probes after the behavior: `gift-link-accept-activates-member`,
+- Name probes after the behavior: `parcel-release-assigns-bay`,
   not `probe-1`.
 - When the diff is large, probe the riskiest surfaces first: data-loss,
   auth, and money-adjacent paths before cosmetic ones.
@@ -150,7 +157,7 @@ green, behavior broken. Probe 2 fails. That is the whole product.
 ## Reference files
 
 - **references/probe-schema.md** — the probes.json schema (v0 draft): probe
-  types, fields, and expected-result encoding. This schema becomes the
-  `--probes` file contract.
+  types, fields, and expected-result encoding. This schema will become the
+  `--probes` file contract once the runner (and its `--probes` flag) exists.
 - **docs/adr/0004-injectable-probe-authoring.md** (repo root) — why authoring is injectable
   and the runner stays deterministic.

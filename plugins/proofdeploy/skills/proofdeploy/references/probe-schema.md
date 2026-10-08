@@ -30,19 +30,19 @@ it. Malformed files will fail verification, never degrade silently.
 
 ```json
 {
-  "id": "gift-link-accept-activates-member",
+  "id": "parcel-release-assigns-bay",
   "type": "http",
-  "description": "Accepting a gift-link invitation activates the member",
+  "description": "Releasing a parcel assigns it a pickup bay",
   "request": {
     "method": "POST",
-    "path": "/api/invitations/accept",
+    "path": "/api/parcels/42/release",
     "headers": {"Content-Type": "application/json"},
-    "body": {"token": "<gift-link-token>"}
+    "body": {}
   },
   "expect": {
     "status": 200,
     "json": {
-      "member.status": "active"
+      "parcel.status": "released"
     }
   }
 }
@@ -66,13 +66,13 @@ scope.
 
 ```json
 {
-  "id": "member-row-active-after-accept",
+  "id": "parcel-row-released-after-release",
   "type": "db",
-  "description": "Member row shows active after gift-link accept",
-  "query": "SELECT status FROM members WHERE id = ?",
-  "params": ["<member-id>"],
+  "description": "Parcel row shows released after release call",
+  "query": "SELECT status FROM parcels WHERE id = ?",
+  "params": ["<parcel-id>"],
   "expect": {
-    "rows": [["active"]]
+    "rows": [["released"]]
   }
 }
 ```
