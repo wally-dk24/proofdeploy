@@ -42,4 +42,8 @@ jobs:
           CONFIG__GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           CONFIG__GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
           CONFIG__GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "false"
+          # The workflow fires on synchronize (pushes), but pr-agent skips
+          # event types not listed here. Keep the two halves in sync.
+          CONFIG__GITHUB_ACTION_CONFIG__PR_ACTIONS: '["opened", "reopened", "ready_for_review", "synchronize"]'
+
 
