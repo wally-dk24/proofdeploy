@@ -21,6 +21,29 @@ def err(errors, where, msg):
     errors.append(f"{where}: {msg}")
 
 
+def check_no_placeholders(value, where, errors):
+    """v0 defines no ${...} substitutions: reject them (fail closed).
+
+    Placeholders break the skill's determinism rules (e.g. wall-clock
+    smuggling) and have no runner-side meaning yet. An allowed set, if ever
+    needed, will be designed explicitly (WAL-57).
+    """
+    if isinstance(value, str):
+        if "${" in value:
+            err(
+                errors,
+                where,
+                "unknown '${...}' placeholder: v0 defines no substitutions; "
+                "write literal values",
+            )
+    elif isinstance(value, dict):
+        for v in value.values():
+            check_no_placeholders(v, where, errors)
+    elif isinstance(value, list):
+        for v in value:
+            check_no_placeholders(v, where, errors)
+
+
 def check_probe(p, seen_ids, errors):
     where = f"probes[{p.get('id', '?')}]"
     if not isinstance(p, dict):
@@ -98,6 +121,7 @@ def validate(doc):
     seen = set()
     for p in probes:
         check_probe(p, seen, errors)
+        check_no_placeholders(p, f"probes[{p.get('id', '?')}]", errors)
     return errors
 
 
