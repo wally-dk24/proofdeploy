@@ -1,0 +1,15 @@
+# proofdeploy.yml — Node.js (Express) + PostgreSQL + Prisma
+#
+# The repo contract: six fields telling the runner how to build, migrate,
+# seed, and start your app, plus where to wait for readiness. Non-secret
+# environment only — the runner provisions the disposable database and
+# injects its connection details itself; never put credentials here.
+
+build: "npm ci && npm run build"
+migrate: "npx prisma migrate deploy"
+seed: "npm run seed"
+start: "node dist/index.js"
+readiness: "http://localhost:3000/health"
+env:
+  NODE_ENV: verification
+  PORT: "3000"
