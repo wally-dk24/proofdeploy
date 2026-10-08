@@ -112,25 +112,25 @@ diff in hand
 
 ## Worked example (fictional)
 
-Change: a patch to a fictional parcel-tracking service alters how released
-parcels appear in the pickup queue. The diff touches the release handler and
-the queue query.
+Change: a patch to a fictional library system fixes the overdue-fine
+boundary: fines now apply at 7+ days overdue (the old code applied them only
+at 8+). The diff touches the fine calculator.
 
-Change model: 2 behavior hunks (handler logic, queue query); 1 refactor hunk
+Change model: 1 behavior hunk (boundary condition); 1 refactor hunk
 (variable rename — no probe).
 
 Probes:
 
-1. **http** `POST /api/parcels/{id}/release` →
-   expect 200 and a parcel object with `status: "released"`.
-2. **http** `GET /api/queue/pickup` after releasing →
-   expect the queue list to contain the parcel with an assigned bay
-   (not a null bay).
-3. **db** `SELECT * FROM parcels WHERE id = ?` → expect `status = 'released'`.
+1. **http** `GET /api/loans/{id}/fine?days_overdue=7` →
+   expect 200 and `fine_cents: 250` (the boundary: the fine applies).
+2. **http** `GET /api/loans/{id}/fine?days_overdue=6` →
+   expect 200 and `fine_cents: 0` (guard below the boundary).
+3. **http** `GET /api/loans/{id}/fine?days_overdue=8` →
+   expect 200 and `fine_cents: 250` (guard above the boundary).
 
-The bug this pattern catches: the handler marked the parcel released but the
-queue query returned a null bay — health check green, test suite green,
-behavior broken. Probe 2 fails. That is the whole product.
+The bug this pattern catches: the old code silently undercharged 7-day
+overdues — health check green, test suite green (it never tested the
+boundary), behavior broken. Probe 1 fails. That is the whole product.
 
 ## Common pitfalls
 
@@ -149,7 +149,7 @@ behavior broken. Probe 2 fails. That is the whole product.
   author didn't re-check.
 - Keep probes independent: no probe depends on another probe's side effects.
   Order them setup → act → assert explicitly instead.
-- Name probes after the behavior: `parcel-release-assigns-bay`,
+- Name probes after the behavior: `fine-applies-at-seven-days`,
   not `probe-1`.
 - When the diff is large, probe the riskiest surfaces first: data-loss,
   auth, and money-adjacent paths before cosmetic ones.

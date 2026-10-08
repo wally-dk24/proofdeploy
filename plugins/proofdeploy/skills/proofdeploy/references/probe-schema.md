@@ -30,19 +30,18 @@ it. Malformed files will fail verification, never degrade silently.
 
 ```json
 {
-  "id": "parcel-release-assigns-bay",
+  "id": "fine-applies-at-seven-days",
   "type": "http",
-  "description": "Releasing a parcel assigns it a pickup bay",
+  "description": "Overdue fine applies at exactly 7 days",
   "request": {
-    "method": "POST",
-    "path": "/api/parcels/42/release",
-    "headers": {"Content-Type": "application/json"},
-    "body": {}
+    "method": "GET",
+    "path": "/api/loans/42/fine?days_overdue=7",
+    "headers": {"Content-Type": "application/json"}
   },
   "expect": {
     "status": 200,
     "json": {
-      "parcel.status": "released"
+      "fine_cents": 250
     }
   }
 }
@@ -66,13 +65,13 @@ scope.
 
 ```json
 {
-  "id": "parcel-row-released-after-release",
+  "id": "no-fine-below-seven-days",
   "type": "db",
-  "description": "Parcel row shows released after release call",
-  "query": "SELECT status FROM parcels WHERE id = ?",
-  "params": ["<parcel-id>"],
+  "description": "No fine row for a 6-day overdue loan",
+  "query": "SELECT fine_cents FROM loans WHERE id = ?",
+  "params": ["<loan-id>"],
   "expect": {
-    "rows": [["released"]]
+    "rows": [[0]]
   }
 }
 ```
@@ -95,8 +94,8 @@ Rules enforced by the runner (v1):
 
 ## Worked file
 
-See `SKILL.md` "Worked example" for the three probes (two HTTP, one DB)
-this schema encodes for the fictional parcel-tracking scenario.
+See `SKILL.md` "Worked example" for the three probes (three HTTP boundary
+probes) this schema encodes for the fictional library-fine scenario.
 
 ## Changelog
 
