@@ -19,14 +19,9 @@ and what would prove it still holds?
 
 ## Try it
 
-Author these yourself with the skill installed, then compare:
-
-```
-/plugin install proofdeploy@wally-dk24
-```
-
-Ask your session to verify `sample.diff` with the proofdeploy skill. Then
-validate the emitted file:
+Author these yourself following `plugins/proofdeploy/skills/proofdeploy/SKILL.md`
+(the plugin is unlisted from the marketplace until the runner exists), then
+compare. Then validate the emitted file:
 
 ```bash
 python3 ../validating-probes/validate.py probes.json

@@ -71,13 +71,10 @@ no amber states, ever.
 
 ## Claude Code marketplace
 
-This repo is its own plugin marketplace. To install the `proofdeploy` skill in
-Claude Code:
-
-```
-/plugin marketplace add wally-dk24/proofdeploy
-/plugin install proofdeploy@wally-dk24
-```
+> **Unlisted until the runner exists.** The `proofdeploy` plugin is developed
+> in this repo (`plugins/proofdeploy/`) but is not currently listed in the
+> marketplace — the skill is authoring-only and the deterministic runner
+> isn't built yet. It will be re-listed when WAL-58 (the runner) lands.
 
 The plugin ships the skill (`plugins/proofdeploy/skills/`) and the
 `/proofdeploy` slash command. Hooks that auto-verify after edits land with the
