@@ -1,0 +1,47 @@
+{
+  "probes": [
+    {
+      "description": "An order line of exactly 10 items gets the 15% bulk rate",
+      "expect": {
+        "json": {
+          "discount_rate": 0.15
+        },
+        "status": 200
+      },
+      "id": "bulk-discount-applies-at-ten-items",
+      "request": {
+        "body": {
+          "quantity": 10
+        },
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "method": "POST",
+        "path": "/api/orders/quote"
+      },
+      "type": "http"
+    },
+    {
+      "description": "An order line of 9 items gets no discount (threshold guard)",
+      "expect": {
+        "json": {
+          "discount_rate": 0.0
+        },
+        "status": 200
+      },
+      "id": "no-discount-below-threshold",
+      "request": {
+        "body": {
+          "quantity": 9
+        },
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "method": "POST",
+        "path": "/api/orders/quote"
+      },
+      "type": "http"
+    }
+  ],
+  "version": "0"
+}

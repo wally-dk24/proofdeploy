@@ -52,7 +52,17 @@ env:
 
 ## Status
 
-Pre-build. The build follows the PRD milestone order: evaluation-repo proposal first, then the diff reader, then the loop.
+**Working now:** the agent skill (authoring draft) — install it from the
+marketplace below, point your coding session at a diff, and get back a change
+model plus `probes.json`. CI (ruff, mypy, pytest, 80% coverage floor) and an
+agent reviewer run on every PR; branch protection requires both.
+
+**Under construction:** the deterministic runner (`proofdeploy verify
+--probes`), the diff reader, the provisioner, and the verdict renderer.
+
+**Proven before production:** the runner stays advisory in CI until the blind
+evaluation earns it gating authority. FAIL or INCONCLUSIVE fails verification —
+no amber states, ever.
 
 ## Claude Code marketplace
 
@@ -71,6 +81,18 @@ deterministic runner. The skill is also installable in any Agent Skills host:
 ```bash
 npx skills add wally-dk24/proofdeploy --skill proofdeploy
 ```
+
+## Examples
+
+`examples/` holds small, honest, runnable samples of what exists today:
+
+- `authoring-a-probe/` — a 1-line diff, its change model, and the two probes
+  that catch the break.
+- `validating-probes/` — a machine-readable draft of the probe schema and a
+  stdlib-only validator.
+
+CI keeps them honest: `tests/test_examples.py` fails if an example stops
+validating.
 
 ## Development
 

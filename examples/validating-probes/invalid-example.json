@@ -1,0 +1,46 @@
+{
+  "probes": [
+    {
+      "description": "First probe with this id",
+      "expect": {
+        "status": 200
+      },
+      "id": "dup",
+      "request": {
+        "method": "GET",
+        "path": "/api/orders/quote"
+      },
+      "type": "http"
+    },
+    {
+      "description": "Duplicate id, and status-only (no json/contains)",
+      "expect": {
+        "status": 200
+      },
+      "id": "dup",
+      "request": {
+        "method": "GET",
+        "path": "/api/orders/quote"
+      },
+      "type": "http"
+    },
+    {
+      "description": "A write disguised as a probe",
+      "expect": {
+        "rows": []
+      },
+      "id": "write-query",
+      "params": [
+        "o-1"
+      ],
+      "query": "DELETE FROM orders WHERE id = ?",
+      "type": "db"
+    },
+    {
+      "description": "v1 only knows http and db",
+      "id": "bad-type",
+      "type": "grpc"
+    }
+  ],
+  "version": "99"
+}
