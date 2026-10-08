@@ -4,6 +4,11 @@
 
 ProofDeploy is a CLI tool that reads your diff, authors executable probes for exactly what changed, runs them against a provisioned instance of the change, and renders per-claim verdicts. The pipeline stops answering "did it compile" and starts answering "does it work."
 
+> **Status:** the authoring half (diff → probes) is real today via the
+> ProofDeploy skill; the deterministic runner (probes → verdicts) is under
+> construction. The transcript below is illustrative example output, not a
+> real run.
+
 ```
 $ proofdeploy verify
 
