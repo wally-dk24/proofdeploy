@@ -2,7 +2,7 @@
 
 import pytest
 
-from proofdeploy.yml import RepoContract, find_contract, load_contract
+from proofdeploy.yml import find_contract, load_contract
 
 
 def write(tmp_path, text):

@@ -21,15 +21,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     v = sub.add_parser("verify", help="Verify a diff by probing a provisioned instance.")
     v.add_argument("--repo", default=None, help="Repo URL to clone (default: current directory).")
-    v.add_argument("--from", dest="from_ref", default=None, help="Base ref for the diff (default: merge-base with main).")
+    v.add_argument(
+        "--from",
+        dest="from_ref",
+        default=None,
+        help="Base ref for the diff (default: merge-base with main).",
+    )
     v.add_argument("--to", dest="to_ref", default="HEAD", help="Target ref (default: HEAD).")
-    v.add_argument("--target-url", default=None,
-                   help="Probe this URL instead of provisioning (loopback only unless --allow-remote-target).")
-    v.add_argument("--allow-remote-target", action="store_true",
-                   help="Permit a non-loopback --target-url; forces all probes read-only, HTTP GET/HEAD only, no DB probes.")
+    v.add_argument(
+        "--target-url",
+        default=None,
+        help="Probe this URL instead of provisioning (loopback only unless --allow-remote-target).",
+    )
+    v.add_argument(
+        "--allow-remote-target",
+        action="store_true",
+        help=(
+            "Permit a non-loopback --target-url; forces all probes read-only, "
+            "HTTP GET/HEAD only, no DB probes."
+        ),
+    )
     v.add_argument("--format", choices=["term", "html", "json"], default="term")
-    v.add_argument("--output", default=None, help="Write the report here (default: stdout / ./proofdeploy-report.html).")
-    v.add_argument("--model", default=None, help="Model for the probe author (default: $PROOFDEPLOY_MODEL).")
+    v.add_argument(
+        "--output",
+        default=None,
+        help="Write the report here (default: stdout / ./proofdeploy-report.html).",
+    )
+    v.add_argument(
+        "--model", default=None, help="Model for the probe author (default: $PROOFDEPLOY_MODEL)."
+    )
     return p
 
 

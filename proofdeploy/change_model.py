@@ -18,6 +18,7 @@ class HunkKind(str, Enum):
 @dataclass
 class Claim:
     """A behavioral claim extracted from the diff: what changed, or what must not have."""
+
     id: str
     kind: HunkKind
     statement: str
@@ -28,7 +29,10 @@ class Claim:
 @dataclass
 class SchemaFact:
     """A schema-change fact from a migration diff (framework adapters map to these)."""
-    operation: str  # add_column | alter_column | drop_column | create_index | drop_index | seed_data | ...
+
+    operation: (
+        str  # add_column | alter_column | drop_column | create_index | drop_index | seed_data | ...
+    )
     table: str
     detail: dict = field(default_factory=dict)
 
@@ -37,7 +41,9 @@ class SchemaFact:
 class ChangeModel:
     claims: list[Claim] = field(default_factory=list)
     schema_facts: list[SchemaFact] = field(default_factory=list)
-    informational: list[str] = field(default_factory=list)  # config changes, v1: reported, not probed
+    informational: list[str] = field(
+        default_factory=list
+    )  # config changes, v1: reported, not probed
 
     @property
     def probeable(self) -> bool:
