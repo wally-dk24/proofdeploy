@@ -33,5 +33,6 @@ jobs:
           OPENAI__KEY: ${{ secrets.GROQ_API_KEY }}
           OPENAI__API_BASE: "https://api.groq.com/openai/v1"
           # Must be a model on the account; verified 2026-10-08 via /openai/v1/models.
-          CONFIG__MODEL: "openai/gpt-oss-120b"
+          CONFIG__MODEL: "groq/openai/gpt-oss-120b"
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
