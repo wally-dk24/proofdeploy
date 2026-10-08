@@ -57,10 +57,12 @@ env:
 
 ## Status
 
-**Working now:** the agent skill (authoring draft) — install it from the
-marketplace below, point your coding session at a diff, and get back a change
-model plus `probes.json`. CI (ruff, mypy, pytest, 80% coverage floor) and an
-agent reviewer run on every PR; branch protection requires both.
+**Working now:** the agent skill (authoring draft) — unlisted from the
+marketplace until the runner exists; author from
+`plugins/proofdeploy/skills/proofdeploy/SKILL.md` directly. Point your coding
+session at a diff, and get back a change model plus `probes.json`. CI (ruff,
+mypy, pytest, 80% coverage floor) and an agent reviewer run on every PR;
+branch protection requires both.
 
 **Under construction:** the deterministic runner (`proofdeploy verify
 --probes`), the diff reader, the provisioner, and the verdict renderer.
