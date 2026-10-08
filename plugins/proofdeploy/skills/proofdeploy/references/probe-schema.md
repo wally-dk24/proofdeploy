@@ -96,7 +96,7 @@ Rules enforced by the runner (v1):
 ## Worked file
 
 See `SKILL.md` "Worked example" for the three probes (two HTTP, one DB)
-this schema encodes for the gift-link scenario.
+this schema encodes for the fictional parcel-tracking scenario.
 
 ## Changelog
 
