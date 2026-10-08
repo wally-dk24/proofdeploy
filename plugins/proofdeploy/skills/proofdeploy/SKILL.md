@@ -152,5 +152,5 @@ green, behavior broken. Probe 2 fails. That is the whole product.
 - **references/probe-schema.md** — the probes.json schema (v0 draft): probe
   types, fields, and expected-result encoding. This schema becomes the
   `--probes` file contract.
-- **docs/adr/0004-injectable-probe-authoring.md** — why authoring is injectable
+- **docs/adr/0004-injectable-probe-authoring.md** (repo root) — why authoring is injectable
   and the runner stays deterministic.
