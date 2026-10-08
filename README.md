@@ -52,7 +52,7 @@ env:
 
 ## Status
 
-Pre-build. The build follows the [PRD](https://app.plane.so/wally-dk24-personal-workspace-2026/projects/1ded5f08-8ce7-426a-9eda-cdd1db0e28ea/pages/24c08ca9-836a-4c91-858e-761bdc944eb9) milestone order: evaluation-repo proposal first, then the diff reader, then the loop.
+Pre-build. The build follows the PRD milestone order: evaluation-repo proposal first, then the diff reader, then the loop.
 
 ## Development
 
