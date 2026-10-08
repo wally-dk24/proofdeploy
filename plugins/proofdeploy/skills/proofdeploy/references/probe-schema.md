@@ -30,19 +30,18 @@ it. Malformed files will fail verification, never degrade silently.
 
 ```json
 {
-  "id": "gift-link-accept-activates-member",
+  "id": "fine-applies-at-seven-days",
   "type": "http",
-  "description": "Accepting a gift-link invitation activates the member",
+  "description": "Overdue fine applies at exactly 7 days",
   "request": {
-    "method": "POST",
-    "path": "/api/invitations/accept",
-    "headers": {"Content-Type": "application/json"},
-    "body": {"token": "<gift-link-token>"}
+    "method": "GET",
+    "path": "/api/loans/42/fine?days_overdue=7",
+    "headers": {"Content-Type": "application/json"}
   },
   "expect": {
     "status": 200,
     "json": {
-      "member.status": "active"
+      "fine_cents": 250
     }
   }
 }
@@ -66,13 +65,13 @@ scope.
 
 ```json
 {
-  "id": "member-row-active-after-accept",
+  "id": "no-fine-below-seven-days",
   "type": "db",
-  "description": "Member row shows active after gift-link accept",
-  "query": "SELECT status FROM members WHERE id = ?",
-  "params": ["<member-id>"],
+  "description": "No fine row for a 6-day overdue loan",
+  "query": "SELECT fine_cents FROM loans WHERE id = ?",
+  "params": ["<loan-id>"],
   "expect": {
-    "rows": [["active"]]
+    "rows": [[0]]
   }
 }
 ```
@@ -95,8 +94,8 @@ Rules enforced by the runner (v1):
 
 ## Worked file
 
-See `SKILL.md` "Worked example" for the three probes (two HTTP, one DB)
-this schema encodes for the gift-link scenario.
+See `SKILL.md` "Worked example" for the three probes (three HTTP boundary
+probes) this schema encodes for the fictional library-fine scenario.
 
 ## Changelog
 
