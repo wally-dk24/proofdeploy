@@ -42,8 +42,10 @@ jobs:
           CONFIG__GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           CONFIG__GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
           CONFIG__GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "false"
-          # The workflow fires on synchronize (pushes), but pr-agent skips
-          # event types not listed here. Keep the two halves in sync.
-          CONFIG__GITHUB_ACTION_CONFIG__PR_ACTIONS: '["opened", "reopened", "ready_for_review", "synchronize"]'
+          # synchronize is routed to the push-trigger path, not pr_actions
+          # (pr-agent handles it first, by design). One review per push.
+          CONFIG__GITHUB_ACTION_CONFIG__HANDLE_PUSH_TRIGGER: "true"
+          CONFIG__GITHUB_ACTION_CONFIG__PUSH_COMMANDS: '["/review"]'
+
 
 
