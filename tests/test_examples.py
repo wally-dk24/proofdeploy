@@ -38,6 +38,31 @@ def test_invalid_example_fails_loudly():
         assert fragment in out, f"missing expected error: {fragment}"
 
 
+def test_unknown_placeholder_rejected(tmp_path):
+    """v0 defines no ${...} substitutions: fail closed (day-2 review #6)."""
+    doc = {
+        "version": "0",
+        "probes": [
+            {
+                "id": "p1",
+                "type": "http",
+                "description": "placeholder probe",
+                "request": {
+                    "method": "GET",
+                    "path": "/x",
+                    "headers": {"If-Modified-Since": "${NOW_HTTP_DATE}"},
+                },
+                "expect": {"status": 200, "contains": "ok"},
+            }
+        ],
+    }
+    p = tmp_path / "probes.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    code, out = run(p)
+    assert code == 1, "placeholder probe passed validation"
+    assert "unknown '${...}' placeholder" in out
+
+
 def test_schema_json_is_well_formed_and_current():
     schema = json.loads((ROOT / "examples" / "validating-probes" / "probe-schema.json").read_text())
     assert schema["properties"]["version"]["const"] == "0"
