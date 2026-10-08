@@ -34,18 +34,22 @@ jobs:
           OPENAI__API_BASE: "https://api.groq.com/openai/v1"
           # Must be a model on the account; verified 2026-10-08 via /openai/v1/models.
           CONFIG__MODEL: "groq/openai/gpt-oss-120b"
+          # Effective cap is Groq's free-tier TPM budget (8000/min), not the
+          # model's 128k context. Keeps review prompts under the per-minute
+          # ceiling; pr-agent clips large diffs to fit. Raise if the Groq tier
+          # is ever upgraded.
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "6000"
+          # Nested settings use dotted keys in this action (per pr-agent docs);
+          # the CONFIG__ form only reaches top-level settings. One LLM call
+          # per trigger fits the free-tier TPM budget; /describe and /improve
+          # stay available as manual issue-comment commands.
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "false"
+          github_action_config.auto_improve: "false"
+          github_action_config.handle_push_trigger: "true"
+          github_action_config.push_commands: '["/review"]'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Free-tier TPM budget (8000/min) fits one LLM call per trigger,
-          # not three. Auto-run only the review; /describe and /improve stay
-          # available as manual issue-comment commands.
-          CONFIG__GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
-          CONFIG__GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
-          CONFIG__GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "false"
-          # synchronize is routed to the push-trigger path, not pr_actions
-          # (pr-agent handles it first, by design). One review per push.
-          CONFIG__GITHUB_ACTION_CONFIG__HANDLE_PUSH_TRIGGER: "true"
-          CONFIG__GITHUB_ACTION_CONFIG__PUSH_COMMANDS: '["/review"]'
+
 
 
 
