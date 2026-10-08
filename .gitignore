@@ -9,3 +9,5 @@ build/
 .proofdeploy/
 proofdeploy-report.html
 .DS_Store
+.coverage
+htmlcov/
