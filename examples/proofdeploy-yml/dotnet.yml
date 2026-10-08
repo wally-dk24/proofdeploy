@@ -1,9 +1,10 @@
 # proofdeploy.yml — ASP.NET Core + SQL Server + EF Core
 #
-# The repo contract: six fields telling the runner how to build, migrate,
-# seed, and start your app, plus where to wait for readiness. Non-secret
-# environment only — the runner provisions the disposable database and
-# injects its connection details itself; never put credentials here.
+# The repo contract: what the runner needs to build, start, and probe your app.
+# Required: build, start, readiness. Optional: migrate (DB-backed apps only),
+# seed (only if probes need pre-existing data), env (non-secret config only).
+# The runner provisions the disposable database and injects its connection
+# details itself; never put credentials here.
 
 build: "dotnet build -c Release"
 migrate: "dotnet ef database update"

@@ -45,7 +45,8 @@ def test_schema_json_is_well_formed_and_current():
 
 
 YML_DIR = ROOT / "examples" / "proofdeploy-yml"
-REQUIRED_YML_KEYS = {"build", "migrate", "seed", "start", "readiness", "env"}
+REQUIRED_YML_KEYS = {"build", "start", "readiness"}
+OPTIONAL_YML_KEYS = {"migrate", "seed", "env"}
 SECRET_HINTS = ("password", "secret", "token", "passwd", "credential")
 
 
@@ -58,14 +59,24 @@ def test_proofdeploy_yml_examples():
     assert len(files) >= 3, "expected per-stack proofdeploy.yml examples"
     for path in files:
         doc = _load_yml(path)
-        assert set(doc) == REQUIRED_YML_KEYS, f"{path.name}: keys {sorted(doc)}"
-        for key in ("build", "migrate", "seed", "start", "readiness"):
+        missing = sorted(REQUIRED_YML_KEYS - set(doc))
+        assert not missing, f"{path.name}: missing required keys {missing}"
+        assert set(doc) <= REQUIRED_YML_KEYS | OPTIONAL_YML_KEYS, (
+            f"{path.name}: unknown keys {sorted(set(doc) - REQUIRED_YML_KEYS - OPTIONAL_YML_KEYS)}"
+        )
+        for key in ("build", "start", "readiness"):
             val = doc[key]
             assert isinstance(val, str) and val.strip(), (
                 f"{path.name}: '{key}' must be a non-empty string"
             )
-        assert isinstance(doc["env"], dict), f"{path.name}: 'env' must be a mapping"
-        for k, v in doc["env"].items():
+        for key in ("migrate", "seed"):
+            if key in doc:
+                assert isinstance(doc[key], str) and doc[key].strip(), (
+                    f"{path.name}: '{key}' must be a non-empty string when present"
+                )
+        env = doc.get("env", {})
+        assert isinstance(env, dict), f"{path.name}: 'env' must be a mapping"
+        for k, v in env.items():
             assert isinstance(v, str), f"{path.name}: env['{k}'] must be a string"
             lowered = k.lower()
             assert not any(h in lowered for h in SECRET_HINTS), (
