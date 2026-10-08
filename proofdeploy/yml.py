@@ -20,15 +20,13 @@ class RepoContract:
     env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "RepoContract":
+    def from_dict(cls, data: dict) -> RepoContract:
         if not isinstance(data, dict):
             raise ValueError(f"proofdeploy.yml must be a mapping, got: {type(data).__name__}")
 
         missing = [k for k in REQUIRED_KEYS if not data.get(k)]
         if missing:
-            raise ValueError(
-                f"proofdeploy.yml missing required keys: {', '.join(missing)}"
-            )
+            raise ValueError(f"proofdeploy.yml missing required keys: {', '.join(missing)}")
         env = data.get("env") or {}
         if not isinstance(env, dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in env.items()
