@@ -1,0 +1,37 @@
+name: pr-agent
+
+# OSS agent reviewer on every PR (ADR 0003). Advisory, non-blocking.
+# Requires the GROQ_API_KEY repository secret (Settings -> Secrets -> Actions).
+# Third-party actions are pinned to immutable commit SHAs; bump deliberately.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+  issue_comment:
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    if: >-
+      github.event.sender.type != 'Bot' &&
+      (github.event_name != 'issue_comment' ||
+       contains(github.event.comment.body, '/review') ||
+       contains(github.event.comment.body, '/describe') ||
+       contains(github.event.comment.body, '/improve') ||
+       contains(github.event.comment.body, '/ask'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: PR Agent review
+        # qodo-ai/pr-agent v0.47.0
+        uses: qodo-ai/pr-agent@8e5a9295973b24af4b70cafd0b660a230811ef9e
+        env:
+          # Both documented key forms; identical values, no conflict.
+          OPENAI_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI__KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI__API_BASE: "https://api.groq.com/openai/v1"
+          # Must be a model on the account; verified 2026-10-08 via /openai/v1/models.
+          CONFIG__MODEL: "openai/gpt-oss-120b"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
