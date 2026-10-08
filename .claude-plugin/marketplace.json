@@ -1,0 +1,1 @@
+{"name":"wally-dk24","owner":{"name":"wally-dk24"},"plugins":[{"description":"Change-aware verification: author probes from your diff and catch the breaks your test suite misses.","name":"proofdeploy","source":"./plugins/proofdeploy"}]}

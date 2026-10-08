@@ -54,9 +54,27 @@ env:
 
 Pre-build. The build follows the PRD milestone order: evaluation-repo proposal first, then the diff reader, then the loop.
 
+## Claude Code marketplace
+
+This repo is its own plugin marketplace. To install the `proofdeploy` skill in
+Claude Code:
+
+```
+/plugin marketplace add wally-dk24/proofdeploy
+/plugin install proofdeploy@wally-dk24
+```
+
+The plugin ships the skill (`plugins/proofdeploy/skills/`) and the
+`/proofdeploy` slash command. Hooks that auto-verify after edits land with the
+deterministic runner. The skill is also installable in any Agent Skills host:
+
+```bash
+npx skills add wally-dk24/proofdeploy --skill proofdeploy
+```
+
 ## Development
 
-Feature branches off `main`, PRs required, Copilot code review on every PR.
+Feature branches off `main`, PRs required, agent review on every PR.
 
 ```
 git checkout -b feature/<name>

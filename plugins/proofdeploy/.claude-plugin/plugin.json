@@ -1,0 +1,1 @@
+{"author":{"name":"wally-dk24"},"description":"Verify behavior-changing code edits with change-aware probes (diff -> probes -> verdicts).","license":"MIT","name":"proofdeploy","version":"0.1.0"}
