@@ -7,14 +7,21 @@ def test_verify_flags_match_prd():
     args = build_parser().parse_args(
         [
             "verify",
-            "--repo", "https://example.com/r.git",
-            "--from", "main",
-            "--to", "abc123",
-            "--target-url", "http://localhost:5000",
+            "--repo",
+            "https://example.com/r.git",
+            "--from",
+            "main",
+            "--to",
+            "abc123",
+            "--target-url",
+            "http://localhost:5000",
             "--allow-remote-target",
-            "--format", "json",
-            "--output", "out.json",
-            "--model", "some-model",
+            "--format",
+            "json",
+            "--output",
+            "out.json",
+            "--model",
+            "some-model",
         ]
     )
     assert args.command == "verify"
