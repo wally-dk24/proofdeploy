@@ -28,8 +28,14 @@ from pathlib import Path
 # credential placeholder and must pass through untouched.
 TEMPLATE_FIELDS = ("repo_name", "seed_note", "auth_mechanism", "auth_scope", "flags_note")
 
-# The author's input bundle contains exactly these three items, nothing else.
-BUNDLE_ALLOWLIST = ("diff.patch", "snapshot", "fixture-description.txt")
+# The author's input bundle contains exactly these items, nothing else.
+# skill-author.md is the generated author copy (hash e42f12d7...); the audited
+# source skill.md never enters the bundle.
+BUNDLE_ALLOWLIST = ("diff.patch", "snapshot", "fixture-description.txt", "skill-author.md")
+
+# Expected sha256 of the generated author copy. The assembler verifies this
+# fail-closed: a different skill means a different measurement.
+EXPECTED_SKILL_HASH = "e42f12d71ea9f5ceee0f6d13b553f7cb13426954053db684ae4e2a6a8d73f5f9"
 
 TEMPLATE_FILENAME = "fixture_template.txt"
 
@@ -86,6 +92,7 @@ class AuthorBundle:
     diff: Path
     snapshot: Path
     description: Path
+    skill: Path
     manifest: Path
 
 
@@ -239,18 +246,24 @@ def assemble_author_bundle(
     template_file: str | Path | None = None,
     source_sha: str | None = None,
     diff_range: str | None = None,
+    skill_path: str | Path | None = None,
+    expected_skill_hash: str = EXPECTED_SKILL_HASH,
 ) -> AuthorBundle:
     """Assemble the blind author's input bundle from the allowlist.
 
     Verifies the frozen template hash before rendering (fail closed), renders
-    the fixture description from the yml fixture mapping, copies the diff and
-    the snapshot, and writes a manifest NEXT TO the bundle (never inside it —
-    the manifest may record source SHAs and diff ranges that must not reach
-    the author).
+    the fixture description from the yml fixture mapping, copies the diff,
+    the snapshot, and the generated author skill copy, and writes a manifest
+    NEXT TO the bundle (never inside it — the manifest may record source SHAs
+    and diff ranges that must not reach the author).
 
-    Fail-closed throughout: template hash mismatch, non-empty output dir,
-    `.git` at any depth in the snapshot, symlinks in the snapshot, or a
-    final bundle whose contents differ from the allowlist all raise.
+    The skill hash is verified fail-closed and recorded in the manifest, so
+    every run is tied to exactly the registered skill content.
+
+    Fail-closed throughout: template hash mismatch, skill hash mismatch,
+    non-empty output dir, `.git` at any depth in the snapshot, symlinks in
+    the snapshot, or a final bundle whose contents differ from the allowlist
+    all raise.
     """
     tpath = Path(template_file) if template_file else template_path()
     actual_hash = hashlib.sha256(tpath.read_bytes()).hexdigest()
@@ -275,22 +288,42 @@ def assemble_author_bundle(
     out_diff = out / "diff.patch"
     out_snap = out / "snapshot"
     out_desc = out / "fixture-description.txt"
+    out_skill = out / "skill-author.md"
     shutil.copyfile(diff_p, out_diff)
     # copytree without symlinks=True never creates symlinks, but the source
     # tree was already checked above; re-check the copy belt and braces.
     shutil.copytree(snap_p, out_snap)
     _check_snapshot_tree(out_snap)
     out_desc.write_text(description, encoding="utf-8")
+
+    # The generated author copy goes in the bundle; its hash is verified
+    # fail-closed and recorded in the manifest. The audited source never
+    # enters the bundle.
+    if skill_path is None:
+        raise ValueError("skill_path is required: the author bundle must include skill-author.md")
+    skill_p = Path(skill_path)
+    if not skill_p.is_file():
+        raise ValueError(f"skill file not found: {skill_p}")
+    skill_hash = _sha256_file(skill_p)
+    if skill_hash != expected_skill_hash:
+        raise ValueError(
+            "skill hash mismatch: expected the registered author copy; "
+            "a different skill means a different measurement"
+        )
+    shutil.copyfile(skill_p, out_skill)
+
     _check_bundle_contents(out)
 
     manifest = {
         "assembled_at": datetime.now(timezone.utc).isoformat(),
         "template_sha256": actual_hash,
+        "skill_sha256": skill_hash,
         "allowlist": list(BUNDLE_ALLOWLIST),
         "snapshot_tree_sha256": _tree_hash(out_snap),
         "files": {
             "diff.patch": _sha256_file(out_diff),
             "fixture-description.txt": _sha256_file(out_desc),
+            "skill-author.md": skill_hash,
         },
     }
     # Source SHAs and diff ranges live in the manifest, which sits next to
@@ -306,5 +339,6 @@ def assemble_author_bundle(
         diff=out_diff,
         snapshot=out_snap,
         description=out_desc,
+        skill=out_skill,
         manifest=out_manifest,
     )
