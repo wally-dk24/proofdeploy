@@ -4,13 +4,13 @@
 
 **Note:** Skill v1 was voided (drafted from a fabricated dev list). This is a fresh draft from the verified TRAIN bugs T1–T7 in `docs/evaluation/dev-set-v2-2026-10-09.md`.
 
-**How to use this document:** Read it before opening the author bundle. It teaches how to probe, not what to find. Every numbered item carries a provenance tag: `[PROC]` (general procedure), `[DEV: T<n>]` (illustrated by TRAIN dev-set bug T<n>), `[DEV: Bottle]` (illustrated by the Bottle TRAIN bug). An untagged item is a drafting error.
+**How to use this document:** Read it before opening the author bundle. It teaches how to probe, not what to find. Every numbered item carries a provenance tag: `[PROC]` (general procedure), `[DEV: T<n>]` (illustrated by TRAIN dev-set bug T<n>). An untagged item is a drafting error.
 
 ---
 
 ## 1. Your job
 
-1. You are not verifying that the feature works. You are trying to find where it breaks. A probe that passes on both the buggy and fixed code tells you nothing. Every probe must be able to fail if the behavior it checks were wrong. `[PROC]`
+1. You are not verifying that the feature works. Every probe must be able to fail if the behavior it checks were wrong. `[PROC]`
 
 2. For each behavior the diff changes, write at least two probes: one for the expected case and one for an adversarial case (see section 3). If you only write expected-case probes, you have not done the job. `[PROC]`
 
@@ -30,7 +30,7 @@
 
 8. When the diff adds a guard, check, or validation, probe both sides of it: an input that should pass the guard and an input that should be rejected by it. Then probe the boundary between them. `[PROC]`
 
-9. Structure every probe as setup / act / assert, plus a negative case. Setup creates the preconditions. Act performs one operation. Assert checks the externally observable result. The negative case performs the same operation under adversarial conditions (different actor, malformed input, repeated invocation) and asserts the result differs appropriately. `[PROC]`
+9. Structure every probe as setup / act / assert, plus a negative case. Setup creates the preconditions. Act performs one operation. Assert checks the externally observable result. The negative case performs the same operation under adversarial conditions (different actor, malformed input) and asserts the result differs appropriately. `[PROC]`
 
 ---
 
@@ -38,17 +38,17 @@
 
 Ask these about every behavior the diff touches. They are generic; the answers come from the bundle, not from this list.
 
-10. What happens when the operation is performed twice with the same inputs? Does the second invocation behave like the first, is it rejected, or does it produce a different result? For batch operations, what happens when one record in the batch carries a hostile value? `[DEV: T1]`
+10. For batch operations, what happens when one record in the batch carries a hostile value? `[DEV: T1]`
 
 11. What happens with no authentication at all? `[DEV: T5]`
 
 12. What happens with an empty, missing, or malformed input where the code expects a well-formed one? Does it reach the same handler, a different handler, or an error path? `[DEV: T3]` `[DEV: T7]`
 
-13. When the diff introduces two or more new conditions, what happens when more than one applies at the same time? What happens when they disagree (one matches, the other does not)? Probe the combinations, not just each condition alone. `[DEV: Bottle]`
+13. When the diff introduces two or more new conditions, what happens when more than one applies at the same time? What happens when they disagree (one matches, the other does not)? Probe the combinations, not just each condition alone. `[DEV: T6]`
 
 14. What happens when the same logical input is represented differently — different case, different encoding — or arrives as an unexpected type — a dict where a string was expected, bytes where text was expected, a list where a scalar was expected? Does the code normalize before comparing, or does the representation leak through? `[DEV: T2]` `[DEV: T4]`
 
-15. Can the same request reach a different route or handler the diff did not change? If so, probe the behavior through that path too. `[DEV: T4]`
+15. Can the same request reach a different route or handler the diff did not change? If so, probe the behavior through that path too. `[DEV: T3]`
 
 ---
 
@@ -82,7 +82,15 @@ Each example is from the TRAIN dev set only, cited by commit SHA. Study the patt
 
 v1 was voided (drafted from a fabricated dev list). v1→v2 T-number mapping: v1 T1 (Payload replay) dropped; v1 T2 (Payload SQLi, fabricated) dropped; v1 T3 (Fastify header) is now T2; v1 T4 (Fastify URL) is now T3; v1 T5 (Django GIS) is now T4; v1 T6 (LMCache) is now T5; v1 T7 (Express) dropped; new T1 is CodeIgniter4 SQLi; new T6 is Bottle; new T7 is Hono.
 
-- **Item 1:** reworded per reviewer fix 1 — "Every probe must be able to fail if the behavior it checks were wrong."
+### v2.1 fixes (reviewer audit round 2, 2026-10-09)
+
+- **Item 1:** the two bug-implying sentences are now actually deleted (the v2 draft added the new sentence but left them in; the changelog incorrectly said "reworded").
+- **Item 9:** "repeated invocation" removed from the negative-case list — its source (Payload replay) was dropped; no train bug supports it.
+- **Item 10:** "performed twice" sentences deleted — same reason. The batch/hostile-record sentence stays `[DEV: T1]`.
+- **Item 13:** retagged `[DEV: Bottle]` → `[DEV: T6]` to match dev-set numbering.
+- **Item 15:** retagged `[DEV: T4]` → `[DEV: T3]` — the "different route or handler" shape is T3 (Fastify), not T4 (Django GIS). Caused by v1→v2 renumbering.
+
+- **Item 1:** reworded per reviewer fix 1 — deleted "You are trying to find where it breaks." and "A probe that passes on both the buggy and fixed code tells you nothing." (both implied a bug exists, pushing false alarms). Kept "You are not verifying that the feature works." followed by "Every probe must be able to fail if the behavior it checks were wrong."
 - **Item 2:** parenthetical "(wrong actor, bad input, repeated action, interacting conditions)" replaced with "(see section 3)" per reviewer.
 - **Item 3:** unchanged.
 - **Item 4:** unchanged.
