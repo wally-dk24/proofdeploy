@@ -7,13 +7,19 @@ the first author run; the bundle assembler verifies the hash fail-closed.
 
 The author's full input bundle (diff, repo snapshot without git history,
 fixture description) is assembled by script from an allowlist, never by hand.
+
+Reviewer finding 6: snapshots are created by script via `git archive <B>`
+into an empty directory; the manifest records the source SHA.
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import shutil
+import subprocess
+import tarfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,8 +74,7 @@ def render_description(template_text: str, fields: dict[str, str]) -> str:
         body = body.replace("{" + f + "}", fields[f])
     if "{" in body or "}" in body:
         raise ValueError(
-            "template contains an unknown {placeholder}: "
-            "only the five fixture fields are allowed"
+            "template contains an unknown {placeholder}: only the five fixture fields are allowed"
         )
     return body.replace(sentinel, "${AUTH_TOKEN}")
 
@@ -111,9 +116,7 @@ def _tree_hash(root: Path) -> str:
     bundle.
     """
     h = hashlib.sha256()
-    files = sorted(
-        p for p in root.rglob("*") if p.is_file() and not p.is_symlink()
-    )
+    files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
     for p in files:
         h.update(p.relative_to(root).as_posix().encode() + b"\x00")
         h.update(_sha256_file(p).encode() + b"\x00")
@@ -128,10 +131,72 @@ def _check_output_dir(out: Path) -> None:
     into the author's bundle outside the allowlist.
     """
     if out.exists() and any(out.iterdir()):
+        raise ValueError(f"output directory is not empty: {out}; assemble into an empty directory")
+
+
+@dataclass
+class Snapshot:
+    """A repo snapshot created by script from a git commit."""
+
+    dir: Path
+    sha: str  # full resolved commit SHA; recorded as the manifest's source_sha
+
+
+def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """Run git in repo_dir, returning the completed process (never raising)."""
+    return subprocess.run(
+        ["git", "-C", str(repo_dir), *args],
+        capture_output=True,
+        check=False,
+    )
+
+
+def create_snapshot(
+    *,
+    repo_dir: str | Path,
+    commit_rev: str,
+    output_dir: str | Path,
+) -> Snapshot:
+    """Create a repo snapshot at <commit_rev> via `git archive`.
+
+    Resolves <commit_rev> to its full SHA with `git rev-parse`, then streams
+    `git archive <sha>` out of repo_dir and extracts it into output_dir,
+    which must be absent or empty (fail closed). `git archive` emits file
+    contents only — no history, no `.git` directory — so there is nothing
+    to smuggle by construction.
+
+    Returns the snapshot directory and the resolved full SHA. Pass the SHA
+    as `source_sha` to `assemble_author_bundle` so the manifest records
+    exactly which commit the snapshot came from.
+
+    Fail-closed: unknown rev, non-empty output dir, or an archive member
+    that would extract outside output_dir all raise.
+    """
+    repo = Path(repo_dir)
+    out = Path(output_dir)
+
+    rev = _git(repo, "rev-parse", "--verify", f"{commit_rev}^{{commit}}")
+    if rev.returncode != 0:
         raise ValueError(
-            f"output directory is not empty: {out}; "
-            "assemble into an empty directory"
+            f"cannot resolve commit {commit_rev!r} in {repo}: {rev.stderr.decode().strip()}"
         )
+    sha = rev.stdout.decode().strip()
+
+    _check_output_dir(out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    arch = _git(repo, "archive", sha)
+    if arch.returncode != 0:
+        raise ValueError(f"git archive {sha} failed in {repo}: {arch.stderr.decode().strip()}")
+    with tarfile.open(fileobj=io.BytesIO(arch.stdout)) as tf:
+        for member in tf.getmembers():
+            # Belt and braces: git archive never emits these, but a
+            # hand-built tar must not escape the snapshot directory.
+            target = (out / member.name).resolve()
+            if not str(target).startswith(str(out.resolve()) + "/"):
+                raise ValueError(f"archive member escapes snapshot dir: {member.name}")
+        tf.extractall(out)
+    return Snapshot(dir=out, sha=sha)
 
 
 def _check_bundle_contents(out: Path) -> None:
@@ -139,8 +204,7 @@ def _check_bundle_contents(out: Path) -> None:
     actual = sorted(p.name for p in out.iterdir())
     if actual != sorted(BUNDLE_ALLOWLIST):
         raise ValueError(
-            f"bundle contents {actual} do not match the allowlist "
-            f"{sorted(BUNDLE_ALLOWLIST)}"
+            f"bundle contents {actual} do not match the allowlist {sorted(BUNDLE_ALLOWLIST)}"
         )
 
 
@@ -171,8 +235,7 @@ def assemble_author_bundle(
     actual_hash = hashlib.sha256(tpath.read_bytes()).hexdigest()
     if actual_hash != expected_template_hash:
         raise ValueError(
-            "template hash mismatch: the frozen template changed; "
-            "prior author runs are invalidated"
+            "template hash mismatch: the frozen template changed; prior author runs are invalidated"
         )
 
     diff_p = Path(diff_path)
@@ -218,6 +281,9 @@ def assemble_author_bundle(
     out_manifest = out.with_name(out.name + ".manifest.json")
     out_manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return AuthorBundle(
-        root=out, diff=out_diff, snapshot=out_snap,
-        description=out_desc, manifest=out_manifest,
+        root=out,
+        diff=out_diff,
+        snapshot=out_snap,
+        description=out_desc,
+        manifest=out_manifest,
     )
