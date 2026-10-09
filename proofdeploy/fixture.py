@@ -15,7 +15,6 @@ into an empty directory; the manifest records the source SHA.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import shutil
 import subprocess
@@ -130,6 +129,8 @@ def _check_output_dir(out: Path) -> None:
     Anything already in the output directory would otherwise ride along
     into the author's bundle outside the allowlist.
     """
+    if out.exists() and not out.is_dir():
+        raise ValueError(f"output path exists and is not a directory: {out}")
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"output directory is not empty: {out}; assemble into an empty directory")
 
@@ -165,12 +166,18 @@ def create_snapshot(
     contents only — no history, no `.git` directory — so there is nothing
     to smuggle by construction.
 
+    The archive streams through a pipe (never fully buffered in memory) and
+    each member is validated before extraction: symlinks, hardlinks, and
+    non-file/non-dir members are refused outright, and any member whose
+    path would escape output_dir raises.
+
     Returns the snapshot directory and the resolved full SHA. Pass the SHA
     as `source_sha` to `assemble_author_bundle` so the manifest records
     exactly which commit the snapshot came from.
 
-    Fail-closed: unknown rev, non-empty output dir, or an archive member
-    that would extract outside output_dir all raise.
+    Fail-closed: unknown rev, non-empty output dir, `git archive` failure,
+    or an archive member that is a link or would extract outside output_dir
+    all raise.
     """
     repo = Path(repo_dir)
     out = Path(output_dir)
@@ -185,17 +192,31 @@ def create_snapshot(
     _check_output_dir(out)
     out.mkdir(parents=True, exist_ok=True)
 
-    arch = _git(repo, "archive", sha)
-    if arch.returncode != 0:
-        raise ValueError(f"git archive {sha} failed in {repo}: {arch.stderr.decode().strip()}")
-    with tarfile.open(fileobj=io.BytesIO(arch.stdout)) as tf:
-        for member in tf.getmembers():
-            # Belt and braces: git archive never emits these, but a
-            # hand-built tar must not escape the snapshot directory.
-            target = (out / member.name).resolve()
-            if not str(target).startswith(str(out.resolve()) + "/"):
-                raise ValueError(f"archive member escapes snapshot dir: {member.name}")
-        tf.extractall(out)
+    out_resolved = out.resolve()
+    proc = subprocess.Popen(
+        ["git", "-C", str(repo), "archive", sha],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None  # for mypy: Popen with PIPE sets it
+        with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
+            for member in tf:
+                if member.issym() or member.islnk():
+                    raise ValueError(f"archive member is a link, refused: {member.name}")
+                if not (member.isfile() or member.isdir()):
+                    raise ValueError(f"archive member is not a file or dir, refused: {member.name}")
+                target = (out / member.name).resolve()
+                if not str(target).startswith(str(out_resolved) + "/"):
+                    raise ValueError(f"archive member escapes snapshot dir: {member.name}")
+                tf.extract(member, out)
+    finally:
+        # If validation raised mid-stream, stop the producer.
+        if proc.poll() is None:
+            proc.kill()
+        _, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise ValueError(f"git archive {sha} failed in {repo}: {stderr.decode().strip()}")
     return Snapshot(dir=out, sha=sha)
 
 

@@ -363,3 +363,42 @@ def test_create_snapshot_feeds_bundle_with_recorded_sha(tmp_path):
     manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
     assert manifest["source_sha"] == sha
     assert manifest["diff_range"] == f"{sha}^..{sha}"
+
+
+def test_create_snapshot_rejects_output_path_is_file(tmp_path):
+    """pr-agent: an output path that exists as a file gets a clean error."""
+    repo, sha = _git_repo(tmp_path)
+    out = tmp_path / "snap"
+    out.write_text("i am a file\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a directory"):
+        fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=out)
+
+
+def _git_repo_with_symlink(tmp_path):
+    """A git repo containing a committed symlink; returns (repo_dir, sha)."""
+    repo = tmp_path / "linkrepo"
+    repo.mkdir()
+    (repo / "real.txt").write_text("data\n", encoding="utf-8")
+    (repo / "link.txt").symlink_to("real.txt")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "one"], cwd=repo, check=True, env=env)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return repo, sha
+
+
+def test_create_snapshot_refuses_symlink_members(tmp_path):
+    """pr-agent: tar symlinks are refused at extraction, never written."""
+    repo, sha = _git_repo_with_symlink(tmp_path)
+    with pytest.raises(ValueError, match="is a link, refused"):
+        fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
+    assert not (tmp_path / "snap" / "link.txt").exists()
