@@ -139,7 +139,7 @@ def _validate_assertion(a: Any, i: int) -> None:
     _check_no_code_probe(a, where)
 
 
-def _validate_setup_step(s: Any, i: int, allow_harness_app: bool = True) -> None:
+def _validate_setup_step(s: Any, i: int, allow_harness_app: bool = False) -> None:
     where = f"setup[{i}]"
     if not isinstance(s, dict):
         _reject(f"{where} must be an object")
@@ -170,15 +170,15 @@ def _validate_setup_step(s: Any, i: int, allow_harness_app: bool = True) -> None
         _reject(f"{where} has unknown fields: {sorted(unknown)}")
 
 
-def validate_probe(probe: Any, allow_harness_app: bool = True) -> dict[str, Any]:
+def validate_probe(probe: Any, allow_harness_app: bool = False) -> dict[str, Any]:
     """Validate a single probe against the strict schema.
 
     Returns the probe unchanged on success. Raises ProbeRejected on any
     violation — wrong shape, unknown fields, non-HTTP/DB content, or code
     meant to run inside the target process.
 
-    Set allow_harness_app=False for eval repos, where the harness_app setup
-    step is forbidden.
+    allow_harness_app defaults to False (fail-closed). Dev-set library repos
+    opt in explicitly; eval repos must never set it.
     """
     if not isinstance(probe, dict):
         _reject("probe must be a JSON object")
@@ -214,14 +214,15 @@ def validate_probe(probe: Any, allow_harness_app: bool = True) -> dict[str, Any]
     return probe  # type: ignore[no-any-return]
 
 
-def parse_probes(text: str, allow_harness_app: bool = True) -> list[dict]:
+def parse_probes(text: str, allow_harness_app: bool = False) -> list[dict]:
     """Extract and validate probes from fenced JSON code blocks.
 
     The author outputs each probe as a fenced ```json block. Anything outside
     the blocks is ignored. Every block must parse as JSON and pass
     validate_probe; any failure rejects the whole set.
 
-    Set allow_harness_app=False for eval repos.
+    allow_harness_app defaults to False (fail-closed). Dev-set library repos
+    opt in explicitly.
     """
     blocks = re.findall(r"```json\s*\n(.*?)```", text, re.DOTALL)
     if not blocks:
@@ -254,7 +255,7 @@ class ProbeSet:
     harness_app_hashes: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_author_output(cls, text: str, allow_harness_app: bool = True) -> ProbeSet:
+    def from_author_output(cls, text: str, allow_harness_app: bool = False) -> ProbeSet:
         probes = parse_probes(text, allow_harness_app=allow_harness_app)
         hashes = []
         for p in probes:

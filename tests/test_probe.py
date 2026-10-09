@@ -113,7 +113,7 @@ def test_harness_app_setup_step():
             "entrypoint": "app",
         }
     ]
-    ps = ProbeSet.from_author_output(_fenced(p))
+    ps = ProbeSet.from_author_output(_fenced(p), allow_harness_app=True)
     assert len(ps.harness_app_hashes) == 1
     assert len(ps.harness_app_hashes[0]) == 64  # sha256 hex
 
@@ -138,13 +138,12 @@ def test_harness_app_rejected_when_not_allowed():
             "entrypoint": "app",
         }
     ]
-    # Allowed by default (dev-set library repos)
-    validate_probe(p, allow_harness_app=True)
-    # Rejected for eval repos
+    # Rejected by default (fail-closed); dev-set library repos opt in explicitly
     with pytest.raises(ProbeRejected, match="only allowed for dev-set library repos"):
-        validate_probe(p, allow_harness_app=False)
+        validate_probe(p)
+    validate_probe(p, allow_harness_app=True)
     with pytest.raises(ProbeRejected):
-        parse_probes(_fenced(p), allow_harness_app=False)
+        parse_probes(_fenced(p))
 
 
 def test_harness_app_source_allows_imports():
