@@ -89,3 +89,15 @@ the checkpoint. Exactly one model per run (rule 5).
 
 Under Backups: "No control failed to build" is corrected to "No control was
 replaced" (C5's build was PARTIAL; it was not replaced).
+
+---
+
+## Addendum 2026-10-09: dev-set registration
+
+**Dev list:** `docs/evaluation/dev-set-2026-10-09.md` (10 bugs: 6 TRAIN + 4 HELD-OUT; 10 clean diffs, split equally). Pre-registered before skill drafting. TRAIN half may be read for drafting; HELD-OUT half is measurement-only.
+
+**Minimum scores (Master's decision, 2026-10-09):**
+- False alarms (INCONCLUSIVE counts as one): at most **1 in 10** clean diffs.
+- Catches: at least **3 in 10** bugs, strictly above the no-skill baseline.
+
+These floors are fixed before any dev-set measurement. The checkpoint bar is unchanged.
