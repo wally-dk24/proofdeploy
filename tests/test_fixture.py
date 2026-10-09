@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -74,9 +76,9 @@ def test_template_file_renders_with_fixture_fields():
 
 
 def test_template_hash_is_stable():
-    assert fixture.template_hash() == hashlib.sha256(
-        fixture.template_path().read_bytes()
-    ).hexdigest()
+    assert (
+        fixture.template_hash() == hashlib.sha256(fixture.template_path().read_bytes()).hexdigest()
+    )
 
 
 def _write_yml(tmp_path):
@@ -105,8 +107,7 @@ def test_yml_loads_optional_fixture_mapping(tmp_path):
 def test_yml_without_fixture_still_loads(tmp_path):
     p = tmp_path / "proofdeploy.yml"
     p.write_text(
-        "build: 'npm ci'\nstart: 'node dist/index.js'\n"
-        "readiness: 'http://localhost:3000/health'\n",
+        "build: 'npm ci'\nstart: 'node dist/index.js'\nreadiness: 'http://localhost:3000/health'\n",
         encoding="utf-8",
     )
     assert load_contract(p).fixture == {}
@@ -263,9 +264,7 @@ def test_assemble_rejects_git_file_at_depth(tmp_path):
 
 def test_manifest_records_source_sha_and_range_outside_bundle(tmp_path):
     """Finding 5: source SHAs live in the manifest, next to the bundle."""
-    bundle = _assemble(
-        tmp_path, source_sha="abc123", diff_range="abc123^..abc123"
-    )
+    bundle = _assemble(tmp_path, source_sha="abc123", diff_range="abc123^..abc123")
     manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
     assert manifest["source_sha"] == "abc123"
     assert manifest["diff_range"] == "abc123^..abc123"
@@ -284,3 +283,122 @@ def test_tree_hash_is_deterministic(tmp_path):
     assert fixture._tree_hash(snap) == fixture._tree_hash(snap)
     (snap / "src" / "extra.js").write_text("x\n", encoding="utf-8")
     assert fixture._tree_hash(snap) != fixture._tree_hash(_snapshot(tmp_path.parent / "other"))
+
+
+# --- Finding 6: snapshots are created by script via `git archive` ---
+
+
+def _git_repo(tmp_path):
+    """A tiny real git repo with one commit; returns (repo_dir, full_sha)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "app.js").write_text("console.log(1);\n", encoding="utf-8")
+    (repo / "README.md").write_text("# hi\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "one"], cwd=repo, check=True, env=env)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return repo, sha
+
+
+def test_create_snapshot_happy_path(tmp_path):
+    """Finding 6: `git archive <B>` into an empty dir; manifest gets the SHA."""
+    repo, sha = _git_repo(tmp_path)
+    snap = fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
+    assert snap.sha == sha
+    assert (snap.dir / "src" / "app.js").read_text(encoding="utf-8") == "console.log(1);\n"
+    assert (snap.dir / "README.md").is_file()
+    # git archive carries no history by construction.
+    assert not (snap.dir / ".git").exists()
+    assert list(snap.dir.rglob(".git")) == []
+
+
+def test_create_snapshot_resolves_short_rev_to_full_sha(tmp_path):
+    repo, sha = _git_repo(tmp_path)
+    snap = fixture.create_snapshot(repo_dir=repo, commit_rev=sha[:7], output_dir=tmp_path / "snap")
+    assert snap.sha == sha
+
+
+def test_create_snapshot_rejects_unknown_rev(tmp_path):
+    repo, _ = _git_repo(tmp_path)
+    with pytest.raises(ValueError, match="cannot resolve commit"):
+        fixture.create_snapshot(repo_dir=repo, commit_rev="deadbee", output_dir=tmp_path / "snap")
+
+
+def test_create_snapshot_rejects_nonempty_output_dir(tmp_path):
+    repo, sha = _git_repo(tmp_path)
+    out = tmp_path / "snap"
+    out.mkdir()
+    (out / "stray").write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError, match="not empty"):
+        fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=out)
+
+
+def test_create_snapshot_feeds_bundle_with_recorded_sha(tmp_path):
+    """End to end: scripted snapshot -> bundle, manifest records source_sha."""
+    repo, sha = _git_repo(tmp_path)
+    snap = fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
+    yml = _write_yml(tmp_path)
+    diff = tmp_path / "b.patch"
+    diff.write_text("diff --git a/x b/x\n", encoding="utf-8")
+    bundle = fixture.assemble_author_bundle(
+        diff_path=diff,
+        snapshot_dir=snap.dir,
+        yml_fixture=load_contract(yml).fixture,
+        output_dir=tmp_path / "bundle",
+        expected_template_hash=fixture.template_hash(),
+        source_sha=snap.sha,
+        diff_range=f"{sha}^..{sha}",
+    )
+    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+    assert manifest["source_sha"] == sha
+    assert manifest["diff_range"] == f"{sha}^..{sha}"
+
+
+def test_create_snapshot_rejects_output_path_is_file(tmp_path):
+    """pr-agent: an output path that exists as a file gets a clean error."""
+    repo, sha = _git_repo(tmp_path)
+    out = tmp_path / "snap"
+    out.write_text("i am a file\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a directory"):
+        fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=out)
+
+
+def _git_repo_with_symlink(tmp_path):
+    """A git repo containing a committed symlink; returns (repo_dir, sha)."""
+    repo = tmp_path / "linkrepo"
+    repo.mkdir()
+    (repo / "real.txt").write_text("data\n", encoding="utf-8")
+    (repo / "link.txt").symlink_to("real.txt")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "one"], cwd=repo, check=True, env=env)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return repo, sha
+
+
+def test_create_snapshot_refuses_symlink_members(tmp_path):
+    """pr-agent: tar symlinks are refused at extraction, never written."""
+    repo, sha = _git_repo_with_symlink(tmp_path)
+    with pytest.raises(ValueError, match="is a link, refused"):
+        fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
+    assert not (tmp_path / "snap" / "link.txt").exists()
