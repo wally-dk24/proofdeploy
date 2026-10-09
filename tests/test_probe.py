@@ -127,6 +127,41 @@ def test_harness_app_needs_source():
         validate_probe(p)
 
 
+def test_harness_app_rejected_when_not_allowed():
+    """Eval repos must reject harness_app; only dev-set library repos allow it."""
+    p = _valid_probe()
+    p["setup"] = [
+        {
+            "type": "harness_app",
+            "language": "python",
+            "source": "from bottle import Bottle\napp = Bottle()",
+            "entrypoint": "app",
+        }
+    ]
+    # Allowed by default (dev-set library repos)
+    validate_probe(p, allow_harness_app=True)
+    # Rejected for eval repos
+    with pytest.raises(ProbeRejected, match="only allowed for dev-set library repos"):
+        validate_probe(p, allow_harness_app=False)
+    with pytest.raises(ProbeRejected):
+        parse_probes(_fenced(p), allow_harness_app=False)
+
+
+def test_harness_app_source_allows_imports():
+    """harness_app.source IS code by definition; the blocklist must not apply."""
+    p = _valid_probe()
+    p["setup"] = [
+        {
+            "type": "harness_app",
+            "language": "python",
+            "source": "import os\nfrom bottle import Bottle\napp = Bottle()\n",
+            "entrypoint": "app",
+        }
+    ]
+    # Must pass: the schema allowlist is fail-closed, no substring blocklist on source
+    validate_probe(p, allow_harness_app=True)
+
+
 def test_rejects_no_fenced_blocks():
     with pytest.raises(ProbeRejected):
         parse_probes("just some prose, no blocks")

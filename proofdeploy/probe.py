@@ -139,7 +139,7 @@ def _validate_assertion(a: Any, i: int) -> None:
     _check_no_code_probe(a, where)
 
 
-def _validate_setup_step(s: Any, i: int) -> None:
+def _validate_setup_step(s: Any, i: int, allow_harness_app: bool = True) -> None:
     where = f"setup[{i}]"
     if not isinstance(s, dict):
         _reject(f"{where} must be an object")
@@ -147,15 +147,19 @@ def _validate_setup_step(s: Any, i: int) -> None:
     if stype not in ALLOWED_SETUP_TYPES:
         _reject(f"{where}.type must be one of {sorted(ALLOWED_SETUP_TYPES)}, got {stype!r}")
     if stype == "harness_app":
-        # Library repos only: the author writes a minimal app mounting the
-        # library. The app source is hashed alongside the probes.
+        # Library repos only (dev-set): the author writes a minimal app mounting
+        # the library. Eval repos must reject this step type.
+        if not allow_harness_app:
+            _reject(f"{where}: harness_app is only allowed for dev-set library repos")
         if not isinstance(s.get("language"), str):
             _reject(f"{where}: harness_app needs string 'language'")
         if not isinstance(s.get("source"), str) or not s["source"].strip():
             _reject(f"{where}: harness_app needs non-empty string 'source'")
         if not isinstance(s.get("entrypoint"), str):
             _reject(f"{where}: harness_app needs string 'entrypoint'")
-        _check_no_code_probe(s["source"], f"{where}.source")
+        # Note: harness_app.source IS code by definition (a minimal app mounting
+        # the library). The schema allowlist is fail-closed, so no substring
+        # blocklist applies here — that check would reject legitimate imports.
     elif stype == "http":
         # An HTTP call to set up state (e.g. create a fixture record).
         if "act" not in s:
@@ -166,12 +170,15 @@ def _validate_setup_step(s: Any, i: int) -> None:
         _reject(f"{where} has unknown fields: {sorted(unknown)}")
 
 
-def validate_probe(probe: Any) -> dict[str, Any]:
+def validate_probe(probe: Any, allow_harness_app: bool = True) -> dict[str, Any]:
     """Validate a single probe against the strict schema.
 
     Returns the probe unchanged on success. Raises ProbeRejected on any
     violation — wrong shape, unknown fields, non-HTTP/DB content, or code
     meant to run inside the target process.
+
+    Set allow_harness_app=False for eval repos, where the harness_app setup
+    step is forbidden.
     """
     if not isinstance(probe, dict):
         _reject("probe must be a JSON object")
@@ -187,7 +194,7 @@ def validate_probe(probe: Any) -> dict[str, Any]:
     if not isinstance(setup, list):
         _reject("probe.setup must be a list")
     for i, s in enumerate(setup):
-        _validate_setup_step(s, i)
+        _validate_setup_step(s, i, allow_harness_app=allow_harness_app)
 
     _validate_act(probe["act"])
 
@@ -197,16 +204,24 @@ def validate_probe(probe: Any) -> dict[str, Any]:
     for i, a in enumerate(asserts):
         _validate_assertion(a, i)
 
-    _check_no_code_probe(probe, "probe")
+    # Final sweep for code probes. harness_app.source is excluded: it is code
+    # by definition (a minimal app), and the schema allowlist is fail-closed.
+    scrubbed = json.loads(json.dumps(probe))
+    for step in scrubbed.get("setup", []):
+        if isinstance(step, dict) and step.get("type") == "harness_app":
+            step["source"] = ""
+    _check_no_code_probe(scrubbed, "probe")
     return probe  # type: ignore[no-any-return]
 
 
-def parse_probes(text: str) -> list[dict]:
+def parse_probes(text: str, allow_harness_app: bool = True) -> list[dict]:
     """Extract and validate probes from fenced JSON code blocks.
 
     The author outputs each probe as a fenced ```json block. Anything outside
     the blocks is ignored. Every block must parse as JSON and pass
     validate_probe; any failure rejects the whole set.
+
+    Set allow_harness_app=False for eval repos.
     """
     blocks = re.findall(r"```json\s*\n(.*?)```", text, re.DOTALL)
     if not blocks:
@@ -218,7 +233,7 @@ def parse_probes(text: str) -> list[dict]:
         except json.JSONDecodeError as e:
             _reject(f"block {i}: invalid JSON: {e}")
         try:
-            validate_probe(probe)
+            validate_probe(probe, allow_harness_app=allow_harness_app)
         except ProbeRejected as e:
             _reject(f"block {i}: {e}")
         probes.append(probe)
@@ -239,8 +254,8 @@ class ProbeSet:
     harness_app_hashes: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_author_output(cls, text: str) -> ProbeSet:
-        probes = parse_probes(text)
+    def from_author_output(cls, text: str, allow_harness_app: bool = True) -> ProbeSet:
+        probes = parse_probes(text, allow_harness_app=allow_harness_app)
         hashes = []
         for p in probes:
             for step in p.get("setup", []):
