@@ -137,6 +137,7 @@ def test_assemble_bundle_happy_path(tmp_path):
     out = tmp_path / "bundle"
 
     c = load_contract(yml)
+    expected_tree_hash = fixture._tree_hash(snap)
     bundle = fixture.assemble_author_bundle(
         diff_path=diff,
         snapshot_dir=snap,
@@ -147,10 +148,22 @@ def test_assemble_bundle_happy_path(tmp_path):
     assert bundle.description.read_text(encoding="utf-8") == EXPECTED
     assert (bundle.snapshot / "src" / "app.js").is_file()
     assert not (bundle.snapshot / ".git").exists()
+    # Finding 5: the manifest sits next to the bundle, never inside it.
+    assert bundle.manifest.parent == out.parent
+    assert bundle.manifest.name == "bundle.manifest.json"
+    assert not (out / "manifest.json").exists()
+    assert sorted(p.name for p in out.iterdir()) == [
+        "diff.patch",
+        "fixture-description.txt",
+        "snapshot",
+    ]
     manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
     assert manifest["template_sha256"] == fixture.template_hash()
     assert manifest["allowlist"] == ["diff.patch", "snapshot", "fixture-description.txt"]
     assert set(manifest["files"]) == {"diff.patch", "fixture-description.txt"}
+    # Finding 4: the snapshot tree itself is hashed, deterministically.
+    assert manifest["snapshot_tree_sha256"] == fixture._tree_hash(bundle.snapshot)
+    assert manifest["snapshot_tree_sha256"] == expected_tree_hash
 
 
 def test_assemble_rejects_template_hash_mismatch(tmp_path):
@@ -193,3 +206,81 @@ def test_assemble_rejects_missing_diff(tmp_path):
             output_dir=tmp_path / "bundle",
             expected_template_hash=fixture.template_hash(),
         )
+
+
+def _assemble(tmp_path, snap=None, out_name="bundle", **kw):
+    yml = _write_yml(tmp_path)
+    diff = tmp_path / "b.patch"
+    diff.write_text("diff --git a/x b/x\n", encoding="utf-8")
+    args = {
+        "diff_path": diff,
+        "snapshot_dir": snap or _snapshot(tmp_path),
+        "yml_fixture": load_contract(yml).fixture,
+        "output_dir": tmp_path / out_name,
+        "expected_template_hash": fixture.template_hash(),
+    }
+    args.update(kw)
+    return fixture.assemble_author_bundle(**args)
+
+
+def test_assemble_rejects_nonempty_output_dir(tmp_path):
+    """Finding 1: a stray file in the output dir must not ride into the bundle."""
+    out = tmp_path / "bundle"
+    out.mkdir()
+    (out / "probe-sketch.md").write_text("the answer\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not empty"):
+        _assemble(tmp_path)
+
+
+def test_assemble_rejects_symlink_in_snapshot(tmp_path):
+    """Finding 2: symlinks are refused outright (copytree would follow them)."""
+    snap = _snapshot(tmp_path)
+    (tmp_path / "secret").mkdir()
+    (tmp_path / "secret" / "fix.patch").write_text("ANSWER\n", encoding="utf-8")
+    (snap / "link").symlink_to(tmp_path / "secret", target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        _assemble(tmp_path, snap=snap)
+
+
+def test_assemble_rejects_nested_git(tmp_path):
+    """Finding 3: .git is refused at any depth, not just the top level."""
+    snap = _snapshot(tmp_path)
+    nested = snap / "sub" / "vendored"
+    nested.mkdir(parents=True)
+    (nested / ".git").mkdir()
+    with pytest.raises(ValueError, match="must not contain .git"):
+        _assemble(tmp_path, snap=snap)
+
+
+def test_assemble_rejects_git_file_at_depth(tmp_path):
+    """A `.git` *file* (submodule pointer) is also refused."""
+    snap = _snapshot(tmp_path)
+    (snap / "submod").mkdir()
+    (snap / "submod" / ".git").write_text("gitdir: ../.git/modules/x\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must not contain .git"):
+        _assemble(tmp_path, snap=snap)
+
+
+def test_manifest_records_source_sha_and_range_outside_bundle(tmp_path):
+    """Finding 5: source SHAs live in the manifest, next to the bundle."""
+    bundle = _assemble(
+        tmp_path, source_sha="abc123", diff_range="abc123^..abc123"
+    )
+    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+    assert manifest["source_sha"] == "abc123"
+    assert manifest["diff_range"] == "abc123^..abc123"
+    # ...and none of it reaches the bundle the author sees.
+    assert "abc123" not in (bundle.root / "diff.patch").read_text(encoding="utf-8")
+    assert "abc123" not in bundle.description.read_text(encoding="utf-8")
+    assert sorted(p.name for p in bundle.root.iterdir()) == [
+        "diff.patch",
+        "fixture-description.txt",
+        "snapshot",
+    ]
+
+
+def test_tree_hash_is_deterministic(tmp_path):
+    snap = _snapshot(tmp_path)
+    assert fixture._tree_hash(snap) == fixture._tree_hash(snap)
+    (snap / "src" / "extra.js").write_text("x\n", encoding="utf-8")
+    assert fixture._tree_hash(snap) != fixture._tree_hash(_snapshot(tmp_path.parent / "other"))

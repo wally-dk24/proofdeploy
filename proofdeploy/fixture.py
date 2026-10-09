@@ -89,6 +89,61 @@ def _sha256_file(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def _check_snapshot_tree(snap: Path) -> None:
+    """Fail closed on anything that could smuggle history or outside content.
+
+    Refuses `.git` at any depth (a submodule or vendored checkout can carry
+    history in a nested `.git`) and refuses symlinks altogether (`copytree`
+    would otherwise follow a link pointing outside the snapshot).
+    """
+    for p in snap.rglob("*"):
+        if p.name == ".git":
+            raise ValueError(f"snapshot must not contain .git history: {p}")
+        if p.is_symlink():
+            raise ValueError(f"snapshot must not contain symlinks: {p}")
+
+
+def _tree_hash(root: Path) -> str:
+    """Deterministic hash of a directory tree.
+
+    sha256 over each file's sorted relative posix path plus its content
+    hash, so the manifest records exactly which snapshot went into the
+    bundle.
+    """
+    h = hashlib.sha256()
+    files = sorted(
+        p for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+    )
+    for p in files:
+        h.update(p.relative_to(root).as_posix().encode() + b"\x00")
+        h.update(_sha256_file(p).encode() + b"\x00")
+    h.update(f"{len(files)} files".encode())
+    return h.hexdigest()
+
+
+def _check_output_dir(out: Path) -> None:
+    """The bundle directory must be empty (or absent) before assembly.
+
+    Anything already in the output directory would otherwise ride along
+    into the author's bundle outside the allowlist.
+    """
+    if out.exists() and any(out.iterdir()):
+        raise ValueError(
+            f"output directory is not empty: {out}; "
+            "assemble into an empty directory"
+        )
+
+
+def _check_bundle_contents(out: Path) -> None:
+    """After assembly the bundle must contain exactly the allowlist."""
+    actual = sorted(p.name for p in out.iterdir())
+    if actual != sorted(BUNDLE_ALLOWLIST):
+        raise ValueError(
+            f"bundle contents {actual} do not match the allowlist "
+            f"{sorted(BUNDLE_ALLOWLIST)}"
+        )
+
+
 def assemble_author_bundle(
     *,
     diff_path: str | Path,
@@ -97,13 +152,20 @@ def assemble_author_bundle(
     output_dir: str | Path,
     expected_template_hash: str,
     template_file: str | Path | None = None,
+    source_sha: str | None = None,
+    diff_range: str | None = None,
 ) -> AuthorBundle:
     """Assemble the blind author's input bundle from the allowlist.
 
     Verifies the frozen template hash before rendering (fail closed), renders
     the fixture description from the yml fixture mapping, copies the diff and
-    the snapshot (refusing snapshots that contain .git), and writes a manifest
-    recording the sha256 of every bundle item.
+    the snapshot, and writes a manifest NEXT TO the bundle (never inside it —
+    the manifest may record source SHAs and diff ranges that must not reach
+    the author).
+
+    Fail-closed throughout: template hash mismatch, non-empty output dir,
+    `.git` at any depth in the snapshot, symlinks in the snapshot, or a
+    final bundle whose contents differ from the allowlist all raise.
     """
     tpath = Path(template_file) if template_file else template_path()
     actual_hash = hashlib.sha256(tpath.read_bytes()).hexdigest()
@@ -120,8 +182,8 @@ def assemble_author_bundle(
         raise ValueError(f"diff not found: {diff_p}")
     if not snap_p.is_dir():
         raise ValueError(f"snapshot dir not found: {snap_p}")
-    if (snap_p / ".git").exists():
-        raise ValueError("snapshot must not contain .git history")
+    _check_snapshot_tree(snap_p)
+    _check_output_dir(out)
 
     description = render_description(tpath.read_text(encoding="utf-8"), yml_fixture)
 
@@ -130,24 +192,30 @@ def assemble_author_bundle(
     out_snap = out / "snapshot"
     out_desc = out / "fixture-description.txt"
     shutil.copyfile(diff_p, out_diff)
-    if out_snap.exists():
-        shutil.rmtree(out_snap)
+    # copytree without symlinks=True never creates symlinks, but the source
+    # tree was already checked above; re-check the copy belt and braces.
     shutil.copytree(snap_p, out_snap)
-    # Belt and braces: the copy must not have smuggled .git in either.
-    if (out_snap / ".git").exists():
-        raise ValueError("snapshot copy contains .git history")
+    _check_snapshot_tree(out_snap)
     out_desc.write_text(description, encoding="utf-8")
+    _check_bundle_contents(out)
 
     manifest = {
         "assembled_at": datetime.now(timezone.utc).isoformat(),
         "template_sha256": actual_hash,
         "allowlist": list(BUNDLE_ALLOWLIST),
+        "snapshot_tree_sha256": _tree_hash(out_snap),
         "files": {
             "diff.patch": _sha256_file(out_diff),
             "fixture-description.txt": _sha256_file(out_desc),
         },
     }
-    out_manifest = out / "manifest.json"
+    # Source SHAs and diff ranges live in the manifest, which sits next to
+    # the bundle — never inside it, never reaching the author.
+    if source_sha is not None:
+        manifest["source_sha"] = source_sha
+    if diff_range is not None:
+        manifest["diff_range"] = diff_range
+    out_manifest = out.with_name(out.name + ".manifest.json")
     out_manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return AuthorBundle(
         root=out, diff=out_diff, snapshot=out_snap,
