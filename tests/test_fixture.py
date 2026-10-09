@@ -140,6 +140,7 @@ def test_assemble_bundle_happy_path(tmp_path):
 
     c = load_contract(yml)
     expected_tree_hash = fixture._tree_hash(snap)
+    fixture.EXPECTED_SKILL_HASH = fixture._sha256_file(skill)
     bundle = fixture.assemble_author_bundle(
         diff_path=diff,
         snapshot_dir=snap,
@@ -147,7 +148,6 @@ def test_assemble_bundle_happy_path(tmp_path):
         output_dir=out,
         expected_template_hash=fixture.template_hash(),
         skill_path=skill,
-        expected_skill_hash=fixture._sha256_file(skill),
     )
     assert bundle.description.read_text(encoding="utf-8") == EXPECTED
     assert (bundle.snapshot / "src" / "app.js").is_file()
@@ -190,7 +190,6 @@ def test_assemble_rejects_template_hash_mismatch(tmp_path):
             output_dir=tmp_path / "bundle",
             expected_template_hash="0" * 64,
             skill_path=_write_skill(tmp_path),
-            expected_skill_hash="0" * 64,
         )
 
 
@@ -199,6 +198,7 @@ def test_assemble_rejects_skill_hash_mismatch(tmp_path):
     yml = _write_yml(tmp_path)
     diff = tmp_path / "b.patch"
     diff.write_text("x", encoding="utf-8")
+    fixture.EXPECTED_SKILL_HASH = "f" * 64
     with pytest.raises(ValueError, match="skill hash mismatch"):
         fixture.assemble_author_bundle(
             diff_path=diff,
@@ -207,7 +207,6 @@ def test_assemble_rejects_skill_hash_mismatch(tmp_path):
             output_dir=tmp_path / "bundle",
             expected_template_hash=fixture.template_hash(),
             skill_path=_write_skill(tmp_path),
-            expected_skill_hash="f" * 64,
         )
 
 
@@ -223,6 +222,31 @@ def test_assemble_requires_skill_path(tmp_path):
             output_dir=tmp_path / "bundle",
             expected_template_hash=fixture.template_hash(),
         )
+
+
+def test_assemble_no_skill_mode(tmp_path):
+    """The baseline arm builds a bundle without skill-author.md."""
+    yml = _write_yml(tmp_path)
+    diff = tmp_path / "b.patch"
+    diff.write_text("diff --git a/x b/x\n", encoding="utf-8")
+    bundle = fixture.assemble_author_bundle(
+        diff_path=diff,
+        snapshot_dir=_snapshot(tmp_path),
+        yml_fixture=load_contract(yml).fixture,
+        output_dir=tmp_path / "bundle",
+        expected_template_hash=fixture.template_hash(),
+        no_skill=True,
+    )
+    assert bundle.skill is None
+    assert not (tmp_path / "bundle" / "skill-author.md").exists()
+    assert sorted(p.name for p in (tmp_path / "bundle").iterdir()) == [
+        "diff.patch",
+        "fixture-description.txt",
+        "snapshot",
+    ]
+    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+    assert manifest["skill_sha256"] is None
+    assert "skill-author.md" not in manifest["files"]
 
 
 def test_assemble_rejects_snapshot_with_git(tmp_path):
@@ -265,17 +289,22 @@ def _assemble(tmp_path, snap=None, out_name="bundle", **kw):
     diff = tmp_path / "b.patch"
     diff.write_text("diff --git a/x b/x\n", encoding="utf-8")
     skill = _write_skill(tmp_path)
-    args = {
-        "diff_path": diff,
-        "snapshot_dir": snap or _snapshot(tmp_path),
-        "yml_fixture": load_contract(yml).fixture,
-        "output_dir": tmp_path / out_name,
-        "expected_template_hash": fixture.template_hash(),
-        "skill_path": skill,
-        "expected_skill_hash": fixture._sha256_file(skill),
-    }
-    args.update(kw)
-    return fixture.assemble_author_bundle(**args)
+    # The skill hash is fixed in code; tests override it and restore after.
+    orig_hash = fixture.EXPECTED_SKILL_HASH
+    fixture.EXPECTED_SKILL_HASH = fixture._sha256_file(skill)
+    try:
+        args = {
+            "diff_path": diff,
+            "snapshot_dir": snap or _snapshot(tmp_path),
+            "yml_fixture": load_contract(yml).fixture,
+            "output_dir": tmp_path / out_name,
+            "expected_template_hash": fixture.template_hash(),
+            "skill_path": skill,
+        }
+        args.update(kw)
+        return fixture.assemble_author_bundle(**args)
+    finally:
+        fixture.EXPECTED_SKILL_HASH = orig_hash
 
 
 def test_assemble_rejects_nonempty_output_dir(tmp_path):
@@ -407,6 +436,7 @@ def test_create_snapshot_feeds_bundle_with_recorded_sha(tmp_path):
     diff = tmp_path / "b.patch"
     diff.write_text("diff --git a/x b/x\n", encoding="utf-8")
     skill = _write_skill(tmp_path)
+    fixture.EXPECTED_SKILL_HASH = fixture._sha256_file(skill)
     bundle = fixture.assemble_author_bundle(
         diff_path=diff,
         snapshot_dir=snap.dir,
@@ -416,7 +446,6 @@ def test_create_snapshot_feeds_bundle_with_recorded_sha(tmp_path):
         source_sha=snap.sha,
         diff_range=f"{sha}^..{sha}",
         skill_path=skill,
-        expected_skill_hash=fixture._sha256_file(skill),
     )
     manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
     assert manifest["source_sha"] == sha
