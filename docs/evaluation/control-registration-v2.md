@@ -73,3 +73,19 @@ remains held.
   (approved; condition: each commit uses its own `dev-config.ts`, unmodified)
 - Directus: `55aa188ba1ab053a970d3438db505d70fc9ff7303d977e4271c1062e3fef9026`
   (approved after wording fix to "static Bearer token in the Authorization header")
+
+---
+
+## Addendum 2026-10-09: probe-authoring model pin
+
+**Model:** `openai/gpt-oss-120b` (Groq API)
+**Vendor-stated training cutoff:** June 2024 (OpenAI gpt-oss model card)
+**Pin:** exact Groq model ID `openai/gpt-oss-120b`; no tools, no web access
+**Decision:** Master, 2026-10-09. The model is a user preference in the
+framework; this is the registered default for the Bottle blind dry run and
+the checkpoint. Exactly one model per run (rule 5).
+
+## Addendum 2026-10-09: wording fix
+
+Under Backups: "No control failed to build" is corrected to "No control was
+replaced" (C5's build was PARTIAL; it was not replaced).
