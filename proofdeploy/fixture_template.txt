@@ -1,0 +1,26 @@
+# ProofDeploy fixture description template — FROZEN 2026-10-09
+#
+# This is the exact text the blind author receives as their fixture description,
+# with {placeholders} filled by script from the `fixture` section of
+# proofdeploy.yml. Nothing else is added, nothing is hand-edited.
+#
+# Rules (reviewer findings 1-2, fixture plan §2):
+# - No feature nouns in the template or in the values that fill it.
+# - ${AUTH_TOKEN} is NOT a template placeholder: it is filled by the runner
+#   at provisioning time with the disposable super-admin credential.
+#   Template rendering must leave it untouched.
+# - The sha256 of this file is recorded in the evaluation register before
+#   the first author run. Any change invalidates prior runs.
+#
+# Template fields (all required in the yml `fixture` mapping):
+#   repo_name      — human name of the repository under test
+#   seed_note      — what seed data exists, in generic terms
+#   auth_mechanism — how the token is presented (e.g. header name)
+#   auth_scope     — the privilege level of the injected token
+#   flags_note     — the state of feature flags
+Repository: {repo_name}
+Seed data: {seed_note}
+Authentication: {auth_mechanism}. Your token: ${AUTH_TOKEN}.
+Token scope: {auth_scope}. No other users, roles, or credentials exist beyond what the seed creates.
+Feature flags: {flags_note}.
+You may create users, roles, data, or change settings in setup steps before your probes run.

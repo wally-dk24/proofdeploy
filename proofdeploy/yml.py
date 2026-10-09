@@ -3,6 +3,10 @@
 Contract (frozen 2026-10-08, PR #17): build, start, readiness are required.
 migrate is optional (database-backed apps only), seed is optional (only when
 probes need pre-existing data), env is optional non-secret config.
+`fixture` is optional (added 2026-10-09 for the blind-author fixture
+description): a string-to-string mapping with the five template fields
+(repo_name, seed_note, auth_mechanism, auth_scope, flags_note). Adding it
+as optional keeps the frozen contract backward compatible.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ class RepoContract:
     migrate: str | None = None
     seed: str | None = None
     env: dict[str, str] = field(default_factory=dict)
+    fixture: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> RepoContract:
@@ -38,6 +43,11 @@ class RepoContract:
             isinstance(k, str) and isinstance(v, str) for k, v in env.items()
         ):
             raise ValueError("proofdeploy.yml 'env' must be a mapping of strings")
+        fixture = data.get("fixture") or {}
+        if not isinstance(fixture, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in fixture.items()
+        ):
+            raise ValueError("proofdeploy.yml 'fixture' must be a mapping of strings")
         return cls(
             build=data["build"],
             start=data["start"],
@@ -45,6 +55,7 @@ class RepoContract:
             migrate=data.get("migrate"),
             seed=data.get("seed"),
             env=dict(env),
+            fixture=dict(fixture),
         )
 
 
