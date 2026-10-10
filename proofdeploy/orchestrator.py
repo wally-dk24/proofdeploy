@@ -80,7 +80,13 @@ from proofdeploy.runpair import (
     write_score_record,
 )
 from proofdeploy.sandbox import IMAGES as SANDBOX_IMAGES
-from proofdeploy.sandbox import Sandbox, SandboxApp, SandboxConfig, check_podman
+from proofdeploy.sandbox import (
+    Sandbox,
+    SandboxApp,
+    SandboxConfig,
+    assert_measurement_gate,
+    check_podman,
+)
 from proofdeploy.yml import RepoContract, load_contract
 
 # Fixture keys rendered into the author-facing description by design.
@@ -154,6 +160,9 @@ class _Side:
     provision: ProvisionResult
     executor: Executor | None = None
     auth_password: str | None = None  # runner's disposable password (secret)
+    # Isolation actually in effect for this side's sandbox app (network
+    # mode, userns mode, uid). None when the sandbox was not used.
+    sandbox_evidence: dict[str, object] | None = None
 
 
 class Orchestrator:
@@ -177,12 +186,14 @@ class Orchestrator:
         unit_id: str,
         rev_base: str,
         rev_tip: str,
-        run_kind: str,
-    ) -> tuple[Any, dict[str, Any], str, str, str, str, str]:
+    ) -> tuple[Any, dict[str, Any], str, str, str, str]:
         """Assemble the author bundle.
 
-        Returns (bundle, manifest, prompt, raw_diff, base_sha, tip_sha,
-        run_context).
+        Returns (bundle, manifest, prompt, raw_diff, base_sha, tip_sha).
+        The prompt is a pure function of the verified bundle plus the
+        frozen template: no run metadata ("run kind", unit id) is
+        included, so the orchestrator's knowledge cannot leak to the
+        model through the prompt.
         Fail-closed: empty diff, bad template hash, or a secret in the
         prompt/bundle aborts before any model call. The answer-key check
         is a separate step (``_check_answer_key``) so tests can seed a
@@ -220,23 +231,20 @@ class Orchestrator:
         manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
         skill_text = bundle.skill.read_text(encoding="utf-8") if bundle.skill else ""
         description = bundle.description.read_text(encoding="utf-8")
-        run_context = f"Run kind: {run_kind}. Unit id: {unit_id}."
         prompt = build_author_prompt(
             skill_text=skill_text,
             fixture_description=description,
             diff_text=diff_text,
             snapshot_dir=snapshot.dir,
-            run_context=run_context,
         )
         self._say(f"bundle assembled at {bundle.root}")
         self._leak_check_bundle(bundle, prompt, contract)
-        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, run_context
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha
 
     def _check_answer_key(
         self,
         bundle: Any,
         prompt: str,
-        run_context: str,
         base_sha: str,
         tip_sha: str,
         fix_rev: str | None,
@@ -270,7 +278,6 @@ class Orchestrator:
             fix_sha=fix_sha,
             fix_subject=fix_subject,
             expected_skill_hash=EXPECTED_SKILL_HASH,
-            run_context=run_context,
         )
         self._say(f"answer-key check passed; bundle manifest {manifest_sha[:12]}")
         return manifest_sha
@@ -468,6 +475,7 @@ class Orchestrator:
         return _Side(
             rev=rev, sha=sha, snapshot_dir=snapshot.dir,
             contract=contract, provision=provision,
+            sandbox_evidence=dict(app.sandbox_evidence),
         )
 
     def _register_runner_user(self, side: _Side) -> str:
@@ -543,19 +551,24 @@ class Orchestrator:
         cfg = self.cfg
         if not (cfg.bug_id and cfg.rev_bug_base and cfg.rev_bug and cfg.rev_fix):
             raise OrchestratorError("measure_bug needs bug_id, rev_bug_base, rev_bug, rev_fix")
+        if cfg.sandbox:
+            # Fail-closed isolation gate: refuse the measured run unless
+            # the host meets the sandbox requirements (userns remapping,
+            # bridge network for the install phase).
+            assert_measurement_gate()
+            self._say("sandbox measurement gate passed")
         unit_dir = cfg.workdir / f"bug-{cfg.bug_id}"
         unit_dir.mkdir(parents=True, exist_ok=True)
         repo = self._init_records_repo()
 
-        bundle, manifest, prompt, _, base_sha, tip_sha, run_context = self._build_bundle(
+        bundle, manifest, prompt, _, base_sha, tip_sha = self._build_bundle(
             unit_dir,
             unit_id=cfg.bug_id,
             rev_base=cfg.rev_bug_base,
             rev_tip=cfg.rev_bug,
-            run_kind="bug",
         )
         manifest_sha = self._check_answer_key(
-            bundle, prompt, run_context, base_sha, tip_sha, fix_rev=cfg.rev_fix
+            bundle, prompt, base_sha, tip_sha, fix_rev=cfg.rev_fix
         )
         probeset, raw = self._author_probes(prompt)
 
@@ -616,6 +629,10 @@ class Orchestrator:
                 model_request=raw.request_record,
                 author_prompt_sha256=author_prompt_sha256(),
                 skill_sha256=manifest.get("skill_sha256"),
+                sandbox_evidence={
+                    "fix_parent": parent.sandbox_evidence or {},
+                    "fix": fix.sandbox_evidence or {},
+                },
                 fix_parent_provision=parent.provision.to_dict(),
                 fix_provision=fix.provision.to_dict(),
                 fix_parent_results=parent_results,
@@ -681,20 +698,24 @@ class Orchestrator:
         cfg = self.cfg
         if not (cfg.clean_id and cfg.rev_clean):
             raise OrchestratorError("measure_clean needs clean_id and rev_clean")
+        if cfg.sandbox:
+            # Fail-closed isolation gate: refuse the measured run unless
+            # the host meets the sandbox requirements.
+            assert_measurement_gate()
+            self._say("sandbox measurement gate passed")
         unit_dir = cfg.workdir / f"clean-{cfg.clean_id}"
         unit_dir.mkdir(parents=True, exist_ok=True)
         repo = self._init_records_repo()
 
         # The clean author bundle: C^->C diff + C snapshot.
-        bundle, manifest, prompt, _, base_sha, tip_sha, run_context = self._build_bundle(
+        bundle, manifest, prompt, _, base_sha, tip_sha = self._build_bundle(
             unit_dir,
             unit_id=cfg.clean_id,
             rev_base=f"{cfg.rev_clean}^",
             rev_tip=cfg.rev_clean,
-            run_kind="clean",
         )
         manifest_sha = self._check_answer_key(
-            bundle, prompt, run_context, base_sha, tip_sha, fix_rev=None
+            bundle, prompt, base_sha, tip_sha, fix_rev=None
         )
         probeset, raw = self._author_probes(prompt)
 
@@ -743,6 +764,7 @@ class Orchestrator:
                 model_request=raw.request_record,
                 author_prompt_sha256=author_prompt_sha256(),
                 skill_sha256=manifest.get("skill_sha256"),
+                sandbox_evidence={"c": side.sandbox_evidence or {}},
                 runner_log=list(self.log),
                 fixture=dict(side.contract.fixture),
                 contract_env=dict(side.contract.env),

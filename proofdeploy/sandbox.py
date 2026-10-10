@@ -123,6 +123,9 @@ class SandboxCapabilities:
     podman_version: str = ""
     # Can podman create an --internal isolated network? (needs netavark)
     isolated_network: bool = False
+    # Can podman create a bridge network with an external route (for
+    # the install phase)? (needs netavark)
+    build_network: bool = False
     # Can podman do --uidmap userns remapping?
     userns_remap: bool = False
     reason: str = ""
@@ -195,6 +198,40 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
     except (OSError, subprocess.TimeoutExpired) as e:
         if not caps.reason:
             caps.reason = f"userns probe failed: {e}"
+    # Build network: a bridge with an external route for the install
+    # phase (the install needs the egress proxy). Same netavark
+    # machinery as the isolated probe; probed separately because the
+    # install must never fall back to --net=host.
+    build_net = "pd-capability-probe-build"
+    try:
+        proc = subprocess.run(
+            PODMAN + ["network", "create", build_net],
+            capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode == 0:
+            run = subprocess.run(
+                PODMAN
+                + [
+                    "run", "--rm", "--net", build_net,
+                    IMAGES["python"], "python3", "-c", "pass",
+                ],
+                capture_output=True, text=True, timeout=90,
+            )
+            if run.returncode == 0:
+                caps.build_network = True
+            elif not caps.reason:
+                caps.reason = (
+                    f"build network unavailable: {run.stderr.strip()[:150]}"
+                )
+            subprocess.run(
+                PODMAN + ["network", "rm", build_net],
+                capture_output=True, timeout=60,
+            )
+        elif not caps.reason:
+            caps.reason = f"build network unavailable: {proc.stderr.strip()[:150]}"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        if not caps.reason:
+            caps.reason = f"build network probe failed: {e}"
     return caps
 
 
@@ -209,8 +246,15 @@ class SandboxConfig:
     # Network mode: "auto" (isolated bridge if available, else none+socket),
     # "isolated", "none+socket". "host" is refused for unattended runs.
     network_mode: str = "auto"
-    # Fail closed if userns remapping is unavailable.
-    require_userns: bool = False
+    # Fail closed if userns remapping is unavailable. The default is
+    # True: a measured run is refused on a host that cannot remap
+    # container root away from host root.
+    require_userns: bool = True
+    # Explicit dev-only opt-out of the userns requirement. When set, the
+    # sandbox falls back to --user 65534 (nobody) with a logged warning,
+    # and the opt-out is written into the evidence record. This is the
+    # only way to run without userns remapping; it is never silent.
+    allow_no_userns: bool = False
 
 
 def _podman_base() -> list[str]:
@@ -324,6 +368,13 @@ class Sandbox:
     log: list[str] = field(default_factory=list)
     _caps: SandboxCapabilities | None = field(default=None, repr=False)
     _network_name: str | None = field(default=None, repr=False)
+    _build_network_name: str | None = field(default=None, repr=False)
+    # Isolation actually in effect, for the evidence record. Set by
+    # _user_args() and start()/install().
+    userns_mode: str | None = field(default=None, repr=False)
+    userns_opt_out: bool = field(default=False, repr=False)
+    app_network_mode: str | None = field(default=None, repr=False)
+    install_network: str | None = field(default=None, repr=False)
 
     def _capabilities(self) -> SandboxCapabilities:
         if self._caps is None:
@@ -373,23 +424,68 @@ class Sandbox:
         self.log.append(f"isolated network: {name} (--internal, no external route)")
         return name
 
+    def _ensure_build_network(self) -> str:
+        """Create (once) a bridge network for the install phase.
+
+        The install runs untrusted install scripts, so it must not use
+        ``--net=host``: in the host namespace the scripts can reach
+        host-loopback services and metadata endpoints. The build network
+        is a normal bridge (external route for the egress proxy).
+        """
+        if self._build_network_name:
+            return self._build_network_name
+        name = "pd-build"
+        ok, reason = _run(
+            _podman_base() + ["network", "exists", name], 30, self.log
+        )
+        if not ok:
+            ok, reason = _run(
+                _podman_base() + ["network", "create", name],
+                60,
+                self.log,
+            )
+            if not ok:
+                raise SandboxError(
+                    "could not create build network for the install phase: "
+                    f"{reason}; measured runs are refused without an "
+                    "isolated install network (the install must not use "
+                    "--net=host)"
+                )
+        self._build_network_name = name
+        self.log.append(f"build network: {name} (bridge, external route for proxy)")
+        return name
+
     def _user_args(self) -> list[str]:
-        """Userns remapping if available, else de-privileged user."""
+        """Userns remapping if available, else fail closed or explicit opt-out.
+
+        Fail-closed by default (``require_userns=True``): when the host
+        cannot remap container root away from host root, the run is
+        refused. The only way past is the explicit dev flag
+        ``allow_no_userns=True``, which falls back to ``--user 65534``
+        (nobody) with a logged warning and records the opt-out on the
+        Sandbox (``userns_opt_out``) for the evidence record.
+        """
         caps = self._capabilities()
         if caps.userns_remap:
+            self.userns_mode = "userns-remap"
+            self.userns_opt_out = False
             self.log.append("userns remapping: --uidmap 0:1:65536")
             return ["--uidmap", "0:1:65536", "--cap-drop=ALL",
                     "--security-opt=no-new-privileges"]
-        if self.config.require_userns:
+        if self.config.require_userns and not self.config.allow_no_userns:
             raise SandboxError(
                 "userns remapping unavailable on this host "
-                f"({caps.reason}); require_userns=True refuses to run"
+                f"({caps.reason}); require_userns=True refuses to run "
+                "(explicit dev opt-out: allow_no_userns=True)"
             )
+        self.userns_mode = "nobody-fallback"
+        self.userns_opt_out = self.config.allow_no_userns
         self.log.append(
             "WARNING: userns remapping unavailable "
             f"({caps.reason}); falling back to --user 65534 "
-            "(nobody). Container root still maps to host root: no "
-            "unattended run on an untrusted host."
+            "(nobody). Container root still maps to host root."
+            + (" Explicit dev opt-out (allow_no_userns=True)."
+               if self.config.allow_no_userns else "")
         )
         return ["--user", SANDBOX_UID, "--cap-drop=ALL",
                 "--security-opt=no-new-privileges"]
@@ -404,14 +500,19 @@ class Sandbox:
             name,
         ]
         if with_network:
-            # Install phase only: host network + proxy so pip/npm work.
-            args += ["--net=host"]
+            # Install phase: bridge network with the proxy (never
+            # --net=host: install scripts are untrusted code and must
+            # not reach host-loopback services or metadata endpoints).
+            build_net = self._ensure_build_network()
+            args += ["--net", build_net]
+            self.install_network = f"bridge:{build_net}"
         else:
             mode = self._resolve_network_mode()
             if mode == "isolated":
                 args += ["--net", self._ensure_isolated_network()]
             else:
                 args += ["--net=none"]
+            self.app_network_mode = mode
         args += self._user_args()
         args += [
             "-v",
@@ -505,8 +606,22 @@ class Sandbox:
         run_env["PORT"] = str(port)
 
         if mode == "isolated":
-            return self._start_isolated(checkout, command, run_env, name)
-        return self._start_none_socket(checkout, command, run_env, port, name)
+            app = self._start_isolated(checkout, command, run_env, name)
+        else:
+            app = self._start_none_socket(checkout, command, run_env, port, name)
+        app.sandbox_evidence = self._isolation_evidence(mode)
+        return app
+
+    def _isolation_evidence(self, app_mode: str) -> dict[str, object]:
+        """Isolation actually in effect, for the evidence record."""
+        uid = 0 if self.userns_mode == "userns-remap" else 65534
+        return {
+            "app_network_mode": app_mode,
+            "install_network": self.install_network,
+            "userns_mode": self.userns_mode,
+            "userns_opt_out": self.userns_opt_out,
+            "app_uid": uid,
+        }
 
     def _start_isolated(
         self,
@@ -622,6 +737,9 @@ class SandboxApp:
     sandbox: Sandbox
     target_url: str
     _proxy: _TcpToUnixProxy | None = None
+    # Isolation actually in effect for this app (network mode, userns
+    # mode, uid). Set by Sandbox.start(); goes in the evidence record.
+    sandbox_evidence: dict[str, object] = field(default_factory=dict)
 
     @property
     def port(self) -> int:
@@ -663,6 +781,41 @@ def sandbox_evidence() -> dict[str, object]:
         "podman": caps.podman,
         "podman_version": caps.podman_version,
         "isolated_network": caps.isolated_network,
+        "build_network": caps.build_network,
         "userns_remap": caps.userns_remap,
         "reason": caps.reason,
     }
+
+
+def assert_measurement_gate(config: SandboxConfig | None = None) -> None:
+    """Fail-closed gate for measured runs: refuse unless the host can
+    meet the isolation requirements.
+
+    A measured run is refused when:
+    - podman is unavailable;
+    - the host cannot remap container root away from host root
+      (``--uidmap``), unless the explicit dev flag
+      ``allow_no_userns=True`` is set;
+    - the host cannot create a bridge network for the install phase
+      (the install must not use ``--net=host``).
+
+    Raises SandboxError on refusal. The orchestrator calls this before
+    provisioning any measured side.
+    """
+    cfg = config or SandboxConfig()
+    caps = check_sandbox_capabilities()
+    if not caps.podman:
+        raise SandboxError(
+            f"measured run refused: no container runtime ({caps.reason})"
+        )
+    if not caps.userns_remap and not cfg.allow_no_userns:
+        raise SandboxError(
+            "measured run refused: userns remapping unavailable on this host "
+            f"({caps.reason}); require_userns=True is the default "
+            "(explicit dev opt-out: allow_no_userns=True)"
+        )
+    if not caps.build_network:
+        raise SandboxError(
+            "measured run refused: no bridge network for the install phase "
+            f"({caps.reason}); the install must not use --net=host"
+        )

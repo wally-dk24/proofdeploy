@@ -44,7 +44,7 @@ Records:
   versions, lockfile hashes), and the per-probe results with typed
   reasons and the recorded requests (act and setup steps).
 - The evidence record also holds ``author_prompt_sha256``: the SHA-256
-  of the frozen author-prompt template (``proofdeploy/author_prompt_v1.md``)
+  of the frozen author-prompt template (``proofdeploy/author_prompt_v2.md``)
   that built the prompt, and ``model_request``: the exact model request
   as sent (model, temperature, per-message hashes, and the seed/tools
   fields as sent).
@@ -413,9 +413,13 @@ def build_evidence_record(
     # through the in-repo client.
     model_request: dict[str, Any] | None = None,
     # SHA-256 of the frozen author-prompt template file
-    # (proofdeploy/author_prompt_v1.md). The template is versioned and
+    # (proofdeploy/author_prompt_v2.md). The template is versioned and
     # must be registered before any measured run.
     author_prompt_sha256: str | None = None,
+    # Isolation actually in effect for the sandbox apps (per side:
+    # network mode, userns mode, uid the app ran as). Empty when the
+    # sandbox was not used.
+    sandbox_evidence: dict[str, Any] | None = None,
     harness_version: str = HARNESS_VERSION,
     scoring_version: str = DEFAULT_SCORING_VERSION,
     fix_parent_provision: dict[str, Any] | None = None,
@@ -498,6 +502,7 @@ def build_evidence_record(
         "model_attempts": model_attempts,
         "model_request": model_request or {},
         "author_prompt_sha256": author_prompt_sha256,
+        "sandbox_evidence": sandbox_evidence or {},
         "harness_version": harness_version,
         "scoring_version": scoring_version,
         "fix_parent_provision": fix_parent_provision or {},
