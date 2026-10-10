@@ -29,6 +29,15 @@ class RepoContract:
     seed: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     fixture: dict[str, str] = field(default_factory=dict)
+    # Database declaration (optional): e.g. {"kind": "sqlite", "path": "./app.db"}.
+    # When declared, the executor uses this path for DB assertions. When absent,
+    # DB assertions are INCONCLUSIVE `probe` (fail-closed).
+    database: dict[str, str] | None = None
+    # Auth declaration (optional): e.g. {"mode": "register", "path": "/register",
+    # "method": "POST", "username_field": "username", "password_field": "password",
+    # "token_json_path": "token"}. Validated at load, before anything runs.
+    # Absent means no credential.
+    auth: dict[str, str] | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> RepoContract:
@@ -48,6 +57,35 @@ class RepoContract:
             isinstance(k, str) and isinstance(v, str) for k, v in fixture.items()
         ):
             raise ValueError("proofdeploy.yml 'fixture' must be a mapping of strings")
+        database = data.get("database")
+        if database is not None:
+            if not isinstance(database, dict):
+                raise ValueError("proofdeploy.yml 'database' must be a mapping")
+            kind = database.get("kind")
+            path = database.get("path")
+            if kind != "sqlite":
+                raise ValueError(
+                    f"proofdeploy.yml 'database.kind' must be 'sqlite', got: {kind!r}"
+                )
+            if not isinstance(path, str) or not path:
+                raise ValueError("proofdeploy.yml 'database.path' must be a non-empty string")
+            database = {"kind": kind, "path": path}
+        auth = data.get("auth")
+        if auth is not None:
+            if not isinstance(auth, dict):
+                raise ValueError("proofdeploy.yml 'auth' must be a mapping")
+            mode = auth.get("mode")
+            if mode != "register":
+                raise ValueError(
+                    f"proofdeploy.yml 'auth.mode' must be 'register', got: {mode!r}"
+                )
+            for key in ("path", "method", "username_field", "password_field", "token_json_path"):
+                val = auth.get(key)
+                if not isinstance(val, str) or not val:
+                    raise ValueError(
+                        f"proofdeploy.yml 'auth.{key}' must be a non-empty string"
+                    )
+            auth = {k: str(v) for k, v in auth.items() if isinstance(v, str)}
         return cls(
             build=data["build"],
             start=data["start"],
@@ -56,6 +94,8 @@ class RepoContract:
             seed=data.get("seed"),
             env=dict(env),
             fixture=dict(fixture),
+            database=database,
+            auth=auth,
         )
 
 

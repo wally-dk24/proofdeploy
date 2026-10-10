@@ -427,13 +427,18 @@ class Orchestrator:
         use_sandbox: bool,
         capability_probe: dict[str, Any],
         error: BaseException,
+        runner_log: list[str] | None = None,
+        provisioning: dict[str, Any] | None = None,
+        probe_results: Any | None = None,
     ) -> dict[str, Any]:
         """Record an INCONCLUSIVE run after an orchestrator crash (O3).
 
         If the orchestrator fails after the model call (e.g., provisioning
-        crash, probe execution crash), the prompt, raw response, and parsed
-        probes must not be lost. This commits an evidence record with
-        verdict INCONCLUSIVE and a typed reason, then the score as usual.
+        crash, probe execution crash), the prompt, raw response, parsed
+        probes, runner log, and any provisioning/probe results gathered so
+        far must not be lost. This commits an evidence record with verdict
+        INCONCLUSIVE and a typed reason (cause, exception type and message),
+        then the score as usual.
 
         Master's principle: state what failed, never lose it.
         """
@@ -449,8 +454,12 @@ class Orchestrator:
             write_score_record,
         )
 
-        cause = f"orchestrator_crash: {type(error).__name__}: {error}"
-        self._say(f"orchestrator crashed after authoring; recording INCONCLUSIVE: {cause[:200]}")
+        cause = "orchestrator_crash"
+        error_text = f"{type(error).__name__}: {error}"
+        self._say(
+            "orchestrator crashed after authoring; recording INCONCLUSIVE: "
+            f"{error_text[:200]}"
+        )
         record = build_evidence_record(
             run_kind=run_kind,
             bug_id=cfg.bug_id if run_kind == "bug" else None,
@@ -467,6 +476,13 @@ class Orchestrator:
             measured_result=use_sandbox,
             provenance=self._provenance(capability_probe),
             model_request=raw.request_record,
+            # O3: keep the reason, the runner log, and everything gathered
+            # before the crash.
+            inconclusive_cause=cause,
+            inconclusive_error=error_text,
+            runner_log=list(runner_log) if runner_log else list(self.log),
+            crash_provisioning=provisioning or {},
+            crash_probe_results=probe_results,
         )
         record_id, _, evidence_sha = write_evidence_record(
             record, repo, repo, secret_values=self.cfg.extra_secrets,
@@ -620,6 +636,76 @@ class Orchestrator:
         runtime_name = _detect_runtime(snapshot.dir)
         image = SANDBOX_IMAGES.get(runtime_name, SANDBOX_IMAGES["python"])
         logs.append(f"sandbox image: {image} (runtime {runtime_name})")
+        # Item 5: fail closed when the image's runtime doesn't satisfy the
+        # repo's declared version (requires-python / engines). Record the
+        # image digest and the runtime version in the evidence.
+        from proofdeploy.runner import _requires_python_from_toml
+        from proofdeploy.runner import satisfies_range
+
+        _sandbox_requires_python = _requires_python_from_toml
+        declared_range = None
+        if runtime_name == "python":
+            pyproject = snapshot.dir / "pyproject.toml"
+            if pyproject.is_file():
+                declared_range = _sandbox_requires_python(pyproject)
+        elif runtime_name == "node":
+            pkg = snapshot.dir / "package.json"
+            if pkg.is_file():
+                try:
+                    import json
+                    data = json.loads(pkg.read_text(encoding="utf-8"))
+                    engines = data.get("engines") or {}
+                    if isinstance(engines, dict):
+                        declared_range = engines.get("node")
+                except Exception:
+                    pass
+        # Get the image's runtime version and digest.
+        image_version = None
+        image_digest = None
+        try:
+            import subprocess as _sp
+            ver_cmd = (
+                ["python3", "--version"] if runtime_name == "python"
+                else ["node", "--version"]
+            )
+            r = _sp.run(
+                ["podman", "run", "--rm", image] + ver_cmd,
+                capture_output=True, text=True, timeout=60,
+            )
+            out = (r.stdout or r.stderr or "").strip()
+            # "Python 3.12.3" -> "3.12.3"; "v22.1.0" -> "22.1.0"
+            image_version = out.split()[-1].lstrip("v") if out else None
+            r2 = _sp.run(
+                ["podman", "images", "--digests", "--format", "{{.Digest}}", image],
+                capture_output=True, text=True, timeout=30,
+            )
+            image_digest = (r2.stdout or "").strip().split("\n")[0] or None
+        except Exception as e:
+            logs.append(f"sandbox runtime version check failed: {e}")
+        logs.append(f"sandbox runtime version: {image_version} (digest {image_digest})")
+        if declared_range and image_version:
+            ecosystem = "python" if runtime_name == "python" else "node"
+            if not satisfies_range(image_version, declared_range, ecosystem=ecosystem):
+                logs.append(
+                    f"sandbox runtime {image_version} does not satisfy "
+                    f"declared {declared_range}: BUILD_FAILED"
+                )
+                provision = ProvisionResult(
+                    status=ProvisionStatus.BUILD_FAILED,
+                    reason=(
+                        f"sandbox image runtime {image_version} does not satisfy "
+                        f"declared version {declared_range}"
+                    ),
+                    logs=logs,
+                    runtime=runtime_name,
+                    runtime_version=image_version,
+                )
+                # Record the digest/version even on failure.
+                provision.image_digest = image_digest
+                return _Side(
+                    rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+                    contract=contract, provision=provision,
+                )
         sb = Sandbox(SandboxConfig(image=image))
         # Secret-free contract env only; never the full env.
         secret_free_env = {
@@ -689,8 +775,10 @@ class Orchestrator:
             target_url=app.target_url,
             logs=logs,
             runtime=runtime_name,
+            runtime_version=image_version,
             run_id=f"sandbox-{tag}-{sha[:8]}",
         )
+        provision.image_digest = image_digest
         # Stash the SandboxApp for cleanup; the finally block stops it.
         provision.proc = app
         self._say(f"provision {tag} ({sha[:12]}): READY -> {app.target_url} (sandbox)")
@@ -703,37 +791,37 @@ class Orchestrator:
     def _credential_config(self, side: _Side) -> dict[str, Any] | None:
         """Parse the contract's declared credential provider, if any.
 
-        The contract declares auth via the fixture's `credential_provider`
-        key (a JSON object). Absent means no credential: no token is used,
-        `${AUTH_TOKEN}` is unknown, and a probe using it is INCONCLUSIVE
-        `probe` (fail-closed, never a crash).
+        The contract declares auth via the top-level `auth:` mapping,
+        validated at load by `load_contract`. Absent means no credential:
+        no token is used, `${AUTH_TOKEN}` is unknown, and a probe using
+        it is INCONCLUSIVE `probe` (fail-closed, never a crash).
 
         Registration is one declared provider mode (`register`), never a
         default. Its requests are recorded and logged as writes by the
         executor; a provider failure is INCONCLUSIVE `auth`, never an
         exception.
         """
-        raw = side.contract.fixture.get("credential_provider")
-        if not raw:
+        auth = side.contract.auth
+        if not auth:
             return None
-        try:
-            cfg = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise OrchestratorError(
-                f"contract fixture 'credential_provider' is not valid JSON: {e}"
-            ) from e
-        if not isinstance(cfg, dict):
-            raise OrchestratorError(
-                "contract fixture 'credential_provider' must be a JSON object"
-            )
-        return cfg
+        return dict(auth)
 
     def _make_executor(self, side: _Side) -> Executor:
         assert side.provision and side.provision.target_url
-        db_path = side.snapshot_dir / "notes.db"
+        # DB path comes from the contract's `database:` declaration, not a
+        # hard-coded filename. None declared means the executor gets no DB
+        # path and DB assertions are INCONCLUSIVE `probe`.
+        db_path = None
+        declared = side.contract.database
+        if declared and declared.get("kind") == "sqlite":
+            candidate = side.snapshot_dir / declared["path"]
+            # Resolve relative to the snapshot dir (contract paths are
+            # relative to the repo root, which the snapshot mirrors).
+            if candidate.is_file():
+                db_path = str(candidate)
         return Executor(
             target_url=side.provision.target_url,
-            db_path=str(db_path) if db_path.is_file() else None,
+            db_path=db_path,
             provisioned=True,
             contract_env=dict(side.contract.env),
             fixture=dict(side.contract.fixture),
@@ -984,6 +1072,14 @@ class Orchestrator:
             # O3: any failure after authoring commits an INCONCLUSIVE
             # record with a typed reason, then the score as usual.
             # Master's principle: state what failed, never lose it.
+            # Gather everything available at crash time.
+            crash_provisioning = {}
+            try:
+                for i, s in enumerate(sides):
+                    if s.provision:
+                        crash_provisioning[f"side_{i}"] = s.provision.to_dict()
+            except Exception:
+                pass
             return self._record_orchestrator_crash(
                 cfg, unit_dir, repo, bundle, manifest, prompt,
                 base_sha, tip_sha, manifest_sha, raw, probeset,
@@ -991,6 +1087,12 @@ class Orchestrator:
                 use_sandbox=use_sandbox,
                 capability_probe=capability_probe,
                 error=e,
+                runner_log=list(self.log),
+                provisioning=crash_provisioning,
+                probe_results={
+                    "parent_results": [r.to_dict() for r in (parent_results or [])],
+                    "fix_results": [r.to_dict() for r in (fix_results or [])],
+                },
             )
         finally:
             for side in sides:
@@ -1173,6 +1275,13 @@ class Orchestrator:
         except Exception as e:
             # O3: any failure after authoring commits an INCONCLUSIVE
             # record with a typed reason, then the score as usual.
+            crash_provisioning = {}
+            try:
+                for i, s in enumerate(sides):
+                    if s.provision:
+                        crash_provisioning[f"side_{i}"] = s.provision.to_dict()
+            except Exception:
+                pass
             return self._record_orchestrator_crash(
                 cfg, unit_dir, repo, bundle, manifest, prompt,
                 base_sha, tip_sha, manifest_sha, raw, probeset,
@@ -1180,6 +1289,11 @@ class Orchestrator:
                 use_sandbox=use_sandbox,
                 capability_probe=capability_probe,
                 error=e,
+                runner_log=list(self.log),
+                provisioning=crash_provisioning,
+                probe_results={
+                    "c_results": [r.to_dict() for r in (c_results or [])],
+                },
             )
         finally:
             for side in sides:

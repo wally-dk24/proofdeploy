@@ -465,6 +465,13 @@ def build_evidence_record(
     # Every token minted by the credential provider during the run:
     # all are secret-collected.
     minted_tokens: list[str] | None = None,
+    # O3: crash record fields. When the orchestrator crashes after
+    # authoring, these preserve the reason and everything gathered
+    # before the crash.
+    inconclusive_cause: str | None = None,
+    inconclusive_error: str | None = None,
+    crash_provisioning: dict[str, Any] | None = None,
+    crash_probe_results: Any | None = None,
 ) -> dict[str, Any]:
     """Build the evidence record for a run pair (before scoring).
 
@@ -548,6 +555,11 @@ def build_evidence_record(
         "public_contract_env_keys": public_contract_env_keys or [],
         "captured_values": merged_captured,
         "minted_tokens": merged_minted,
+        # O3: crash record fields (only set on orchestrator crashes).
+        "inconclusive_cause": inconclusive_cause,
+        "inconclusive_error": inconclusive_error,
+        "crash_provisioning": crash_provisioning or {},
+        "crash_probe_results": crash_probe_results,
         "verdict": None,
     }
     return record

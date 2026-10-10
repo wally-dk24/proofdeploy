@@ -62,6 +62,8 @@ class ProvisionResult:
     reason: str | None = None  # human-readable cause for BUILD_FAILED/START_FAILED
     target_log_path: str | None = None  # captured target stdout/stderr
     run_id: str | None = None  # per-run scratch dirs: workdir/venvs/<run_id>, workdir/runs/<run_id>
+    # Sandbox image digest (recorded when provisioned in the sandbox).
+    image_digest: str | None = None
     # Live process handle on READY. Caller-owned: the caller must terminate
     # it when done and call cleanup_run(run_id). Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
@@ -77,6 +79,7 @@ class ProvisionResult:
             "lockfile_sha256": self.lockfile_sha256,
             "runtime": self.runtime,
             "runtime_version": self.runtime_version,
+            "image_digest": self.image_digest,
             "package_manager": self.package_manager,
             "reason": self.reason,
             "target_log_path": self.target_log_path,
@@ -787,31 +790,60 @@ class Provisioner:
                     logs.append(f"cleaned up: {d}")
 
     def stop_target(self, proc: Any, logs: list[str] | None = None) -> None:
-        """Terminate and reap a READY target's process (O2).
+        """Terminate and reap a READY target's process group (O2).
 
         Called on every exit path for a READY target, before cleanup_run().
-        Terminates gracefully, escalates to kill, and reaps to avoid
-        zombies. Tolerates already-exited processes.
+        The target was started with start_new_session=True, so it leads its
+        own process group. Terminates the whole group gracefully, escalates
+        to kill, and reaps to avoid zombies. Tolerates already-exited
+        processes.
         """
         if proc is None:
             return
         try:
+            import os
+            import signal
+
             if proc.poll() is None:
-                # Still running: terminate gracefully, then kill.
-                proc.terminate()
+                # Still running: terminate the whole process group
+                # gracefully, then kill.
                 try:
-                    proc.wait(timeout=10)
-                except Exception:
+                    pgid = os.getpgid(proc.pid)
+                except (OSError, ProcessLookupError):
+                    pgid = None
+                if pgid is not None:
                     try:
-                        proc.kill()
-                    except Exception:
+                        os.killpg(pgid, signal.SIGTERM)
+                    except (OSError, ProcessLookupError):
                         pass
                     try:
-                        proc.wait(timeout=5)
+                        proc.wait(timeout=10)
                     except Exception:
-                        pass
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                        except (OSError, ProcessLookupError):
+                            pass
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                else:
+                    # Fallback: no process group (shouldn't happen with
+                    # start_new_session=True, but tolerate it).
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            pass
                 if logs is not None:
-                    logs.append("target process terminated")
+                    logs.append("target process group terminated")
             else:
                 # Already exited: reap to avoid zombie.
                 try:
@@ -1111,6 +1143,9 @@ class Provisioner:
                     stderr=subprocess.STDOUT,
                     text=True,
                     env=start_env,
+                    # O2: start the target in its own session so the whole
+                    # process group (wrapper + children) can be killed.
+                    start_new_session=True,
                 )
             except FileNotFoundError as e:
                 return _start_failed(f"missing binary for start command: {e.filename}")

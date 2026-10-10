@@ -343,3 +343,40 @@ def test_allowlist_refuses_extra_file_at_bundle_root(tmp_path):
         check_bundle_answer_key(
             ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
         )
+
+
+def test_tampered_skill_copy_refused(tmp_path):
+    """T2(a): disabling the answer-key skill-hash check must be caught.
+
+    A skill file present in the no-skill arm must be refused by the
+    answer-key leak check.
+    """
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    # The test bundle uses no_skill=True; smuggle a skill file in.
+    skill_file = ctx["bundle"] / "skill-author.md"
+    skill_file.write_text("smuggled skill content")
+    # The check must refuse: skill present in no-skill arm.
+    with pytest.raises(AnswerKeyLeakError, match="skill"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
+
+
+def test_tampered_fixture_description_refused(tmp_path):
+    """T2(b): disabling the fixture-description check must be caught.
+    
+    A tampered fixture-description.txt must be refused by the answer-key
+    leak check.
+    """
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    # Tamper the fixture description in the bundle.
+    desc_file = ctx["bundle"] / "fixture-description.txt"
+    if desc_file.is_file():
+        desc_file.write_text("tampered fixture description")
+    # The check must refuse: fixture description mismatch.
+    with pytest.raises(AnswerKeyLeakError, match="fixture-description"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )

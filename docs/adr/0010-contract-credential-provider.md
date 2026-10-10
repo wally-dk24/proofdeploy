@@ -23,18 +23,17 @@ credential providers. No default registration.
    - `${AUTH_TOKEN}` is an unknown placeholder.
    - A probe using it is INCONCLUSIVE `probe` (fail-closed, never a crash).
 
-2. **Registration as a declared provider.** The contract's fixture may
-   declare a `credential_provider` key (a JSON object). The `register`
-   mode:
-   ```json
-   {
-     "mode": "register",
-     "path": "/register",
-     "method": "POST",
-     "username_field": "username",
-     "password_field": "password",
-     "token_json_path": "token"
-   }
+2. **Registration as a declared provider.** The contract declares a
+   top-level, typed `auth:` mapping (validated at load by
+   `load_contract`, before anything runs). The `register` mode:
+   ```yaml
+   auth:
+     mode: register
+     path: /register
+     method: POST
+     username_field: username
+     password_field: password
+     token_json_path: token
    ```
    - A random username and password are generated per run.
    - The request is recorded and logged as a write (it's a POST).

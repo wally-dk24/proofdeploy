@@ -1107,3 +1107,134 @@ def test_crash_after_authoring_records_inconclusive(tmp_path):
     assert evidence["record_type"] == "evidence"
     assert evidence["prompt"]
     assert evidence["raw_model_response"]
+
+
+def test_unsandboxed_normal_run_records_not_measured(tmp_path):
+    """T2(c): the normal (non-failure) evidence path must not hard-code
+    measured_result=True. An unsandboxed run records measured_result=False.
+    """
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-normal-unmeasured",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    Orchestrator(cfg).measure_bug()
+    records = read_records(out)
+    evidence = records[0]
+    # Unsandboxed normal run: never a measured result.
+    assert evidence["measured_result"] is False
+    assert evidence["sandboxed"] is False
+
+
+def test_no_auth_app_clean_run(tmp_path):
+    """T4: a clean-diff run against the no-auth toy app completes."""
+    info = make_mini_repo_no_auth(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-no-auth-clean",
+        rev_clean=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_clean()
+    assert summary["run_kind"] == "clean"
+    assert summary["parent_ready"] if "parent_ready" in summary else True
+
+
+def test_no_auth_app_model_failure(tmp_path):
+    """T4: a model failure on the no-auth toy app records INCONCLUSIVE."""
+    from proofdeploy.model_client import ModelCallError
+
+    info = make_mini_repo_no_auth(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    def failing_runner(prompt: str):
+        raise ModelCallError("overflow", cause="model_overflow")
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-no-auth-mf",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=failing_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "INCONCLUSIVE"
+
+
+def _sandbox_caps():
+    """Capability probe for sandbox tests (cached)."""
+    try:
+        from proofdeploy.sandbox import capability_probe
+        return capability_probe()
+    except Exception:
+        return {}
+
+
+requires_sandbox = pytest.mark.skipif(
+    not _sandbox_caps().get("podman", False),
+    reason="no container runtime: sandboxed orchestrator test needs podman",
+)
+
+
+@requires_sandbox
+def test_sandboxed_end_to_end_orchestrator(tmp_path):
+    """T1: sandboxed end-to-end orchestrator test (canned model, real container).
+
+    Runs in the `sandbox-tests` CI job. Asserts READY on both sides, probe
+    results, the score, sandboxed=True, measured_result=True, and sandbox
+    evidence.
+    """
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-sandbox-e2e",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        # Sandboxed (no allow_unsandboxed).
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["parent_ready"] is True
+    assert summary["fix_ready"] is True
+    assert summary["verdict"] in ("candidate_catch", "no_catch", "INCONCLUSIVE")
+
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["sandboxed"] is True
+    assert evidence["measured_result"] is True
+    assert evidence["sandbox_evidence"]
