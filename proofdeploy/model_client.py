@@ -12,7 +12,7 @@ touches). The snapshot directory itself never leaves the machine; only
 this prompt string is sent to the model.
 
 The author prompt's framing text, output contract, and truncation caps
-live in the frozen template ``proofdeploy/author_prompt_v1.md``. Its
+live in the frozen template ``proofdeploy/author_prompt_v2.md``. Its
 SHA-256 (``author_prompt_sha256()``) is recorded in every evidence
 record; any change to the template is a new version that must be
 re-registered before any measured run.
@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from proofdeploy import __version__
+
 # Registered measurement configuration. These are constants, not
 # parameters: a different model or temperature is a different
 # measurement and must be registered, not passed at call time.
@@ -48,12 +50,13 @@ TEMPERATURE = 0.2
 
 # Frozen author-prompt template. The file is versioned; its hash is in
 # every evidence record.
-PROMPT_TEMPLATE_FILENAME = "author_prompt_v1.md"
+PROMPT_TEMPLATE_FILENAME = "author_prompt_v2.md"
 
 _GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_ALLOWED_HOSTS = ["api.groq.com"]
 # Groq's edge WAF 403s requests without a real User-Agent (2026-10-08).
-_GROQ_USER_AGENT = "wally-groq-cli/1.0"
+# Derived from the package version, never hardcoded.
+_GROQ_USER_AGENT = f"proofdeploy/{__version__}"
 
 _DIFF_FILE_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
 
@@ -69,22 +72,54 @@ def author_prompt_sha256(path: str | Path | None = None) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-def _parse_template(text: str) -> dict[str, Any]:
-    """Split the template into framing, contract, caps, closing.
+# Top-level template sections, in order. A ``## <name>`` line starts a
+# new section only when <name> is in this set; any other ``## `` line is
+# content of the current section. That is what lets the ``## Body``
+# skeleton contain literal ``## `` prompt headings.
+_TEMPLATE_SECTIONS = (
+    "Framing",
+    "Output contract",
+    "Caps",
+    "Body",
+    "File entry",
+    "Unavailable file",
+    "More files",
+    "Closing",
+)
 
-    Sections are ``## Framing``, ``## Output contract``, ``## Caps``,
-    ``## Closing``. Fail-closed: every section must be present.
+# Placeholders the builder substitutes with bundle content. The
+# ``[[...]]`` syntax is used because the template contains literal JSON
+# braces (the output contract), which would collide with str.format.
+_PLACEHOLDERS = (
+    "framing",
+    "contract",
+    "closing",
+    "skill_text",
+    "fixture_description",
+    "diff_text",
+    "snapshot_file_list",
+    "touched_file_contents",
+)
+
+
+def _parse_template(text: str) -> dict[str, Any]:
+    """Split the template into its sections.
+
+    Fail-closed: every section in ``_TEMPLATE_SECTIONS`` must be
+    present, exactly once, and no ``[[placeholder]]`` may be left
+    unsubstituted by the builder (checked at build time).
     """
     sections: dict[str, list[str]] = {}
     current: str | None = None
     for line in text.splitlines():
-        if line.startswith("## "):
+        if line.startswith("## ") and line[3:].strip() in _TEMPLATE_SECTIONS:
             current = line[3:].strip()
+            if current in sections:
+                raise ValueError(f"prompt template has duplicate section: {current}")
             sections[current] = []
         elif current is not None:
             sections[current].append(line)
-    required = ("Framing", "Output contract", "Caps", "Closing")
-    missing = [s for s in required if s not in sections]
+    missing = [s for s in _TEMPLATE_SECTIONS if s not in sections]
     if missing:
         raise ValueError(
             f"prompt template missing sections: {', '.join(missing)}"
@@ -97,11 +132,22 @@ def _parse_template(text: str) -> dict[str, Any]:
     for key in ("max_diff_files", "max_file_bytes", "max_listed_files"):
         if key not in caps:
             raise ValueError(f"prompt template caps missing {key}")
+    # Every placeholder used in the Body must be a known one; an unknown
+    # [[...]] would silently survive substitution.
+    for m in re.finditer(r"\[\[([a-z_]+)\]\]", "\n".join(sections["Body"])):
+        if m.group(1) not in _PLACEHOLDERS:
+            raise ValueError(
+                f"prompt template Body uses unknown placeholder: [[{m.group(1)}]]"
+            )
     return {
         "framing": "\n".join(sections["Framing"]).strip(),
         "contract": "\n".join(sections["Output contract"]).strip(),
-        "caps": caps,
+        "body": "\n".join(sections["Body"]).strip(),
+        "file_entry": "\n".join(sections["File entry"]).strip(),
+        "unavailable_file": "\n".join(sections["Unavailable file"]).strip(),
+        "more_files": "\n".join(sections["More files"]).strip(),
         "closing": "\n".join(sections["Closing"]).strip(),
+        "caps": caps,
     }
 
 
@@ -143,7 +189,6 @@ def build_author_prompt(
     fixture_description: str,
     diff_text: str,
     snapshot_dir: str | Path,
-    run_context: str = "",
     template_path: str | Path | None = None,
 ) -> str:
     """Compose the blind author's prompt from bundle inputs only.
@@ -152,6 +197,11 @@ def build_author_prompt(
     template file. Deterministic: same bundle in, same prompt out. The
     snapshot contributes its file list and the full content of every
     file the diff touches (capped); nothing else on the machine is read.
+
+    The prompt is a pure function of the verified bundle plus the
+    frozen template. There is deliberately no channel for run metadata
+    (no "run kind", no unit id): anything outside the bundle would let
+    the orchestrator's knowledge leak to the model.
     """
     tpl = load_prompt_template(template_path)
     caps = tpl["caps"]
@@ -163,50 +213,41 @@ def build_author_prompt(
         if p.is_file() and not p.is_symlink()
     )
     listed = all_files[: caps["max_listed_files"]]
-
-    parts = [tpl["framing"], ""]
-    if run_context:
-        parts += [run_context.strip(), ""]
-    parts += [
-        tpl["contract"],
-        "---",
-        "## Authoring skill",
-        "",
-        skill_text.rstrip(),
-        "",
-        "---",
-        "## Fixture",
-        "",
-        fixture_description.rstrip(),
-        "",
-        "---",
-        "## Diff (the change under test)",
-        "",
-        "```diff",
-        diff_text.rstrip(),
-        "```",
-        "",
-        "---",
-        "## Snapshot file list",
-        "",
-        "\n".join(listed),
-    ]
+    file_list = "\n".join(listed)
     if len(all_files) > caps["max_listed_files"]:
-        parts.append(f"... ({len(all_files) - caps['max_listed_files']} more files)")
-    parts += ["", "---", "## Touched file contents", ""]
+        remaining = len(all_files) - caps["max_listed_files"]
+        file_list += "\n" + tpl["more_files"].replace("[[remaining]]", str(remaining))
+
+    touched_parts: list[str] = []
     for rel in touched:
         content = _read_text_capped(snap / rel, caps["max_file_bytes"])
-        parts.append(f"### FILE: {rel}")
-        parts.append("")
         if content is None:
-            parts.append("(binary, missing, or too large: not inlined)")
+            entry = tpl["unavailable_file"].replace("[[path]]", rel)
         else:
-            parts.append("```")
-            parts.append(content.rstrip())
-            parts.append("```")
-        parts.append("")
-    parts.append(tpl["closing"])
-    return "\n".join(parts)
+            entry = (
+                tpl["file_entry"]
+                .replace("[[path]]", rel)
+                .replace("[[content]]", content.rstrip())
+            )
+        touched_parts.append(entry)
+    touched_text = "\n\n".join(touched_parts)
+
+    prompt: str = tpl["body"]
+    prompt = prompt.replace("[[framing]]", tpl["framing"])
+    prompt = prompt.replace("[[contract]]", tpl["contract"])
+    prompt = prompt.replace("[[closing]]", tpl["closing"])
+    prompt = prompt.replace("[[skill_text]]", skill_text.rstrip())
+    prompt = prompt.replace("[[fixture_description]]", fixture_description.rstrip())
+    prompt = prompt.replace("[[diff_text]]", diff_text.rstrip())
+    prompt = prompt.replace("[[snapshot_file_list]]", file_list)
+    prompt = prompt.replace("[[touched_file_contents]]", touched_text)
+    # Fail-closed: no placeholder may survive substitution.
+    leftover = re.findall(r"\[\[([a-z_]+)\]\]", prompt)
+    if leftover:
+        raise ValueError(
+            f"prompt has unsubstituted placeholders: {sorted(set(leftover))}"
+        )
+    return prompt
 
 
 def _message_hashes(messages: list[dict[str, Any]]) -> list[str]:

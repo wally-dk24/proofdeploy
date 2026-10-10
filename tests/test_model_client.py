@@ -45,9 +45,94 @@ def test_build_author_prompt_deterministic(tmp_path):
         fixture_description="Repository: demo",
         diff_text=diff,
         snapshot_dir=snap,
-        run_context="Run kind: bug.",
     )
     assert build_author_prompt(**kw) == build_author_prompt(**kw)
+
+
+def test_build_author_prompt_has_no_run_context_parameter():
+    """The run_context channel is removed: the prompt is a pure function
+    of the verified bundle plus the frozen template. A run_context-style
+    hint has nowhere to go."""
+    import inspect
+
+    from proofdeploy.leakcheck import check_bundle_answer_key
+
+    assert "run_context" not in inspect.signature(build_author_prompt).parameters
+    assert "run_context" not in inspect.signature(check_bundle_answer_key).parameters
+    # Passing it is a TypeError, not a silent extra.
+    import pytest
+
+    with pytest.raises(TypeError):
+        build_author_prompt(
+            skill_text="s",
+            fixture_description="f",
+            diff_text="d",
+            snapshot_dir=".",
+            run_context="Run kind: bug.",
+        )
+
+
+def test_prompt_carries_no_run_metadata(tmp_path):
+    """No 'Run kind: bug|clean' or unit id may appear in the prompt."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "app.py").write_text("x = 1\n")
+    prompt = build_author_prompt(
+        skill_text="SKILL",
+        fixture_description="Repository: demo",
+        diff_text="--- a/app.py\n+++ b/app.py\n",
+        snapshot_dir=snap,
+    )
+    assert "Run kind:" not in prompt
+    assert "Unit id:" not in prompt
+
+
+def test_empty_bundle_yields_only_template_text(tmp_path):
+    """With an empty bundle, every heading/label in the prompt comes
+    from the frozen template file: no Python-injected headings."""
+    from proofdeploy.model_client import prompt_template_path
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    prompt = build_author_prompt(
+        skill_text="",
+        fixture_description="",
+        diff_text="",
+        snapshot_dir=snap,
+    )
+    template_text = prompt_template_path().read_text(encoding="utf-8")
+    template_headings = {
+        line.strip()
+        for line in template_text.splitlines()
+        if line.startswith("## ") or line.startswith("### ")
+    }
+    prompt_headings = [
+        line.strip()
+        for line in prompt.splitlines()
+        if line.startswith("## ") or line.startswith("### ")
+    ]
+    assert prompt_headings, "prompt should still have template headings"
+    for heading in prompt_headings:
+        assert heading in template_headings, f"non-template heading: {heading!r}"
+
+
+def test_template_covers_diff_label(tmp_path):
+    """The '## Diff (the change under test)' label lives in the template,
+    not in Python code."""
+    from proofdeploy.model_client import prompt_template_path
+
+    template_text = prompt_template_path().read_text(encoding="utf-8")
+    assert "## Diff (the change under test)" in template_text
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "app.py").write_text("x = 1\n")
+    prompt = build_author_prompt(
+        skill_text="",
+        fixture_description="",
+        diff_text="--- a/app.py\n+++ b/app.py\n",
+        snapshot_dir=snap,
+    )
+    assert "## Diff (the change under test)" in prompt
 
 
 def test_build_author_prompt_contains_bundle_only(tmp_path):
@@ -127,8 +212,10 @@ def test_call_model_default_runner_is_groq(monkeypatch):
     # No seed, no tools: the request sends exactly model + messages + temperature.
     assert "seed" not in body
     assert "tools" not in body
-    # Groq's WAF requires a real User-Agent.
-    assert seen["ua"] == "wally-groq-cli/1.0"
+    # Groq's WAF requires a real User-Agent, derived from the package version.
+    from proofdeploy import __version__
+
+    assert seen["ua"] == f"proofdeploy/{__version__}"
     assert seen["cred_applied"]
     # The exact request is recorded for evidence.
     rec = resp.request_record

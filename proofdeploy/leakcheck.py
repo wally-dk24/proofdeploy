@@ -91,7 +91,6 @@ def check_bundle_answer_key(
     fix_subject: str | None,
     expected_skill_hash: str,
     no_skill: bool = False,
-    run_context: str = "",
 ) -> str:
     """Fail-closed allowlist-by-equality check on the author bundle.
 
@@ -245,7 +244,6 @@ def check_bundle_answer_key(
         fixture_description=actual_desc,
         diff_text=actual_diff,
         snapshot_dir=snapshot_dir,
-        run_context=run_context,
     )
     if prompt != verified_prompt:
         raise AnswerKeyLeakError(

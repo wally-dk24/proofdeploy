@@ -186,19 +186,16 @@ def _eq_bundle(root: Path, info: dict[str, str]) -> dict:
         skill_path=skill_path,
         no_skill=True,
     )
-    run_context = "Run kind: bug. Unit id: eq."
     prompt = build_author_prompt(
         skill_text="",
         fixture_description=(bundle_dir / "fixture-description.txt").read_text(),
         diff_text=diff_text,
         snapshot_dir=bundle_dir / "snapshot",
-        run_context=run_context,
     )
     return {
         "bundle": bundle_dir,
         "manifest": Path(str(bundle_dir) + ".manifest.json"),
         "prompt": prompt,
-        "run_context": run_context,
         "skill_hash": skill_hash,
         "info": info,
         "no_skill": True,
@@ -217,7 +214,6 @@ def _eq_check_kwargs(ctx: dict) -> dict:
         "fix_subject": fix_subject,
         "expected_skill_hash": ctx["skill_hash"],
         "no_skill": ctx.get("no_skill", False),
-        "run_context": ctx["run_context"],
     }
 
 
@@ -283,48 +279,59 @@ def test_allowlist_refuses_fix_test_file_in_snapshot(tmp_path):
         )
 
 
-def test_allowlist_backstop_refuses_fix_sha_prefix_in_prompt(tmp_path):
-    from proofdeploy.model_client import build_author_prompt
+def _eq_repo_with_fix_info_in_bug(root: Path, *, include: str = "both") -> dict[str, str]:
+    """Variant of _eq_repo where B's own content contains fix info.
 
-    info = _eq_repo(tmp_path)
+    The prompt is then byte-equal to the re-derivation (it is built
+    correctly from the verified bundle), but the final-prompt backstop
+    must still refuse: B legitimately containing fix info is exactly
+    what the backstop is for. (The old run_context smuggling channel
+    is gone; this is the only way fix info can reach the prompt now.)
+
+    ``include``: "sha", "subject", or "both".
+    """
+    info = _eq_repo(root)
+    repo = Path(info["repo"])
+    fix = info["fix"]
+    subject = _git(repo, "log", "-1", "--format=%s", fix)
+    # Amend the bug commit so B's app.py contains fix info.
+    _git(repo, "checkout", "-q", info["bug"])
+    extra = ""
+    if include in ("sha", "both"):
+        extra += f"# ref {fix[:12]}\n"
+    if include in ("subject", "both"):
+        extra += f"# note: {subject}\n"
+    (repo / "app.py").write_text(f"VALUE = 2\n{extra}")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "--amend", "-m", "bug")
+    info["bug"] = _git(repo, "rev-parse", "HEAD")
+    return info
+
+
+def test_allowlist_backstop_refuses_fix_sha_prefix_in_prompt(tmp_path):
+    info = _eq_repo_with_fix_info_in_bug(tmp_path, include="sha")
     ctx = _eq_bundle(tmp_path, info)
-    # A 12-char fix SHA prefix smuggled via run_context (prompt-only channel).
-    bad_context = ctx["run_context"] + f" ref {info['fix'][:12]}"
-    bad_prompt = build_author_prompt(
-        skill_text="",
-        fixture_description=(ctx["bundle"] / "fixture-description.txt").read_text(),
-        diff_text=(ctx["bundle"] / "diff.patch").read_text(),
-        snapshot_dir=ctx["bundle"] / "snapshot",
-        run_context=bad_context,
-    )
-    kwargs = _eq_check_kwargs(ctx)
-    kwargs["run_context"] = bad_context
+    # The prompt is correctly derived from the verified bundle, but
+    # B's content contains a 12-char fix SHA prefix: the backstop must
+    # refuse.
+    assert info["fix"][:12] in ctx["prompt"]
     with pytest.raises(AnswerKeyLeakError, match="backstop.*fix SHA prefix"):
         check_bundle_answer_key(
-            ctx["bundle"], ctx["manifest"], bad_prompt, **kwargs
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
         )
 
 
 def test_allowlist_backstop_refuses_fix_subject_in_prompt(tmp_path):
-    from proofdeploy.model_client import build_author_prompt
-
-    info = _eq_repo(tmp_path)
+    info = _eq_repo_with_fix_info_in_bug(tmp_path, include="subject")
     ctx = _eq_bundle(tmp_path, info)
     repo = Path(info["repo"])
     subject = _git(repo, "log", "-1", "--format=%s", info["fix"])
-    bad_context = ctx["run_context"] + f" note: {subject}"
-    bad_prompt = build_author_prompt(
-        skill_text="",
-        fixture_description=(ctx["bundle"] / "fixture-description.txt").read_text(),
-        diff_text=(ctx["bundle"] / "diff.patch").read_text(),
-        snapshot_dir=ctx["bundle"] / "snapshot",
-        run_context=bad_context,
-    )
-    kwargs = _eq_check_kwargs(ctx)
-    kwargs["run_context"] = bad_context
+    # The prompt is correctly derived, but B's content contains the
+    # fix subject: the backstop must refuse.
+    assert subject in ctx["prompt"]
     with pytest.raises(AnswerKeyLeakError, match="backstop.*subject"):
         check_bundle_answer_key(
-            ctx["bundle"], ctx["manifest"], bad_prompt, **kwargs
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
         )
 
 
