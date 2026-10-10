@@ -312,6 +312,82 @@ class Orchestrator:
         self._say(f"answer-key check passed; bundle manifest {manifest_sha[:12]}")
         return manifest_sha
 
+    def _record_inconclusive(
+        self,
+        cfg: MeasureConfig,
+        unit_dir: Path,
+        repo: Path,
+        bundle: Any,
+        manifest: dict[str, Any],
+        prompt: str,
+        base_sha: str,
+        tip_sha: str,
+        manifest_sha: str,
+        reason_type: str,
+        reason_detail: str,
+    ) -> dict[str, Any]:
+        """Record an INCONCLUSIVE run (model call failed, etc.).
+
+        Writes an evidence record (with no probes) and a score record
+        with verdict INCONCLUSIVE and a typed reason. Never records a
+        probe failure for a model/transport error.
+        """
+        from proofdeploy.model_client import (
+            author_prompt_builder_sha256,
+            author_prompt_sha256,
+        )
+        from proofdeploy.runpair import (
+            build_evidence_record,
+            commit_records,
+            write_evidence_record,
+            write_score_record,
+        )
+
+        # Minimal evidence: no probes were produced.
+        record = build_evidence_record(
+            run_kind="bug",
+            bug_id=cfg.bug_id,
+            prompt=prompt,
+            bundle_manifest=manifest,
+            bundle_manifest_sha256=manifest_sha,
+            author_prompt_sha256=author_prompt_sha256(),
+            author_prompt_builder_sha256=author_prompt_builder_sha256(),
+            skill_sha256=manifest.get("skill_sha256"),
+            sandboxed=False,
+            measured_result=False,
+            provenance=self._provenance({}),
+        )
+        record_id, _, evidence_sha = write_evidence_record(
+            record, repo, repo, secret_values=self.cfg.extra_secrets,
+        )
+        self._say(f"evidence committed: {evidence_sha[:12]}")
+        # Score with INCONCLUSIVE verdict and typed reason in the note.
+        from proofdeploy.runpair import RunPairVerdict
+        score_path, _ = write_score_record(
+            output_dir=repo,
+            repo=repo,
+            evidence_record_id=record_id,
+            run_kind="bug",
+            bug_id=cfg.bug_id,
+            verdict=RunPairVerdict.INCONCLUSIVE,
+            note=f"{reason_type}: {reason_detail}",
+            secret_values=self.cfg.extra_secrets,
+        )
+        score_sha = commit_records(
+            repo, repo, f"score: bug {cfg.bug_id} ({record_id[:8]})"
+        )
+        self._say(f"score committed: {score_sha[:12]}")
+        return {
+            "run_kind": "bug",
+            "bug_id": cfg.bug_id,
+            "evidence_record_id": record_id,
+            "evidence_commit": evidence_sha,
+            "score_commit": score_sha,
+            "verdict": "inconclusive",
+            "reason_type": reason_type,
+            "reason_detail": reason_detail,
+        }
+
     def _leak_check_bundle(
         self, bundle: Any, prompt: str, contract: RepoContract
     ) -> None:
@@ -620,7 +696,20 @@ class Orchestrator:
         manifest_sha = self._check_answer_key(
             bundle, prompt, base_sha, tip_sha, fix_rev=cfg.rev_fix
         )
-        probeset, raw = self._author_probes(prompt)
+        try:
+            probeset, raw = self._author_probes(prompt)
+        except Exception as e:
+            # Model call failed (context overflow, transport error, etc.).
+            # Record as INCONCLUSIVE with a typed reason, never as a probe
+            # failure. The run did not produce probes, so there is nothing
+            # to score.
+            self._say(f"model call failed; recording INCONCLUSIVE: {e}")
+            return self._record_inconclusive(
+                cfg, unit_dir, repo, bundle, manifest, prompt,
+                base_sha, tip_sha, manifest_sha,
+                reason_type="model_call_failed",
+                reason_detail=str(e),
+            )
 
         prov_workdir = cfg.workdir / "provisioner"
         prov_workdir.mkdir(parents=True, exist_ok=True)

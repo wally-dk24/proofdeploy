@@ -51,7 +51,7 @@ TEMPERATURE = 0.2
 
 # Frozen author-prompt template. The file is versioned; its hash is in
 # every evidence record.
-PROMPT_TEMPLATE_FILENAME = "author_prompt_v6.md"
+PROMPT_TEMPLATE_FILENAME = "author_prompt_v7.md"
 
 _GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_ALLOWED_HOSTS = ["api.groq.com"]

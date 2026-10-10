@@ -506,3 +506,37 @@ def test_measure_bug_no_skill_arm_end_to_end(tmp_path):
     assert "(none)" in evidence["prompt"]
     # Builder hash is recorded.
     assert evidence["author_prompt_builder_sha256"]
+
+
+def test_measure_bug_model_failure_is_inconclusive(tmp_path):
+    """If the model call fails (e.g. context overflow), the run is
+    INCONCLUSIVE with a typed reason, never a probe failure."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    def failing_runner(prompt: str):
+        raise RuntimeError("context length exceeded")
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-fail",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=failing_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["reason_type"] == "model_call_failed"
+    assert "context length exceeded" in summary["reason_detail"]
+    # Records were written.
+    records = read_records(out)
+    assert len(records) == 2
+    assert records[0]["record_type"] == "evidence"
+    assert records[1]["record_type"] == "score"
