@@ -367,6 +367,27 @@ def _message_hashes(messages: list[dict[str, Any]]) -> list[str]:
     ]
 
 
+class ModelCallError(Exception):
+    """The model call itself failed (context overflow, transport error).
+
+    This is distinct from a model that returned unparsable content
+    (which is a probe-validation matter, handled per-probe). Only
+    ModelCallError (and subclasses) are caught by the orchestrator's
+    INCONCLUSIVE path; our own parse/validation bugs must propagate.
+
+    The ``cause`` is one of:
+    - "model_overflow": the prompt exceeds the model's context; no retry.
+    - "model_transport": no response, or a transport error; exactly one retry.
+    """
+
+
+    def __init__(self, message: str, cause: str):
+        super().__init__(message)
+        if cause not in ("model_overflow", "model_transport"):
+            raise ValueError(f"unknown ModelCallError cause: {cause}")
+        self.cause = cause
+
+
 @dataclass
 class ModelResponse:
     """What the model returned, with transport metadata."""

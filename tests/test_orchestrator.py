@@ -508,22 +508,22 @@ def test_measure_bug_no_skill_arm_end_to_end(tmp_path):
     assert evidence["author_prompt_builder_sha256"]
 
 
-def test_measure_bug_model_failure_is_inconclusive(tmp_path):
-    """If the model call fails (e.g. context overflow), the run is
-    INCONCLUSIVE with a typed reason, never a probe failure."""
+def test_measure_bug_model_overflow_no_retry(tmp_path):
+    """model_overflow: no retry, INCONCLUSIVE, counts as not caught."""
     info = make_mini_repo(tmp_path)
     out = tmp_path / "records"
     work = tmp_path / "work"
 
     def failing_runner(prompt: str):
-        raise RuntimeError("context length exceeded")
+        from proofdeploy.model_client import ModelCallError
+        raise ModelCallError("context length exceeded", cause="model_overflow")
 
     cfg = MeasureConfig(
         repo_dir=Path(info["repo"]),
         output_dir=out,
         workdir=work,
         skill_path=skill_path(),
-        bug_id="mini-fail",
+        bug_id="mini-overflow",
         rev_bug_base=info["base"],
         rev_bug=info["bug"],
         rev_fix=info["fix"],
@@ -533,10 +533,74 @@ def test_measure_bug_model_failure_is_inconclusive(tmp_path):
     )
     summary = Orchestrator(cfg).measure_bug()
     assert summary["verdict"] == "inconclusive"
-    assert summary["reason_type"] == "model_call_failed"
-    assert "context length exceeded" in summary["reason_detail"]
-    # Records were written.
-    records = read_records(out)
-    assert len(records) == 2
-    assert records[0]["record_type"] == "evidence"
-    assert records[1]["record_type"] == "score"
+    assert summary["reason_class"] == "environment"
+    assert summary["cause"] == "model_overflow"
+    assert summary["counting"] == "counts_as_not_caught"
+    # Only one attempt (no retry for overflow).
+    assert len(summary["model_attempts"]) == 1
+    assert "model_overflow" in summary["model_attempts"][0]
+
+
+def test_measure_bug_model_transport_retry_twice(tmp_path):
+    """model_transport failing twice: one retry, both recorded."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    def failing_runner(prompt: str):
+        from proofdeploy.model_client import ModelCallError
+        raise ModelCallError("connection reset", cause="model_transport")
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-transport",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=failing_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "model_transport"
+    # Two attempts (one retry).
+    assert len(summary["model_attempts"]) == 2
+    assert "attempt_1" in summary["model_attempts"][0]
+    assert "attempt_2" in summary["model_attempts"][1]
+
+
+def test_measure_bug_model_transport_retry_succeeds(tmp_path):
+    """model_transport succeeding on retry: normal run proceeds."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    calls = []
+
+    def flaky_runner(prompt: str):
+        from proofdeploy.model_client import ModelCallError
+        calls.append(1)
+        if len(calls) == 1:
+            raise ModelCallError("timeout", cause="model_transport")
+        return canned_probes(prompt)
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-retry-ok",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=flaky_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    # Retry succeeded, so normal scoring proceeds.
+    assert summary["verdict"] == "candidate_catch"
+    assert len(calls) == 2

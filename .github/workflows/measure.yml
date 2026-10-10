@@ -132,6 +132,9 @@ jobs:
           # The key is available to `proofdeploy measure` on the host only.
           # It never enters containers, never appears in prompts, and is
           # redacted by value in records.
+          # Use set +e: if measure fails, we still write the SHAs (which
+          # may be empty) to GITHUB_OUTPUT, then exit with the code.
+          set +e
           mkdir -p /tmp/workdir /tmp/output
           # Provenance goes to `measure` itself via --provenance-* args,
           # so the evidence record carries them (not via GITHUB_ENV after).
@@ -163,12 +166,15 @@ jobs:
               --clean "$CLEAN" \
               $PROV_ARGS 2>&1)
           fi
+          CODE=$?
           echo "$OUTPUT"
           # Take the evidence and score SHAs from measure's own output.
+          # Always write them (even if empty) so the push step can decide.
           EVIDENCE_SHA=$(echo "$OUTPUT" | grep -oP 'evidence committed: \K[0-9a-f]{40}' | head -1)
           SCORE_SHA=$(echo "$OUTPUT" | grep -oP 'score committed: \K[0-9a-f]{40}' | head -1)
           echo "evidence_sha=$EVIDENCE_SHA" >> "$GITHUB_OUTPUT"
           echo "score_sha=$SCORE_SHA" >> "$GITHUB_OUTPUT"
+          exit $CODE
 
       - name: Push records to durable branch
         # Always push, even if the run failed or was INCONCLUSIVE.
@@ -184,14 +190,25 @@ jobs:
           # separate pushes to the records branch. The runner's disk is
           # wiped after the run; the branch is the durable store.
           # Use an explicit token URL (checkout used persist-credentials: false).
+          # Never push an empty source: `git push <url> ":refs/heads/…"`
+          # DELETES the branch.
           RECORDS_BRANCH="records/run-$RUN_ID"
           cd /tmp/output
           git config user.name "proofdeploy-measure"
           git config user.email "proofdeploy-measure@users.noreply.github.com"
           REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          # Evidence first.
-          git push "$REPO_URL" "$EVIDENCE_SHA:refs/heads/$RECORDS_BRANCH"
-          echo "Pushed evidence $EVIDENCE_SHA to $RECORDS_BRANCH"
-          # Then score.
-          git push "$REPO_URL" "$SCORE_SHA:refs/heads/$RECORDS_BRANCH"
-          echo "Pushed score $SCORE_SHA to $RECORDS_BRANCH"
+          if [ -n "$EVIDENCE_SHA" ]; then
+            git push "$REPO_URL" "$EVIDENCE_SHA:refs/heads/$RECORDS_BRANCH"
+            echo "Pushed evidence $EVIDENCE_SHA to $RECORDS_BRANCH"
+          elif git rev-parse --verify HEAD >/dev/null 2>&1; then
+            echo "WARNING: no evidence SHA parsed; pushing HEAD"
+            git push "$REPO_URL" "HEAD:refs/heads/$RECORDS_BRANCH"
+          else
+            echo "WARNING: no evidence SHA and no HEAD; nothing to push"
+          fi
+          if [ -n "$SCORE_SHA" ]; then
+            git push "$REPO_URL" "$SCORE_SHA:refs/heads/$RECORDS_BRANCH"
+            echo "Pushed score $SCORE_SHA to $RECORDS_BRANCH"
+          else
+            echo "WARNING: no score SHA parsed; skipping score push"
+          fi

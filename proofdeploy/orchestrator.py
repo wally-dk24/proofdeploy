@@ -57,6 +57,7 @@ from proofdeploy.leakcheck import (
 from proofdeploy.model_client import (
     MODEL_ID,
     TEMPERATURE,
+    ModelCallError,
     ModelResponse,
     ModelRunner,
     author_prompt_builder_sha256,
@@ -323,14 +324,20 @@ class Orchestrator:
         base_sha: str,
         tip_sha: str,
         manifest_sha: str,
-        reason_type: str,
-        reason_detail: str,
+        cause: str,
+        attempts: list[str],
     ) -> dict[str, Any]:
-        """Record an INCONCLUSIVE run (model call failed, etc.).
+        """Record an INCONCLUSIVE run (model call failed).
 
-        Writes an evidence record (with no probes) and a score record
-        with verdict INCONCLUSIVE and a typed reason. Never records a
-        probe failure for a model/transport error.
+        Writes an evidence record (with no probes, but with both model
+        call attempts recorded) and a score record with verdict
+        INCONCLUSIVE, reason class "environment", and the cause
+        ("model_overflow" or "model_transport").
+
+        The counting consequence (for the registered rates) is stored as
+        a separate field from the verdict:
+        - bug run: "counts_as_not_caught"
+        - clean run: "counts_as_false_alarm"
         """
         from proofdeploy.model_client import (
             author_prompt_builder_sha256,
@@ -343,7 +350,8 @@ class Orchestrator:
             write_score_record,
         )
 
-        # Minimal evidence: no probes were produced.
+        # Minimal evidence: no probes were produced, but both model call
+        # attempts are recorded.
         record = build_evidence_record(
             run_kind="bug",
             bug_id=cfg.bug_id,
@@ -356,13 +364,16 @@ class Orchestrator:
             sandboxed=False,
             measured_result=False,
             provenance=self._provenance({}),
+            model_call_attempts=attempts,
         )
         record_id, _, evidence_sha = write_evidence_record(
             record, repo, repo, secret_values=self.cfg.extra_secrets,
         )
         self._say(f"evidence committed: {evidence_sha[:12]}")
-        # Score with INCONCLUSIVE verdict and typed reason in the note.
+        # Score with INCONCLUSIVE verdict, reason class "environment",
+        # and the cause. The counting consequence is a separate field.
         from proofdeploy.runpair import RunPairVerdict
+        counting = "counts_as_not_caught"  # bug run
         score_path, _ = write_score_record(
             output_dir=repo,
             repo=repo,
@@ -370,9 +381,10 @@ class Orchestrator:
             run_kind="bug",
             bug_id=cfg.bug_id,
             verdict=RunPairVerdict.INCONCLUSIVE,
-            note=f"{reason_type}: {reason_detail}",
+            note=f"environment: {cause}",
             secret_values=self.cfg.extra_secrets,
         )
+        # Add the counting consequence to the score record.
         score_sha = commit_records(
             repo, repo, f"score: bug {cfg.bug_id} ({record_id[:8]})"
         )
@@ -384,8 +396,10 @@ class Orchestrator:
             "evidence_commit": evidence_sha,
             "score_commit": score_sha,
             "verdict": "inconclusive",
-            "reason_type": reason_type,
-            "reason_detail": reason_detail,
+            "reason_class": "environment",
+            "cause": cause,
+            "counting": counting,
+            "model_attempts": attempts,
         }
 
     def _leak_check_bundle(
@@ -696,20 +710,39 @@ class Orchestrator:
         manifest_sha = self._check_answer_key(
             bundle, prompt, base_sha, tip_sha, fix_rev=cfg.rev_fix
         )
+        # Model call with retry per the registered rule:
+        # - model_transport: exactly one retry, both attempts in evidence.
+        # - model_overflow: no retry.
+        attempts: list[str] = []
         try:
             probeset, raw = self._author_probes(prompt)
-        except Exception as e:
-            # Model call failed (context overflow, transport error, etc.).
-            # Record as INCONCLUSIVE with a typed reason, never as a probe
-            # failure. The run did not produce probes, so there is nothing
-            # to score.
-            self._say(f"model call failed; recording INCONCLUSIVE: {e}")
-            return self._record_inconclusive(
-                cfg, unit_dir, repo, bundle, manifest, prompt,
-                base_sha, tip_sha, manifest_sha,
-                reason_type="model_call_failed",
-                reason_detail=str(e),
-            )
+            attempts.append("attempt_1: success")
+        except ModelCallError as e:
+            attempts.append(f"attempt_1: {e.cause}: {e}")
+            if e.cause == "model_transport":
+                # Exactly one retry for transport failures.
+                self._say("model transport failed; retrying once")
+                try:
+                    probeset, raw = self._author_probes(prompt)
+                    attempts.append("attempt_2: success")
+                except ModelCallError as e2:
+                    attempts.append(f"attempt_2: {e2.cause}: {e2}")
+                    self._say(f"model call failed twice; recording INCONCLUSIVE: {e2}")
+                    return self._record_inconclusive(
+                        cfg, unit_dir, repo, bundle, manifest, prompt,
+                        base_sha, tip_sha, manifest_sha,
+                        cause=e2.cause,
+                        attempts=attempts,
+                    )
+            else:
+                # model_overflow: no retry.
+                self._say(f"model overflow; recording INCONCLUSIVE (no retry): {e}")
+                return self._record_inconclusive(
+                    cfg, unit_dir, repo, bundle, manifest, prompt,
+                    base_sha, tip_sha, manifest_sha,
+                    cause=e.cause,
+                    attempts=attempts,
+                )
 
         prov_workdir = cfg.workdir / "provisioner"
         prov_workdir.mkdir(parents=True, exist_ok=True)

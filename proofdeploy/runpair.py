@@ -424,6 +424,9 @@ def build_evidence_record(
     # Recorded next to author_prompt_sha256 so the exact rendering code
     # is pinned in every evidence record.
     author_prompt_builder_sha256: str | None = None,
+    # Model call attempt log (for INCONCLUSIVE runs): list of strings like
+    # "attempt_1: model_transport: ...", "attempt_2: success".
+    model_call_attempts: list[str] | None = None,
     # Truncation flags from prompt construction: which caps applied
     # (diff_files_truncated, file_bytes_truncated, listed_files_truncated).
     truncation_flags: dict[str, Any] | None = None,
@@ -523,6 +526,7 @@ def build_evidence_record(
         "model_id": model_id,
         "model_temperature": model_temperature,
         "model_attempts": model_attempts,
+        "model_call_attempts": model_call_attempts,
         "model_request": model_request or {},
         "author_prompt_sha256": author_prompt_sha256,
         "author_prompt_builder_sha256": author_prompt_builder_sha256,
