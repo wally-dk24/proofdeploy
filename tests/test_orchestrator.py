@@ -693,8 +693,8 @@ def test_measure_clean_model_transport_retry_succeeds(tmp_path):
     assert len(calls) == 2
 
 
-def test_inconclusive_records_measured_result_true(tmp_path):
-    """INCONCLUSIVE evidence records measured_result=True with real values."""
+def test_inconclusive_unsandboxed_records_not_measured(tmp_path):
+    """Unsandboxed dev INCONCLUSIVE: measured_result=False (never counts)."""
     info = make_mini_repo(tmp_path)
     out = tmp_path / "records"
     work = tmp_path / "work"
@@ -719,9 +719,8 @@ def test_inconclusive_records_measured_result_true(tmp_path):
     Orchestrator(cfg).measure_bug()
     records = read_records(out)
     evidence = records[0]
-    # measured_result=True (not the hiding Master rejected).
-    assert evidence["measured_result"] is True
-    # Real sandboxed value (allow_unsandboxed=True → False).
+    # Unsandboxed dev run: never a measured result.
+    assert evidence["measured_result"] is False
     assert evidence["sandboxed"] is False
     # Provenance is present (not empty).
     assert "provenance" in evidence
