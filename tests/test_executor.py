@@ -21,6 +21,18 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"not found")
+        elif self.path == "/bad":
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"bad request")
+        elif self.path == "/denied":
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b"unauthorized")
+        elif self.path == "/forbidden":
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"forbidden")
         else:
             self.send_response(500)
             self.end_headers()
@@ -356,19 +368,56 @@ def test_inconclusive_reason_in_to_dict():
 
 
 def test_non_2xx_setup_is_inconclusive_environment(server):
-    # /missing returns 404 on the server fixture. A non-2xx setup response
-    # is INCONCLUSIVE (environment), not silently continued.
+    # Any other path returns 500 on the server fixture. A non-2xx setup
+    # response is INCONCLUSIVE (environment), not silently continued.
     ex = Executor(target_url=server)
     p = _probe(
-        setup=[{"type": "http", "act": {"method": "GET", "path": "/missing"}}],
+        setup=[{"type": "http", "act": {"method": "GET", "path": "/explode"}}],
         assert_=[{"type": "status", "equals": 200}],
     )
     r = ex.run_probe(p)
     assert r.verdict == Verdict.INCONCLUSIVE
     assert r.reason == InconclusiveReason.ENVIRONMENT
-    assert any("404" in d for d in r.details)
+    assert any("500" in d for d in r.details)
     # The act must not run after a failed setup.
     assert not any(d.startswith("act:") for d in r.details)
+
+
+def _setup_inconclusive_reason(server, path):
+    """Run a probe whose setup hits `path`; return its INCONCLUSIVE reason."""
+    ex = Executor(target_url=server)
+    p = _probe(
+        setup=[{"type": "http", "act": {"method": "GET", "path": path}}],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    # The act must not run after a failed setup.
+    assert not any(d.startswith("act:") for d in r.details)
+    return r.reason
+
+
+def test_setup_401_is_inconclusive_auth(server):
+    # 401 from setup: credential problem -> AUTH (the only reason class
+    # an admin may downgrade to "warn").
+    assert _setup_inconclusive_reason(server, "/denied") == InconclusiveReason.AUTH
+
+
+def test_setup_403_is_inconclusive_auth(server):
+    assert _setup_inconclusive_reason(server, "/forbidden") == InconclusiveReason.AUTH
+
+
+def test_setup_400_is_inconclusive_probe(server):
+    # 400 from setup: the probe's request was wrong -> PROBE.
+    assert _setup_inconclusive_reason(server, "/bad") == InconclusiveReason.PROBE
+
+
+def test_setup_404_is_inconclusive_probe(server):
+    assert _setup_inconclusive_reason(server, "/missing") == InconclusiveReason.PROBE
+
+
+def test_setup_500_is_inconclusive_environment(server):
+    assert _setup_inconclusive_reason(server, "/explode") == InconclusiveReason.ENVIRONMENT
 
 
 def test_write_act_on_non_provisioned_target_is_inconclusive_probe(server):

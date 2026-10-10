@@ -10,7 +10,8 @@ Fail-closed rules:
 - ``harness_app`` setup steps are INCONCLUSIVE (reason ``environment``)
   until WO-5 can provision them.
 - A setup HTTP step whose response is not 2xx makes the probe
-  INCONCLUSIVE (reason ``environment``).
+  INCONCLUSIVE, with precise typing: 401/403 -> ``auth``, other 4xx ->
+  ``probe``, 5xx -> ``environment``.
 - Write methods (POST/PUT/DELETE/PATCH) are allowed only when the
   provisioner says the target was provisioned (``provisioned=True``);
   localhost alone is not sufficient. A write on a non-provisioned target
@@ -333,6 +334,8 @@ class Executor:
         A failed step is INCONCLUSIVE, not silently continued:
         - unknown step type -> reason PROBE
         - unreachable target or 5xx from a setup HTTP call -> reason ENVIRONMENT
+        - 401/403 from a setup HTTP call -> reason AUTH
+        - other 4xx from a setup HTTP call -> reason PROBE
         """
         logs: list[str] = []
         writes: list[str] = []
@@ -374,9 +377,19 @@ class Executor:
                         writes,
                     )
                 if not (200 <= status < 300):
+                    # Precise INCONCLUSIVE typing for setup failures:
+                    # 401/403 -> AUTH (credential problem; admin may downgrade)
+                    # other 4xx -> PROBE (the probe's request was wrong)
+                    # 5xx -> ENVIRONMENT (target-side failure)
+                    if status in (401, 403):
+                        reason = InconclusiveReason.AUTH
+                    elif 400 <= status < 500:
+                        reason = InconclusiveReason.PROBE
+                    else:
+                        reason = InconclusiveReason.ENVIRONMENT
                     return (
                         logs,
-                        InconclusiveReason.ENVIRONMENT,
+                        reason,
                         f"setup[{i}]: setup call returned {status}",
                         writes,
                     )
