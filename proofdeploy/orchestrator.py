@@ -59,6 +59,7 @@ from proofdeploy.model_client import (
     TEMPERATURE,
     ModelResponse,
     ModelRunner,
+    author_prompt_sha256,
     build_author_prompt,
     call_model,
 )
@@ -177,10 +178,11 @@ class Orchestrator:
         rev_base: str,
         rev_tip: str,
         run_kind: str,
-    ) -> tuple[Any, dict[str, Any], str, str, str, str]:
+    ) -> tuple[Any, dict[str, Any], str, str, str, str, str]:
         """Assemble the author bundle.
 
-        Returns (bundle, manifest, prompt, raw_diff, base_sha, tip_sha).
+        Returns (bundle, manifest, prompt, raw_diff, base_sha, tip_sha,
+        run_context).
         Fail-closed: empty diff, bad template hash, or a secret in the
         prompt/bundle aborts before any model call. The answer-key check
         is a separate step (``_check_answer_key``) so tests can seed a
@@ -218,37 +220,57 @@ class Orchestrator:
         manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
         skill_text = bundle.skill.read_text(encoding="utf-8") if bundle.skill else ""
         description = bundle.description.read_text(encoding="utf-8")
+        run_context = f"Run kind: {run_kind}. Unit id: {unit_id}."
         prompt = build_author_prompt(
             skill_text=skill_text,
             fixture_description=description,
             diff_text=diff_text,
             snapshot_dir=snapshot.dir,
-            run_context=f"Run kind: {run_kind}. Unit id: {unit_id}.",
+            run_context=run_context,
         )
         self._say(f"bundle assembled at {bundle.root}")
         self._leak_check_bundle(bundle, prompt, contract)
-        return bundle, manifest, prompt, diff_text, base_sha, tip_sha
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, run_context
 
     def _check_answer_key(
-        self, bundle: Any, base_sha: str, tip_sha: str, fix_rev: str | None
+        self,
+        bundle: Any,
+        prompt: str,
+        run_context: str,
+        base_sha: str,
+        tip_sha: str,
+        fix_rev: str | None,
     ) -> str:
-        """Answer-key check (WO-5 brief): fail the run if the bundle holds
-        the fix SHA, later commits' content, fix tests, eval files, or
-        a .git directory. Runs before any model call. Returns the bundle
+        """Answer-key check (WO-5 brief): allowlist by equality.
+
+        Fail the run if the bundle is not byte-equal to the allowlist
+        recomputed from B (diff.patch, snapshot, skill, fixture
+        description), if the prompt was not built from the verified
+        files, or if the prompt backstop finds fix-SHA prefixes or the
+        fix subject. Runs before any model call. Returns the bundle
         manifest hash for the record."""
+        from proofdeploy.fixture import EXPECTED_SKILL_HASH
+
         repo = self.cfg.repo_dir
         fix_sha = (
             _git(repo, "rev-parse", "--verify", f"{fix_rev}^{{commit}}")
             if fix_rev
             else None
         )
+        fix_subject = (
+            _git(repo, "log", "-1", "--format=%s", fix_sha) if fix_sha else None
+        )
         manifest_sha = check_bundle_answer_key(
             bundle.root,
             bundle.manifest,
+            prompt,
+            repo_dir=repo,
             bug_sha=tip_sha,
             bug_parent_sha=base_sha,
             fix_sha=fix_sha,
-            repo_dir=repo,
+            fix_subject=fix_subject,
+            expected_skill_hash=EXPECTED_SKILL_HASH,
+            run_context=run_context,
         )
         self._say(f"answer-key check passed; bundle manifest {manifest_sha[:12]}")
         return manifest_sha
@@ -525,7 +547,7 @@ class Orchestrator:
         unit_dir.mkdir(parents=True, exist_ok=True)
         repo = self._init_records_repo()
 
-        bundle, manifest, prompt, _, base_sha, tip_sha = self._build_bundle(
+        bundle, manifest, prompt, _, base_sha, tip_sha, run_context = self._build_bundle(
             unit_dir,
             unit_id=cfg.bug_id,
             rev_base=cfg.rev_bug_base,
@@ -533,7 +555,7 @@ class Orchestrator:
             run_kind="bug",
         )
         manifest_sha = self._check_answer_key(
-            bundle, base_sha, tip_sha, fix_rev=cfg.rev_fix
+            bundle, prompt, run_context, base_sha, tip_sha, fix_rev=cfg.rev_fix
         )
         probeset, raw = self._author_probes(prompt)
 
@@ -591,6 +613,8 @@ class Orchestrator:
                 model_id=MODEL_ID,
                 model_temperature=TEMPERATURE,
                 model_attempts=1,
+                model_request=raw.request_record,
+                author_prompt_sha256=author_prompt_sha256(),
                 skill_sha256=manifest.get("skill_sha256"),
                 fix_parent_provision=parent.provision.to_dict(),
                 fix_provision=fix.provision.to_dict(),
@@ -662,7 +686,7 @@ class Orchestrator:
         repo = self._init_records_repo()
 
         # The clean author bundle: C^->C diff + C snapshot.
-        bundle, manifest, prompt, _, base_sha, tip_sha = self._build_bundle(
+        bundle, manifest, prompt, _, base_sha, tip_sha, run_context = self._build_bundle(
             unit_dir,
             unit_id=cfg.clean_id,
             rev_base=f"{cfg.rev_clean}^",
@@ -670,7 +694,7 @@ class Orchestrator:
             run_kind="clean",
         )
         manifest_sha = self._check_answer_key(
-            bundle, base_sha, tip_sha, fix_rev=None
+            bundle, prompt, run_context, base_sha, tip_sha, fix_rev=None
         )
         probeset, raw = self._author_probes(prompt)
 
@@ -716,6 +740,8 @@ class Orchestrator:
                 model_id=MODEL_ID,
                 model_temperature=TEMPERATURE,
                 model_attempts=1,
+                model_request=raw.request_record,
+                author_prompt_sha256=author_prompt_sha256(),
                 skill_sha256=manifest.get("skill_sha256"),
                 runner_log=list(self.log),
                 fixture=dict(side.contract.fixture),

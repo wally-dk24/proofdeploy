@@ -85,23 +85,55 @@ def test_call_model_default_runner_is_groq(monkeypatch):
 
     seen: dict = {}
 
-    def fake_run(cmd, **kw):
-        seen["cmd"] = cmd
-        seen["prompt"] = kw.get("text")
+    class FakeResp:
+        def __enter__(self):
+            return self
 
-        class P:
-            returncode = 0
-            stdout = json.dumps({"content": "resp", "finish_reason": "stop"})
-            stderr = ""
+        def __exit__(self, *a):
+            return False
 
-        return P()
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": "resp"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"total_tokens": 10},
+                }
+            ).encode()
 
-    monkeypatch.setattr(mc.subprocess, "run", fake_run)
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["body"] = json.loads(req.data.decode())
+        seen["ua"] = req.get_header("User-agent")
+        return FakeResp()
+
+    def fake_cred(req):
+        seen["cred_applied"] = True
+
+    monkeypatch.setattr(mc.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(mc, "_credential_surrogate", lambda: fake_cred)
     resp = call_model("the prompt")
     assert resp.content == "resp"
-    cmd = seen["cmd"]
-    assert "--model" in cmd and "openai/gpt-oss-120b" in cmd
-    assert "--temperature" in cmd and "0.2" in cmd
-    assert "--user" in cmd and cmd[cmd.index("--user") + 1] == "the prompt"
-    # No seed, no tools flags: the CLI sends exactly model + temperature.
-    assert "--seed" not in cmd
+    assert resp.finish_reason == "stop"
+    assert seen["url"] == "https://api.groq.com/openai/v1/chat/completions"
+    body = seen["body"]
+    assert body["model"] == "openai/gpt-oss-120b"
+    assert body["temperature"] == 0.2
+    assert body["messages"] == [{"role": "user", "content": "the prompt"}]
+    # No seed, no tools: the request sends exactly model + messages + temperature.
+    assert "seed" not in body
+    assert "tools" not in body
+    # Groq's WAF requires a real User-Agent.
+    assert seen["ua"] == "wally-groq-cli/1.0"
+    assert seen["cred_applied"]
+    # The exact request is recorded for evidence.
+    rec = resp.request_record
+    assert rec["model"] == "openai/gpt-oss-120b"
+    assert rec["temperature"] == 0.2
+    assert rec["seed"] is None
+    assert rec["tools"] is None
+    assert len(rec["message_hashes"]) == 1 and len(rec["message_hashes"][0]) == 64

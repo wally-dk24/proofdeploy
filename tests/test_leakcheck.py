@@ -87,99 +87,254 @@ def _git(repo: Path, *args: str) -> str:
     return p.stdout.strip()
 
 
-def _answer_key_repo(root: Path) -> dict[str, str]:
-    """Repo with base -> bug (B) -> fix commits for answer-key tests."""
-    repo = root / "ak-repo"
+
+# ---------------------------------------------------------------------------
+# Allowlist-by-equality answer-key check (orchestrator review, 2026-10-10).
+# ---------------------------------------------------------------------------
+
+
+_YML = """\
+build: "true"
+start: "true"
+readiness: "/health"
+fixture:
+  repo_name: "ak"
+  seed_note: "seed"
+  auth_mechanism: "none"
+  auth_scope: "none"
+  flags_note: "none"
+env: {}
+"""
+
+
+def _eq_repo(root: Path) -> dict[str, str]:
+    """Repo with base (B^) -> bug (B) -> fix, plus proofdeploy.yml at B."""
+    from proofdeploy.fixture import EXPECTED_SKILL_HASH  # noqa: F401
+
+    repo = root / "eq-repo"
     repo.mkdir()
     _git(repo, "init", "-q")
     _git(repo, "config", "user.name", "test")
     _git(repo, "config", "user.email", "test@test")
     (repo / "app.py").write_text("VALUE = 1\n")
+    (repo / "proofdeploy.yml").write_text(_YML)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     base = _git(repo, "rev-parse", "HEAD")
     (repo / "app.py").write_text("VALUE = 2\n")
+    (repo / "retrieval.py").write_text("# clean helper, name contains eval\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "bug")
     bug = _git(repo, "rev-parse", "HEAD")
     (repo / "app.py").write_text("VALUE = 1\n")
+    (repo / "test_fix.py").write_text("def test_fix():\n    assert True\n")
     _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "fix")
+    _git(repo, "commit", "-q", "-m", "Fix app value handling")
     fix = _git(repo, "rev-parse", "HEAD")
     return {"repo": str(repo), "base": base, "bug": bug, "fix": fix}
 
 
-def _answer_key_bundle(root: Path, info: dict[str, str]) -> tuple[Path, Path]:
-    """A minimal valid bundle dir + manifest for the answer-key check."""
-    bundle = root / "bundle"
-    snap = bundle / "snapshot"
-    snap.mkdir(parents=True)
-    (snap / "app.py").write_text("VALUE = 2\n")
-    diff = _git(Path(info["repo"]), "diff", f"{info['base']}..{info['bug']}", "--")
-    (bundle / "diff.patch").write_text(diff)
-    (bundle / "fixture-description.txt").write_text("Repository: ak\n")
-    (bundle / "skill-author.md").write_text("# skill\n")
-    manifest = {
-        "source_sha": info["bug"],
-        "diff_range": f"{info['base']}..{info['bug']}",
-    }
-    manifest_path = root / "bundle.manifest.json"
-    manifest_path.write_text(json.dumps(manifest))
-    return bundle, manifest_path
+def _eq_bundle(root: Path, info: dict[str, str]) -> dict:
+    """Build a real bundle (B^->B diff + B snapshot) and its prompt."""
+    from proofdeploy.fixture import (
+        EXPECTED_SKILL_HASH,
+        assemble_author_bundle,
+        template_hash,
+    )
+    from proofdeploy.model_client import build_author_prompt
 
+    repo = Path(info["repo"])
+    work = root / "eq-work"
+    work.mkdir()
+    # B^->B diff.
+    diff_text = _git(repo, "diff", f"{info['base']}..{info['bug']}", "--")
+    diff_path = work / "diff.patch"
+    diff_path.write_text(diff_text)
+    # B snapshot via git archive.
+    snap_src = work / "snap-src"
+    snap_src.mkdir()
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "archive", info["bug"]],
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["tar", "-x", "-C", str(snap_src)],
+        input=proc.stdout,
+        capture_output=True,
+        check=True,
+    )
+    # Skill file with a known hash (passed as expected).
+    skill_path = work / "skill.md"
+    skill_path.write_text("# test skill\n")
+    import hashlib
 
-def _check_kwargs(bundle: Path, manifest: Path, info: dict[str, str]) -> dict:
+    skill_hash = hashlib.sha256(skill_path.read_bytes()).hexdigest()
+    bundle_dir = work / "bundle"
+    bundle = assemble_author_bundle(
+        diff_path=diff_path,
+        snapshot_dir=snap_src,
+        yml_fixture={
+            "repo_name": "ak",
+            "seed_note": "seed",
+            "auth_mechanism": "none",
+            "auth_scope": "none",
+            "flags_note": "none",
+        },
+        output_dir=bundle_dir,
+        expected_template_hash=template_hash(),
+        source_sha=info["bug"],
+        diff_range=f"{info['base']}..{info['bug']}",
+        skill_path=skill_path,
+        no_skill=True,
+    )
+    run_context = "Run kind: bug. Unit id: eq."
+    prompt = build_author_prompt(
+        skill_text="",
+        fixture_description=(bundle_dir / "fixture-description.txt").read_text(),
+        diff_text=diff_text,
+        snapshot_dir=bundle_dir / "snapshot",
+        run_context=run_context,
+    )
     return {
+        "bundle": bundle_dir,
+        "manifest": Path(str(bundle_dir) + ".manifest.json"),
+        "prompt": prompt,
+        "run_context": run_context,
+        "skill_hash": skill_hash,
+        "info": info,
+        "no_skill": True,
+    }
+
+
+def _eq_check_kwargs(ctx: dict) -> dict:
+    info = ctx["info"]
+    repo = Path(info["repo"])
+    fix_subject = _git(repo, "log", "-1", "--format=%s", info["fix"])
+    return {
+        "repo_dir": repo,
         "bug_sha": info["bug"],
         "bug_parent_sha": info["base"],
         "fix_sha": info["fix"],
-        "repo_dir": Path(info["repo"]),
+        "fix_subject": fix_subject,
+        "expected_skill_hash": ctx["skill_hash"],
+        "no_skill": ctx.get("no_skill", False),
+        "run_context": ctx["run_context"],
     }
 
 
-def test_answer_key_clean_bundle_passes(tmp_path):
-    info = _answer_key_repo(tmp_path)
-    bundle, manifest = _answer_key_bundle(tmp_path, info)
-    sha = check_bundle_answer_key(bundle, manifest, **_check_kwargs(bundle, manifest, info))
-    assert sha == bundle_manifest_hash(manifest)
-    assert len(sha) == 64
-
-
-def test_answer_key_refuses_fix_sha_in_bundle(tmp_path):
-    info = _answer_key_repo(tmp_path)
-    bundle, manifest = _answer_key_bundle(tmp_path, info)
-    # Seed the fix SHA into a snapshot file.
-    (bundle / "snapshot" / "app.py").write_text(f"VALUE = 2\n# {info['fix']}\n")
-    with pytest.raises(AnswerKeyLeakError, match="fix SHA"):
-        check_bundle_answer_key(bundle, manifest, **_check_kwargs(bundle, manifest, info))
-
-
-def test_answer_key_refuses_seeded_fix_diff(tmp_path):
-    """The required test: seed the fix diff into the bundle; the run is refused."""
-    info = _answer_key_repo(tmp_path)
-    bundle, manifest = _answer_key_bundle(tmp_path, info)
-    # Deliberately replace the B^->B diff with the B->fix diff.
-    fix_diff = _git(
-        Path(info["repo"]), "diff", f"{info['bug']}..{info['fix']}", "--"
+def test_allowlist_clean_bundle_with_retrieval_passes(tmp_path):
+    """A clean bundle containing retrieval.py must pass (no filename heuristic)."""
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    # retrieval.py is in the B snapshot; the bundle is valid.
+    assert (ctx["bundle"] / "snapshot" / "retrieval.py").is_file()
+    sha = check_bundle_answer_key(
+        ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
     )
-    (bundle / "diff.patch").write_text(fix_diff)
-    with pytest.raises(AnswerKeyLeakError, match="fix diff"):
-        check_bundle_answer_key(bundle, manifest, **_check_kwargs(bundle, manifest, info))
+    assert sha == bundle_manifest_hash(ctx["manifest"])
 
 
-def test_answer_key_refuses_git_directory(tmp_path):
-    info = _answer_key_repo(tmp_path)
-    bundle, manifest = _answer_key_bundle(tmp_path, info)
-    (bundle / ".git" / "objects").mkdir(parents=True)
-    with pytest.raises(AnswerKeyLeakError, match=".git"):
-        check_bundle_answer_key(bundle, manifest, **_check_kwargs(bundle, manifest, info))
+def test_allowlist_refuses_fix_diff_appended(tmp_path):
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    repo = Path(info["repo"])
+    fix_diff = _git(repo, "diff", f"{info['bug']}..{info['fix']}", "--")
+    with open(ctx["bundle"] / "diff.patch", "a") as f:
+        f.write("\n" + fix_diff)
+    with pytest.raises(AnswerKeyLeakError, match="byte-equal"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
 
 
-def test_answer_key_refuses_wrong_source_sha(tmp_path):
-    info = _answer_key_repo(tmp_path)
-    bundle, manifest = _answer_key_bundle(tmp_path, info)
-    bad = json.loads(manifest.read_text())
-    bad["source_sha"] = info["fix"]
-    manifest.write_text(json.dumps(bad))
-    with pytest.raises(AnswerKeyLeakError, match="source_sha"):
-        check_bundle_answer_key(bundle, manifest, **_check_kwargs(bundle, manifest, info))
+def test_allowlist_refuses_fix_hunk_in_extra_file(tmp_path):
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    repo = Path(info["repo"])
+    fix_diff = _git(repo, "diff", f"{info['bug']}..{info['fix']}", "--")
+    # One fix hunk smuggled as an extra snapshot file.
+    (ctx["bundle"] / "snapshot" / "extra.py").write_text(fix_diff)
+    with pytest.raises(AnswerKeyLeakError, match="file list"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
+
+
+def test_allowlist_refuses_snapshot_file_replaced_by_fix(tmp_path):
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    # Replace app.py with its fix version.
+    (ctx["bundle"] / "snapshot" / "app.py").write_text("VALUE = 1\n")
+    with pytest.raises(AnswerKeyLeakError, match="!= B version"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
+
+
+def test_allowlist_refuses_fix_test_file_in_snapshot(tmp_path):
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    # The fix's test file smuggled into the snapshot.
+    (ctx["bundle"] / "snapshot" / "test_fix.py").write_text(
+        "def test_fix():\n    assert True\n"
+    )
+    with pytest.raises(AnswerKeyLeakError, match="file list"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
+
+
+def test_allowlist_backstop_refuses_fix_sha_prefix_in_prompt(tmp_path):
+    from proofdeploy.model_client import build_author_prompt
+
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    # A 12-char fix SHA prefix smuggled via run_context (prompt-only channel).
+    bad_context = ctx["run_context"] + f" ref {info['fix'][:12]}"
+    bad_prompt = build_author_prompt(
+        skill_text="",
+        fixture_description=(ctx["bundle"] / "fixture-description.txt").read_text(),
+        diff_text=(ctx["bundle"] / "diff.patch").read_text(),
+        snapshot_dir=ctx["bundle"] / "snapshot",
+        run_context=bad_context,
+    )
+    kwargs = _eq_check_kwargs(ctx)
+    kwargs["run_context"] = bad_context
+    with pytest.raises(AnswerKeyLeakError, match="backstop.*fix SHA prefix"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], bad_prompt, **kwargs
+        )
+
+
+def test_allowlist_backstop_refuses_fix_subject_in_prompt(tmp_path):
+    from proofdeploy.model_client import build_author_prompt
+
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    repo = Path(info["repo"])
+    subject = _git(repo, "log", "-1", "--format=%s", info["fix"])
+    bad_context = ctx["run_context"] + f" note: {subject}"
+    bad_prompt = build_author_prompt(
+        skill_text="",
+        fixture_description=(ctx["bundle"] / "fixture-description.txt").read_text(),
+        diff_text=(ctx["bundle"] / "diff.patch").read_text(),
+        snapshot_dir=ctx["bundle"] / "snapshot",
+        run_context=bad_context,
+    )
+    kwargs = _eq_check_kwargs(ctx)
+    kwargs["run_context"] = bad_context
+    with pytest.raises(AnswerKeyLeakError, match="backstop.*subject"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], bad_prompt, **kwargs
+        )
+
+
+def test_allowlist_refuses_extra_file_at_bundle_root(tmp_path):
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    (ctx["bundle"] / "evil.txt").write_text("smuggled")
+    with pytest.raises(AnswerKeyLeakError, match="not the allowlist"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
