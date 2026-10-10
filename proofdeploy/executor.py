@@ -120,6 +120,13 @@ class ProbeResult:
     # body), in order, for replayability. Empty when the probe has no
     # setup HTTP steps.
     setup_requests: list[dict[str, Any]] | None = None
+    # Secrets from THIS probe run, for the record's fail-closed redaction.
+    # captured_bindings holds setup-step captures (name -> value);
+    # minted_tokens holds provider-issued tokens. These are NEVER
+    # serialized by to_dict(): build_evidence_record collects them from
+    # the results instead of trusting the caller to pass them in.
+    captured_bindings: dict[str, str] = field(default_factory=dict, repr=False)
+    minted_tokens: list[str] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -753,6 +760,18 @@ class Executor:
         # AUTH_TOKEN, and declared capture names are known bindings.
         ctx = self._make_context(probe.get("setup", []))
 
+        def _attach_secrets(pr: ProbeResult) -> ProbeResult:
+            """Copy this run's captured/minted secrets onto the result.
+
+            The secrets are never serialized by to_dict(); runpair's
+            build_evidence_record collects them from the results for the
+            record's fail-closed redaction, so a caller that forgets to
+            pass captured_values cannot leak a session token.
+            """
+            pr.captured_bindings = dict(ctx.run_captures)
+            pr.minted_tokens = list(ctx.run_minted)
+            return pr
+
         # 2. Setup steps. A failed step is INCONCLUSIVE, not silently continued.
         # Captures from setup steps land in ctx for the act below.
         setup_logs, setup_reason, setup_detail, setup_writes, setup_requests = self.run_setup(
@@ -762,13 +781,15 @@ class Executor:
         writes.extend(setup_writes)
         if setup_reason is not None:
             details.append(setup_detail or "setup failed")
-            return ProbeResult(
-                probe_index=index,
-                verdict=Verdict.INCONCLUSIVE,
-                reason=setup_reason,
-                details=details,
-                writes=writes,
-                setup_requests=setup_requests,
+            return _attach_secrets(
+                ProbeResult(
+                    probe_index=index,
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason=setup_reason,
+                    details=details,
+                    writes=writes,
+                    setup_requests=setup_requests,
+                )
             )
 
         # 2b. Proactive credential provider: mint/refresh BEFORE the act is
@@ -779,13 +800,15 @@ class Executor:
         provider_reason = self._ensure_credential(ctx, details, writes)
         if provider_reason is not None:
             details.append("credential provider failed")
-            return ProbeResult(
-                probe_index=index,
-                verdict=Verdict.INCONCLUSIVE,
-                reason=provider_reason,
-                details=details,
-                writes=writes,
-                setup_requests=setup_requests,
+            return _attach_secrets(
+                ProbeResult(
+                    probe_index=index,
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason=provider_reason,
+                    details=details,
+                    writes=writes,
+                    setup_requests=setup_requests,
+                )
             )
 
         # 2c. Substitute ${NAME} placeholders in the act, failing closed on
@@ -797,13 +820,15 @@ class Executor:
             act = ctx.apply_strict(raw_act)
         except PlaceholderError as e:
             details.append(str(e))
-            return ProbeResult(
-                probe_index=index,
-                verdict=Verdict.INCONCLUSIVE,
-                reason=InconclusiveReason.PROBE,
-                details=details,
-                writes=writes,
-                setup_requests=setup_requests,
+            return _attach_secrets(
+                ProbeResult(
+                    probe_index=index,
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason=InconclusiveReason.PROBE,
+                    details=details,
+                    writes=writes,
+                    setup_requests=setup_requests,
+                )
             )
         method = act.get("method", "GET")
         path = act.get("path", "/")
@@ -832,14 +857,16 @@ class Executor:
 
         if status is None:
             details.append("target unreachable")
-            return ProbeResult(
-                probe_index=index,
-                verdict=Verdict.INCONCLUSIVE,
-                reason=InconclusiveReason.ENVIRONMENT,
-                details=details,
-                writes=writes,
-                setup_requests=setup_requests,
-                request=sent_request,
+            return _attach_secrets(
+                ProbeResult(
+                    probe_index=index,
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason=InconclusiveReason.ENVIRONMENT,
+                    details=details,
+                    writes=writes,
+                    setup_requests=setup_requests,
+                    request=sent_request,
+                )
             )
 
         # 4. Substitute ${NAME} placeholders in the assertions, failing
@@ -848,28 +875,11 @@ class Executor:
             assertions = ctx.apply_strict(probe.get("assert", []))
         except PlaceholderError as e:
             details.append(str(e))
-            return ProbeResult(
-                probe_index=index,
-                verdict=Verdict.INCONCLUSIVE,
-                reason=InconclusiveReason.PROBE,
-                details=details,
-                request=sent_request,
-                http_status=status,
-                http_headers=headers,
-                http_body=body,
-                writes=writes,
-                setup_requests=setup_requests,
-            )
-
-        # 4. DB queries: one independent result per db assertion.
-        db_results: dict[int, Any] = {}
-        if any(a.get("type") == "db" for a in assertions):
-            if self.db_path is None:
-                details.append("db assertion but no db_path")
-                return ProbeResult(
+            return _attach_secrets(
+                ProbeResult(
                     probe_index=index,
                     verdict=Verdict.INCONCLUSIVE,
-                    reason=InconclusiveReason.ENVIRONMENT,
+                    reason=InconclusiveReason.PROBE,
                     details=details,
                     request=sent_request,
                     http_status=status,
@@ -877,6 +887,27 @@ class Executor:
                     http_body=body,
                     writes=writes,
                     setup_requests=setup_requests,
+                )
+            )
+
+        # 4. DB queries: one independent result per db assertion.
+        db_results: dict[int, Any] = {}
+        if any(a.get("type") == "db" for a in assertions):
+            if self.db_path is None:
+                details.append("db assertion but no db_path")
+                return _attach_secrets(
+                    ProbeResult(
+                        probe_index=index,
+                        verdict=Verdict.INCONCLUSIVE,
+                        reason=InconclusiveReason.ENVIRONMENT,
+                        details=details,
+                        request=sent_request,
+                        http_status=status,
+                        http_headers=headers,
+                        http_body=body,
+                        writes=writes,
+                        setup_requests=setup_requests,
+                    )
                 )
             for ai, a in enumerate(assertions):
                 if a.get("type") != "db":
@@ -907,17 +938,19 @@ class Executor:
         else:
             verdict, reason = Verdict.PASS, None
 
-        return ProbeResult(
-            probe_index=index,
-            verdict=verdict,
-            reason=reason,
-            details=details,
-            request=sent_request,
-            http_status=status,
-            http_headers=headers,
-            http_body=body,
-            writes=writes,
-            setup_requests=setup_requests,
+        return _attach_secrets(
+            ProbeResult(
+                probe_index=index,
+                verdict=verdict,
+                reason=reason,
+                details=details,
+                request=sent_request,
+                http_status=status,
+                http_headers=headers,
+                http_body=body,
+                writes=writes,
+                setup_requests=setup_requests,
+            )
         )
 
     def run_all(self, probes: list[dict[str, Any]]) -> list[ProbeResult]:

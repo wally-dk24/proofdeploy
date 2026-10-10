@@ -482,7 +482,7 @@ def test_score_verdict_is_candidate_catch_not_catch(tmp_path):
         bug_id="THROWAWAY-1",
         probe_index=0,
         judge="reviewer",
-        judge_role="orchestrator",
+        judge_role="reviewer",
         condition3_met=True,
     )
     j_id, _ = write_judgment_record(judgment, out, repo, score_record_id=score_id)
@@ -677,7 +677,7 @@ def test_judgment_record_shape(tmp_path):
         bug_id="THROWAWAY-1",
         probe_index=0,
         judge="reviewer",
-        judge_role="orchestrator",
+        judge_role="reviewer",
         condition3_met=True,
         note="probe targets the auth check the fix added",
     )
@@ -688,7 +688,7 @@ def test_judgment_record_shape(tmp_path):
     assert records[-1]["verdict"] == "catch"
     assert records[-1]["condition3_met"] is True
     assert records[-1]["probe_index"] == 0
-    assert records[-1]["judge_role"] == "orchestrator"
+    assert records[-1]["judge_role"] == "reviewer"
     assert records[-1]["evidence_commit_sha"] == ev_commit
     # A rejected judgment is no_catch.
     j2 = build_judgment_record(
@@ -699,7 +699,7 @@ def test_judgment_record_shape(tmp_path):
         bug_id="B",
         probe_index=0,
         judge="reviewer",
-        judge_role="orchestrator",
+        judge_role="reviewer",
         condition3_met=False,
     )
     assert j2["verdict"] == "no_catch"
@@ -716,7 +716,7 @@ def test_judgment_refuses_probe_not_in_candidate_catch(tmp_path):
         run_kind="bug",
         probe_index=99,
         judge="reviewer",
-        judge_role="orchestrator",
+        judge_role="reviewer",
         condition3_met=True,
     )
     with pytest.raises(JudgmentRejectedError):
@@ -734,7 +734,7 @@ def test_judgment_requires_boolean_condition3(tmp_path):
             run_kind="bug",
             probe_index=0,
             judge="reviewer",
-            judge_role="orchestrator",
+            judge_role="reviewer",
             condition3_met=None,
         )
     # ...and a hand-built record with None is refused at write time too.
@@ -752,7 +752,11 @@ def test_judgment_requires_boolean_condition3(tmp_path):
         write_judgment_record(bad, out, repo, score_record_id=score_id)
 
 
-def test_judgment_requires_judge_role_and_refuses_wally_on_bug_runs(tmp_path):
+def test_judgment_role_allowlist_and_reviewer_only_on_bug_runs(tmp_path):
+    # The orchestrator's repro: judge="Wally" with role "reviewer", and
+    # judge="wally-dk24" with role "implementer", were both accepted on a
+    # bug run. Now the role is allowlisted and bug runs require
+    # role "reviewer" with a non-empty judge.
     repo, out, ev_id, ev_commit, score_id = _bug_score(tmp_path)
     base = dict(
         evidence_record_id=ev_id,
@@ -762,16 +766,53 @@ def test_judgment_requires_judge_role_and_refuses_wally_on_bug_runs(tmp_path):
         probe_index=0,
         condition3_met=True,
     )
+    # Unknown role refused at build time.
+    with pytest.raises(JudgmentRejectedError):
+        build_judgment_record(**base, judge="reviewer", judge_role="builder")
     with pytest.raises(JudgmentRejectedError):
         build_judgment_record(**base, judge="reviewer", judge_role=None)
-    # "wally" may not judge measured (bug) runs.
-    wally = build_judgment_record(**base, judge="wally", judge_role="builder")
-    with pytest.raises(JudgmentRejectedError):
-        write_judgment_record(wally, out, repo, score_record_id=score_id)
-    # A named human reviewer passes.
-    ok = build_judgment_record(**base, judge="reviewer", judge_role="orchestrator")
-    j_id, _ = write_judgment_record(ok, out, repo, score_record_id=score_id)
+    # "Wally" with role reviewer passes the allowlist: the gate is on
+    # the role, not the name. The old name-based block ("wally" only)
+    # was fragile; the role allowlist is the enforcement.
+    wally_caps = build_judgment_record(**base, judge="Wally", judge_role="reviewer")
+    j_id, _ = write_judgment_record(wally_caps, out, repo, score_record_id=score_id)
     assert read_records(out)[-1]["record_id"] == j_id
+    # implementer role refused on bug runs.
+    impl = build_judgment_record(**base, judge="wally-dk24", judge_role="implementer")
+    with pytest.raises(JudgmentRejectedError):
+        write_judgment_record(impl, out, repo, score_record_id=score_id)
+    # Empty judge refused on bug runs.
+    anon = build_judgment_record(**base, judge="", judge_role="reviewer")
+    with pytest.raises(JudgmentRejectedError):
+        write_judgment_record(anon, out, repo, score_record_id=score_id)
+    # A named reviewer passes.
+    ok = build_judgment_record(**base, judge="reviewer", judge_role="reviewer")
+    j2_id, _ = write_judgment_record(ok, out, repo, score_record_id=score_id)
+    assert read_records(out)[-1]["record_id"] == j2_id
+
+
+def test_judgment_refuses_evidence_mismatch(tmp_path):
+    # A judgment whose evidence id or commit differs from the score's
+    # is refused.
+    repo, out, ev_id, ev_commit, score_id = _bug_score(tmp_path)
+    base = dict(
+        score_record_id=score_id,
+        run_kind="bug",
+        probe_index=0,
+        judge="reviewer",
+        judge_role="reviewer",
+        condition3_met=True,
+    )
+    wrong_id = build_judgment_record(
+        **base, evidence_record_id="0" * 32, evidence_commit_sha=ev_commit
+    )
+    with pytest.raises(JudgmentRejectedError):
+        write_judgment_record(wrong_id, out, repo, score_record_id=score_id)
+    wrong_commit = build_judgment_record(
+        **base, evidence_record_id=ev_id, evidence_commit_sha="f" * 40
+    )
+    with pytest.raises(JudgmentRejectedError):
+        write_judgment_record(wrong_commit, out, repo, score_record_id=score_id)
 
 
 def test_judgment_refuses_missing_score_record(tmp_path):
@@ -784,7 +825,7 @@ def test_judgment_refuses_missing_score_record(tmp_path):
         run_kind="bug",
         probe_index=0,
         judge="reviewer",
-        judge_role="orchestrator",
+        judge_role="reviewer",
         condition3_met=True,
     )
     with pytest.raises(JudgmentRejectedError):
@@ -859,3 +900,128 @@ def test_score_reads_evidence_at_commit_not_working_tree(tmp_path):
     score = next(r for r in records if r.get("record_id") == score_id)
     assert score["candidate_catch"] == [0]
     assert score["verdict"] == "candidate_catch"
+
+
+# ---------------------------------------------------------------------------
+# Executor hands its secrets to the record (WO-4 third review, item 1)
+# ---------------------------------------------------------------------------
+
+
+def test_executor_attaches_captured_and_minted_secrets_to_result():
+    # The executor's ProbeResult carries the run's captured bindings and
+    # minted tokens (never serialized). build_evidence_record collects
+    # them from the results, so a caller that forgets captured_values
+    # cannot leak a session token.
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    TOKEN = "session-token-live-xyz-789"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            assert self.path == "/login"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"token": TOKEN}).encode())
+
+        def do_GET(self):
+            assert self.path == "/me"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            # Echo the captured token in the response body (the leak
+            # scenario: the token appears in http_body).
+            self.wfile.write(json.dumps({"echo": TOKEN}).encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        from proofdeploy.executor import Executor
+
+        ex = Executor(target_url=f"http://127.0.0.1:{port}", provisioned=True)
+        probe = {
+            "setup": [
+                {
+                    "type": "http",
+                    "act": {"method": "POST", "path": "/login"},
+                    "capture": {"TOKEN": {"from": "body", "json_path": "token"}},
+                }
+            ],
+            "act": {"method": "GET", "path": "/me"},
+            "assert": [{"type": "status", "equals": 200}],
+        }
+        r = ex.run_probe(probe, 0)
+        assert r.verdict == Verdict.PASS
+        # The executor attached the secrets to the result...
+        assert r.captured_bindings.get("TOKEN") == TOKEN
+        # ...and they are never serialized.
+        assert "captured_bindings" not in r.to_dict()
+        assert "minted_tokens" not in r.to_dict()
+    finally:
+        srv.shutdown()
+
+
+def test_evidence_auto_collects_secrets_from_results_no_caller_values(tmp_path):
+    # The orchestrator's repro: a session token captured in setup and
+    # echoed in the act's response body leaked when the caller didn't
+    # pass captured_values. Now build_evidence_record collects from the
+    # results automatically.
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from proofdeploy.executor import Executor
+
+    TOKEN = "session-token-live-xyz-789"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"token": TOKEN}).encode())
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"echo": TOKEN}).encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        ex = Executor(target_url=f"http://127.0.0.1:{port}", provisioned=True)
+        probe = {
+            "setup": [
+                {
+                    "type": "http",
+                    "act": {"method": "POST", "path": "/login"},
+                    "capture": {"TOKEN": {"from": "body", "json_path": "token"}},
+                }
+            ],
+            "act": {"method": "GET", "path": "/me"},
+            "assert": [{"type": "status", "equals": 200}],
+        }
+        r = ex.run_probe(probe, 0)
+        assert r.verdict == Verdict.PASS
+        assert TOKEN in r.http_body  # the leak scenario: token in body
+
+        repo = _git_repo(tmp_path)
+        out = tmp_path / "runs"
+        # NO captured_values / minted_tokens passed by the caller.
+        record = build_evidence_record(**_evidence_kwargs(fix_parent_results=[r], fix_results=[r]))
+        _, path, _ = write_evidence_record(record, out, repo)
+        blob = path.read_text(encoding="utf-8")
+        assert TOKEN not in blob, "captured session token leaked into the record"
+    finally:
+        srv.shutdown()

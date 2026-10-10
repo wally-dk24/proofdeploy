@@ -16,8 +16,10 @@ Scoring implements the registered run-pair rule exactly
   append-only judgment record that cites the evidence and score records
   and holds the probe index, the judge, the judge's role, and the
   condition-3 decision. Judgments are validated: the probe must be in
-  the score's candidate_catch, condition3_met must be a bool, and
-  ``wally`` may not judge measured (bug) runs.
+  the score's candidate_catch, condition3_met must be a bool, the
+  judgment's evidence id and commit must match the score's, and the
+  judge role is allowlisted (on measured runs only "reviewer" may
+  judge, and the judge must not be empty).
 - A sibling probe that is INCONCLUSIVE or FAILs on both sides does not
   cancel the catch.
 - Pair INCONCLUSIVE only when a side's provisioning isn't READY (no
@@ -431,6 +433,25 @@ def build_evidence_record(
     None.
     """
     parsed = parsed_probes or []
+    # Fail-closed secret collection from the probe results themselves.
+    # The executor attaches each run's captured bindings and minted
+    # tokens to the ProbeResult (never serialized); we collect them
+    # here so a caller that forgets to pass captured_values cannot
+    # leak a session token into the committed record.
+    auto_captured: dict[str, str] = {}
+    auto_minted: list[str] = []
+    for _r in (fix_parent_results or []) + (fix_results or []) + (c_results or []):
+        for _k, _v in _r.captured_bindings.items():
+            auto_captured.setdefault(_k, _v)
+        auto_minted.extend(_r.minted_tokens)
+    # Caller-supplied values are explicit and win on name conflicts.
+    merged_captured = {**auto_captured, **(captured_values or {})}
+    _seen_minted = set(minted_tokens or [])
+    merged_minted = list(minted_tokens or [])
+    for _t in auto_minted:
+        if _t not in _seen_minted:
+            _seen_minted.add(_t)
+            merged_minted.append(_t)
     record: dict[str, Any] = {
         "record_id": uuid.uuid4().hex,
         "timestamp": _utc_now(),
@@ -461,8 +482,8 @@ def build_evidence_record(
         "contract_env": contract_env or {},
         "public_fixture_keys": public_fixture_keys or [],
         "public_contract_env_keys": public_contract_env_keys or [],
-        "captured_values": captured_values or {},
-        "minted_tokens": minted_tokens or [],
+        "captured_values": merged_captured,
+        "minted_tokens": merged_minted,
         "verdict": None,
     }
     return record
@@ -748,6 +769,12 @@ class JudgmentRejectedError(ValueError):
     """A judgment record failed validation."""
 
 
+# Fixed set of judge roles. Judgments are allowlisted: an unknown role
+# is refused. On measured (bug) runs only "reviewer" may judge; the
+# role is recorded so the provenance of every catch is auditable.
+JUDGE_ROLES = frozenset({"reviewer", "implementer", "auditor"})
+
+
 def build_judgment_record(
     *,
     evidence_record_id: str,
@@ -772,13 +799,16 @@ def build_judgment_record(
     cited probe.
 
     ``condition3_met`` must be a bool and ``judge_role`` must be
-    recorded; anything else raises. ("wally" may not judge measured
-    runs; that is enforced in write_judgment_record.)
+    recorded; anything else raises. (Role allowlisting and the
+    reviewer-only rule for measured runs are enforced in
+    write_judgment_record.)
     """
     if not isinstance(condition3_met, bool):
         raise JudgmentRejectedError(f"condition3_met must be a bool, got {condition3_met!r}")
-    if not judge_role:
-        raise JudgmentRejectedError("judge_role is required")
+    if judge_role not in JUDGE_ROLES:
+        raise JudgmentRejectedError(
+            f"judge_role must be one of {sorted(JUDGE_ROLES)}, got {judge_role!r}"
+        )
     return {
         "record_id": uuid.uuid4().hex,
         "timestamp": _utc_now(),
@@ -809,10 +839,14 @@ def write_judgment_record(
     """Validate and append the judgment record.
 
     - The score record must exist in the log.
+    - The judgment's evidence_record_id and evidence_commit_sha must
+      match the score's (a judgment cannot be attached to a different
+      evidence than the score it cites).
     - ``probe_index`` must be in the score's ``candidate_catch``.
     - ``condition3_met`` must be a bool.
-    - ``judge_role`` is required.
-    - ``wally`` may not judge measured (bug) runs.
+    - ``judge_role`` must be in the fixed JUDGE_ROLES set. On measured
+      (bug) runs the role must be ``reviewer`` and ``judge`` must not be
+      empty: the implementer cannot judge its own catch.
 
     The reviewer commits the judgment separately. Raises
     JudgmentRejectedError on any violation.
@@ -820,6 +854,16 @@ def write_judgment_record(
     score = _find_record_in_log(output_dir, score_record_id)
     if score is None or score.get("record_type") != "score":
         raise JudgmentRejectedError(f"score record {score_record_id} not found in log")
+    if record.get("evidence_record_id") != score.get("evidence_record_id"):
+        raise JudgmentRejectedError(
+            f"evidence_record_id {record.get('evidence_record_id')!r} does not match "
+            f"the score's {score.get('evidence_record_id')!r}"
+        )
+    if record.get("evidence_commit_sha") != score.get("evidence_commit_sha"):
+        raise JudgmentRejectedError(
+            f"evidence_commit_sha {record.get('evidence_commit_sha')!r} does not match "
+            f"the score's {score.get('evidence_commit_sha')!r}"
+        )
     candidates = score.get("candidate_catch") or []
     if record.get("probe_index") not in candidates:
         raise JudgmentRejectedError(
@@ -830,10 +874,17 @@ def write_judgment_record(
         raise JudgmentRejectedError(
             f"condition3_met must be a bool, got {record.get('condition3_met')!r}"
         )
-    if not record.get("judge_role"):
-        raise JudgmentRejectedError("judge_role is required")
-    if score.get("run_kind") == "bug" and record.get("judge") == "wally":
-        raise JudgmentRejectedError("'wally' may not judge measured (bug) runs")
+    if record.get("judge_role") not in JUDGE_ROLES:
+        raise JudgmentRejectedError(
+            f"judge_role must be one of {sorted(JUDGE_ROLES)}, got {record.get('judge_role')!r}"
+        )
+    if score.get("run_kind") == "bug":
+        if record.get("judge_role") != "reviewer":
+            raise JudgmentRejectedError(
+                f"bug runs must be judged by role 'reviewer', got {record.get('judge_role')!r}"
+            )
+        if not record.get("judge"):
+            raise JudgmentRejectedError("judge must not be empty on bug runs")
     if record.get("run_kind") != score.get("run_kind"):
         raise JudgmentRejectedError(
             f"run_kind {record.get('run_kind')!r} does not match score {score.get('run_kind')!r}"
