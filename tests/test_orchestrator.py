@@ -1238,3 +1238,41 @@ def test_sandboxed_end_to_end_orchestrator(tmp_path):
     assert evidence["sandboxed"] is True
     assert evidence["measured_result"] is True
     assert evidence["sandbox_evidence"]
+
+
+def test_target_process_group_killed(tmp_path):
+    """O2: a wrapper start command that spawns a child must not leave
+    survivors. The whole process group is terminated.
+    """
+    import subprocess
+    import time
+
+    from proofdeploy.runner import Provisioner
+
+    # Simulate a wrapper start: sh -c "sleep 300 & wait" spawns a child.
+    proc = subprocess.Popen(
+        ["sh", "-c", "sleep 300 & wait"],
+        start_new_session=True,
+    )
+    child_pids = []
+    try:
+        # Give the child time to spawn.
+        time.sleep(0.5)
+        # Find child processes of the wrapper.
+        out = subprocess.run(
+            ["ps", "--ppid", str(proc.pid), "-o", "pid="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        child_pids = [p for p in out.split() if p.isdigit()]
+        assert child_pids, "test setup: wrapper should have spawned a child"
+    finally:
+        # Use the fixed stop_target.
+        runner = Provisioner(workdir=tmp_path / "work")
+        runner.stop_target(proc, logs=[])
+        # The child must be gone too (process group kill).
+        time.sleep(0.5)
+        for pid in child_pids:
+            r = subprocess.run(
+                ["ps", "-p", pid], capture_output=True, timeout=10,
+            )
+            assert r.returncode != 0, f"child process {pid} survived stop_target"
