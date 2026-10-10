@@ -251,9 +251,11 @@ class Orchestrator:
             skill_path=cfg.skill_path,
         )
         manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
-        skill_text = bundle.skill.read_text(encoding="utf-8") if bundle.skill else ""
+        skill_text = (
+            bundle.skill.read_text(encoding="utf-8") if bundle.skill else "(none)"
+        )
         description = bundle.description.read_text(encoding="utf-8")
-        prompt = build_author_prompt(
+        prompt, truncation_flags = build_author_prompt(
             skill_text=skill_text,
             fixture_description=description,
             diff_text=diff_text,
@@ -261,7 +263,7 @@ class Orchestrator:
         )
         self._say(f"bundle assembled at {bundle.root}")
         self._leak_check_bundle(bundle, prompt, contract)
-        return bundle, manifest, prompt, diff_text, base_sha, tip_sha
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, truncation_flags
 
     def _check_answer_key(
         self,
@@ -573,6 +575,16 @@ class Orchestrator:
         cfg = self.cfg
         if not (cfg.bug_id and cfg.rev_bug_base and cfg.rev_bug and cfg.rev_fix):
             raise OrchestratorError("measure_bug needs bug_id, rev_bug_base, rev_bug, rev_fix")
+        # Refuse the silent-host-run footgun: sandbox=False without the
+        # explicit allow_unsandboxed flag is a programmer error, not a
+        # dev opt-out. The only way to run unsandboxed is the explicit
+        # flag.
+        if not cfg.sandbox and not cfg.allow_unsandboxed:
+            raise OrchestratorError(
+                "sandbox=False without allow_unsandboxed=True refuses to run: "
+                "untrusted code must not run on the host silently. Use "
+                "allow_unsandboxed=True for an explicit dev opt-out."
+            )
         use_sandbox = cfg.sandbox and not cfg.allow_unsandboxed
         capability_probe: dict[str, object] = {}
         if use_sandbox:
@@ -591,11 +603,13 @@ class Orchestrator:
         unit_dir.mkdir(parents=True, exist_ok=True)
         repo = self._init_records_repo()
 
-        bundle, manifest, prompt, _, base_sha, tip_sha = self._build_bundle(
-            unit_dir,
-            unit_id=cfg.bug_id,
-            rev_base=cfg.rev_bug_base,
-            rev_tip=cfg.rev_bug,
+        bundle, manifest, prompt, _, base_sha, tip_sha, truncation_flags = (
+            self._build_bundle(
+                unit_dir,
+                unit_id=cfg.bug_id,
+                rev_base=cfg.rev_bug_base,
+                rev_tip=cfg.rev_bug,
+            )
         )
         manifest_sha = self._check_answer_key(
             bundle, prompt, base_sha, tip_sha, fix_rev=cfg.rev_fix
@@ -659,6 +673,7 @@ class Orchestrator:
                 model_request=raw.request_record,
                 author_prompt_sha256=author_prompt_sha256(),
                 skill_sha256=manifest.get("skill_sha256"),
+                truncation_flags=truncation_flags,
                 sandbox_evidence={
                     "fix_parent": parent.sandbox_evidence or {},
                     "fix": fix.sandbox_evidence or {},
@@ -731,6 +746,12 @@ class Orchestrator:
         cfg = self.cfg
         if not (cfg.clean_id and cfg.rev_clean):
             raise OrchestratorError("measure_clean needs clean_id and rev_clean")
+        if not cfg.sandbox and not cfg.allow_unsandboxed:
+            raise OrchestratorError(
+                "sandbox=False without allow_unsandboxed=True refuses to run: "
+                "untrusted code must not run on the host silently. Use "
+                "allow_unsandboxed=True for an explicit dev opt-out."
+            )
         use_sandbox = cfg.sandbox and not cfg.allow_unsandboxed
         capability_probe: dict[str, object] = {}
         if use_sandbox:
@@ -749,11 +770,13 @@ class Orchestrator:
         repo = self._init_records_repo()
 
         # The clean author bundle: C^->C diff + C snapshot.
-        bundle, manifest, prompt, _, base_sha, tip_sha = self._build_bundle(
-            unit_dir,
-            unit_id=cfg.clean_id,
-            rev_base=f"{cfg.rev_clean}^",
-            rev_tip=cfg.rev_clean,
+        bundle, manifest, prompt, _, base_sha, tip_sha, truncation_flags = (
+            self._build_bundle(
+                unit_dir,
+                unit_id=cfg.clean_id,
+                rev_base=f"{cfg.rev_clean}^",
+                rev_tip=cfg.rev_clean,
+            )
         )
         manifest_sha = self._check_answer_key(
             bundle, prompt, base_sha, tip_sha, fix_rev=None
@@ -805,6 +828,7 @@ class Orchestrator:
                 model_request=raw.request_record,
                 author_prompt_sha256=author_prompt_sha256(),
                 skill_sha256=manifest.get("skill_sha256"),
+                truncation_flags=truncation_flags,
                 sandbox_evidence={"c": side.sandbox_evidence or {}},
                 sandboxed=use_sandbox,
                 measured_result=use_sandbox,

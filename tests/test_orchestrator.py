@@ -314,7 +314,7 @@ def test_measure_bug_refuses_seeded_fix_diff(tmp_path, monkeypatch):
     orig_build = orch._build_bundle
 
     def tampered_build(unit_dir: Path, **kwargs):
-        bundle, manifest, prompt, diff_text, base_sha, tip_sha = orig_build(
+        bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags = orig_build(
             unit_dir, **kwargs
         )
         # Deliberately seed the fix diff into the bundle's diff.patch.
@@ -323,7 +323,7 @@ def test_measure_bug_refuses_seeded_fix_diff(tmp_path, monkeypatch):
             capture_output=True, text=True, check=True,
         ).stdout
         (bundle.root / "diff.patch").write_text(fix_diff, encoding="utf-8")
-        return bundle, manifest, prompt, diff_text, base_sha, tip_sha
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags
 
     monkeypatch.setattr(orch, "_build_bundle", tampered_build)
     with pytest.raises(AnswerKeyLeakError, match="byte-equal"):
@@ -356,7 +356,7 @@ def test_measure_bug_refuses_fix_sha_in_snapshot(tmp_path, monkeypatch):
     orig_build = orch._build_bundle
 
     def tampered_build(unit_dir: Path, **kwargs):
-        bundle, manifest, prompt, diff_text, base_sha, tip_sha = orig_build(
+        bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags = orig_build(
             unit_dir, **kwargs
         )
         snap_file = bundle.root / "snapshot" / "app.py"
@@ -364,7 +364,7 @@ def test_measure_bug_refuses_fix_sha_in_snapshot(tmp_path, monkeypatch):
             snap_file.read_text(encoding="utf-8") + f"\n# fix {info['fix']}\n",
             encoding="utf-8",
         )
-        return bundle, manifest, prompt, diff_text, base_sha, tip_sha
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags
 
     monkeypatch.setattr(orch, "_build_bundle", tampered_build)
     with pytest.raises(AnswerKeyLeakError, match="!= B version"):

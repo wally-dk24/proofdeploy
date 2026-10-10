@@ -1,0 +1,143 @@
+# ProofDeploy measurement workflow (WO-5).
+#
+# Manually triggered. Runs one measured unit through `proofdeploy measure`
+# in the sandbox. FAILS CLOSED: refuses to run if the capability probe
+# fails the measurement gate. Never falls back to unsandboxed.
+#
+# Secrets: uses the `measurement` environment (not repository secrets).
+# Master holds GROQ_API_KEY there with himself as required reviewer.
+# The key never enters the container environment, never appears in a
+# prompt, and is redacted by value in every record.
+#
+# Records: the evidence commit is pushed first, then the score commit,
+# to the `records/run-<run-id>` branch. A runner's disk is wiped after
+# each run; the branch is the durable store.
+#
+# Provenance: every evidence record carries the Actions run URL and ID,
+# the runner image, and the capability probe output.
+#
+# DO NOT TRIGGER before the reviewer has seen the exact contents.
+# Any change to this workflow goes back to review.
+
+name: measure
+
+on:
+  workflow_dispatch:
+    inputs:
+      unit_id:
+        description: "Unit ID for this measured run (e.g. wo5-acceptance)"
+        required: true
+        type: string
+      bug_id:
+        description: "Bug ID (for measure_bug; leave empty for measure_clean)"
+        required: false
+        type: string
+      rev_bug_base:
+        description: "Base revision (parent of bug)"
+        required: false
+        type: string
+      rev_bug:
+        description: "Bug revision"
+        required: false
+        type: string
+      rev_fix:
+        description: "Fix revision"
+        required: false
+        type: string
+      clean_id:
+        description: "Clean ID (for measure_clean; leave empty for measure_bug)"
+        required: false
+        type: string
+      rev_clean:
+        description: "Clean revision"
+        required: false
+        type: string
+
+# No repository-level secrets. The GROQ_API_KEY comes from the
+# `measurement` environment, where Master is the required reviewer.
+# The workflow cannot start until Master approves it there.
+environment: measurement
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    # The environment gate: Master must approve before this runs.
+    # This is where the GROQ_API_KEY lives.
+    environment: measurement
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Capability probe (fail-closed gate)
+        id: probe
+        run: |
+          python -c "
+          from proofdeploy.sandbox import check_sandbox_capabilities, assert_measurement_gate
+          from proofdeploy.sandbox import SandboxConfig
+          import json
+          # The gate refuses (raises) if the host cannot meet the requirements.
+          # This step fails the workflow if the gate fails. No fallback.
+          cfg = SandboxConfig()
+          probe = assert_measurement_gate(cfg)
+          print('GATE PASSED')
+          print(json.dumps(probe, indent=2))
+          "
+
+      - name: Run measured unit
+        env:
+          # The key is available to the `proofdeploy measure` command on the
+          # host only. It is never passed to containers (the sandbox strips
+          # it), never appears in prompts, and is redacted by value in records.
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          # Record provenance for the evidence record.
+          echo "PROOFDEPLOY_RUN_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
+          echo "PROOFDEPLOY_RUN_ID=${{ github.run_id }}" >> $GITHUB_ENV
+          echo "PROOFDEPLOY_RUNNER_IMAGE=${{ runner.os }}-${{ runner.arch }}" >> $GITHUB_ENV
+          if [ -n "${{ inputs.bug_id }}" ]; then
+            python -m proofdeploy measure-bug \
+              --unit-id "${{ inputs.unit_id }}" \
+              --bug-id "${{ inputs.bug_id }}" \
+              --rev-bug-base "${{ inputs.rev_bug_base }}" \
+              --rev-bug "${{ inputs.rev_bug }}" \
+              --rev-fix "${{ inputs.rev_fix }}" \
+              --provenance-run-url "$PROOFDEPLOY_RUN_URL" \
+              --provenance-run-id "$PROOFDEPLOY_RUN_ID" \
+              --provenance-runner-image "$PROOFDEPLOY_RUNNER_IMAGE"
+          else
+            python -m proofdeploy measure-clean \
+              --unit-id "${{ inputs.unit_id }}" \
+              --clean-id "${{ inputs.clean_id }}" \
+              --rev-clean "${{ inputs.rev_clean }}" \
+              --provenance-run-url "$PROOFDEPLOY_RUN_URL" \
+              --provenance-run-id "$PROOFDEPLOY_RUN_ID" \
+              --provenance-runner-image "$PROOFDEPLOY_RUNNER_IMAGE"
+          fi
+
+      - name: Push records to durable branch
+        run: |
+          # The evidence commit is pushed first, then the score commit.
+          # The runner's disk is wiped after the run; the branch is durable.
+          RECORDS_BRANCH="records/run-${{ github.run_id }}"
+          git config user.name "proofdeploy-measure"
+          git config user.email "proofdeploy-measure@users.noreply.github.com"
+          # The measure command creates the records repo; push its branches.
+          # (Exact push commands depend on the records repo layout; the
+          # orchestrator reviews this before the first trigger.)
+          echo "Records branch: $RECORDS_BRANCH"
+          echo "Evidence and score commits are in the local records repo."
+          echo "Push them to $RECORDS_BRANCH before the runner is destroyed."

@@ -239,7 +239,7 @@ def check_bundle_answer_key(
 
     # 6. The prompt is built only from verified files: re-derive it from
     #    the verified bundle files and require byte equality.
-    verified_prompt = build_author_prompt(
+    verified_prompt, _ = build_author_prompt(
         skill_text=skill_text,
         fixture_description=actual_desc,
         diff_text=actual_diff,

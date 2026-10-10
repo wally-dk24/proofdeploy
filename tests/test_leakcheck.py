@@ -186,7 +186,7 @@ def _eq_bundle(root: Path, info: dict[str, str]) -> dict:
         skill_path=skill_path,
         no_skill=True,
     )
-    prompt = build_author_prompt(
+    prompt, _ = build_author_prompt(
         skill_text="",
         fixture_description=(bundle_dir / "fixture-description.txt").read_text(),
         diff_text=diff_text,

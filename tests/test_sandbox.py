@@ -694,13 +694,16 @@ def test_tcp_proxy_bridges_data(tmp_path):
         client = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
         client.sendall(b"hello-proxy")
         client.close()
+        # Wait for the proxy to accept the connection and forward the
+        # data BEFORE stopping it. Stopping first races the proxy's
+        # accept loop and drops the bytes.
+        import time
+
+        deadline = time.time() + 5
+        while not received and time.time() < deadline:
+            time.sleep(0.05)
     finally:
         proxy.stop()
-    import time
-
-    deadline = time.time() + 5
-    while not received and time.time() < deadline:
-        time.sleep(0.05)
     assert received and received[0] == b"hello-proxy"
 
 

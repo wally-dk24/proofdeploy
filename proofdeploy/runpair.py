@@ -413,9 +413,12 @@ def build_evidence_record(
     # through the in-repo client.
     model_request: dict[str, Any] | None = None,
     # SHA-256 of the frozen author-prompt template file
-    # (proofdeploy/author_prompt_v3.md). The template is versioned and
+    # (proofdeploy/author_prompt_v4.md). The template is versioned and
     # must be registered before any measured run.
     author_prompt_sha256: str | None = None,
+    # Truncation flags from prompt construction: which caps applied
+    # (diff_files_truncated, file_bytes_truncated, listed_files_truncated).
+    truncation_flags: dict[str, Any] | None = None,
     # Isolation actually in effect for the sandbox apps (per side:
     # network mode, userns mode, uid the app ran as). Empty when the
     # sandbox was not used.
@@ -512,6 +515,7 @@ def build_evidence_record(
         "model_attempts": model_attempts,
         "model_request": model_request or {},
         "author_prompt_sha256": author_prompt_sha256,
+        "truncation_flags": truncation_flags or {},
         "sandbox_evidence": sandbox_evidence or {},
         "sandboxed": sandboxed,
         "measured_result": measured_result,

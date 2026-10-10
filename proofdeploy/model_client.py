@@ -51,7 +51,7 @@ TEMPERATURE = 0.2
 
 # Frozen author-prompt template. The file is versioned; its hash is in
 # every evidence record.
-PROMPT_TEMPLATE_FILENAME = "author_prompt_v3.md"
+PROMPT_TEMPLATE_FILENAME = "author_prompt_v4.md"
 
 _GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_ALLOWED_HOSTS = ["api.groq.com"]
@@ -98,6 +98,7 @@ _PLACEHOLDERS = (
     "skill_text",
     "fixture_description",
     "diff_text",
+    "diff_fence",
     "snapshot_file_list",
     "touched_file_contents",
 )
@@ -184,6 +185,25 @@ def _read_text_capped(path: Path, cap: int) -> str | None:
         return None
 
 
+def _fence_for(content: str, info: str = "") -> str:
+    """Code fence longer than any backtick run in the content.
+
+    Prevents the content from accidentally closing the fence. The
+    info string (e.g. "diff", "json") follows the opening fence.
+    """
+    max_run = 0
+    run = 0
+    for ch in content:
+        if ch == "`":
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 0
+    # Fence must be strictly longer than the longest backtick run.
+    fence = "`" * (max_run + 1)
+    return f"{fence}{info}" if info else fence
+
+
 def build_author_prompt(
     *,
     skill_text: str,
@@ -191,7 +211,7 @@ def build_author_prompt(
     diff_text: str,
     snapshot_dir: str | Path,
     template_path: str | Path | None = None,
-) -> str:
+) -> tuple[str, dict[str, object]]:
     """Compose the blind author's prompt from bundle inputs only.
 
     Framing, output contract, and truncation caps come from the frozen
@@ -203,35 +223,66 @@ def build_author_prompt(
     frozen template. There is deliberately no channel for run metadata
     (no "run kind", no unit id): anything outside the bundle would let
     the orchestrator's knowledge leak to the model.
+
+    Returns (prompt, truncation_flags). The flags record which caps
+    applied (diff_files_truncated, file_bytes_truncated, listed_files_truncated);
+    the caller records them in the evidence record.
     """
     tpl = load_prompt_template(template_path)
     caps = tpl["caps"]
     snap = Path(snapshot_dir)
-    touched = diff_touched_files(diff_text)[: caps["max_diff_files"]]
+    truncation_flags: dict[str, object] = {
+        "diff_files_truncated": False,
+        "file_bytes_truncated": False,
+        "listed_files_truncated": False,
+    }
+
+    # Touched files in diff order; cap with explicit marker.
+    all_touched = diff_touched_files(diff_text)
+    if len(all_touched) > caps["max_diff_files"]:
+        truncation_flags["diff_files_truncated"] = True
+    touched = all_touched[: caps["max_diff_files"]]
+
+    # File list sorted by path; cap with explicit marker.
     all_files = sorted(
         p.relative_to(snap).as_posix()
         for p in snap.rglob("*")
         if p.is_file() and not p.is_symlink()
     )
+    if len(all_files) > caps["max_listed_files"]:
+        truncation_flags["listed_files_truncated"] = True
     listed = all_files[: caps["max_listed_files"]]
     file_list = "\n".join(listed)
-    if len(all_files) > caps["max_listed_files"]:
+    if truncation_flags["listed_files_truncated"]:
         remaining = len(all_files) - caps["max_listed_files"]
         file_list += "\n" + tpl["more_files"].replace("[[remaining]]", str(remaining))
 
+    # Touched file contents; cap bytes with explicit marker.
     touched_parts: list[str] = []
     for rel in touched:
         content = _read_text_capped(snap / rel, caps["max_file_bytes"])
         if content is None:
+            # Check if it's too large (vs missing/binary) for the marker.
+            try:
+                size = (snap / rel).stat().st_size
+                if size > caps["max_file_bytes"]:
+                    truncation_flags["file_bytes_truncated"] = True
+            except OSError:
+                pass
             entry = tpl["unavailable_file"].replace("[[path]]", rel)
         else:
+            file_fence = _fence_for(content)
             entry = (
                 tpl["file_entry"]
                 .replace("[[path]]", rel)
+                .replace("[[file_fence]]", file_fence)
                 .replace("[[content]]", content.rstrip())
             )
         touched_parts.append(entry)
     touched_text = "\n\n".join(touched_parts)
+
+    # Diff fence adapts to backtick runs in the diff.
+    diff_fence = _fence_for(diff_text, "diff")
 
     prompt: str = tpl["body"]
     prompt = prompt.replace("[[framing]]", tpl["framing"])
@@ -239,6 +290,7 @@ def build_author_prompt(
     prompt = prompt.replace("[[closing]]", tpl["closing"])
     prompt = prompt.replace("[[skill_text]]", skill_text.rstrip())
     prompt = prompt.replace("[[fixture_description]]", fixture_description.rstrip())
+    prompt = prompt.replace("[[diff_fence]]", diff_fence)
     prompt = prompt.replace("[[diff_text]]", diff_text.rstrip())
     prompt = prompt.replace("[[snapshot_file_list]]", file_list)
     prompt = prompt.replace("[[touched_file_contents]]", touched_text)
@@ -248,7 +300,7 @@ def build_author_prompt(
         raise ValueError(
             f"prompt has unsubstituted placeholders: {sorted(set(leftover))}"
         )
-    return prompt
+    return prompt, truncation_flags
 
 
 def _message_hashes(messages: list[dict[str, Any]]) -> list[str]:
