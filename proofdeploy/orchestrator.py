@@ -355,8 +355,9 @@ class Orchestrator:
         )
 
         # Minimal evidence: no probes were produced, but both model call
-        # attempts are recorded. Per Master's rule, this IS a measured
-        # result (measured_result=True).
+        # attempts are recorded. Per Master's rule, a model failure in a
+        # sandboxed measured run IS a measured result (measured_result =
+        # use_sandbox, matching the normal path). A dev run never counts.
         record = build_evidence_record(
             run_kind=run_kind,
             bug_id=cfg.bug_id if run_kind == "bug" else None,
@@ -368,7 +369,7 @@ class Orchestrator:
             author_prompt_builder_sha256=author_prompt_builder_sha256(),
             skill_sha256=manifest.get("skill_sha256"),
             sandboxed=use_sandbox,
-            measured_result=True,
+            measured_result=use_sandbox,
             provenance=self._provenance(capability_probe),
             model_call_attempts=attempts,
         )

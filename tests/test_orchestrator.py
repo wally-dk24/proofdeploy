@@ -725,3 +725,73 @@ def test_inconclusive_records_measured_result_true(tmp_path):
     assert evidence["sandboxed"] is False
     # Provenance is present (not empty).
     assert "provenance" in evidence
+
+
+def test_inconclusive_sandboxed_counts(tmp_path, monkeypatch):
+    """Sandboxed model failure: measured_result=True, probe in provenance."""
+    from proofdeploy.model_client import ModelCallError
+
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    # Mock the capability gate so a sandboxed run proceeds.
+    fake_probe = {"podman": True, "userns_remap": True}
+    monkeypatch.setattr(
+        "proofdeploy.orchestrator.assert_measurement_gate",
+        lambda: fake_probe,
+    )
+
+    def failing_runner(prompt: str):
+        raise ModelCallError("overflow", cause="model_overflow")
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-sandboxed",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=failing_runner,
+        public_contract_env_keys=["APP_ENV"],
+        # Sandboxed (no allow_unsandboxed).
+    )
+    Orchestrator(cfg).measure_bug()
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["measured_result"] is True
+    assert evidence["sandboxed"] is True
+    assert evidence["provenance"]["capability_probe"] == fake_probe
+
+
+def test_inconclusive_unsandboxed_dev_does_not_count(tmp_path):
+    """Unsandboxed dev model failure: measured_result=False."""
+    from proofdeploy.model_client import ModelCallError
+
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    def failing_runner(prompt: str):
+        raise ModelCallError("overflow", cause="model_overflow")
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-dev",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=failing_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    Orchestrator(cfg).measure_bug()
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["measured_result"] is False
+    assert evidence["sandboxed"] is False
