@@ -808,6 +808,43 @@ def test_ghost_jwt_minted_per_request(auth_server):
     assert sig_b64 == expected, "JWT signature does not verify"
 
 
+def test_setup_step_uses_provider_token(auth_server):
+    # A Ghost probe whose setup step AND act both use ${AUTH_TOKEN}: the
+    # provider mints before each request (one mint per request), both are
+    # logged, and the probe passes.
+    key_id = "abc123"
+    secret_hex = "ef" * 32
+    ex = Executor(
+        target_url=auth_server,
+        provisioned=True,
+        fixture={"ADMIN_KEY": f"{key_id}:{secret_hex}"},
+        credential_config={"mode": "ghost_jwt", "key": "${ADMIN_KEY}", "ttl_seconds": 300},
+    )
+    p = _probe(
+        setup=[
+            {
+                "type": "http",
+                "act": {
+                    "method": "GET",
+                    "path": "/jwt-echo",
+                    "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+                },
+            }
+        ],
+        act={
+            "method": "GET",
+            "path": "/jwt-echo",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+    # One mint per request: setup + act = 2 mints, both logged.
+    mints = [d for d in r.details if "minted ghost_jwt" in d]
+    assert len(mints) == 2, f"expected 2 mints (setup + act), got {len(mints)}: {r.details}"
+
+
 def test_no_provider_401_is_just_401(auth_server):
     # Without a credential config, a 401 on the act is just a 401: the
     # assertions decide the verdict (here FAIL, since 200 was expected).

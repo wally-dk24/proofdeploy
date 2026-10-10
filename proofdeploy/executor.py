@@ -388,6 +388,12 @@ class Executor:
                 ctx.bindings.setdefault(k, v)
                 ctx.known_names.add(k)
         ctx.declare_from_setup(setup_steps)
+        # When a credential provider is configured, AUTH_TOKEN is a known
+        # name from the start: the provider will mint it before each
+        # request, so setup steps may reference ${AUTH_TOKEN} even when
+        # no fixture token exists.
+        if self.credential_config is not None:
+            ctx.known_names.add("AUTH_TOKEN")
         return ctx
 
     def _ensure_credential(
@@ -555,6 +561,13 @@ class Executor:
                 )
             if stype == "http":
                 raw_act = step.get("act", {})
+                # Proactive credential provider: mint/refresh BEFORE the
+                # request's placeholders are substituted, so a fresh token
+                # lands in the request. A 401 response below is the step's
+                # data, never a refresh signal; the request is never re-sent.
+                provider_reason = self._ensure_credential(ctx, logs, writes)
+                if provider_reason is not None:
+                    return logs, provider_reason, "credential provider failed", writes
                 try:
                     act = ctx.apply_strict(raw_act)
                 except PlaceholderError as e:
@@ -573,12 +586,6 @@ class Executor:
                 allowed, detail = self._check_write_allowed(method, f"setup[{i}]")
                 if not allowed:
                     return logs, InconclusiveReason.PROBE, detail, writes
-                # Proactive credential provider: mint/refresh BEFORE the
-                # request. A 401 response below is the step's data, never a
-                # refresh signal; the request is never re-sent.
-                provider_reason = self._ensure_credential(ctx, logs, writes)
-                if provider_reason is not None:
-                    return logs, provider_reason, "credential provider failed", writes
                 status, headers, body, req_logs = _do_http(
                     method, url, act.get("headers"), act.get("body"), self.http_timeout
                 )
