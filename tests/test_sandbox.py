@@ -565,9 +565,22 @@ def test_capability_probe_isolated_no_ip(monkeypatch):
 
     monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
     monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("isolated-no-ip"))
+    monkeypatch.setattr(sb_mod, "_tcp_reachable", lambda *a, **k: True)
     caps = sb_mod.check_sandbox_capabilities()
     assert caps.isolated_network is False
     assert "IP" in caps.reason
+
+
+def test_capability_probe_isolated_unreachable(monkeypatch):
+    """Container has an IP but the host cannot reach it: not capable."""
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
+    monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("all-ok"))
+    monkeypatch.setattr(sb_mod, "_tcp_reachable", lambda *a, **k: False)
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.isolated_network is False
+    assert "cannot reach" in caps.reason
 
 
 def test_capability_probe_userns_fails(monkeypatch):
@@ -575,6 +588,7 @@ def test_capability_probe_userns_fails(monkeypatch):
 
     monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
     monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("userns-fail"))
+    monkeypatch.setattr(sb_mod, "_tcp_reachable", lambda *a, **k: True)
     caps = sb_mod.check_sandbox_capabilities()
     assert caps.userns_remap is False
     assert "userns" in caps.reason.lower() or "isolated" in caps.reason.lower()
@@ -585,6 +599,7 @@ def test_capability_probe_all_capable(monkeypatch):
 
     monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
     monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("all-ok"))
+    monkeypatch.setattr(sb_mod, "_tcp_reachable", lambda *a, **k: True)
     caps = sb_mod.check_sandbox_capabilities()
     assert caps.podman is True
     assert caps.isolated_network is True

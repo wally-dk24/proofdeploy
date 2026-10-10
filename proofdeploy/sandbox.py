@@ -163,13 +163,15 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
     caps.podman = True
     caps.podman_version = proc.stdout.strip()
     # Isolated network: start a detached container on an --internal
-    # network and look up its IP through the SAME code path a real run
-    # uses (JSON-parsed `podman inspect`). Creating the network alone
-    # succeeds even when netavark can't set up the namespace, and a
-    # --rm run exits before its IP can be read; the detached start +
-    # IP lookup is the real test.
+    # network, look up its IP through the SAME code path a real run
+    # uses (JSON-parsed `podman inspect`), and verify the host can
+    # actually reach it. Creating the network alone succeeds even when
+    # netavark can't set up the namespace; a --rm run exits before its
+    # IP can be read; and an IP the host cannot route to is useless.
+    # The detached start + IP lookup + TCP connect is the real test.
     net_name = "pd-capability-probe"
     probe_container = "pd-capability-probe-app"
+    probe_port = 18099
     try:
         proc = subprocess.run(
             PODMAN + ["network", "create", "--internal", net_name],
@@ -182,14 +184,21 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
                     "run", "-d", "--rm", "--name", probe_container,
                     "--net", net_name,
                     IMAGES["python"], "python3", "-c",
-                    "import time; time.sleep(60)",
+                    f"import http.server, functools; "
+                    f"http.server.HTTPServer(('0.0.0.0', {probe_port}), "
+                    f"http.server.SimpleHTTPRequestHandler).serve_forever()",
                 ],
                 capture_output=True, text=True, timeout=90,
             )
             if run.returncode == 0:
                 ip = _container_ip(probe_container, net_name)
-                if ip:
+                if ip and _tcp_reachable(ip, probe_port, timeout=10):
                     caps.isolated_network = True
+                elif ip:
+                    caps.reason = (
+                        "isolated network unavailable: container has IP "
+                        f"{ip} but the host cannot reach it"
+                    )
                 else:
                     caps.reason = (
                         "isolated network unavailable: container started "
@@ -317,6 +326,15 @@ def _run(
     if proc.returncode != 0:
         return False, f"exit {proc.returncode}"
     return True, ""
+
+
+def _tcp_reachable(host: str, port: int, timeout: int = 10) -> bool:
+    """True when a TCP connection to host:port succeeds."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def _container_ip(name: str, network_name: str) -> str:
