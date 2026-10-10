@@ -57,6 +57,7 @@ def server():
     t.start()
     yield f"http://127.0.0.1:{port}"
     srv.shutdown()
+    srv.server_close()
 
 
 def _probe(**kw):
@@ -209,6 +210,7 @@ def server2():
     t.start()
     yield f"http://127.0.0.1:{port}"
     srv.shutdown()
+    srv.server_close()
 
 
 def test_invalid_probe_rejected_before_http():
@@ -630,6 +632,7 @@ def auth_server():
     t.start()
     yield f"http://127.0.0.1:{port}"
     srv.shutdown()
+    srv.server_close()
 
 
 def test_unknown_placeholder_is_inconclusive_probe(auth_server):

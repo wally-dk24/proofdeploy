@@ -393,6 +393,11 @@ class Executor:
 
     target_url: str
     db_path: str | None = None
+    # True when the contract declared a database but the file was missing
+    # at executor construction. DB assertions are INCONCLUSIVE `environment`
+    # (the DB was declared, so this is an environment problem, not a
+    # "no DB configured" case).
+    db_declared_missing: bool = False
     http_timeout: int = 30
     # Fail-closed: harness_app setup steps are rejected unless the caller
     # explicitly opts in (dev-set library repos only).
@@ -1232,7 +1237,10 @@ class Executor:
         db_results: dict[int, Any] = {}
         if any(a.get("type") == "db" for a in assertions):
             if self.db_path is None:
-                details.append("db assertion but no db_path")
+                if self.db_declared_missing:
+                    details.append("db assertion but declared database file is missing")
+                else:
+                    details.append("db assertion but no db_path")
                 return _attach_secrets(
                     ProbeResult(
                         probe_index=index,

@@ -965,6 +965,7 @@ def test_executor_attaches_captured_and_minted_secrets_to_result():
         assert "minted_tokens" not in r.to_dict()
     finally:
         srv.shutdown()
+    srv.server_close()
 
 
 def test_evidence_auto_collects_secrets_from_results_no_caller_values(tmp_path):
@@ -1025,6 +1026,7 @@ def test_evidence_auto_collects_secrets_from_results_no_caller_values(tmp_path):
         assert TOKEN not in blob, "captured session token leaked into the record"
     finally:
         srv.shutdown()
+    srv.server_close()
 
 
 def test_evidence_record_carries_registered_model_config():

@@ -61,6 +61,13 @@ class RepoContract:
         if database is not None:
             if not isinstance(database, dict):
                 raise ValueError("proofdeploy.yml 'database' must be a mapping")
+            # Reject unknown keys (typos must fail, not silently pass).
+            allowed_db_keys = {"kind", "path"}
+            unknown = set(database) - allowed_db_keys
+            if unknown:
+                raise ValueError(
+                    f"proofdeploy.yml 'database' has unknown keys: {sorted(unknown)}"
+                )
             kind = database.get("kind")
             path = database.get("path")
             if kind != "sqlite":
@@ -69,11 +76,28 @@ class RepoContract:
                 )
             if not isinstance(path, str) or not path:
                 raise ValueError("proofdeploy.yml 'database.path' must be a non-empty string")
+            # The contract comes from untrusted repos: the path must stay
+            # inside the checkout. No absolute paths, no `..` components.
+            if path.startswith("/") or ".." in Path(path).parts:
+                raise ValueError(
+                    "proofdeploy.yml 'database.path' must resolve inside "
+                    f"the checkout, got: {path!r}"
+                )
             database = {"kind": kind, "path": path}
         auth = data.get("auth")
         if auth is not None:
             if not isinstance(auth, dict):
                 raise ValueError("proofdeploy.yml 'auth' must be a mapping")
+            # Reject unknown keys (typos must fail, not silently pass).
+            allowed_auth_keys = {
+                "mode", "path", "method", "username_field",
+                "password_field", "token_json_path",
+            }
+            unknown = set(auth) - allowed_auth_keys
+            if unknown:
+                raise ValueError(
+                    f"proofdeploy.yml 'auth' has unknown keys: {sorted(unknown)}"
+                )
             mode = auth.get("mode")
             if mode != "register":
                 raise ValueError(

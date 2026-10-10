@@ -118,6 +118,55 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def check_sandbox_runtime(
+    image: str,
+    runtime_name: str,
+    declared_range: str | None,
+    runner: Any = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Check the sandbox image's runtime version against the declared range.
+
+    Returns (image_version, image_digest, failure_reason). failure_reason is
+    None on success (or when no declared range to check); otherwise a
+    BUILD_FAILED reason. Uses `runner` (defaults to subprocess.run) so tests
+    can inject a fake without podman.
+    """
+    import subprocess as _sp
+
+    from proofdeploy.runner import satisfies_range
+
+    run = runner or _sp.run
+    image_version = None
+    image_digest = None
+    try:
+        ver_cmd = (
+            ["python3", "--version"] if runtime_name == "python"
+            else ["node", "--version"]
+        )
+        r = run(
+            ["podman", "run", "--rm", image] + ver_cmd,
+            capture_output=True, text=True, timeout=60,
+        )
+        out = (r.stdout or r.stderr or "").strip()
+        # "Python 3.12.3" -> "3.12.3"; "v22.1.0" -> "22.1.0"
+        image_version = out.split()[-1].lstrip("v") if out else None
+        r2 = run(
+            ["podman", "images", "--digests", "--format", "{{.Digest}}", image],
+            capture_output=True, text=True, timeout=30,
+        )
+        image_digest = (r2.stdout or "").strip().split("\n")[0] or None
+    except Exception as e:
+        return None, None, f"sandbox runtime version check failed: {e}"
+    if declared_range and image_version:
+        ecosystem = "python" if runtime_name == "python" else "node"
+        if not satisfies_range(image_version, declared_range, ecosystem=ecosystem):
+            return image_version, image_digest, (
+                f"sandbox image runtime {image_version} does not satisfy "
+                f"declared version {declared_range}"
+            )
+    return image_version, image_digest, None
+
+
 @dataclass
 class MeasureConfig:
     """One measured unit: a bug run or a clean-diff run."""
@@ -639,7 +688,7 @@ class Orchestrator:
         # Item 5: fail closed when the image's runtime doesn't satisfy the
         # repo's declared version (requires-python / engines). Record the
         # image digest and the runtime version in the evidence.
-        from proofdeploy.runner import _requires_python_from_toml, satisfies_range
+        from proofdeploy.runner import _requires_python_from_toml
 
         _sandbox_requires_python = _requires_python_from_toml
         declared_range = None
@@ -658,53 +707,26 @@ class Orchestrator:
                         declared_range = engines.get("node")
                 except Exception:
                     pass
-        # Get the image's runtime version and digest.
-        image_version = None
-        image_digest = None
-        try:
-            import subprocess as _sp
-            ver_cmd = (
-                ["python3", "--version"] if runtime_name == "python"
-                else ["node", "--version"]
-            )
-            r = _sp.run(
-                ["podman", "run", "--rm", image] + ver_cmd,
-                capture_output=True, text=True, timeout=60,
-            )
-            out = (r.stdout or r.stderr or "").strip()
-            # "Python 3.12.3" -> "3.12.3"; "v22.1.0" -> "22.1.0"
-            image_version = out.split()[-1].lstrip("v") if out else None
-            r2 = _sp.run(
-                ["podman", "images", "--digests", "--format", "{{.Digest}}", image],
-                capture_output=True, text=True, timeout=30,
-            )
-            image_digest = (r2.stdout or "").strip().split("\n")[0] or None
-        except Exception as e:
-            logs.append(f"sandbox runtime version check failed: {e}")
+        # Get the image's runtime version and digest (unit-testable).
+        image_version, image_digest, runtime_failure = check_sandbox_runtime(
+            image, runtime_name, declared_range
+        )
         logs.append(f"sandbox runtime version: {image_version} (digest {image_digest})")
-        if declared_range and image_version:
-            ecosystem = "python" if runtime_name == "python" else "node"
-            if not satisfies_range(image_version, declared_range, ecosystem=ecosystem):
-                logs.append(
-                    f"sandbox runtime {image_version} does not satisfy "
-                    f"declared {declared_range}: BUILD_FAILED"
-                )
-                provision = ProvisionResult(
-                    status=ProvisionStatus.BUILD_FAILED,
-                    reason=(
-                        f"sandbox image runtime {image_version} does not satisfy "
-                        f"declared version {declared_range}"
-                    ),
-                    logs=logs,
-                    runtime=runtime_name,
-                    runtime_version=image_version,
-                )
-                # Record the digest/version even on failure.
-                provision.image_digest = image_digest
-                return _Side(
-                    rev=rev, sha=sha, snapshot_dir=snapshot.dir,
-                    contract=contract, provision=provision,
-                )
+        if runtime_failure:
+            logs.append(f"{runtime_failure}: BUILD_FAILED")
+            provision = ProvisionResult(
+                status=ProvisionStatus.BUILD_FAILED,
+                reason=runtime_failure,
+                logs=logs,
+                runtime=runtime_name,
+                runtime_version=image_version,
+            )
+            # Record the digest/version even on failure.
+            provision.image_digest = image_digest
+            return _Side(
+                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+                contract=contract, provision=provision,
+            )
         sb = Sandbox(SandboxConfig(image=image))
         # Secret-free contract env only; never the full env.
         secret_free_env = {
@@ -809,8 +831,10 @@ class Orchestrator:
         assert side.provision and side.provision.target_url
         # DB path comes from the contract's `database:` declaration, not a
         # hard-coded filename. None declared means the executor gets no DB
-        # path and DB assertions are INCONCLUSIVE `probe`.
+        # path and DB assertions are INCONCLUSIVE. Declared but missing
+        # means INCONCLUSIVE `environment` (flagged explicitly, not silent).
         db_path = None
+        db_declared_missing = False
         declared = side.contract.database
         if declared and declared.get("kind") == "sqlite":
             candidate = side.snapshot_dir / declared["path"]
@@ -818,9 +842,12 @@ class Orchestrator:
             # relative to the repo root, which the snapshot mirrors).
             if candidate.is_file():
                 db_path = str(candidate)
+            else:
+                db_declared_missing = True
         return Executor(
             target_url=side.provision.target_url,
             db_path=db_path,
+            db_declared_missing=db_declared_missing,
             provisioned=True,
             contract_env=dict(side.contract.env),
             fixture=dict(side.contract.fixture),

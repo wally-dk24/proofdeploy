@@ -21,6 +21,7 @@ import json
 import os
 import secrets
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 
 TOKENS = {}
 VALUE = __VALUE__
@@ -1107,6 +1108,129 @@ def test_crash_after_authoring_records_inconclusive(tmp_path):
     assert evidence["record_type"] == "evidence"
     assert evidence["prompt"]
     assert evidence["raw_model_response"]
+    # O5: unsandboxed crash is not a measured result.
+    assert evidence["measured_result"] is False
+    assert evidence["sandboxed"] is False
+
+
+def test_sandboxed_crash_records_measured(tmp_path, monkeypatch):
+    """O5: a sandboxed crash (gate mocked) records measured_result=True."""
+    import proofdeploy.orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "assert_measurement_gate", lambda: {})
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-crash-sandboxed",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        sandbox=True,
+        allow_unsandboxed=False,
+    )
+    orch = Orchestrator(cfg)
+    def bad_provision_sandbox(*args, **kwargs):
+        raise RuntimeError("simulated post-authoring crash (sandboxed)")
+    orch._provision_side_sandbox = bad_provision_sandbox
+    summary = orch.measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "orchestrator_crash"
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["measured_result"] is True
+    assert evidence["sandboxed"] is True
+
+
+def test_unsandboxed_clean_run_records_not_measured(tmp_path):
+    """O6: an unsandboxed clean run records measured_result=False."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-clean-unmeasured",
+        rev_clean=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    Orchestrator(cfg).measure_clean()
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["measured_result"] is False
+    assert evidence["sandboxed"] is False
+
+
+def test_sandboxed_clean_run_records_measured(tmp_path, monkeypatch):
+    """O6: a sandboxed clean run (gate mocked) records measured_result=True."""
+    import proofdeploy.orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "assert_measurement_gate", lambda: {})
+
+    from proofdeploy.runner import ProvisionResult, ProvisionStatus
+
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-clean-sandboxed",
+        rev_clean=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        sandbox=True,
+        allow_unsandboxed=False,
+    )
+    orch = Orchestrator(cfg)
+
+    # Fake a READY sandboxed side without a real container.
+    def fake_provision_sandbox(rev, port, unit_dir, name):
+        from types import SimpleNamespace as _SNS
+
+        from proofdeploy.orchestrator import _Side
+
+        contract = _SNS(
+            build=None, migrate=None, seed=None, env={}, start="x",
+            readiness="/", fixture={}, database=None, auth=None,
+        )
+        side = _Side(
+            name=name,
+            sha="abc123",
+            snapshot_dir=tmp_path / "snap",
+            contract=contract,
+            provision=ProvisionResult(
+                status=ProvisionStatus.READY,
+                target_url=f"http://127.0.0.1:{port}",
+                run_id="fake",
+                sandbox_evidence={"image": "fake"},
+            ),
+        )
+        return side
+
+    orch._provision_side_sandbox = fake_provision_sandbox
+    # Stub out the executor and probe run: no real target.
+    def fake_make_executor(side):
+        from proofdeploy.executor import Executor
+        return Executor(target_url=side.provision.target_url)
+    orch._make_executor = fake_make_executor
+    orch.measure_clean()
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["measured_result"] is True
+    assert evidence["sandboxed"] is True
 
 
 def test_unsandboxed_normal_run_records_not_measured(tmp_path):
@@ -1203,6 +1327,75 @@ requires_sandbox = pytest.mark.skipif(
 )
 
 
+def test_check_sandbox_runtime_match():
+    """Coverage: sandbox runtime check passes when the image satisfies the
+    declared range. Uses a fake runner (no podman)."""
+    from proofdeploy.orchestrator import check_sandbox_runtime
+
+    class FakeResult:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        if "--version" in cmd:
+            return FakeResult("Python 3.12.3\n")
+        return FakeResult("sha256:abc123\n")
+
+    version, digest, failure = check_sandbox_runtime(
+        "python:3.12-slim", "python", ">=3.12,<3.13", runner=fake_run
+    )
+    assert version == "3.12.3"
+    assert digest == "sha256:abc123"
+    assert failure is None
+
+
+def test_check_sandbox_runtime_mismatch_fails_closed():
+    """Coverage: sandbox runtime check fails closed (BUILD_FAILED reason)
+    when the image version does not satisfy the declared range."""
+    from proofdeploy.orchestrator import check_sandbox_runtime
+
+    class FakeResult:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        if "--version" in cmd:
+            return FakeResult("Python 3.11.0\n")
+        return FakeResult("sha256:def456\n")
+
+    version, digest, failure = check_sandbox_runtime(
+        "python:3.12-slim", "python", ">=3.12,<3.13", runner=fake_run
+    )
+    assert version == "3.11.0"
+    assert digest == "sha256:def456"
+    assert failure is not None
+    assert "does not satisfy" in failure
+
+
+def test_check_sandbox_runtime_no_declared_range():
+    """Coverage: no declared range means no failure, version still recorded."""
+    from proofdeploy.orchestrator import check_sandbox_runtime
+
+    class FakeResult:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        if "--version" in cmd:
+            return FakeResult("v22.1.0\n")
+        return FakeResult("sha256:789\n")
+
+    version, digest, failure = check_sandbox_runtime(
+        "node:22", "node", None, runner=fake_run
+    )
+    assert version == "22.1.0"
+    assert digest == "sha256:789"
+    assert failure is None
+
+
 @requires_sandbox
 def test_sandboxed_end_to_end_orchestrator(tmp_path):
     """T1: sandboxed end-to-end orchestrator test (canned model, real container).
@@ -1243,22 +1436,84 @@ def test_sandboxed_end_to_end_orchestrator(tmp_path):
 def test_target_process_group_killed(tmp_path):
     """O2: a wrapper start command that spawns a child must not leave
     survivors. The whole process group is terminated.
+
+    Goes through Provisioner.provision (not a hand-built Popen) to prove
+    the provisioner starts targets with start_new_session=True. Treats
+    zombies as dead (some hosts' init doesn't reap orphans) and checks
+    the port no longer answers.
     """
+    import os
+    import socket
     import subprocess
     import time
+    import urllib.request
 
-    from proofdeploy.runner import Provisioner
+    from proofdeploy.runner import Provisioner, ProvisionStatus
 
-    # Simulate a wrapper start: sh -c "sleep 300 & wait" spawns a child.
-    proc = subprocess.Popen(
-        ["sh", "-c", "sleep 300 & wait"],
-        start_new_session=True,
+    # A tiny HTTP app with /health.
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "requirements.txt").write_text("# no third-party deps\n")
+    (snap / "app.py").write_text(
+        "import os\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "class H(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200)\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(b'ok')\n"
+        "    def log_message(self, *a):\n"
+        "        pass\n"
+        "port = int(os.environ.get('PORT', '8000'))\n"
+        "HTTPServer(('127.0.0.1', port), H).serve_forever()\n"
     )
-    child_pids = []
+
+    # Find a free port.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    from types import SimpleNamespace as _SNS2
+
+    contract = _SNS2(
+        build=None,
+        migrate=None,
+        seed=None,
+        env={},
+        # Wrapper start: spawns a child (the backgrounded python3) and waits.
+        start='sh -c "python3 app.py & wait"',
+        readiness="/",
+        fixture={},
+        database=None,
+        auth=None,
+    )
+    prov = Provisioner(workdir=tmp_path / "work")
+    # Mock _exec for install/build steps (not relevant to O2); the start
+    # step uses subprocess.Popen directly and runs for real.
+    def fake_exec(cmd, cwd, timeout, logs, env):
+        logs.append(f"$ {' '.join(cmd)} (mocked)")
+        return True, None
+    # Fake venv dir (bin subdir need not exist; system PATH still applies).
+    prov._make_venv = lambda *a, **k: tmp_path  # type: ignore[method-assign]
+    prov._exec = fake_exec  # type: ignore[method-assign]
+    result = prov.provision(
+        snapshot_dir=snap,
+        contract=contract,
+        port=port,
+        require_lockfile_match=False,
+    )
+    assert result.status == ProvisionStatus.READY, f"provision failed: {result.reason}"
+    proc = result.proc
+    assert proc is not None
     try:
-        # Give the child time to spawn.
-        time.sleep(0.5)
-        # Find child processes of the wrapper.
+        # The provisioner must start the target in its own session:
+        # process-group id equals the pid.
+        pgid = os.getpgid(proc.pid)
+        assert pgid == proc.pid, (
+            f"target is not a process-group leader: pid={proc.pid} pgid={pgid}"
+        )
+        # Give the wrapper's child time to spawn.
+        time.sleep(1.0)
         out = subprocess.run(
             ["ps", "--ppid", str(proc.pid), "-o", "pid="],
             capture_output=True, text=True, timeout=10,
@@ -1266,13 +1521,32 @@ def test_target_process_group_killed(tmp_path):
         child_pids = [p for p in out.split() if p.isdigit()]
         assert child_pids, "test setup: wrapper should have spawned a child"
     finally:
-        # Use the fixed stop_target.
-        runner = Provisioner(workdir=tmp_path / "work")
-        runner.stop_target(proc, logs=[])
-        # The child must be gone too (process group kill).
-        time.sleep(0.5)
-        for pid in child_pids:
-            r = subprocess.run(
-                ["ps", "-p", pid], capture_output=True, timeout=10,
-            )
-            assert r.returncode != 0, f"child process {pid} survived stop_target"
+        prov.stop_target(proc, logs=[])
+
+    def _is_dead_or_zombie(pid: str) -> bool:
+        """True if the process is gone or a zombie (state Z)."""
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                state = f.read().split()[2]
+            return state == "Z"
+        except (FileNotFoundError, ProcessLookupError, IndexError):
+            return True
+
+    # Every group member must be gone or a zombie.
+    time.sleep(1.0)
+    for pid in child_pids:
+        assert _is_dead_or_zombie(pid), f"child process {pid} survived stop_target"
+    assert _is_dead_or_zombie(str(proc.pid)), "target process survived stop_target"
+
+    # The port must no longer answer.
+    time.sleep(0.5)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5):
+            raise AssertionError(f"port {port} still answers after stop_target")
+    except AssertionError:
+        raise
+    except Exception:
+        pass  # Expected: connection refused.
+
+    # Clean up the run's scratch dirs.
+    prov.cleanup_run(result.run_id, logs=[])
