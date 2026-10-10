@@ -774,6 +774,10 @@ class Provisioner:
         Called automatically on every failure path. On READY the caller
         owns the target process and must call this when done with it.
         Tolerates missing dirs.
+
+        NOTE: this does NOT stop the target process. Use stop_target()
+        first to terminate and reap the process, then cleanup_run() to
+        remove the scratch dirs.
         """
         for sub in ("venvs", "runs"):
             d = self.workdir / sub / run_id
@@ -781,6 +785,42 @@ class Provisioner:
                 shutil.rmtree(d, ignore_errors=True)
                 if logs is not None:
                     logs.append(f"cleaned up: {d}")
+
+    def stop_target(self, proc: Any, logs: list[str] | None = None) -> None:
+        """Terminate and reap a READY target's process (O2).
+
+        Called on every exit path for a READY target, before cleanup_run().
+        Terminates gracefully, escalates to kill, and reaps to avoid
+        zombies. Tolerates already-exited processes.
+        """
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                # Still running: terminate gracefully, then kill.
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                if logs is not None:
+                    logs.append("target process terminated")
+            else:
+                # Already exited: reap to avoid zombie.
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+        except Exception as e:
+            if logs is not None:
+                logs.append(f"target stop failed: {e}")
 
     def provision(
         self,

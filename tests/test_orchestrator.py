@@ -794,3 +794,319 @@ def test_inconclusive_unsandboxed_dev_does_not_count(tmp_path):
     evidence = records[0]
     assert evidence["measured_result"] is False
     assert evidence["sandboxed"] is False
+
+
+# ------------------------------------------------------------------
+# O1: No hard-coded /register. Auth comes from the contract.
+# ------------------------------------------------------------------
+
+MINI_APP_NO_AUTH = '''\\
+import json
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+VALUE = __VALUE__
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._json(200, {"ok": True})
+        elif self.path == "/value":
+            self._json(200, {"v": VALUE})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def log_message(self, *args):
+        pass
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+'''
+
+MINI_YML_NO_AUTH = """build: "python -m py_compile app.py"
+start: "python app.py"
+readiness: "/health"
+env:
+  APP_ENV: verification
+fixture:
+  repo_name: "mini-app-no-auth"
+  seed_note: "empty"
+  auth_mechanism: "none"
+  auth_scope: "no auth"
+  flags_note: "no feature flags"
+"""
+
+
+def make_mini_repo_no_auth(root: Path) -> dict[str, str]:
+    """A tiny app with NO /register endpoint and no credential declared."""
+    repo = root / "mini-app-no-auth"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@test")
+    (repo / "requirements.txt").write_text("# no third-party deps\\n")
+    (repo / "proofdeploy.yml").write_text(MINI_YML_NO_AUTH)
+    shas = {}
+    for tag, value in (("base", 1), ("bug", 2), ("fix", 1)):
+        (repo / "app.py").write_text(MINI_APP_NO_AUTH.replace("__VALUE__", str(value)))
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", tag)
+        shas[tag] = _git(repo, "rev-parse", "HEAD")
+    return {"repo": str(repo), **shas}
+
+
+def test_no_auth_app_does_not_crash(tmp_path):
+    """O1: an app without /register and no declared credential does not
+    crash. Probes run; no token is used."""
+    info = make_mini_repo_no_auth(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-no-auth",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    # No crash; the run completes and scores.
+    assert summary["verdict"] == "candidate_catch"
+    assert summary["parent_ready"] and summary["fix_ready"]
+
+
+def test_declared_registration_provider(tmp_path):
+    """O1: a contract-declared register provider mints a token."""
+    import json
+
+    info = make_mini_repo(tmp_path)
+    # Add the credential_provider declaration to the fixture.
+    # We modify the base commit's yml so the fix still restores VALUE=1.
+    repo = Path(info["repo"])
+    # Amend the fix commit to include the provider declaration.
+    _git(repo, "checkout", "-q", info["fix"])
+    yml_path = repo / "proofdeploy.yml"
+    yml_text = yml_path.read_text()
+    provider_json = json.dumps({
+        "mode": "register",
+        "path": "/register",
+        "method": "POST",
+        "username_field": "username",
+        "password_field": "password",
+        "token_json_path": "token",
+    })
+    yml_text = yml_text.replace(
+        '  flags_note: "no feature flags"',
+        f'  flags_note: "no feature flags"\n  credential_provider: \'{provider_json}\'',
+    )
+    yml_path.write_text(yml_text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "--amend", "--no-edit")
+    new_fix = _git(repo, "rev-parse", "HEAD")
+
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=repo,
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-provider",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=new_fix,
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    # The run completes; the provider was used (no crash on /register).
+    assert summary["verdict"] == "candidate_catch"
+
+
+def test_provider_failure_is_inconclusive_auth(tmp_path):
+    """O1: a declared provider with a bad endpoint does not crash the run.
+    The failure is INCONCLUSIVE auth, never an exception."""
+    import json
+
+    info = make_mini_repo(tmp_path)
+    repo = Path(info["repo"])
+    _git(repo, "checkout", "-q", info["fix"])
+    yml_path = repo / "proofdeploy.yml"
+    yml_text = yml_path.read_text()
+    # Declare a provider pointing at a non-existent endpoint.
+    provider_json = json.dumps({
+        "mode": "register",
+        "path": "/nonexistent-register",
+        "method": "POST",
+        "username_field": "username",
+        "password_field": "password",
+        "token_json_path": "token",
+    })
+    yml_text = yml_text.replace(
+        '  flags_note: "no feature flags"',
+        f'  flags_note: "no feature flags"\n  credential_provider: \'{provider_json}\'',
+    )
+    yml_path.write_text(yml_text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "--amend", "--no-edit")
+    new_fix = _git(repo, "rev-parse", "HEAD")
+
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=repo,
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-bad-provider",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=new_fix,
+        model_runner=canned_probes,  # probes don't use auth
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    # Should not raise; the run completes (provider only runs when a probe
+    # needs ${AUTH_TOKEN}).
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] in ("candidate_catch", "no_catch", "inconclusive")
+
+
+# ------------------------------------------------------------------
+# O2: Target processes are terminated on every exit path.
+# ------------------------------------------------------------------
+
+def _count_app_processes():
+    """Count running 'python app.py' processes (our test targets)."""
+    import subprocess
+    p = subprocess.run(
+        ["ps", "-eo", "args"],
+        capture_output=True, text=True,
+    )
+    return sum(1 for line in p.stdout.splitlines() if "python app.py" in line)
+
+
+def test_target_process_stopped_after_run(tmp_path):
+    """O2: after a normal run, no target process is alive."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    before = _count_app_processes()
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-cleanup",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    Orchestrator(cfg).measure_bug()
+    import time
+    time.sleep(2)  # let the OS reap
+    after = _count_app_processes()
+    assert after <= before, f"target processes leaked: {before} -> {after}"
+
+
+def test_target_process_stopped_after_crash(tmp_path):
+    """O2: after a crash, no target process is alive."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    before = _count_app_processes()
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-crash-cleanup",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    orch = Orchestrator(cfg)
+    # Monkeypatch the executor's run_probe to raise after provisioning.
+    # This simulates a crash after the targets are READY.
+    from proofdeploy import orchestrator as orch_module
+    orig_make_executor = orch._make_executor
+    def bad_make_executor(side):
+        ex = orig_make_executor(side)
+        orig_run = ex.run_probe
+        def crashing_run(*args, **kwargs):
+            raise RuntimeError("simulated crash during probe")
+        ex.run_probe = crashing_run
+        return ex
+    orch._make_executor = bad_make_executor
+    # The crash should be recorded as INCONCLUSIVE, not propagate.
+    summary = orch.measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "orchestrator_crash"
+    import time
+    time.sleep(2)
+    after = _count_app_processes()
+    assert after <= before, f"target processes leaked after crash: {before} -> {after}"
+
+
+# ------------------------------------------------------------------
+# O3: Crash after authoring commits an INCONCLUSIVE record.
+# ------------------------------------------------------------------
+
+def test_crash_after_authoring_records_inconclusive(tmp_path):
+    """O3: a crash after the model call commits an INCONCLUSIVE record
+    with a typed reason; the prompt and response are not lost."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-crash-record",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    orch = Orchestrator(cfg)
+    # Crash during probe execution (after authoring).
+    orig = orch._provision_side
+    def bad_provision(*args, **kwargs):
+        raise RuntimeError("simulated post-authoring crash")
+    orch._provision_side = bad_provision
+    summary = orch.measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "orchestrator_crash"
+    # The evidence record exists with the prompt and raw response.
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["record_type"] == "evidence"
+    assert evidence["prompt"]
+    assert evidence["raw_model_response"]

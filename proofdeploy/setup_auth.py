@@ -28,6 +28,10 @@ Credential provider (proactive, never reactive):
 - `refresh` mode calls a refresh endpoint, but only when there is no
   token or a provider-issued token nears expiry. Fixture tokens have no
   known expiry and are never refreshed proactively.
+- `register` mode registers a disposable user on the target (declared in
+  the contract, never a default): POSTs to a declared endpoint with
+  generated credentials and extracts the token from the response. A
+  provider failure is INCONCLUSIVE `auth`, never an exception.
 
 harness_app setup steps are provisioned for real by the executor
 (WO-5): the step's source is written to a file and started as a process
@@ -283,6 +287,13 @@ class CredentialProvider:
       {"mode": "refresh", "path": "/auth/refresh", "method": "POST",
       "headers": {...}, "body": {...}, "token_json_path": "access_token",
       "expires_in_json_path": "expires_in"}.
+    - `register`: register a disposable user on the target. The endpoint,
+      body fields, and token field are declared in the contract (never a
+      default). Config: {"mode": "register", "path": "/register",
+      "method": "POST", "username_field": "username",
+      "password_field": "password", "token_json_path": "token"}.
+      A random username and password are generated per run; both are
+      secrets for the record's redaction.
     """
 
     config: dict[str, Any]

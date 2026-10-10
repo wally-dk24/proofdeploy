@@ -35,10 +35,8 @@ evidence to score.
 from __future__ import annotations
 
 import json
-import secrets
 import socket
 import subprocess
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -173,7 +171,6 @@ class _Side:
     contract: RepoContract
     provision: ProvisionResult
     executor: Executor | None = None
-    auth_password: str | None = None  # runner's disposable password (secret)
     # Isolation actually in effect for this side's sandbox app (network
     # mode, userns mode, uid). None when the sandbox was not used.
     sandbox_evidence: dict[str, object] | None = None
@@ -413,6 +410,100 @@ class Orchestrator:
             "model_attempts": attempts,
         }
 
+    def _record_orchestrator_crash(
+        self,
+        cfg: MeasureConfig,
+        unit_dir: Path,
+        repo: Path,
+        bundle: Any,
+        manifest: dict[str, Any],
+        prompt: str,
+        base_sha: str,
+        tip_sha: str,
+        manifest_sha: str,
+        raw: ModelResponse,
+        probeset: ProbeSet,
+        run_kind: str,
+        use_sandbox: bool,
+        capability_probe: dict[str, Any],
+        error: BaseException,
+    ) -> dict[str, Any]:
+        """Record an INCONCLUSIVE run after an orchestrator crash (O3).
+
+        If the orchestrator fails after the model call (e.g., provisioning
+        crash, probe execution crash), the prompt, raw response, and parsed
+        probes must not be lost. This commits an evidence record with
+        verdict INCONCLUSIVE and a typed reason, then the score as usual.
+
+        Master's principle: state what failed, never lose it.
+        """
+        from proofdeploy.model_client import (
+            author_prompt_builder_sha256,
+            author_prompt_sha256,
+        )
+        from proofdeploy.runpair import (
+            RunPairVerdict,
+            build_evidence_record,
+            commit_records,
+            write_evidence_record,
+            write_score_record,
+        )
+
+        cause = f"orchestrator_crash: {type(error).__name__}: {error}"
+        self._say(f"orchestrator crashed after authoring; recording INCONCLUSIVE: {cause[:200]}")
+        record = build_evidence_record(
+            run_kind=run_kind,
+            bug_id=cfg.bug_id if run_kind == "bug" else None,
+            clean_id=cfg.clean_id if run_kind == "clean" else None,
+            prompt=prompt,
+            raw_model_response=raw.content,
+            parsed_probes=probeset.probes,
+            bundle_manifest=manifest,
+            bundle_manifest_sha256=manifest_sha,
+            author_prompt_sha256=author_prompt_sha256(),
+            author_prompt_builder_sha256=author_prompt_builder_sha256(),
+            skill_sha256=manifest.get("skill_sha256"),
+            sandboxed=use_sandbox,
+            measured_result=use_sandbox,
+            provenance=self._provenance(capability_probe),
+            model_request=raw.request_record,
+        )
+        record_id, _, evidence_sha = write_evidence_record(
+            record, repo, repo, secret_values=self.cfg.extra_secrets,
+        )
+        self._say(f"evidence committed: {evidence_sha[:12]}")
+        counting = (
+            "counts_as_not_caught" if run_kind == "bug"
+            else "counts_as_false_alarm"
+        )
+        score_path, _ = write_score_record(
+            output_dir=repo,
+            repo=repo,
+            evidence_record_id=record_id,
+            run_kind=run_kind,
+            bug_id=cfg.bug_id if run_kind == "bug" else None,
+            clean_id=cfg.clean_id if run_kind == "clean" else None,
+            verdict=RunPairVerdict.INCONCLUSIVE,
+            note="environment: orchestrator_crash",
+            secret_values=self.cfg.extra_secrets,
+        )
+        score_sha = commit_records(
+            repo, repo, f"score: {run_kind} {(cfg.bug_id or cfg.clean_id)} ({record_id[:8]})"
+        )
+        self._say(f"score committed: {score_sha[:12]}")
+        return {
+            "run_kind": run_kind,
+            "bug_id": cfg.bug_id if run_kind == "bug" else None,
+            "clean_id": cfg.clean_id if run_kind == "clean" else None,
+            "evidence_record_id": record_id,
+            "evidence_commit": evidence_sha,
+            "score_commit": score_sha,
+            "verdict": "inconclusive",
+            "reason_class": "environment",
+            "cause": "orchestrator_crash",
+            "counting": counting,
+        }
+
     def _leak_check_bundle(
         self, bundle: Any, prompt: str, contract: RepoContract
     ) -> None:
@@ -609,40 +700,35 @@ class Orchestrator:
             sandbox_evidence=dict(app.sandbox_evidence),
         )
 
-    def _register_runner_user(self, side: _Side) -> str:
-        """Create the runner's disposable credential on a READY target.
+    def _credential_config(self, side: _Side) -> dict[str, Any] | None:
+        """Parse the contract's declared credential provider, if any.
 
-        The app exposes open registration; the runner registers a random
-        user and returns its bearer token, which becomes ${AUTH_TOKEN}
-        for the probe runs. Password and token are secrets: they are
-        collected for the record's fail-closed redaction and never enter
-        the author bundle or prompt (authoring already happened).
+        The contract declares auth via the fixture's `credential_provider`
+        key (a JSON object). Absent means no credential: no token is used,
+        `${AUTH_TOKEN}` is unknown, and a probe using it is INCONCLUSIVE
+        `probe` (fail-closed, never a crash).
+
+        Registration is one declared provider mode (`register`), never a
+        default. Its requests are recorded and logged as writes by the
+        executor; a provider failure is INCONCLUSIVE `auth`, never an
+        exception.
         """
-        assert side.provision and side.provision.target_url
-        password = secrets.token_hex(16)
-        username = f"runner-{secrets.token_hex(4)}"
-        body = json.dumps({"username": username, "password": password}).encode()
-        req = urllib.request.Request(
-            side.provision.target_url.rstrip("/") + "/register",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        raw = side.contract.fixture.get("credential_provider")
+        if not raw:
+            return None
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = json.loads(r.read().decode("utf-8"))
-        except Exception as e:
+            cfg = json.loads(raw)
+        except json.JSONDecodeError as e:
             raise OrchestratorError(
-                f"runner registration failed on {side.provision.target_url}: {e}"
+                f"contract fixture 'credential_provider' is not valid JSON: {e}"
             ) from e
-        token = data.get("token")
-        if not isinstance(token, str) or not token:
-            raise OrchestratorError("registration did not return a token")
-        side.auth_password = password
-        self.cfg.extra_secrets.extend([password, token])
-        return token
+        if not isinstance(cfg, dict):
+            raise OrchestratorError(
+                "contract fixture 'credential_provider' must be a JSON object"
+            )
+        return cfg
 
-    def _make_executor(self, side: _Side, token: str | None) -> Executor:
+    def _make_executor(self, side: _Side) -> Executor:
         assert side.provision and side.provision.target_url
         db_path = side.snapshot_dir / "notes.db"
         return Executor(
@@ -651,7 +737,8 @@ class Orchestrator:
             provisioned=True,
             contract_env=dict(side.contract.env),
             fixture=dict(side.contract.fixture),
-            auth_token=token,
+            auth_token=None,
+            credential_config=self._credential_config(side),
             allow_harness_app=self.cfg.allow_harness_app,
             harness=(
                 HarnessAppConfig(workdir=self.cfg.workdir / "harness")
@@ -797,10 +884,11 @@ class Orchestrator:
             parent, fix = sides
             parent_results = fix_results = None
             if parent.provision.ready and fix.provision.ready:
-                parent_token = self._register_runner_user(parent)
-                fix_token = self._register_runner_user(fix)
-                parent.executor = self._make_executor(parent, parent_token)
-                fix.executor = self._make_executor(fix, fix_token)
+                # Auth comes from the contract's declared credential
+                # provider (O1). Absent means no token; the executor
+                # handles ${AUTH_TOKEN} as unknown (INCONCLUSIVE probe).
+                parent.executor = self._make_executor(parent)
+                fix.executor = self._make_executor(fix)
                 try:
                     parent_results = [
                         parent.executor.run_probe(p, i)
@@ -892,6 +980,18 @@ class Orchestrator:
                 "parent_ready": parent.provision.ready,
                 "fix_ready": fix.provision.ready,
             }
+        except Exception as e:
+            # O3: any failure after authoring commits an INCONCLUSIVE
+            # record with a typed reason, then the score as usual.
+            # Master's principle: state what failed, never lose it.
+            return self._record_orchestrator_crash(
+                cfg, unit_dir, repo, bundle, manifest, prompt,
+                base_sha, tip_sha, manifest_sha, raw, probeset,
+                run_kind="bug",
+                use_sandbox=use_sandbox,
+                capability_probe=capability_probe,
+                error=e,
+            )
         finally:
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
@@ -900,6 +1000,9 @@ class Orchestrator:
                         proc.stop()
                         self._say(f"sandbox stop: {side.provision.run_id}")
                     else:
+                        # O2: terminate and reap the target process on every
+                        # exit path, then remove the scratch dirs.
+                        runner.stop_target(proc, self.log)
                         runner.cleanup_run(side.provision.run_id, self.log)
                         self._say(f"cleanup_run: {side.provision.run_id}")
 
@@ -999,8 +1102,9 @@ class Orchestrator:
             (side,) = sides
             c_results = None
             if side.provision.ready:
-                token = self._register_runner_user(side)
-                side.executor = self._make_executor(side, token)
+                # Auth comes from the contract's declared credential
+                # provider (O1). Absent means no token.
+                side.executor = self._make_executor(side)
                 try:
                     c_results = [
                         side.executor.run_probe(p, i)
@@ -1066,6 +1170,17 @@ class Orchestrator:
                 "probe_count": len(probeset.probes),
                 "c_ready": side.provision.ready,
             }
+        except Exception as e:
+            # O3: any failure after authoring commits an INCONCLUSIVE
+            # record with a typed reason, then the score as usual.
+            return self._record_orchestrator_crash(
+                cfg, unit_dir, repo, bundle, manifest, prompt,
+                base_sha, tip_sha, manifest_sha, raw, probeset,
+                run_kind="clean",
+                use_sandbox=use_sandbox,
+                capability_probe=capability_probe,
+                error=e,
+            )
         finally:
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
@@ -1074,6 +1189,9 @@ class Orchestrator:
                         proc.stop()
                         self._say(f"sandbox stop: {side.provision.run_id}")
                     else:
+                        # O2: terminate and reap the target process on every
+                        # exit path, then remove the scratch dirs.
+                        runner.stop_target(proc, self.log)
                         runner.cleanup_run(side.provision.run_id, self.log)
                         self._say(f"cleanup_run: {side.provision.run_id}")
 
