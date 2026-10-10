@@ -326,6 +326,9 @@ class Orchestrator:
         manifest_sha: str,
         cause: str,
         attempts: list[str],
+        run_kind: str,
+        use_sandbox: bool,
+        capability_probe: dict[str, Any],
     ) -> dict[str, Any]:
         """Record an INCONCLUSIVE run (model call failed).
 
@@ -334,8 +337,9 @@ class Orchestrator:
         INCONCLUSIVE, reason class "environment", and the cause
         ("model_overflow" or "model_transport").
 
-        The counting consequence (for the registered rates) is stored as
-        a separate field from the verdict:
+        Per Master's rule (Addendum 4): a model failure in a measured run
+        IS a measured result (measured_result=True). It counts against the
+        tool. The counting consequence is stored as a separate field:
         - bug run: "counts_as_not_caught"
         - clean run: "counts_as_false_alarm"
         """
@@ -351,19 +355,21 @@ class Orchestrator:
         )
 
         # Minimal evidence: no probes were produced, but both model call
-        # attempts are recorded.
+        # attempts are recorded. Per Master's rule, this IS a measured
+        # result (measured_result=True).
         record = build_evidence_record(
-            run_kind="bug",
-            bug_id=cfg.bug_id,
+            run_kind=run_kind,
+            bug_id=cfg.bug_id if run_kind == "bug" else None,
+            clean_id=cfg.clean_id if run_kind == "clean" else None,
             prompt=prompt,
             bundle_manifest=manifest,
             bundle_manifest_sha256=manifest_sha,
             author_prompt_sha256=author_prompt_sha256(),
             author_prompt_builder_sha256=author_prompt_builder_sha256(),
             skill_sha256=manifest.get("skill_sha256"),
-            sandboxed=False,
-            measured_result=False,
-            provenance=self._provenance({}),
+            sandboxed=use_sandbox,
+            measured_result=True,
+            provenance=self._provenance(capability_probe),
             model_call_attempts=attempts,
         )
         record_id, _, evidence_sha = write_evidence_record(
@@ -373,25 +379,29 @@ class Orchestrator:
         # Score with INCONCLUSIVE verdict, reason class "environment",
         # and the cause. The counting consequence is a separate field.
         from proofdeploy.runpair import RunPairVerdict
-        counting = "counts_as_not_caught"  # bug run
+        counting = (
+            "counts_as_not_caught" if run_kind == "bug"
+            else "counts_as_false_alarm"
+        )
         score_path, _ = write_score_record(
             output_dir=repo,
             repo=repo,
             evidence_record_id=record_id,
-            run_kind="bug",
-            bug_id=cfg.bug_id,
+            run_kind=run_kind,
+            bug_id=cfg.bug_id if run_kind == "bug" else None,
+            clean_id=cfg.clean_id if run_kind == "clean" else None,
             verdict=RunPairVerdict.INCONCLUSIVE,
             note=f"environment: {cause}",
             secret_values=self.cfg.extra_secrets,
         )
-        # Add the counting consequence to the score record.
         score_sha = commit_records(
-            repo, repo, f"score: bug {cfg.bug_id} ({record_id[:8]})"
+            repo, repo, f"score: {run_kind} {(cfg.bug_id or cfg.clean_id)} ({record_id[:8]})"
         )
         self._say(f"score committed: {score_sha[:12]}")
         return {
-            "run_kind": "bug",
-            "bug_id": cfg.bug_id,
+            "run_kind": run_kind,
+            "bug_id": cfg.bug_id if run_kind == "bug" else None,
+            "clean_id": cfg.clean_id if run_kind == "clean" else None,
             "evidence_record_id": record_id,
             "evidence_commit": evidence_sha,
             "score_commit": score_sha,
@@ -733,6 +743,9 @@ class Orchestrator:
                         base_sha, tip_sha, manifest_sha,
                         cause=e2.cause,
                         attempts=attempts,
+                        run_kind="bug",
+                        use_sandbox=use_sandbox,
+                        capability_probe=capability_probe,
                     )
             else:
                 # model_overflow: no retry.
@@ -742,6 +755,9 @@ class Orchestrator:
                     base_sha, tip_sha, manifest_sha,
                     cause=e.cause,
                     attempts=attempts,
+                    run_kind="bug",
+                    use_sandbox=use_sandbox,
+                    capability_probe=capability_probe,
                 )
 
         prov_workdir = cfg.workdir / "provisioner"
@@ -926,7 +942,45 @@ class Orchestrator:
         manifest_sha = self._check_answer_key(
             bundle, prompt, base_sha, tip_sha, fix_rev=None
         )
-        probeset, raw = self._author_probes(prompt)
+        # Model call with retry per the registered rule:
+        # - model_transport: exactly one retry, both attempts in evidence.
+        # - model_overflow: no retry.
+        attempts: list[str] = []
+        try:
+            probeset, raw = self._author_probes(prompt)
+            attempts.append("attempt_1: success")
+        except ModelCallError as e:
+            attempts.append(f"attempt_1: {e.cause}: {e}")
+            if e.cause == "model_transport":
+                # Exactly one retry for transport failures.
+                self._say("model transport failed; retrying once")
+                try:
+                    probeset, raw = self._author_probes(prompt)
+                    attempts.append("attempt_2: success")
+                except ModelCallError as e2:
+                    attempts.append(f"attempt_2: {e2.cause}: {e2}")
+                    self._say(f"model call failed twice; recording INCONCLUSIVE: {e2}")
+                    return self._record_inconclusive(
+                        cfg, unit_dir, repo, bundle, manifest, prompt,
+                        base_sha, tip_sha, manifest_sha,
+                        cause=e2.cause,
+                        attempts=attempts,
+                        run_kind="clean",
+                        use_sandbox=use_sandbox,
+                        capability_probe=capability_probe,
+                    )
+            else:
+                # model_overflow: no retry.
+                self._say(f"model overflow; recording INCONCLUSIVE (no retry): {e}")
+                return self._record_inconclusive(
+                    cfg, unit_dir, repo, bundle, manifest, prompt,
+                    base_sha, tip_sha, manifest_sha,
+                    cause=e.cause,
+                    attempts=attempts,
+                    run_kind="clean",
+                    use_sandbox=use_sandbox,
+                    capability_probe=capability_probe,
+                )
 
         prov_workdir = cfg.workdir / "provisioner"
         prov_workdir.mkdir(parents=True, exist_ok=True)

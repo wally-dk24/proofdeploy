@@ -604,3 +604,124 @@ def test_measure_bug_model_transport_retry_succeeds(tmp_path):
     # Retry succeeded, so normal scoring proceeds.
     assert summary["verdict"] == "candidate_catch"
     assert len(calls) == 2
+
+
+def test_measure_clean_model_overflow_no_retry(tmp_path):
+    """Clean path: model_overflow → INCONCLUSIVE, counts as false alarm."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    def failing_runner(prompt: str):
+        from proofdeploy.model_client import ModelCallError
+        raise ModelCallError("context length exceeded", cause="model_overflow")
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-clean-overflow",
+        rev_clean=info["fix"],
+        model_runner=failing_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_clean()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["run_kind"] == "clean"
+    assert summary["cause"] == "model_overflow"
+    assert summary["counting"] == "counts_as_false_alarm"
+    assert len(summary["model_attempts"]) == 1
+
+
+def test_measure_clean_model_transport_retry_twice(tmp_path):
+    """Clean path: transport failing twice → one retry, both recorded."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    def failing_runner(prompt: str):
+        from proofdeploy.model_client import ModelCallError
+        raise ModelCallError("timeout", cause="model_transport")
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-clean-transport",
+        rev_clean=info["fix"],
+        model_runner=failing_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_clean()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["counting"] == "counts_as_false_alarm"
+    assert len(summary["model_attempts"]) == 2
+
+
+def test_measure_clean_model_transport_retry_succeeds(tmp_path):
+    """Clean path: transport succeeding on retry → normal run."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    calls = []
+
+    def flaky_runner(prompt: str):
+        from proofdeploy.model_client import ModelCallError
+        calls.append(1)
+        if len(calls) == 1:
+            raise ModelCallError("timeout", cause="model_transport")
+        return canned_probes(prompt)
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-clean-retry-ok",
+        rev_clean=info["fix"],
+        model_runner=flaky_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_clean()
+    assert summary["run_kind"] == "clean"
+    assert summary["false_alarm"] is False
+    assert len(calls) == 2
+
+
+def test_inconclusive_records_measured_result_true(tmp_path):
+    """INCONCLUSIVE evidence records measured_result=True with real values."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    def failing_runner(prompt: str):
+        from proofdeploy.model_client import ModelCallError
+        raise ModelCallError("overflow", cause="model_overflow")
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-measured",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=failing_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    Orchestrator(cfg).measure_bug()
+    records = read_records(out)
+    evidence = records[0]
+    # measured_result=True (not the hiding Master rejected).
+    assert evidence["measured_result"] is True
+    # Real sandboxed value (allow_unsandboxed=True → False).
+    assert evidence["sandboxed"] is False
+    # Provenance is present (not empty).
+    assert "provenance" in evidence
