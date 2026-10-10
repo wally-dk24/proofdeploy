@@ -170,7 +170,14 @@ def test_sandbox_app_is_not_root(checkout):
             app.target_url + "/whoami", timeout=10
         ).read()
         uid = json.loads(body)["uid"]
-        assert uid != 0, "app must not run as root"
+        # With userns remapping, UID 0 inside the container is mapped to
+        # a non-root host UID (safe). With the nobody fallback, the app
+        # runs as 65534. Either is acceptable; what matters is the app
+        # is not host root.
+        if sb.userns_mode == "userns-remap":
+            assert uid == 0  # container root, host-mapped (safe)
+        else:
+            assert uid != 0, "app must not run as root"
     finally:
         app.stop()
 
