@@ -1025,3 +1025,25 @@ def test_evidence_auto_collects_secrets_from_results_no_caller_values(tmp_path):
         assert TOKEN not in blob, "captured session token leaked into the record"
     finally:
         srv.shutdown()
+
+
+def test_evidence_record_carries_registered_model_config():
+    # WO-5 brief: "The model and its settings are recorded." The pinned
+    # model client config must land in the evidence record and survive
+    # the secret redaction applied before the record is committed.
+    record = build_evidence_record(
+        run_kind="bug",
+        bug_id="X",
+        fix_sha="a" * 40,
+        fix_parent_sha="b" * 40,
+        model_id="openai/gpt-oss-120b",
+        model_temperature=0.2,
+        model_attempts=1,
+    )
+    assert record["model_id"] == "openai/gpt-oss-120b"
+    assert record["model_temperature"] == 0.2
+    assert record["model_attempts"] == 1
+    out = redact_record(record, [])
+    assert out["model_id"] == "openai/gpt-oss-120b"
+    assert out["model_temperature"] == 0.2
+    assert out["model_attempts"] == 1
