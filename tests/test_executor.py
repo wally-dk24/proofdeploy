@@ -398,8 +398,8 @@ def _setup_inconclusive_reason(server, path):
 
 
 def test_setup_401_is_inconclusive_auth(server):
-    # 401 from setup: credential problem -> AUTH (the only reason class
-    # an admin may downgrade to "warn").
+    # 401 from setup: credential problem -> AUTH (only ENVIRONMENT may be
+    # downgraded to "warn" by an admin; AUTH and PROBE never can).
     assert _setup_inconclusive_reason(server, "/denied") == InconclusiveReason.AUTH
 
 
@@ -467,3 +467,275 @@ def test_harness_app_setup_is_inconclusive_environment(server):
     assert r.verdict == Verdict.INCONCLUSIVE
     assert r.reason == InconclusiveReason.ENVIRONMENT
     assert not any(d.startswith("act:") for d in r.details)
+
+
+# ---------------------------------------------------------------------------
+# WO-3: setup capture, strict placeholders, AUTH_TOKEN precedence, refresh.
+# ---------------------------------------------------------------------------
+
+
+class _AuthHandler(BaseHTTPRequestHandler):
+    """Live server for WO-3: capture, placeholders, and credential refresh."""
+
+    def _json(self, code, obj, headers=None):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
+
+    def do_GET(self):
+        if self.path == "/me":
+            # Echoes back the Authorization header it received.
+            self._json(200, {"auth": self.headers.get("Authorization")})
+        elif self.path == "/protected":
+            if self.headers.get("Authorization") == "Bearer new-token":
+                self._json(200, {"status": "ok"})
+            else:
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"unauthorized")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+        if self.path == "/login":
+            self._json(200, {"token": "tok-123"})
+        elif self.path == "/auth/refresh":
+            self._json(200, {"access_token": "new-token"})
+        elif self.path == "/auth/refresh-fail":
+            self.send_response(500)
+            self.end_headers()
+        elif self.path == "/login-echo":
+            # Returns the Authorization header it saw, for capture tests.
+            self._json(200, {"seen": self.headers.get("Authorization")})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture()
+def auth_server():
+    srv = HTTPServer(("127.0.0.1", 0), _AuthHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{port}"
+    srv.shutdown()
+
+
+def test_unknown_placeholder_is_inconclusive_probe(auth_server):
+    # ${TYPO} is not env, fixture, AUTH_TOKEN, or a declared capture:
+    # fail closed, never sent literally.
+    ex = Executor(target_url=auth_server, provisioned=True)
+    p = _probe(
+        act={"method": "GET", "path": "/me", "headers": {"Authorization": "Bearer ${TYPO}"}},
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.PROBE
+    assert any("unknown placeholder" in d for d in r.details)
+
+
+def test_capture_flows_into_later_steps(auth_server):
+    # Setup POST /login captures TOKEN; the act sends it; the target echoes it.
+    ex = Executor(target_url=auth_server, provisioned=True)
+    p = _probe(
+        setup=[
+            {
+                "type": "http",
+                "act": {"method": "POST", "path": "/login"},
+                "capture": {"TOKEN": {"from": "body", "json_path": "token"}},
+            }
+        ],
+        act={"method": "GET", "path": "/me", "headers": {"Authorization": "Bearer ${TOKEN}"}},
+        assert_=[
+            {"type": "status", "equals": 200},
+            {"type": "body", "json_path": {"path": "auth", "equals": "Bearer tok-123"}},
+        ],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+
+
+def test_capture_from_header(auth_server):
+    # Header captures work too (X-Token from a response).
+    ex = Executor(target_url=auth_server, provisioned=True)
+    p = _probe(
+        setup=[
+            {
+                "type": "http",
+                "act": {"method": "POST", "path": "/login"},
+                "capture": {"CT": {"from": "header", "name": "Content-Type"}},
+            }
+        ],
+        act={"method": "GET", "path": "/me", "headers": {"X-Cap": "${CT}"}},
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+
+
+def test_missing_capture_is_inconclusive_probe(auth_server):
+    # Declared capture whose json_path does not exist: the act referencing
+    # it fails closed instead of sending "${TOKEN}" literally.
+    ex = Executor(target_url=auth_server, provisioned=True)
+    p = _probe(
+        setup=[
+            {
+                "type": "http",
+                "act": {"method": "POST", "path": "/login"},
+                "capture": {"TOKEN": {"from": "body", "json_path": "nope.missing"}},
+            }
+        ],
+        act={"method": "GET", "path": "/me", "headers": {"Authorization": "Bearer ${TOKEN}"}},
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.PROBE
+    assert any("never set" in d for d in r.details)
+
+
+def test_auth_token_fixture_wins_over_capture(auth_server):
+    # A setup step capturing AUTH_TOKEN cannot override the fixture's.
+    ex = Executor(target_url=auth_server, provisioned=True, auth_token="fixture-secret")
+    p = _probe(
+        setup=[
+            {
+                "type": "http",
+                "act": {"method": "POST", "path": "/login"},
+                "capture": {"AUTH_TOKEN": {"from": "body", "json_path": "token"}},
+            }
+        ],
+        act={
+            "method": "POST",
+            "path": "/login-echo",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        assert_=[
+            {"type": "status", "equals": 200},
+            {"type": "body", "json_path": {"path": "seen", "equals": "Bearer fixture-secret"}},
+        ],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+
+
+def test_refresh_on_401_success(auth_server):
+    # Expired fixture token -> 401 -> refresh -> retry with new token -> PASS.
+    ex = Executor(
+        target_url=auth_server,
+        provisioned=True,
+        auth_token="expired-token",
+        refresh_config={
+            "path": "/auth/refresh",
+            "method": "POST",
+            "token_json_path": "access_token",
+        },
+    )
+    p = _probe(
+        act={
+            "method": "GET",
+            "path": "/protected",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+    assert any("credential refresh succeeded" in d for d in r.details)
+
+
+def test_refresh_on_401_failure(auth_server):
+    # Refresh endpoint 500s: the probe is INCONCLUSIVE/auth, not a FAIL.
+    ex = Executor(
+        target_url=auth_server,
+        provisioned=True,
+        auth_token="expired-token",
+        refresh_config={
+            "path": "/auth/refresh-fail",
+            "method": "POST",
+            "token_json_path": "access_token",
+        },
+    )
+    p = _probe(
+        act={
+            "method": "GET",
+            "path": "/protected",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.AUTH
+    assert any("credential refresh failed" in d for d in r.details)
+
+
+def test_no_refresh_without_config(auth_server):
+    # Without a refresh config, a 401 on the act is just a 401: the
+    # assertions decide the verdict (here FAIL, since 200 was expected).
+    ex = Executor(target_url=auth_server, provisioned=True, auth_token="expired-token")
+    p = _probe(
+        act={
+            "method": "GET",
+            "path": "/protected",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.FAIL
+
+
+def test_capture_schema_rejected():
+    # The schema validates capture specs: bad 'from', bad name, unknown keys.
+    from proofdeploy.probe import ProbeRejected, validate_probe
+
+    bad_from = _probe(
+        setup=[
+            {
+                "type": "http",
+                "act": {"method": "GET", "path": "/ok"},
+                "capture": {"T": {"from": "cookie", "json_path": "t"}},
+            }
+        ],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    with pytest.raises(ProbeRejected):
+        validate_probe(bad_from)
+
+    bad_field = _probe(
+        setup=[
+            {
+                "type": "http",
+                "act": {"method": "GET", "path": "/ok"},
+                "capture": {"T": {"from": "body"}},
+            }
+        ],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    with pytest.raises(ProbeRejected):
+        validate_probe(bad_field)
+
+    ok = _probe(
+        setup=[
+            {
+                "type": "http",
+                "act": {"method": "GET", "path": "/ok"},
+                "capture": {"T": {"from": "body", "json_path": "a.b"}},
+            }
+        ],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    validate_probe(ok)  # no raise

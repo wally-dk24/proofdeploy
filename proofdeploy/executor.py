@@ -19,6 +19,18 @@ Fail-closed rules:
 - Only GET and HEAD are allowed against remote (non-localhost) targets;
   anything else is INCONCLUSIVE (reason ``probe``).
 - Redirects are never followed; a 3xx response is evaluated as-is.
+- ``${NAME}`` placeholders must name a known binding (contract ``env``
+  key, fixture key, ``AUTH_TOKEN``, or a capture declared by a setup
+  step). Unknown names are INCONCLUSIVE (reason ``probe``), never sent
+  literally. A declared capture that was never set is also
+  INCONCLUSIVE (reason ``probe``).
+- Setup steps capture named bindings from their responses; later steps,
+  the act, and the assertions reference them as ``${NAME}``.
+- ``${AUTH_TOKEN}`` precedence: a refreshed token beats the fixture's,
+  which beats any setup-step capture.
+- Credential refresh: on a 401, when a refresh config exists, the runner
+  calls the refresh endpoint, installs the new token, and retries once.
+  A failed refresh is INCONCLUSIVE (reason ``auth``).
 - The HTTP client never executes code inside the target process.
 
 Verdict precedence: FAIL beats INCONCLUSIVE beats PASS. A probe that both
@@ -38,6 +50,11 @@ from enum import Enum
 from typing import Any
 
 from proofdeploy.probe import ProbeRejected, validate_probe
+from proofdeploy.setup_auth import (
+    PlaceholderError,
+    SetupContext,
+    capture_bindings,
+)
 
 
 class Verdict(Enum):
@@ -303,6 +320,19 @@ class Executor:
     # when the target was provisioned by the provisioner. Localhost alone
     # is NOT sufficient.
     provisioned: bool = False
+    # Contract `env` keys: known `${NAME}` bindings for every probe run.
+    contract_env: dict[str, str] = field(default_factory=dict)
+    # Fixture mapping (from proofdeploy.yml): all keys are known bindings.
+    # The fixture's `auth_token` key (if present) becomes ${AUTH_TOKEN}.
+    fixture: dict[str, str] = field(default_factory=dict)
+    # Explicit auth token; wins over fixture["auth_token"] when both set.
+    auth_token: str | None = None
+    # Credential-refresh config for JWT-style auth (e.g. Ghost):
+    # {"path": "/auth/refresh", "method": "POST", "headers": {...},
+    #  "body": {...}, "token_json_path": "access_token"}
+    # On a 401, the runner calls the refresh endpoint, installs the new
+    # token as ${AUTH_TOKEN}, and retries the request once.
+    refresh_config: dict[str, Any] | None = None
 
     def _log_write(
         self, method: str, url: str, status: int | None, writes: list[str], details: list[str]
@@ -325,20 +355,115 @@ class Executor:
             f"{where}: write method {method} requires a provisioned target; failing closed"
         )
 
+    def _make_context(self, setup_steps: list[dict[str, Any]]) -> SetupContext:
+        """Build the SetupContext for one probe run.
+
+        Known `${NAME}` bindings: contract env keys, fixture keys,
+        AUTH_TOKEN (from the explicit token or the fixture), and every
+        capture name declared by the setup steps.
+        """
+        token = self.auth_token
+        if token is None and self.fixture.get("auth_token"):
+            token = self.fixture["auth_token"]
+        ctx = SetupContext(auth_token=token)
+        ctx.bindings.update(self.contract_env)
+        ctx.known_names.update(self.contract_env.keys())
+        for k, v in self.fixture.items():
+            if k != "auth_token":
+                ctx.bindings.setdefault(k, v)
+                ctx.known_names.add(k)
+        ctx.declare_from_setup(setup_steps)
+        return ctx
+
+    def _attempt_refresh(self, ctx: SetupContext, details: list[str]) -> bool:
+        """Try the credential-refresh flow (Ghost JWT behavior).
+
+        Calls the refresh endpoint, installs the new token as ${AUTH_TOKEN},
+        and returns True. Returns False on any failure; the caller then
+        reports INCONCLUSIVE (reason ``auth``). Only one attempt per probe
+        run (``ctx.refresh_attempted``).
+        """
+        cfg = self.refresh_config or {}
+        if ctx.refresh_attempted:
+            return False
+        ctx.refresh_attempted = True
+        path = cfg.get("path")
+        token_path = cfg.get("token_json_path")
+        if not isinstance(path, str) or not path.startswith("/"):
+            details.append(
+                "credential refresh failed: refresh_config needs 'path' starting with '/'"
+            )
+            return False
+        if not isinstance(token_path, str) or not token_path:
+            details.append("credential refresh failed: refresh_config needs 'token_json_path'")
+            return False
+        method = str(cfg.get("method", "POST")).upper()
+        try:
+            headers = ctx.apply_strict(cfg.get("headers") or {})
+            body = ctx.apply_strict(cfg.get("body"))
+        except PlaceholderError as e:
+            details.append(f"credential refresh failed: {e}")
+            return False
+        url = self.target_url.rstrip("/") + path
+        allowed, detail = _check_remote_method(method, url)
+        if not allowed:
+            details.append(f"credential refresh refused: {detail}")
+            return False
+        allowed, detail = self._check_write_allowed(method, "refresh")
+        if not allowed:
+            details.append(f"credential refresh refused: {detail}")
+            return False
+        details.append(f"credential refresh: {method} {path}")
+        status, _, resp_body, req_logs = _do_http(
+            method, url, headers if isinstance(headers, dict) else None, body, self.http_timeout
+        )
+        details.extend(req_logs)
+        if status is None or not (200 <= status < 300):
+            details.append(f"credential refresh failed: refresh endpoint returned {status}")
+            return False
+        try:
+            data = json.loads(resp_body)
+        except json.JSONDecodeError:
+            details.append("credential refresh failed: refresh response is not JSON")
+            return False
+        cur: Any = data
+        for part in str(token_path).split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                cur = None
+                break
+        if not isinstance(cur, str) or not cur:
+            details.append(
+                f"credential refresh failed: no token at '{token_path}' in refresh response"
+            )
+            return False
+        ctx.refresh_token(cur)
+        details.append("credential refresh succeeded; retrying with the new token")
+        return True
+
     def run_setup(
-        self, setup_steps: list[dict[str, Any]]
+        self, setup_steps: list[dict[str, Any]], ctx: SetupContext | None = None
     ) -> tuple[list[str], InconclusiveReason | None, str | None, list[str]]:
         """Run setup steps. Returns (logs, failure_reason, failure_detail, writes).
 
-        harness_app steps are handled by the provisioner, not here.
+        harness_app steps are INCONCLUSIVE (environment) until WO-5.
         A failed step is INCONCLUSIVE, not silently continued:
         - unknown step type -> reason PROBE
+        - unknown/missing ${NAME} placeholder -> reason PROBE (fail-closed)
         - unreachable target or 5xx from a setup HTTP call -> reason ENVIRONMENT
         - 401/403 from a setup HTTP call -> reason AUTH
         - other 4xx from a setup HTTP call -> reason PROBE
+
+        Each http step's act is placeholder-substituted before the call, and
+        its `capture` spec (if any) is extracted into `ctx` after a 2xx.
+        On a 401 with a refresh config, the credential-refresh flow runs and
+        the step is retried once.
         """
         logs: list[str] = []
         writes: list[str] = []
+        if ctx is None:
+            ctx = self._make_context(setup_steps)
         for i, step in enumerate(setup_steps):
             stype = step.get("type")
             if stype == "harness_app":
@@ -351,7 +476,16 @@ class Executor:
                     writes,
                 )
             if stype == "http":
-                act = step.get("act", {})
+                raw_act = step.get("act", {})
+                try:
+                    act = ctx.apply_strict(raw_act)
+                except PlaceholderError as e:
+                    return (
+                        logs,
+                        InconclusiveReason.PROBE,
+                        f"setup[{i}]: {e}",
+                        writes,
+                    )
                 method = act.get("method", "GET")
                 path = act.get("path", "/")
                 url = self.target_url.rstrip("/") + path
@@ -361,10 +495,31 @@ class Executor:
                 allowed, detail = self._check_write_allowed(method, f"setup[{i}]")
                 if not allowed:
                     return logs, InconclusiveReason.PROBE, detail, writes
-                status, _, _, req_logs = _do_http(
+                status, headers, body, req_logs = _do_http(
                     method, url, act.get("headers"), act.get("body"), self.http_timeout
                 )
                 logs.extend(req_logs)
+                # Credential refresh: on a 401 with a refresh config, refresh
+                # once and retry the step with the new token.
+                if (
+                    status == 401
+                    and self.refresh_config is not None
+                    and not ctx.refresh_attempted
+                    and self._attempt_refresh(ctx, logs)
+                ):
+                    try:
+                        act = ctx.apply_strict(raw_act)
+                    except PlaceholderError as e:
+                        return (
+                            logs,
+                            InconclusiveReason.PROBE,
+                            f"setup[{i}]: {e}",
+                            writes,
+                        )
+                    status, headers, body, req_logs = _do_http(
+                        method, url, act.get("headers"), act.get("body"), self.http_timeout
+                    )
+                    logs.extend(req_logs)
                 if method.upper() in WRITE_METHODS:
                     self._log_write(method, url, status, writes, logs)
                 else:
@@ -378,9 +533,10 @@ class Executor:
                     )
                 if not (200 <= status < 300):
                     # Precise INCONCLUSIVE typing for setup failures:
-                    # 401/403 -> AUTH (credential problem; admin may downgrade)
+                    # 401/403 -> AUTH (credential problem)
                     # other 4xx -> PROBE (the probe's request was wrong)
-                    # 5xx -> ENVIRONMENT (target-side failure)
+                    # 5xx -> ENVIRONMENT (target-side failure; the only
+                    #   reason class an admin may downgrade to "warn")
                     if status in (401, 403):
                         reason = InconclusiveReason.AUTH
                     elif 400 <= status < 500:
@@ -393,6 +549,11 @@ class Executor:
                         f"setup[{i}]: setup call returned {status}",
                         writes,
                     )
+                # 2xx: extract declared captures for later steps.
+                captured = capture_bindings(body, headers, step.get("capture") or {})
+                if captured:
+                    logs.append(f"setup[{i}]: captured {sorted(captured)}")
+                    ctx.add(captured)
                 continue
             # Fail closed: unknown setup types are INCONCLUSIVE, never skipped.
             return (
@@ -453,9 +614,14 @@ class Executor:
                 writes=writes,
             )
 
+        # 1c. Build the setup/auth context: contract env, fixture keys,
+        # AUTH_TOKEN, and declared capture names are known bindings.
+        ctx = self._make_context(probe.get("setup", []))
+
         # 2. Setup steps. A failed step is INCONCLUSIVE, not silently continued.
+        # Captures from setup steps land in ctx for the act below.
         setup_logs, setup_reason, setup_detail, setup_writes = self.run_setup(
-            probe.get("setup", [])
+            probe.get("setup", []), ctx
         )
         details.extend(setup_logs)
         writes.extend(setup_writes)
@@ -469,11 +635,61 @@ class Executor:
                 writes=writes,
             )
 
+        # 2b. Substitute ${NAME} placeholders in the act, failing closed on
+        # unknown names or declared-but-unset captures. This happens after
+        # setup so captures are available.
+        raw_act = probe.get("act", {})
+        try:
+            act = ctx.apply_strict(raw_act)
+        except PlaceholderError as e:
+            details.append(str(e))
+            return ProbeResult(
+                probe_index=index,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=InconclusiveReason.PROBE,
+                details=details,
+                writes=writes,
+            )
+        method = act.get("method", "GET")
+        path = act.get("path", "/")
+        url = self.target_url.rstrip("/") + path
+
         # 3. The act: one HTTP request (redirects are never followed).
         status, headers, body, req_logs = _do_http(
             method, url, act.get("headers"), act.get("body"), self.http_timeout
         )
         details.extend(req_logs)
+        # Credential refresh: on a 401 with a refresh config, refresh once
+        # and retry the act with the new token.
+        if status == 401 and self.refresh_config is not None and not ctx.refresh_attempted:
+            if self._attempt_refresh(ctx, details):
+                try:
+                    act = ctx.apply_strict(raw_act)
+                except PlaceholderError as e:
+                    details.append(str(e))
+                    return ProbeResult(
+                        probe_index=index,
+                        verdict=Verdict.INCONCLUSIVE,
+                        reason=InconclusiveReason.PROBE,
+                        details=details,
+                        writes=writes,
+                    )
+                method = act.get("method", "GET")
+                path = act.get("path", "/")
+                url = self.target_url.rstrip("/") + path
+                status, headers, body, req_logs = _do_http(
+                    method, url, act.get("headers"), act.get("body"), self.http_timeout
+                )
+                details.extend(req_logs)
+            else:
+                details.append("credential refresh failed")
+                return ProbeResult(
+                    probe_index=index,
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason=InconclusiveReason.AUTH,
+                    details=details,
+                    writes=writes,
+                )
         if method.upper() in WRITE_METHODS:
             self._log_write(method, url, status, writes, details)
         else:
@@ -489,8 +705,24 @@ class Executor:
                 writes=writes,
             )
 
+        # 3b. Substitute ${NAME} placeholders in the assertions, failing
+        # closed on unknown names or declared-but-unset captures.
+        try:
+            assertions = ctx.apply_strict(probe.get("assert", []))
+        except PlaceholderError as e:
+            details.append(str(e))
+            return ProbeResult(
+                probe_index=index,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=InconclusiveReason.PROBE,
+                details=details,
+                http_status=status,
+                http_headers=headers,
+                http_body=body,
+                writes=writes,
+            )
+
         # 4. DB queries: one independent result per db assertion.
-        assertions = probe.get("assert", [])
         db_results: dict[int, Any] = {}
         if any(a.get("type") == "db" for a in assertions):
             if self.db_path is None:
