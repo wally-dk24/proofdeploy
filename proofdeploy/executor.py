@@ -26,11 +26,14 @@ Fail-closed rules:
   INCONCLUSIVE (reason ``probe``).
 - Setup steps capture named bindings from their responses; later steps,
   the act, and the assertions reference them as ``${NAME}``.
-- ``${AUTH_TOKEN}`` precedence: a refreshed token beats the fixture's,
-  which beats any setup-step capture.
-- Credential refresh: on a 401, when a refresh config exists, the runner
-  calls the refresh endpoint, installs the new token, and retries once.
-  A failed refresh is INCONCLUSIVE (reason ``auth``).
+- ``${AUTH_TOKEN}`` precedence: a provider-issued token beats the
+  fixture's, which beats any setup-step capture.
+- Proactive credential provider: when a ``credential_config`` exists, the
+  runner mints or refreshes the token BEFORE requests are sent (or when a
+  provider-issued token nears expiry). It never looks at a response
+  status, and it never re-sends a request. A 401 from the target is the
+  probe's data for the assertions, never a refresh signal. A provider
+  failure is INCONCLUSIVE (reason ``auth``) before the request is sent.
 - The HTTP client never executes code inside the target process.
 
 Verdict precedence: FAIL beats INCONCLUSIVE beats PASS. A probe that both
@@ -51,9 +54,11 @@ from typing import Any
 
 from proofdeploy.probe import ProbeRejected, validate_probe
 from proofdeploy.setup_auth import (
+    CredentialProvider,
     PlaceholderError,
     SetupContext,
     capture_bindings,
+    mint_ghost_jwt,
 )
 
 
@@ -64,7 +69,11 @@ class Verdict(Enum):
 
 
 class InconclusiveReason(Enum):
-    """Typed reason for an INCONCLUSIVE verdict."""
+    """Typed reason for an INCONCLUSIVE verdict.
+
+    Policy: ENVIRONMENT is the only reason class an admin may downgrade
+    to "warn". AUTH and PROBE can never be downgraded.
+    """
 
     ENVIRONMENT = "environment"  # target/db/setup could not be evaluated
     AUTH = "auth"  # credential missing or expired (fixture/auth flow)
@@ -327,12 +336,18 @@ class Executor:
     fixture: dict[str, str] = field(default_factory=dict)
     # Explicit auth token; wins over fixture["auth_token"] when both set.
     auth_token: str | None = None
-    # Credential-refresh config for JWT-style auth (e.g. Ghost):
-    # {"path": "/auth/refresh", "method": "POST", "headers": {...},
-    #  "body": {...}, "token_json_path": "access_token"}
-    # On a 401, the runner calls the refresh endpoint, installs the new
-    # token as ${AUTH_TOKEN}, and retries the request once.
-    refresh_config: dict[str, Any] | None = None
+    # Proactive credential provider config (None = no provider; the fixture
+    # token, if any, is sent as-is and a 401 is the probe's data).
+    # {"mode": "ghost_jwt", "key": "${ADMIN_KEY}", "ttl_seconds": 300} mints
+    #   a short-lived Ghost Admin API JWT per request (Ghost has no refresh
+    #   endpoint).
+    # {"mode": "refresh", "path": "/auth/refresh", "method": "POST",
+    #  "headers": {...}, "body": {...}, "token_json_path": "access_token",
+    #  "expires_in_json_path": "expires_in"} calls the refresh endpoint,
+    #   but only when there is no token or a provider-issued token nears
+    #   expiry. The provider runs BEFORE requests are sent; it never reacts
+    #   to a response and never re-sends a request.
+    credential_config: dict[str, Any] | None = None
 
     def _log_write(
         self, method: str, url: str, status: int | None, writes: list[str], details: list[str]
@@ -375,57 +390,107 @@ class Executor:
         ctx.declare_from_setup(setup_steps)
         return ctx
 
-    def _attempt_refresh(self, ctx: SetupContext, details: list[str]) -> bool:
-        """Try the credential-refresh flow (Ghost JWT behavior).
+    def _ensure_credential(
+        self, ctx: SetupContext, details: list[str], writes: list[str]
+    ) -> InconclusiveReason | None:
+        """Proactively ensure a valid credential before a request is sent.
 
-        Calls the refresh endpoint, installs the new token as ${AUTH_TOKEN},
-        and returns True. Returns False on any failure; the caller then
-        reports INCONCLUSIVE (reason ``auth``). Only one attempt per probe
-        run (``ctx.refresh_attempted``).
+        Never inspects any response status; never re-sends a request. A
+        401 from the target is the probe's data for the assertions, not a
+        refresh signal.
+
+        Returns an InconclusiveReason when the provider fails (the caller
+        reports INCONCLUSIVE before the request is sent), else None.
         """
-        cfg = self.refresh_config or {}
-        if ctx.refresh_attempted:
-            return False
-        ctx.refresh_attempted = True
+        if self.credential_config is None:
+            return None
+        provider = CredentialProvider(self.credential_config)
+        if not provider.token_needed(ctx):
+            return None
+        if provider.mode == "ghost_jwt":
+            return self._provide_ghost_jwt(provider, ctx, details)
+        if provider.mode == "refresh":
+            return self._provide_refresh(provider, ctx, details, writes)
+        details.append(f"credential provider failed: unknown mode '{provider.mode}'")
+        return InconclusiveReason.AUTH
+
+    def _provide_ghost_jwt(
+        self, provider: CredentialProvider, ctx: SetupContext, details: list[str]
+    ) -> InconclusiveReason | None:
+        """Mint a short-lived Ghost Admin API JWT for this request."""
+        cfg = provider.config
+        try:
+            raw_key = ctx.apply_strict(cfg.get("key", "${ADMIN_KEY}"))
+        except PlaceholderError as e:
+            details.append(f"credential provider failed: {e}")
+            return InconclusiveReason.AUTH
+        if not isinstance(raw_key, str) or not raw_key:
+            details.append("credential provider failed: admin key did not resolve to a string")
+            return InconclusiveReason.AUTH
+        try:
+            ttl = int(cfg.get("ttl_seconds", 300))
+        except (TypeError, ValueError):
+            details.append("credential provider failed: ttl_seconds is not an integer")
+            return InconclusiveReason.AUTH
+        try:
+            token = mint_ghost_jwt(raw_key, ttl)
+        except ValueError as e:
+            details.append(f"credential provider failed: {e}")
+            return InconclusiveReason.AUTH
+        ctx.provide_token(token, expires_in_seconds=float(ttl))
+        details.append(f"credential provider: minted ghost_jwt (ttl {ttl}s)")
+        return None
+
+    def _provide_refresh(
+        self,
+        provider: CredentialProvider,
+        ctx: SetupContext,
+        details: list[str],
+        writes: list[str],
+    ) -> InconclusiveReason | None:
+        """Call the refresh endpoint proactively (no token or near expiry)."""
+        cfg = provider.config
         path = cfg.get("path")
         token_path = cfg.get("token_json_path")
         if not isinstance(path, str) or not path.startswith("/"):
             details.append(
-                "credential refresh failed: refresh_config needs 'path' starting with '/'"
+                "credential provider failed: credential_config needs 'path' starting with '/'"
             )
-            return False
+            return InconclusiveReason.AUTH
         if not isinstance(token_path, str) or not token_path:
-            details.append("credential refresh failed: refresh_config needs 'token_json_path'")
-            return False
+            details.append("credential provider failed: credential_config needs 'token_json_path'")
+            return InconclusiveReason.AUTH
         method = str(cfg.get("method", "POST")).upper()
         try:
             headers = ctx.apply_strict(cfg.get("headers") or {})
             body = ctx.apply_strict(cfg.get("body"))
         except PlaceholderError as e:
-            details.append(f"credential refresh failed: {e}")
-            return False
+            details.append(f"credential provider failed: {e}")
+            return InconclusiveReason.AUTH
         url = self.target_url.rstrip("/") + path
         allowed, detail = _check_remote_method(method, url)
         if not allowed:
-            details.append(f"credential refresh refused: {detail}")
-            return False
-        allowed, detail = self._check_write_allowed(method, "refresh")
+            details.append(f"credential provider refused: {detail}")
+            return InconclusiveReason.AUTH
+        allowed, detail = self._check_write_allowed(method, "credential provider")
         if not allowed:
-            details.append(f"credential refresh refused: {detail}")
-            return False
-        details.append(f"credential refresh: {method} {path}")
+            details.append(f"credential provider refused: {detail}")
+            return InconclusiveReason.AUTH
+        details.append(f"credential provider: {method} {path}")
         status, _, resp_body, req_logs = _do_http(
             method, url, headers if isinstance(headers, dict) else None, body, self.http_timeout
         )
         details.extend(req_logs)
+        if method.upper() in WRITE_METHODS:
+            self._log_write(method, url, status, writes, details)
         if status is None or not (200 <= status < 300):
-            details.append(f"credential refresh failed: refresh endpoint returned {status}")
-            return False
+            details.append(f"credential provider failed: refresh endpoint returned {status}")
+            return InconclusiveReason.AUTH
         try:
             data = json.loads(resp_body)
         except json.JSONDecodeError:
-            details.append("credential refresh failed: refresh response is not JSON")
-            return False
+            details.append("credential provider failed: refresh response is not JSON")
+            return InconclusiveReason.AUTH
         cur: Any = data
         for part in str(token_path).split("."):
             if isinstance(cur, dict) and part in cur:
@@ -435,12 +500,24 @@ class Executor:
                 break
         if not isinstance(cur, str) or not cur:
             details.append(
-                f"credential refresh failed: no token at '{token_path}' in refresh response"
+                f"credential provider failed: no token at '{token_path}' in refresh response"
             )
-            return False
-        ctx.refresh_token(cur)
-        details.append("credential refresh succeeded; retrying with the new token")
-        return True
+            return InconclusiveReason.AUTH
+        expires_in: float | None = None
+        expires_path = cfg.get("expires_in_json_path")
+        if isinstance(expires_path, str) and expires_path:
+            node: Any = data
+            for part in expires_path.split("."):
+                if isinstance(node, dict) and part in node:
+                    node = node[part]
+                else:
+                    node = None
+                    break
+            if isinstance(node, (int, float)) and node > 0:
+                expires_in = float(node)
+        ctx.provide_token(cur, expires_in_seconds=expires_in)
+        details.append("credential provider: token acquired")
+        return None
 
     def run_setup(
         self, setup_steps: list[dict[str, Any]], ctx: SetupContext | None = None
@@ -457,8 +534,9 @@ class Executor:
 
         Each http step's act is placeholder-substituted before the call, and
         its `capture` spec (if any) is extracted into `ctx` after a 2xx.
-        On a 401 with a refresh config, the credential-refresh flow runs and
-        the step is retried once.
+        When a credential provider is configured, it runs proactively
+        before each request; a 401 response is never a refresh signal and
+        no request is ever re-sent.
         """
         logs: list[str] = []
         writes: list[str] = []
@@ -495,31 +573,16 @@ class Executor:
                 allowed, detail = self._check_write_allowed(method, f"setup[{i}]")
                 if not allowed:
                     return logs, InconclusiveReason.PROBE, detail, writes
+                # Proactive credential provider: mint/refresh BEFORE the
+                # request. A 401 response below is the step's data, never a
+                # refresh signal; the request is never re-sent.
+                provider_reason = self._ensure_credential(ctx, logs, writes)
+                if provider_reason is not None:
+                    return logs, provider_reason, "credential provider failed", writes
                 status, headers, body, req_logs = _do_http(
                     method, url, act.get("headers"), act.get("body"), self.http_timeout
                 )
                 logs.extend(req_logs)
-                # Credential refresh: on a 401 with a refresh config, refresh
-                # once and retry the step with the new token.
-                if (
-                    status == 401
-                    and self.refresh_config is not None
-                    and not ctx.refresh_attempted
-                    and self._attempt_refresh(ctx, logs)
-                ):
-                    try:
-                        act = ctx.apply_strict(raw_act)
-                    except PlaceholderError as e:
-                        return (
-                            logs,
-                            InconclusiveReason.PROBE,
-                            f"setup[{i}]: {e}",
-                            writes,
-                        )
-                    status, headers, body, req_logs = _do_http(
-                        method, url, act.get("headers"), act.get("body"), self.http_timeout
-                    )
-                    logs.extend(req_logs)
                 if method.upper() in WRITE_METHODS:
                     self._log_write(method, url, status, writes, logs)
                 else:
@@ -535,8 +598,7 @@ class Executor:
                     # Precise INCONCLUSIVE typing for setup failures:
                     # 401/403 -> AUTH (credential problem)
                     # other 4xx -> PROBE (the probe's request was wrong)
-                    # 5xx -> ENVIRONMENT (target-side failure; the only
-                    #   reason class an admin may downgrade to "warn")
+                    # 5xx -> ENVIRONMENT (target-side failure)
                     if status in (401, 403):
                         reason = InconclusiveReason.AUTH
                     elif 400 <= status < 500:
@@ -635,9 +697,26 @@ class Executor:
                 writes=writes,
             )
 
-        # 2b. Substitute ${NAME} placeholders in the act, failing closed on
+        # 2b. Proactive credential provider: mint/refresh BEFORE the act is
+        # sent (and before its placeholders are substituted, so a fresh
+        # token lands in the request). The act's response is never a
+        # refresh signal and the act is never re-sent: a 401 is data for
+        # the assertions below.
+        provider_reason = self._ensure_credential(ctx, details, writes)
+        if provider_reason is not None:
+            details.append("credential provider failed")
+            return ProbeResult(
+                probe_index=index,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=provider_reason,
+                details=details,
+                writes=writes,
+            )
+
+        # 2c. Substitute ${NAME} placeholders in the act, failing closed on
         # unknown names or declared-but-unset captures. This happens after
-        # setup so captures are available.
+        # setup (so captures are available) and after the credential
+        # provider (so a fresh token is substituted in).
         raw_act = probe.get("act", {})
         try:
             act = ctx.apply_strict(raw_act)
@@ -655,41 +734,11 @@ class Executor:
         url = self.target_url.rstrip("/") + path
 
         # 3. The act: one HTTP request (redirects are never followed).
+        # It is sent exactly once, whatever the response status.
         status, headers, body, req_logs = _do_http(
             method, url, act.get("headers"), act.get("body"), self.http_timeout
         )
         details.extend(req_logs)
-        # Credential refresh: on a 401 with a refresh config, refresh once
-        # and retry the act with the new token.
-        if status == 401 and self.refresh_config is not None and not ctx.refresh_attempted:
-            if self._attempt_refresh(ctx, details):
-                try:
-                    act = ctx.apply_strict(raw_act)
-                except PlaceholderError as e:
-                    details.append(str(e))
-                    return ProbeResult(
-                        probe_index=index,
-                        verdict=Verdict.INCONCLUSIVE,
-                        reason=InconclusiveReason.PROBE,
-                        details=details,
-                        writes=writes,
-                    )
-                method = act.get("method", "GET")
-                path = act.get("path", "/")
-                url = self.target_url.rstrip("/") + path
-                status, headers, body, req_logs = _do_http(
-                    method, url, act.get("headers"), act.get("body"), self.http_timeout
-                )
-                details.extend(req_logs)
-            else:
-                details.append("credential refresh failed")
-                return ProbeResult(
-                    probe_index=index,
-                    verdict=Verdict.INCONCLUSIVE,
-                    reason=InconclusiveReason.AUTH,
-                    details=details,
-                    writes=writes,
-                )
         if method.upper() in WRITE_METHODS:
             self._log_write(method, url, status, writes, details)
         else:
@@ -705,7 +754,7 @@ class Executor:
                 writes=writes,
             )
 
-        # 3b. Substitute ${NAME} placeholders in the assertions, failing
+        # 4. Substitute ${NAME} placeholders in the assertions, failing
         # closed on unknown names or declared-but-unset captures.
         try:
             assertions = ctx.apply_strict(probe.get("assert", []))

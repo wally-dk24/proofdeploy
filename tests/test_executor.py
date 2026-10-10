@@ -475,7 +475,10 @@ def test_harness_app_setup_is_inconclusive_environment(server):
 
 
 class _AuthHandler(BaseHTTPRequestHandler):
-    """Live server for WO-3: capture, placeholders, and credential refresh."""
+    """Live server for WO-3: capture, placeholders, and credential provider."""
+
+    # Counts POSTs to /count-post across requests (for the sent-once test).
+    count_post_hits = 0
 
     def _json(self, code, obj, headers=None):
         self.send_response(code)
@@ -488,6 +491,9 @@ class _AuthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/me":
             # Echoes back the Authorization header it received.
+            self._json(200, {"auth": self.headers.get("Authorization")})
+        elif self.path == "/jwt-echo":
+            # Echoes the Authorization header for ghost_jwt verification.
             self._json(200, {"auth": self.headers.get("Authorization")})
         elif self.path == "/protected":
             if self.headers.get("Authorization") == "Bearer new-token":
@@ -514,6 +520,12 @@ class _AuthHandler(BaseHTTPRequestHandler):
         elif self.path == "/login-echo":
             # Returns the Authorization header it saw, for capture tests.
             self._json(200, {"seen": self.headers.get("Authorization")})
+        elif self.path == "/count-post":
+            # Counts hits, always 401: for the sent-exactly-once test.
+            _AuthHandler.count_post_hits += 1
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b"unauthorized")
         else:
             self.send_response(404)
             self.end_headers()
@@ -631,13 +643,74 @@ def test_auth_token_fixture_wins_over_capture(auth_server):
     assert r.verdict == Verdict.PASS, r.details
 
 
-def test_refresh_on_401_success(auth_server):
-    # Expired fixture token -> 401 -> refresh -> retry with new token -> PASS.
+# ---------------------------------------------------------------------------
+# Credential provider: proactive, never reactive. A 401 from the target is
+# the probe's data for the assertions; it is never a refresh signal and no
+# request is ever re-sent.
+# ---------------------------------------------------------------------------
+
+
+def test_401_with_no_auth_is_pass(auth_server):
+    # No credential config at all: a 401 is just a 401, and the assertion
+    # on it decides the verdict.
+    ex = Executor(target_url=auth_server, provisioned=True)
+    p = _probe(
+        act={"method": "GET", "path": "/protected"},
+        assert_=[{"type": "status", "equals": 401}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+
+
+def test_401_with_expired_fixture_token_is_pass(auth_server):
+    # An expired fixture token is sent as-is (the provider never refreshes
+    # a fixture token proactively): the 401 is the probe's data.
+    ex = Executor(target_url=auth_server, provisioned=True, auth_token="expired-token")
+    p = _probe(
+        act={
+            "method": "GET",
+            "path": "/protected",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        assert_=[{"type": "status", "equals": 401}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+
+
+def test_post_401_sent_exactly_once(auth_server):
+    # The blocker case: a POST that gets a 401 must be sent exactly once,
+    # never retried — even with a credential provider configured.
+    _AuthHandler.count_post_hits = 0
     ex = Executor(
         target_url=auth_server,
         provisioned=True,
-        auth_token="expired-token",
-        refresh_config={
+        credential_config={
+            "mode": "refresh",
+            "path": "/auth/refresh",
+            "method": "POST",
+            "token_json_path": "access_token",
+        },
+    )
+    p = _probe(
+        act={"method": "POST", "path": "/count-post"},
+        assert_=[{"type": "status", "equals": 401}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+    assert _AuthHandler.count_post_hits == 1, "POST was re-sent"
+    # The single write is logged exactly once.
+    assert sum(1 for w in r.writes if "/count-post" in w) == 1
+
+
+def test_proactive_refresh_before_act(auth_server):
+    # No fixture token + refresh config: the provider calls the refresh
+    # endpoint BEFORE the act, and the act uses the fresh token.
+    ex = Executor(
+        target_url=auth_server,
+        provisioned=True,
+        credential_config={
+            "mode": "refresh",
             "path": "/auth/refresh",
             "method": "POST",
             "token_json_path": "access_token",
@@ -653,37 +726,90 @@ def test_refresh_on_401_success(auth_server):
     )
     r = ex.run_probe(p)
     assert r.verdict == Verdict.PASS, r.details
-    assert any("credential refresh succeeded" in d for d in r.details)
+    assert any("credential provider" in d for d in r.details)
 
 
-def test_refresh_on_401_failure(auth_server):
-    # Refresh endpoint 500s: the probe is INCONCLUSIVE/auth, not a FAIL.
+def test_proactive_refresh_failure_is_inconclusive_before_act(auth_server):
+    # The refresh endpoint 500s: INCONCLUSIVE/auth, and the act is never
+    # sent (no request after the provider fails).
+    _AuthHandler.count_post_hits = 0
     ex = Executor(
         target_url=auth_server,
         provisioned=True,
-        auth_token="expired-token",
-        refresh_config={
+        credential_config={
+            "mode": "refresh",
             "path": "/auth/refresh-fail",
             "method": "POST",
             "token_json_path": "access_token",
         },
     )
     p = _probe(
-        act={
-            "method": "GET",
-            "path": "/protected",
-            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
-        },
+        act={"method": "POST", "path": "/count-post"},
         assert_=[{"type": "status", "equals": 200}],
     )
     r = ex.run_probe(p)
     assert r.verdict == Verdict.INCONCLUSIVE
     assert r.reason == InconclusiveReason.AUTH
-    assert any("credential refresh failed" in d for d in r.details)
+    assert _AuthHandler.count_post_hits == 0, "act was sent despite provider failure"
 
 
-def test_no_refresh_without_config(auth_server):
-    # Without a refresh config, a 401 on the act is just a 401: the
+def test_ghost_jwt_minted_per_request(auth_server):
+    # ghost_jwt mode mints a fresh JWT from the fixture admin key; the act
+    # carries it and the server echoes it back for verification.
+    import base64
+    import hashlib
+    import hmac
+    import json as jsonlib
+
+    key_id = "abc123"
+    secret_hex = "ef" * 32
+    ex = Executor(
+        target_url=auth_server,
+        provisioned=True,
+        fixture={"ADMIN_KEY": f"{key_id}:{secret_hex}"},
+        credential_config={"mode": "ghost_jwt", "key": "${ADMIN_KEY}", "ttl_seconds": 300},
+    )
+    p = _probe(
+        act={
+            "method": "GET",
+            "path": "/jwt-echo",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+    assert any("minted ghost_jwt" in d for d in r.details)
+    # The server echoed the JWT; verify its signature independently.
+    import re as _re
+
+    m = _re.search(
+        r'"auth": "Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"', r.http_body
+    )
+    assert m, "no JWT in echoed auth header"
+    header_b64, payload_b64, sig_b64 = m.group(1).split(".")
+
+    def _dec(s):
+        return jsonlib.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
+
+    assert _dec(header_b64)["kid"] == key_id
+    assert _dec(header_b64)["alg"] == "HS256"
+    expected = (
+        base64.urlsafe_b64encode(
+            hmac.new(
+                bytes.fromhex(secret_hex),
+                f"{header_b64}.{payload_b64}".encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        )
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    assert sig_b64 == expected, "JWT signature does not verify"
+
+
+def test_no_provider_401_is_just_401(auth_server):
+    # Without a credential config, a 401 on the act is just a 401: the
     # assertions decide the verdict (here FAIL, since 200 was expected).
     ex = Executor(target_url=auth_server, provisioned=True, auth_token="expired-token")
     p = _probe(
