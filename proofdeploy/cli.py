@@ -92,6 +92,15 @@ def build_parser() -> argparse.ArgumentParser:
             "(repeatable; mirrors the record's public_contract_env_keys)."
         ),
     )
+    m.add_argument(
+        "--sandbox",
+        action="store_true",
+        help=(
+            "Run the app in a de-privileged sandbox container (non-root, "
+            "checkout-only mount, no external network, no secrets in env). "
+            "Required for unattended runs."
+        ),
+    )
     m.add_argument("--note", default="", help="Free-text note stored in the run log.")
     return p
 
@@ -139,6 +148,7 @@ def cmd_measure(args: argparse.Namespace) -> int:
         rev_clean=args.clean,
         allow_harness_app=args.allow_harness_app,
         public_contract_env_keys=list(args.public_env_key),
+        sandbox=args.sandbox,
         note=args.note,
     )
     orch = Orchestrator(cfg)

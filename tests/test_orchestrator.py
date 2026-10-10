@@ -283,3 +283,83 @@ def test_measure_needs_revs():
     )
     with pytest.raises(OrchestratorError):
         Orchestrator(cfg).measure_bug()
+
+
+def test_measure_bug_refuses_seeded_fix_diff(tmp_path, monkeypatch):
+    """Required test (WO-5 brief): seed the fix diff into the bundle; the run is refused."""
+    from proofdeploy.leakcheck import AnswerKeyLeakError
+
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+    )
+    orch = Orchestrator(cfg)
+    orig_build = orch._build_bundle
+
+    def tampered_build(unit_dir: Path, **kwargs):
+        bundle, manifest, prompt, diff_text, base_sha, tip_sha = orig_build(
+            unit_dir, **kwargs
+        )
+        # Deliberately seed the fix diff into the bundle's diff.patch.
+        fix_diff = subprocess.run(
+            ["git", "-C", info["repo"], "diff", f"{info['bug']}..{info['fix']}", "--"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        (bundle.root / "diff.patch").write_text(fix_diff, encoding="utf-8")
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha
+
+    monkeypatch.setattr(orch, "_build_bundle", tampered_build)
+    with pytest.raises(AnswerKeyLeakError, match="fix diff"):
+        orch.measure_bug()
+    # The run is refused before any model call: no records committed.
+    assert not (out / RUNS_LOG_NAME).exists()
+
+
+def test_measure_bug_refuses_fix_sha_in_snapshot(tmp_path, monkeypatch):
+    """The fix SHA smuggled into the snapshot also refuses the run."""
+    from proofdeploy.leakcheck import AnswerKeyLeakError
+
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+    )
+    orch = Orchestrator(cfg)
+    orig_build = orch._build_bundle
+
+    def tampered_build(unit_dir: Path, **kwargs):
+        bundle, manifest, prompt, diff_text, base_sha, tip_sha = orig_build(
+            unit_dir, **kwargs
+        )
+        snap_file = bundle.root / "snapshot" / "app.py"
+        snap_file.write_text(
+            snap_file.read_text(encoding="utf-8") + f"\n# fix {info['fix']}\n",
+            encoding="utf-8",
+        )
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha
+
+    monkeypatch.setattr(orch, "_build_bundle", tampered_build)
+    with pytest.raises(AnswerKeyLeakError, match="fix SHA"):
+        orch.measure_bug()
+    assert not (out / RUNS_LOG_NAME).exists()

@@ -1,7 +1,7 @@
 # ADR 0009: Measured-Unit Orchestrator
 
 **Date:** 2026-10-10
-**Status:** Accepted
+**Status:** Accepted (scope-corrected 2026-10-10 per the orchestrator's addendum)
 
 ## Context
 
@@ -9,20 +9,36 @@ WO-1 (provisioner), WO-2 (executor), WO-3 (setup/auth), and WO-4
 (run-pair runner, scoring, judgment gate) are merged. WO-5 must wire
 them into one command that runs a measured unit end to end: build the
 blind author's bundle, call the registered model, validate the probes,
-provision both sides, execute, record, and score.
+provision fix^ and fix (bugs) or C (clean diffs), execute, record, and
+score.
 
-Three design questions needed answers:
+The WO-5 brief (agreed text at `~/workspace/your_files/wally-brief-2026-10-10.md`,
+plus the orchestrator's addendum) requires:
+
+> **A leak check runs before every model call.** It fails the run if the bundle contains anything outside the allowlist: the fix SHA, any later commit's content, fix tests, eval files or a `.git` directory. The bundle manifest hash goes in the record.
+
+> **Unattended runs:** rootless container mounting only the checkout, network cut after install, no secrets in the container environment. This must be in place before any unattended run.
+
+> Put a `schema_version` on every record and every per-probe result, and document it next to the record format. (Addendum item 8.)
+
+Out of WO-5: the blind real-app run and the Ghost go/no-go (WO-6); no CLI result contract, no exit codes.
+
+Four design questions needed answers:
 
 1. **How does the blind author see the snapshot?** The bundle is a
    directory on disk, but the registered model is a chat API. In the
    skill shape (ADR-0004) an agent reads the bundle files itself; the
    model client must serialize the bundle into the prompt.
-2. **How is the author kept blind?** The task requires a fail-closed
-   leak check: no fixture keys, session tokens, minted tokens, or
-   contract secrets in the bundle or prompt.
+2. **How is the author kept blind?** The brief requires a fail-closed
+   ANSWER-KEY check (not just a secrets check): the bundle must hold
+   only the allowlist. A separate "zero secret values" check runs as
+   an extra.
 3. **How is `harness_app` provisioned?** WO-3/WO-4 left it as
    INCONCLUSIVE (environment) "not yet available (WO-5)". Dev-set
    library repos need the author's harness app actually running.
+4. **How are unattended runs sandboxed?** The app must run
+   de-privileged, with only the checkout mounted and no external
+   network after install.
 
 ## Decision
 
@@ -70,15 +86,25 @@ not attempted here.
 
 ### Leak check (`proofdeploy/leakcheck.py`)
 
-`collect_forbidden_values` gathers every fixture value whose key is
-not public (the five template fields are public by design), every
-contract env value whose key is not declared public, plus
-caller-supplied extra secrets. `assert_no_secrets` scans the prompt
-and every bundle file (including every snapshot file) and raises
-`SecretLeakError` on any occurrence, before any model call. Values
-shorter than 8 characters are ignored to avoid false positives on
-ordinary words; the record's fail-closed redaction still covers every
-value regardless of length when the record is stored.
+Two checks run fail-closed BEFORE every model call:
+
+1. **Answer-key check (required).** `check_bundle_answer_key` verifies
+   the bundle holds only the allowlist. It raises `AnswerKeyLeakError`
+   (refusing the run) if the bundle contains the fix SHA, the B->fix
+   diff (later commit's content), a `.git` directory, or smuggled
+   eval files; it also verifies the manifest's `source_sha` is B and
+   its `diff_range` is B^..B. It returns the bundle manifest hash,
+   which goes in the evidence record (`bundle_manifest_sha256`).
+2. **Secret check (extra).** `collect_forbidden_values` gathers every
+   fixture value whose key is not public (the five template fields are
+   public by design), every contract env value whose key is not
+   declared public, plus caller-supplied extra secrets.
+   `assert_no_secrets` scans the prompt and every bundle file
+   (including every snapshot file) and raises `SecretLeakError` on any
+   occurrence. Values shorter than 8 characters are ignored to avoid
+   false positives on ordinary words; the record's fail-closed
+   redaction still covers every value regardless of length when the
+   record is stored.
 
 ### Harness app (executor)
 
@@ -105,17 +131,43 @@ secret collection and never enter the bundle or prompt (authoring
 happens before provisioning, so they do not exist yet at author
 time).
 
+### Sandbox (`proofdeploy/sandbox.py`)
+
+For unattended runs (`--sandbox`), the app is provisioned in a
+de-privileged container:
+
+- the workload runs as UID 65534 (nobody), with `CAP_DROP=ALL` and
+  `no-new-privileges`; it never runs as root;
+- only the checkout (the snapshot directory) is mounted, at
+  `/checkout`; nothing else from the host enters;
+- install runs WITH network (proxy + platform CA for pip/npm); the
+  app runs WITHOUT any proxy variables, and direct egress is blocked
+  in this environment, so the running app has no external network
+  while the host executor still reaches it on 127.0.0.1;
+- no secrets enter the container environment: only declared-public
+  contract config is passed; auth tokens travel over HTTP.
+
+### Schema version
+
+Every record (evidence, score, judgment) and every per-probe result
+carries `schema_version` (`"1.0.0"`, defined in `proofdeploy/probe.py`
+as `SCHEMA_VERSION`). It is documented next to the record format in
+`proofdeploy/runpair.py`. Bump it when the record format changes.
+
 ## Consequences
 
 - `proofdeploy measure --repo ... --bug-id ... --base ... --bug ... --fix ...`
-  (or `--clean-id`/`--clean`) is the one command for a measured unit.
+  (or `--clean-id`/`--clean`) is the one command for a measured unit;
+  `--sandbox` enables the de-privileged container backend.
 - `harness_app` is real: dev-set library repos can now run end to end.
 - The prompt composition is a measurement choice and is recorded in
   the evidence record (`prompt`, `prompt_sha256`); changing it changes
   the measurement.
-- The 8-character minimum in the leak check is a heuristic; short
+- The 8-character minimum in the secret check is a heuristic; short
   secrets are still redacted at record time, just not
   pre-authoring-checked.
+- The answer-key check is the primary blindness guard; the secret
+  check is defense in depth.
 
 ## Alternatives considered
 

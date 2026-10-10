@@ -34,6 +34,9 @@ The only scoring version is ``v2-per-probe`` (the registered rule).
 Unknown versions raise.
 
 Records:
+- Every record (evidence, score, judgment) and every per-probe result
+  carries ``schema_version`` (currently ``"1.0.0"``). Bump it when the
+  record format changes; readers must refuse unknown versions.
 - Every run writes an evidence record BEFORE any scoring. The evidence
   record holds the prompt, the raw model response, the parsed probes
   (verbatim) and their hash, the bundle manifest (skill hash or no-skill
@@ -73,7 +76,7 @@ from pathlib import Path
 from typing import Any
 
 from proofdeploy.executor import InconclusiveReason, ProbeResult, Verdict
-from proofdeploy.probe import HARNESS_VERSION
+from proofdeploy.probe import HARNESS_VERSION, SCHEMA_VERSION
 
 # The only scoring version: the registered per-probe rule (2026-10-09,
 # PR #38). There is no legacy version; unregistered rules must not be
@@ -395,7 +398,11 @@ def build_evidence_record(
     raw_model_response: str | None = None,
     parsed_probes: list[dict[str, Any]] | None = None,
     bundle_manifest: dict[str, Any] | None = None,
+    bundle_manifest_sha256: str | None = None,
     skill_sha256: str | None = None,
+    model_id: str | None = None,
+    model_temperature: float | None = None,
+    model_attempts: int | None = None,
     harness_version: str = HARNESS_VERSION,
     scoring_version: str = DEFAULT_SCORING_VERSION,
     fix_parent_provision: dict[str, Any] | None = None,
@@ -456,6 +463,7 @@ def build_evidence_record(
         "record_id": uuid.uuid4().hex,
         "timestamp": _utc_now(),
         "record_type": "evidence",
+        "schema_version": SCHEMA_VERSION,
         "run_kind": run_kind,
         "bug_id": bug_id,
         "clean_id": clean_id,
@@ -470,7 +478,11 @@ def build_evidence_record(
         "parsed_probes": parsed,
         "parsed_probes_sha256": _sha256_canonical(parsed),
         "bundle_manifest": bundle_manifest or {},
+        "bundle_manifest_sha256": bundle_manifest_sha256,
         "skill_sha256": skill_sha256,
+        "model_id": model_id,
+        "model_temperature": model_temperature,
+        "model_attempts": model_attempts,
         "harness_version": harness_version,
         "scoring_version": scoring_version,
         "fix_parent_provision": fix_parent_provision or {},
@@ -646,6 +658,7 @@ def build_score_record(
         "record_id": uuid.uuid4().hex,
         "timestamp": _utc_now(),
         "record_type": "score",
+        "schema_version": SCHEMA_VERSION,
         "run_kind": run_kind,
         "bug_id": bug_id,
         "clean_id": clean_id,
@@ -813,6 +826,7 @@ def build_judgment_record(
         "record_id": uuid.uuid4().hex,
         "timestamp": _utc_now(),
         "record_type": "judgment",
+        "schema_version": SCHEMA_VERSION,
         "run_kind": run_kind,
         "bug_id": bug_id,
         "clean_id": clean_id,

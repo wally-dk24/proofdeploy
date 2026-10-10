@@ -51,9 +51,12 @@ from proofdeploy.fixture import (
 )
 from proofdeploy.leakcheck import (
     assert_no_secrets,
+    check_bundle_answer_key,
     collect_forbidden_values,
 )
 from proofdeploy.model_client import (
+    MODEL_ID,
+    TEMPERATURE,
     ModelResponse,
     ModelRunner,
     build_author_prompt,
@@ -63,6 +66,7 @@ from proofdeploy.probe import ProbeRejected, ProbeSet
 from proofdeploy.runner import (
     Provisioner,
     ProvisionResult,
+    ProvisionStatus,
     find_lockfile,
 )
 from proofdeploy.runpair import (
@@ -74,6 +78,8 @@ from proofdeploy.runpair import (
     write_evidence_record,
     write_score_record,
 )
+from proofdeploy.sandbox import IMAGES as SANDBOX_IMAGES
+from proofdeploy.sandbox import Sandbox, SandboxApp, SandboxConfig, check_podman
 from proofdeploy.yml import RepoContract, load_contract
 
 # Fixture keys rendered into the author-facing description by design.
@@ -127,6 +133,8 @@ class MeasureConfig:
     # Contract env keys whose values are benign config, not secrets
     # (mirrors the record's public_contract_env_keys).
     public_contract_env_keys: list[str] = field(default_factory=list)
+    # Sandbox unattended runs in a de-privileged container (WO-5 brief).
+    sandbox: bool = False
     note: str = ""
 
     @property
@@ -162,12 +170,21 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _build_bundle(
-        self, unit_dir: Path, *, unit_id: str, rev_base: str, rev_tip: str, run_kind: str
-    ) -> tuple[dict[str, Any], str, str]:
-        """Assemble the author bundle; return (manifest, prompt, raw_diff).
+        self,
+        unit_dir: Path,
+        *,
+        unit_id: str,
+        rev_base: str,
+        rev_tip: str,
+        run_kind: str,
+    ) -> tuple[Any, dict[str, Any], str, str, str, str]:
+        """Assemble the author bundle.
 
+        Returns (bundle, manifest, prompt, raw_diff, base_sha, tip_sha).
         Fail-closed: empty diff, bad template hash, or a secret in the
-        prompt/bundle aborts before any model call.
+        prompt/bundle aborts before any model call. The answer-key check
+        is a separate step (``_check_answer_key``) so tests can seed a
+        tampered bundle and show the run refused.
         """
         cfg = self.cfg
         repo = cfg.repo_dir
@@ -210,7 +227,31 @@ class Orchestrator:
         )
         self._say(f"bundle assembled at {bundle.root}")
         self._leak_check_bundle(bundle, prompt, contract)
-        return manifest, prompt, diff_text
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha
+
+    def _check_answer_key(
+        self, bundle: Any, base_sha: str, tip_sha: str, fix_rev: str | None
+    ) -> str:
+        """Answer-key check (WO-5 brief): fail the run if the bundle holds
+        the fix SHA, later commits' content, fix tests, eval files, or
+        a .git directory. Runs before any model call. Returns the bundle
+        manifest hash for the record."""
+        repo = self.cfg.repo_dir
+        fix_sha = (
+            _git(repo, "rev-parse", "--verify", f"{fix_rev}^{{commit}}")
+            if fix_rev
+            else None
+        )
+        manifest_sha = check_bundle_answer_key(
+            bundle.root,
+            bundle.manifest,
+            bug_sha=tip_sha,
+            bug_parent_sha=base_sha,
+            fix_sha=fix_sha,
+            repo_dir=repo,
+        )
+        self._say(f"answer-key check passed; bundle manifest {manifest_sha[:12]}")
+        return manifest_sha
 
     def _leak_check_bundle(
         self, bundle: Any, prompt: str, contract: RepoContract
@@ -293,6 +334,120 @@ class Orchestrator:
             provision=provision,
         )
 
+    def _provision_side_sandbox(
+        self, rev: str, port: int, unit_dir: Path, tag: str
+    ) -> _Side:
+        """Provision one side in the sandbox; never raises on build/start failure.
+
+        The app is installed with network, then run in a de-privileged
+        container with no external network, only the checkout mounted,
+        and no secrets in the container environment (WO-5 brief).
+        """
+        import os
+
+        cfg = self.cfg
+        repo = cfg.repo_dir
+        sha = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
+        snap_dir = unit_dir / f"snapshot-{tag}"
+        snapshot = create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=snap_dir)
+        contract = load_contract(snapshot.dir / "proofdeploy.yml")
+        logs: list[str] = [f"sandbox provision {tag} ({sha[:12]})"]
+
+        ok, msg = check_podman()
+        if not ok:
+            logs.append(f"sandbox unavailable: {msg}")
+            provision = ProvisionResult(
+                status=ProvisionStatus.BUILD_FAILED,
+                reason=f"sandbox unavailable: {msg}",
+                logs=logs,
+            )
+            return _Side(
+                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+                contract=contract, provision=provision,
+            )
+
+        runtime_name = _detect_runtime(snapshot.dir)
+        image = SANDBOX_IMAGES.get(runtime_name, SANDBOX_IMAGES["python"])
+        logs.append(f"sandbox image: {image} (runtime {runtime_name})")
+        sb = Sandbox(SandboxConfig(image=image))
+        # Secret-free contract env only; never the full env.
+        secret_free_env = {
+            k: v for k, v in contract.env.items()
+            if k in cfg.public_contract_env_keys
+        }
+
+        proxy_env = {k: v for k, v in os.environ.items() if "proxy" in k.lower()}
+        install_cmds = []
+        if contract.build:
+            install_cmds.append(contract.build)
+        # Python: install the lockfile into the checkout.
+        lockfile = snapshot.dir / "requirements.txt"
+        if lockfile.is_file():
+            install_cmds.insert(0, "pip install --quiet -r requirements.txt")
+        if contract.migrate:
+            install_cmds.append(contract.migrate)
+        if not sb.install(
+            snapshot.dir, install_cmds, secret_free_env, proxy_env, timeout=600
+        ):
+            logs.extend(sb.log)
+            provision = ProvisionResult(
+                status=ProvisionStatus.BUILD_FAILED,
+                reason="sandbox install failed",
+                logs=logs,
+            )
+            return _Side(
+                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+                contract=contract, provision=provision,
+            )
+        logs.extend(sb.log)
+
+        try:
+            app = sb.start(
+                snapshot.dir,
+                contract.start,
+                secret_free_env,
+                port,
+                name=f"pd-{tag}-{sha[:8]}",
+            )
+        except Exception as e:
+            logs.append(f"sandbox start failed: {e}")
+            provision = ProvisionResult(
+                status=ProvisionStatus.START_FAILED,
+                reason=str(e)[:200],
+                logs=logs,
+            )
+            return _Side(
+                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+                contract=contract, provision=provision,
+            )
+        if not app.wait_ready(contract.readiness or "/health", timeout=120):
+            logs.append("sandbox app not ready")
+            app.stop()
+            provision = ProvisionResult(
+                status=ProvisionStatus.START_FAILED,
+                reason="readiness timeout",
+                logs=logs,
+            )
+            return _Side(
+                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+                contract=contract, provision=provision,
+            )
+        logs.append(f"sandbox app READY at {app.target_url}")
+        provision = ProvisionResult(
+            status=ProvisionStatus.READY,
+            target_url=app.target_url,
+            logs=logs,
+            runtime=runtime_name,
+            run_id=f"sandbox-{tag}-{sha[:8]}",
+        )
+        # Stash the SandboxApp for cleanup; the finally block stops it.
+        provision.proc = app
+        self._say(f"provision {tag} ({sha[:12]}): READY -> {app.target_url} (sandbox)")
+        return _Side(
+            rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+            contract=contract, provision=provision,
+        )
+
     def _register_runner_user(self, side: _Side) -> str:
         """Create the runner's disposable credential on a READY target.
 
@@ -370,12 +525,15 @@ class Orchestrator:
         unit_dir.mkdir(parents=True, exist_ok=True)
         repo = self._init_records_repo()
 
-        manifest, prompt, _ = self._build_bundle(
+        bundle, manifest, prompt, _, base_sha, tip_sha = self._build_bundle(
             unit_dir,
             unit_id=cfg.bug_id,
             rev_base=cfg.rev_bug_base,
             rev_tip=cfg.rev_bug,
             run_kind="bug",
+        )
+        manifest_sha = self._check_answer_key(
+            bundle, base_sha, tip_sha, fix_rev=cfg.rev_fix
         )
         probeset, raw = self._author_probes(prompt)
 
@@ -384,12 +542,20 @@ class Orchestrator:
         runner = Provisioner(workdir=prov_workdir)
         sides: list[_Side] = []
         try:
-            sides.append(
-                self._provision_side(runner, cfg.rev_bug, _free_port(), unit_dir, "fix-parent")
-            )
-            sides.append(
-                self._provision_side(runner, cfg.rev_fix, _free_port(), unit_dir, "fix")
-            )
+            if cfg.sandbox:
+                sides.append(
+                    self._provision_side_sandbox(cfg.rev_bug, _free_port(), unit_dir, "fix-parent")
+                )
+                sides.append(
+                    self._provision_side_sandbox(cfg.rev_fix, _free_port(), unit_dir, "fix")
+                )
+            else:
+                sides.append(
+                    self._provision_side(runner, cfg.rev_bug, _free_port(), unit_dir, "fix-parent")
+                )
+                sides.append(
+                    self._provision_side(runner, cfg.rev_fix, _free_port(), unit_dir, "fix")
+                )
             parent, fix = sides
             parent_results = fix_results = None
             if parent.provision.ready and fix.provision.ready:
@@ -421,6 +587,10 @@ class Orchestrator:
                 raw_model_response=raw.content,
                 parsed_probes=probeset.probes,
                 bundle_manifest=manifest,
+                bundle_manifest_sha256=manifest_sha,
+                model_id=MODEL_ID,
+                model_temperature=TEMPERATURE,
+                model_attempts=1,
                 skill_sha256=manifest.get("skill_sha256"),
                 fix_parent_provision=parent.provision.to_dict(),
                 fix_provision=fix.provision.to_dict(),
@@ -474,8 +644,13 @@ class Orchestrator:
         finally:
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
-                    runner.cleanup_run(side.provision.run_id, self.log)
-                    self._say(f"cleanup_run: {side.provision.run_id}")
+                    proc = side.provision.proc
+                    if isinstance(proc, SandboxApp):
+                        proc.stop()
+                        self._say(f"sandbox stop: {side.provision.run_id}")
+                    else:
+                        runner.cleanup_run(side.provision.run_id, self.log)
+                        self._say(f"cleanup_run: {side.provision.run_id}")
 
     def measure_clean(self) -> dict[str, Any]:
         """Run a clean-diff measured unit against C only."""
@@ -487,12 +662,15 @@ class Orchestrator:
         repo = self._init_records_repo()
 
         # The clean author bundle: C^->C diff + C snapshot.
-        manifest, prompt, _ = self._build_bundle(
+        bundle, manifest, prompt, _, base_sha, tip_sha = self._build_bundle(
             unit_dir,
             unit_id=cfg.clean_id,
             rev_base=f"{cfg.rev_clean}^",
             rev_tip=cfg.rev_clean,
             run_kind="clean",
+        )
+        manifest_sha = self._check_answer_key(
+            bundle, base_sha, tip_sha, fix_rev=None
         )
         probeset, raw = self._author_probes(prompt)
 
@@ -501,9 +679,14 @@ class Orchestrator:
         runner = Provisioner(workdir=prov_workdir)
         sides: list[_Side] = []
         try:
-            sides.append(
-                self._provision_side(runner, cfg.rev_clean, _free_port(), unit_dir, "clean")
-            )
+            if cfg.sandbox:
+                sides.append(
+                    self._provision_side_sandbox(cfg.rev_clean, _free_port(), unit_dir, "clean")
+                )
+            else:
+                sides.append(
+                    self._provision_side(runner, cfg.rev_clean, _free_port(), unit_dir, "clean")
+                )
             (side,) = sides
             c_results = None
             if side.provision.ready:
@@ -529,6 +712,10 @@ class Orchestrator:
                 raw_model_response=raw.content,
                 parsed_probes=probeset.probes,
                 bundle_manifest=manifest,
+                bundle_manifest_sha256=manifest_sha,
+                model_id=MODEL_ID,
+                model_temperature=TEMPERATURE,
+                model_attempts=1,
                 skill_sha256=manifest.get("skill_sha256"),
                 runner_log=list(self.log),
                 fixture=dict(side.contract.fixture),
@@ -565,8 +752,13 @@ class Orchestrator:
         finally:
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
-                    runner.cleanup_run(side.provision.run_id, self.log)
-                    self._say(f"cleanup_run: {side.provision.run_id}")
+                    proc = side.provision.proc
+                    if isinstance(proc, SandboxApp):
+                        proc.stop()
+                        self._say(f"sandbox stop: {side.provision.run_id}")
+                    else:
+                        runner.cleanup_run(side.provision.run_id, self.log)
+                        self._say(f"cleanup_run: {side.provision.run_id}")
 
 
 def _detect_runtime(snapshot_dir: Path) -> str:

@@ -63,7 +63,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from proofdeploy.probe import ProbeRejected, validate_probe
+from proofdeploy.probe import SCHEMA_VERSION, ProbeRejected, validate_probe
 from proofdeploy.setup_auth import (
     CredentialProvider,
     PlaceholderError,
@@ -141,6 +141,7 @@ class ProbeResult:
 
     def to_dict(self) -> dict:
         return {
+            "schema_version": SCHEMA_VERSION,
             "probe_index": self.probe_index,
             "verdict": self.verdict.value,
             "reason": self.reason.value if self.reason else None,

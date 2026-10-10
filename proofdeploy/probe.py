@@ -31,6 +31,10 @@ from typing import Any
 # Harness version, recorded in every run manifest. Bump on any schema change.
 HARNESS_VERSION = "1.0.0"
 
+# Record schema version, stamped on every record and every per-probe
+# result (WO-5 addendum item 8). Bump when the record format changes.
+SCHEMA_VERSION = "1.0.0"
+
 # HTTP methods the schema allows. No CONNECT, TRACE, or custom verbs.
 ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 
