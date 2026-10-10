@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from proofdeploy.executor import Executor, Verdict
+from proofdeploy.executor import Executor, InconclusiveReason, Verdict
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -107,7 +107,7 @@ def test_body_contains(server):
 
 
 def test_post_act(server):
-    ex = Executor(target_url=server)
+    ex = Executor(target_url=server, provisioned=True)
     p = {
         "act": {"method": "POST", "path": "/ok", "body": "hi"},
         "assert": [{"type": "status", "equals": 201}],
@@ -173,8 +173,6 @@ def test_result_to_dict(server):
 
 
 # --- WO-2: fail-closed executor tests ---
-
-from proofdeploy.executor import InconclusiveReason  # noqa: E402
 
 
 class _Handler2(_Handler):
@@ -324,7 +322,7 @@ def test_remote_get_allowed_policy_only():
 
 
 def test_writes_are_logged(server):
-    ex = Executor(target_url=server)
+    ex = Executor(target_url=server, provisioned=True)
     p = {
         "act": {"method": "POST", "path": "/ok", "body": "hi"},
         "assert": [{"type": "status", "equals": 201}],
@@ -339,7 +337,7 @@ def test_writes_are_logged(server):
 
 
 def test_setup_write_is_logged(server):
-    ex = Executor(target_url=server)
+    ex = Executor(target_url=server, provisioned=True)
     p = _probe(
         setup=[{"type": "http", "act": {"method": "POST", "path": "/ok", "body": "s"}}],
         assert_=[{"type": "status", "equals": 200}],
@@ -355,3 +353,68 @@ def test_inconclusive_reason_in_to_dict():
     assert r.verdict == Verdict.INCONCLUSIVE
     assert r.reason == InconclusiveReason.ENVIRONMENT
     assert r.to_dict()["reason"] == "environment"
+
+
+def test_non_2xx_setup_is_inconclusive_environment(server):
+    # /missing returns 404 on the server fixture. A non-2xx setup response
+    # is INCONCLUSIVE (environment), not silently continued.
+    ex = Executor(target_url=server)
+    p = _probe(
+        setup=[{"type": "http", "act": {"method": "GET", "path": "/missing"}}],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.ENVIRONMENT
+    assert any("404" in d for d in r.details)
+    # The act must not run after a failed setup.
+    assert not any(d.startswith("act:") for d in r.details)
+
+
+def test_write_act_on_non_provisioned_target_is_inconclusive_probe(server):
+    # Writes need provisioned=True; localhost alone is not sufficient.
+    ex = Executor(target_url=server)  # provisioned defaults to False
+    p = {
+        "act": {"method": "POST", "path": "/ok", "body": "hi"},
+        "assert": [{"type": "status", "equals": 201}],
+    }
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.PROBE
+    assert any("provisioned" in d for d in r.details)
+    # No write was attempted or logged.
+    assert r.writes == []
+
+
+def test_write_setup_on_non_provisioned_target_is_inconclusive_probe(server):
+    ex = Executor(target_url=server)
+    p = _probe(
+        setup=[{"type": "http", "act": {"method": "POST", "path": "/ok", "body": "s"}}],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.PROBE
+    assert r.writes == []
+
+
+def test_harness_app_setup_is_inconclusive_environment(server):
+    # run_setup fails closed on harness_app even when validate_probe would
+    # have allowed it (allow_harness_app=True).
+    ex = Executor(target_url=server, allow_harness_app=True)
+    logs, reason, detail, _ = ex.run_setup(
+        [{"type": "harness_app", "language": "python", "source": "x", "entrypoint": "a"}]
+    )
+    assert reason == InconclusiveReason.ENVIRONMENT
+    assert detail is not None and "WO-5" in detail
+    assert any("WO-5" in line for line in logs)
+
+    # And through run_probe: the probe is INCONCLUSIVE, not executed.
+    p = _probe(
+        setup=[{"type": "harness_app", "language": "python", "source": "x", "entrypoint": "a"}],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.ENVIRONMENT
+    assert not any(d.startswith("act:") for d in r.details)

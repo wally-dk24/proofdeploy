@@ -7,6 +7,14 @@ Fail-closed rules:
 - Every probe is validated with ``validate_probe`` before any HTTP call.
   A schema-invalid probe is INCONCLUSIVE (reason ``probe``), not executed.
 - Unknown setup types are INCONCLUSIVE (reason ``probe``), never skipped.
+- ``harness_app`` setup steps are INCONCLUSIVE (reason ``environment``)
+  until WO-5 can provision them.
+- A setup HTTP step whose response is not 2xx makes the probe
+  INCONCLUSIVE (reason ``environment``).
+- Write methods (POST/PUT/DELETE/PATCH) are allowed only when the
+  provisioner says the target was provisioned (``provisioned=True``);
+  localhost alone is not sufficient. A write on a non-provisioned target
+  is INCONCLUSIVE (reason ``probe``).
 - Only GET and HEAD are allowed against remote (non-localhost) targets;
   anything else is INCONCLUSIVE (reason ``probe``).
 - Redirects are never followed; a 3xx response is evaluated as-is.
@@ -290,6 +298,10 @@ class Executor:
     # Fail-closed: harness_app setup steps are rejected unless the caller
     # explicitly opts in (dev-set library repos only).
     allow_harness_app: bool = False
+    # Fail-closed: write methods (POST/PUT/DELETE/PATCH) are allowed only
+    # when the target was provisioned by the provisioner. Localhost alone
+    # is NOT sufficient.
+    provisioned: bool = False
 
     def _log_write(
         self, method: str, url: str, status: int | None, writes: list[str], details: list[str]
@@ -298,6 +310,19 @@ class Executor:
         line = f"write: {method} {url} -> {status}"
         writes.append(line)
         details.append(line)
+
+    def _check_write_allowed(self, method: str, where: str) -> tuple[bool, str]:
+        """Fail-closed write gate: writes need a provisioned target.
+
+        Returns (allowed, detail).
+        """
+        if method.upper() not in WRITE_METHODS:
+            return True, ""
+        if self.provisioned:
+            return True, ""
+        return False, (
+            f"{where}: write method {method} requires a provisioned target; failing closed"
+        )
 
     def run_setup(
         self, setup_steps: list[dict[str, Any]]
@@ -314,8 +339,14 @@ class Executor:
         for i, step in enumerate(setup_steps):
             stype = step.get("type")
             if stype == "harness_app":
-                logs.append(f"setup[{i}]: harness_app handled by provisioner, skipping")
-                continue
+                # harness_app provisioning is not available until WO-5.
+                logs.append(f"setup[{i}]: harness_app provisioning not yet available (WO-5)")
+                return (
+                    logs,
+                    InconclusiveReason.ENVIRONMENT,
+                    f"setup[{i}]: harness_app provisioning not yet available (WO-5)",
+                    writes,
+                )
             if stype == "http":
                 act = step.get("act", {})
                 method = act.get("method", "GET")
@@ -324,6 +355,9 @@ class Executor:
                 allowed, detail = _check_remote_method(method, url)
                 if not allowed:
                     return logs, InconclusiveReason.PROBE, f"setup[{i}]: {detail}", writes
+                allowed, detail = self._check_write_allowed(method, f"setup[{i}]")
+                if not allowed:
+                    return logs, InconclusiveReason.PROBE, detail, writes
                 status, _, _, req_logs = _do_http(
                     method, url, act.get("headers"), act.get("body"), self.http_timeout
                 )
@@ -339,7 +373,7 @@ class Executor:
                         f"setup[{i}]: target unreachable during setup",
                         writes,
                     )
-                if status >= 500:
+                if not (200 <= status < 300):
                     return (
                         logs,
                         InconclusiveReason.ENVIRONMENT,
@@ -384,6 +418,18 @@ class Executor:
         path = act.get("path", "/")
         url = self.target_url.rstrip("/") + path
         allowed, detail = _check_remote_method(method, url)
+        if not allowed:
+            details.append(detail)
+            return ProbeResult(
+                probe_index=index,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=InconclusiveReason.PROBE,
+                details=details,
+                writes=writes,
+            )
+
+        # 1b. Write gate on the act: writes need a provisioned target.
+        allowed, detail = self._check_write_allowed(method, "act")
         if not allowed:
             details.append(detail)
             return ProbeResult(
