@@ -37,6 +37,7 @@ future work.
 
 from __future__ import annotations
 
+import json
 import shutil
 import socket
 import subprocess
@@ -56,9 +57,9 @@ IMAGES = {
     "node": "docker.io/library/node:22",
 }
 
-# Platform CA for the sandbox's TLS-intercepting egress proxy. Mounted
-# read-only for the install phase so pip/npm can verify the proxy.
-PLATFORM_CA_HOST = "/usr/local/share/ca-certificates/hatch-egress-ca.crt"
+# In-container path for an optional platform CA (see
+# SandboxConfig.ca_cert_host). The host path is configuration, never
+# hardcoded: it differs per machine.
 PLATFORM_CA_CONTAINER = "/ca/hatch-egress-ca.crt"
 
 # Env vars that must never enter a container, even if present in the
@@ -161,10 +162,14 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
         return caps
     caps.podman = True
     caps.podman_version = proc.stdout.strip()
-    # Isolated network: actually run a container on an --internal network.
-    # (Creating the network alone succeeds even when netavark can't set
-    # up the namespace; the run is the real test.)
+    # Isolated network: start a detached container on an --internal
+    # network and look up its IP through the SAME code path a real run
+    # uses (JSON-parsed `podman inspect`). Creating the network alone
+    # succeeds even when netavark can't set up the namespace, and a
+    # --rm run exits before its IP can be read; the detached start +
+    # IP lookup is the real test.
     net_name = "pd-capability-probe"
+    probe_container = "pd-capability-probe-app"
     try:
         proc = subprocess.run(
             PODMAN + ["network", "create", "--internal", net_name],
@@ -174,17 +179,30 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
             run = subprocess.run(
                 PODMAN
                 + [
-                    "run", "--rm", "--net", net_name,
-                    IMAGES["python"], "python3", "-c", "pass",
+                    "run", "-d", "--rm", "--name", probe_container,
+                    "--net", net_name,
+                    IMAGES["python"], "python3", "-c",
+                    "import time; time.sleep(60)",
                 ],
                 capture_output=True, text=True, timeout=90,
             )
             if run.returncode == 0:
-                caps.isolated_network = True
+                ip = _container_ip(probe_container, net_name)
+                if ip:
+                    caps.isolated_network = True
+                else:
+                    caps.reason = (
+                        "isolated network unavailable: container started "
+                        "but its IP could not be read"
+                    )
             else:
                 caps.reason = (
                     f"isolated network unavailable: {run.stderr.strip()[:150]}"
                 )
+            subprocess.run(
+                PODMAN + ["stop", "-t", "0", probe_container],
+                capture_output=True, timeout=60,
+            )
             subprocess.run(
                 PODMAN + ["network", "rm", net_name],
                 capture_output=True, timeout=60,
@@ -267,6 +285,12 @@ class SandboxConfig:
     # and the opt-out is written into the evidence record. This is the
     # only way to run without userns remapping; it is never silent.
     allow_no_userns: bool = False
+    # Host path to a CA certificate for the install phase (a
+    # TLS-intercepting egress proxy's CA). Mounted read-only for the
+    # install ONLY when set AND the file exists. None (the default)
+    # means no CA mount; the install then relies on the image's own
+    # trust store. The evidence record notes whether a CA was used.
+    ca_cert_host: str | None = None
 
 
 def _podman_base() -> list[str]:
@@ -293,6 +317,31 @@ def _run(
     if proc.returncode != 0:
         return False, f"exit {proc.returncode}"
     return True, ""
+
+
+def _container_ip(name: str, network_name: str) -> str:
+    """Read a container's IP on a named network via `podman inspect`.
+
+    Parses the JSON in Python: Go templates cannot address hyphenated
+    network names (e.g. "pd-isolated") with dot syntax. Returns "" when
+    the IP cannot be read. This is the single code path for IP lookup;
+    the capability probe and the real start both use it.
+    """
+    try:
+        proc = subprocess.run(
+            PODMAN + ["inspect", name],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    try:
+        data = json.loads(proc.stdout)
+        ip = data[0]["NetworkSettings"]["Networks"][network_name]["IPAddress"]
+        return ip if isinstance(ip, str) else ""
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return ""
 
 
 class _TcpToUnixProxy:
@@ -533,12 +582,22 @@ class Sandbox:
             "/checkout",
         ]
         if with_network:
-            # Install phase only: the platform CA so pip/npm can verify
-            # the TLS-intercepting egress proxy.
-            args += ["-v", f"{PLATFORM_CA_HOST}:{PLATFORM_CA_CONTAINER}:ro"]
+            # Install phase only: mount the platform CA (if configured
+            # and present) so pip/npm can verify a TLS-intercepting
+            # egress proxy.
+            if self._ca_available():
+                args += [
+                    "-v",
+                    f"{self.config.ca_cert_host}:{PLATFORM_CA_CONTAINER}:ro",
+                ]
         for host_path, container_path in self.config.extra_mounts:
             args += ["-v", f"{host_path}:{container_path}:ro"]
         return args
+
+    def _ca_available(self) -> bool:
+        """True when a CA cert is configured and the file exists."""
+        ca = self.config.ca_cert_host
+        return ca is not None and Path(ca).is_file()
 
     def _prepare_checkout(self, checkout: Path) -> None:
         """Make the checkout usable by the sandbox user.
@@ -572,11 +631,16 @@ class Sandbox:
         self._prepare_checkout(checkout)
         full_env = _strip_secret_env(dict(env))
         full_env.update(proxy_env)
-        # Trust the platform CA for the install phase.
-        full_env["SSL_CERT_FILE"] = PLATFORM_CA_CONTAINER
-        full_env["REQUESTS_CA_BUNDLE"] = PLATFORM_CA_CONTAINER
-        full_env["NODE_EXTRA_CA_CERTS"] = PLATFORM_CA_CONTAINER
-        full_env["PIP_CERT"] = PLATFORM_CA_CONTAINER
+        # Trust the platform CA for the install phase, but only when a
+        # CA is configured and present. Otherwise the image's own trust
+        # store is used.
+        ca_used = self._ca_available()
+        if ca_used:
+            full_env["SSL_CERT_FILE"] = PLATFORM_CA_CONTAINER
+            full_env["REQUESTS_CA_BUNDLE"] = PLATFORM_CA_CONTAINER
+            full_env["NODE_EXTRA_CA_CERTS"] = PLATFORM_CA_CONTAINER
+            full_env["PIP_CERT"] = PLATFORM_CA_CONTAINER
+        self.log.append(f"install: ca_cert_used={ca_used}")
         # The sandbox user has no home; give it a writable one inside
         # the checkout.
         full_env["HOME"] = "/checkout/.sandbox-home"
@@ -633,6 +697,7 @@ class Sandbox:
             "userns_mode": self.userns_mode,
             "userns_opt_out": self.userns_opt_out,
             "app_uid": uid,
+            "install_ca_used": self._ca_available(),
         }
 
     def _start_isolated(
@@ -649,19 +714,10 @@ class Sandbox:
         ok, reason = _run(args, 60, self.log)
         if not ok:
             raise SandboxError(f"sandbox start failed: {reason}")
-        # Container IP on the isolated network.
+        # Container IP on the isolated network, through the shared
+        # lookup (same path the capability probe exercises).
         network_name = self._ensure_isolated_network()
-        ok, out = _run(
-            _podman_base()
-            + [
-                "inspect", name, "--format",
-                "{{.NetworkSettings.Networks." + network_name + ".IPAddress}}",
-            ],
-            30,
-            self.log,
-        )
-        lines = out.strip().splitlines()
-        ip = lines[-1] if ok and lines else ""
+        ip = _container_ip(name, network_name)
         if not ip:
             self.stop(name)
             raise SandboxError("sandbox start: no container IP on isolated network")

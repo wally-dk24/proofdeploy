@@ -488,6 +488,23 @@ def _probe_run(scenario):
             if scenario == "build-run-fail":
                 return _completed(cmd, 1, "", "netavark: setns: EPERM")
             return _completed(cmd, 0, "", "")
+        if "inspect" in text and "pd-capability-probe-app" in text:
+            if scenario == "isolated-no-ip":
+                # Container started but inspect shows no IP.
+                return _completed(
+                    cmd, 0,
+                    '[{"NetworkSettings": {"Networks": '
+                    '{"pd-capability-probe": {"IPAddress": ""}}}}]',
+                    "",
+                )
+            return _completed(
+                cmd, 0,
+                '[{"NetworkSettings": {"Networks": '
+                '{"pd-capability-probe": {"IPAddress": "10.89.0.2"}}}}]',
+                "",
+            )
+        if "stop" in text and "pd-capability-probe-app" in text:
+            return _completed(cmd, 0, "", "")
         return _completed(cmd, 0, "", "")
 
     return fake
@@ -540,6 +557,17 @@ def test_capability_probe_isolated_run_fails(monkeypatch):
     caps = sb_mod.check_sandbox_capabilities()
     assert caps.isolated_network is False
     assert "setns" in caps.reason
+
+
+def test_capability_probe_isolated_no_ip(monkeypatch):
+    """Container starts but its IP cannot be read: not capable."""
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
+    monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("isolated-no-ip"))
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.isolated_network is False
+    assert "IP" in caps.reason
 
 
 def test_capability_probe_userns_fails(monkeypatch):
