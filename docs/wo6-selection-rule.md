@@ -1,4 +1,4 @@
-# WO-6 Selection Rule (v3, redrafted 2026-10-10)
+# WO-6 Selection Rule (v4, redrafted 2026-10-10)
 
 > This rule is mechanical. No human picks the app, the bug, or the base
 > commit. The script and its output are committed. WO-6 is an acceptance
@@ -8,11 +8,19 @@
 > rules (build, start, seed, auth via the `ghost_jwt` provider). It is not
 > a selection criterion.
 
+## Exclusion list
+
+The following repositories are EXCLUDED because this project has already
+examined bugs in them. A bug picked from any of these would not be blind:
+Ghost, Directus, Vendure, NestJS, koa, adonisjs, Flask, FastAPI,
+CodeIgniter4, Fastify, Django, LMCache, Bottle, Hono, body-parser,
+Express, n8n, Strapi, Payload.
+
 ## Candidates
 
 A fixed list of real open-source web applications, committed with this
-rule. None are from the eval set (Ghost, Directus, Vendure), the held-out
-set, or the dev set. Each candidate:
+rule. None are from the eval set, the held-out set, the dev set, or the
+exclusion list above. Each candidate:
 
 - is a web application with a database and a login,
 - is Python or Node,
@@ -24,9 +32,9 @@ The list is fixed; it does not change during selection. Ordered
 deterministically by repository name (lexicographic, case-insensitive):
 
 1. `django-oscar/django-oscar` (Python, e-commerce)
-2. `payloadcms/payload` (Node, CMS)
-3. `saleor/saleor` (Python, e-commerce)
-4. `strapi/strapi` (Node, CMS)
+2. `keystonejs/keystone` (Node, CMS)
+3. `medusajs/medusa` (Node, e-commerce)
+4. `saleor/saleor` (Python, e-commerce)
 
 ## Generic fixtures first (rule 2)
 
