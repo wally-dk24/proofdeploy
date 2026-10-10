@@ -1,0 +1,214 @@
+# ProofDeploy measurement workflow (WO-5).
+#
+# Manually triggered. Runs one measured unit through `proofdeploy measure`
+# in the sandbox. FAILS CLOSED: refuses to run if the capability probe
+# fails the measurement gate. Never falls back to unsandboxed.
+#
+# Secrets: uses the `measurement` environment (not repository secrets).
+# Master holds GROQ_API_KEY there with himself as required reviewer.
+# The key never enters the container environment, never appears in a
+# prompt, and is redacted by value in every record.
+#
+# Records: the evidence commit is pushed first, then the score commit,
+# to the `records/run-<run-id>` branch. The runner's disk is wiped after
+# the run; the branch is the durable store.
+#
+# Provenance: passed to `measure` itself via --provenance-* args, so the
+# evidence record carries the Actions run URL/ID, runner image, and the
+# capability probe output.
+#
+# DO NOT TRIGGER before the reviewer has seen the exact contents.
+# Any change to this workflow goes back to review.
+
+name: measure
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm:
+        description: "Probe-authoring arm: skill or no-skill"
+        required: true
+        type: choice
+        options:
+          - skill
+          - no-skill
+      target_repo:
+        description: "Target app repo URL (e.g. https://github.com/org/app.git)"
+        required: true
+        type: string
+      bug_id:
+        description: "Bug ID (for bug runs; leave empty for clean runs)"
+        required: false
+        type: string
+      base:
+        description: "B^: parent of the bug-introducing commit"
+        required: false
+        type: string
+      bug:
+        description: "B: the bug-introducing commit"
+        required: false
+        type: string
+      fix:
+        description: "The fix commit"
+        required: false
+        type: string
+      clean_id:
+        description: "Clean ID (for clean runs; leave empty for bug runs)"
+        required: false
+        type: string
+      clean:
+        description: "C: the clean-diff commit"
+        required: false
+        type: string
+
+# Least privilege: only need to push records to this repo.
+permissions:
+  contents: write
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # The environment gate: Master must approve before this runs.
+    # GROQ_API_KEY lives in the `measurement` environment.
+    environment: measurement
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Check out target repo
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          # Quote the input via env to avoid shell injection.
+          git clone "$TARGET_REPO" /tmp/target-repo
+
+      - name: Capability probe (fail-closed gate)
+        id: probe
+        run: |
+          python -c "
+          from proofdeploy.sandbox import assert_measurement_gate
+          # Fail-closed: raises if the host cannot meet the requirements.
+          # No config arg needed; uses defaults. This step fails the
+          # workflow if the gate fails. No fallback.
+          probe = assert_measurement_gate()
+          print('GATE PASSED')
+          import json
+          print(json.dumps(probe, indent=2))
+          "
+
+      - name: Run measured unit
+        id: measure
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ARM: ${{ inputs.arm }}
+          BUG_ID: ${{ inputs.bug_id }}
+          BASE: ${{ inputs.base }}
+          BUG: ${{ inputs.bug }}
+          FIX: ${{ inputs.fix }}
+          CLEAN_ID: ${{ inputs.clean_id }}
+          CLEAN: ${{ inputs.clean }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          # Note: $ImageOS/$ImageVersion are available in the runner env;
+          # we pass them via env below for provenance.
+        run: |
+          # The key is available to `proofdeploy measure` on the host only.
+          # It never enters containers, never appears in prompts, and is
+          # redacted by value in records.
+          # Use set +e: if measure fails, we still write the SHAs (which
+          # may be empty) to GITHUB_OUTPUT, then exit with the code.
+          set +e
+          mkdir -p /tmp/workdir /tmp/output
+          # Provenance goes to `measure` itself via --provenance-* args,
+          # so the evidence record carries them (not via GITHUB_ENV after).
+          PROV_ARGS="--provenance-run-url $RUN_URL --provenance-run-id $RUN_ID --provenance-runner-image $ImageOS-$ImageVersion"
+          if [ "$ARM" = "skill" ]; then
+            # The skill arm uses the registered skill file from the repo.
+            SKILL_ARGS="--skill $GITHUB_WORKSPACE/docs/evaluation/skill/skill-author.md"
+          else
+            SKILL_ARGS="--no-skill"
+          fi
+          if [ -n "$BUG_ID" ]; then
+            OUTPUT=$(python -m proofdeploy.cli measure \
+              --repo /tmp/target-repo \
+              --workdir /tmp/workdir \
+              --output-dir /tmp/output \
+              $SKILL_ARGS \
+              --bug-id "$BUG_ID" \
+              --base "$BASE" \
+              --bug "$BUG" \
+              --fix "$FIX" \
+              $PROV_ARGS 2>&1)
+          else
+            OUTPUT=$(python -m proofdeploy.cli measure \
+              --repo /tmp/target-repo \
+              --workdir /tmp/workdir \
+              --output-dir /tmp/output \
+              $SKILL_ARGS \
+              --clean-id "$CLEAN_ID" \
+              --clean "$CLEAN" \
+              $PROV_ARGS 2>&1)
+          fi
+          CODE=$?
+          echo "$OUTPUT"
+          # Take the evidence and score SHAs from measure's own output.
+          # Always write them (even if empty) so the push step can decide.
+          EVIDENCE_SHA=$(echo "$OUTPUT" | grep -oP 'evidence committed: \K[0-9a-f]{40}' | head -1)
+          SCORE_SHA=$(echo "$OUTPUT" | grep -oP 'score committed: \K[0-9a-f]{40}' | head -1)
+          echo "evidence_sha=$EVIDENCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "score_sha=$SCORE_SHA" >> "$GITHUB_OUTPUT"
+          exit $CODE
+
+      - name: Push records to durable branch
+        # Always push, even if the run failed or was INCONCLUSIVE.
+        # INCONCLUSIVE runs count in the published rates.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          EVIDENCE_SHA: ${{ steps.measure.outputs.evidence_sha }}
+          SCORE_SHA: ${{ steps.measure.outputs.score_sha }}
+        run: |
+          # Push the evidence commit first, then the score commit, as two
+          # separate pushes to the records branch. The runner's disk is
+          # wiped after the run; the branch is the durable store.
+          # Use an explicit token URL (checkout used persist-credentials: false).
+          # Never push an empty source: `git push <url> ":refs/heads/…"`
+          # DELETES the branch.
+          RECORDS_BRANCH="records/run-$RUN_ID"
+          cd /tmp/output
+          git config user.name "proofdeploy-measure"
+          git config user.email "proofdeploy-measure@users.noreply.github.com"
+          REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if [ -n "$EVIDENCE_SHA" ]; then
+            git push "$REPO_URL" "$EVIDENCE_SHA:refs/heads/$RECORDS_BRANCH"
+            echo "Pushed evidence $EVIDENCE_SHA to $RECORDS_BRANCH"
+          elif git rev-parse --verify HEAD >/dev/null 2>&1; then
+            echo "WARNING: no evidence SHA parsed; pushing HEAD"
+            git push "$REPO_URL" "HEAD:refs/heads/$RECORDS_BRANCH"
+          else
+            echo "WARNING: no evidence SHA and no HEAD; nothing to push"
+          fi
+          if [ -n "$SCORE_SHA" ]; then
+            git push "$REPO_URL" "$SCORE_SHA:refs/heads/$RECORDS_BRANCH"
+            echo "Pushed score $SCORE_SHA to $RECORDS_BRANCH"
+          else
+            echo "WARNING: no score SHA parsed; skipping score push"
+          fi

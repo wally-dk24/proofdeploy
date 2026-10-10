@@ -7,8 +7,11 @@ Fail-closed rules:
 - Every probe is validated with ``validate_probe`` before any HTTP call.
   A schema-invalid probe is INCONCLUSIVE (reason ``probe``), not executed.
 - Unknown setup types are INCONCLUSIVE (reason ``probe``), never skipped.
-- ``harness_app`` setup steps are INCONCLUSIVE (reason ``environment``)
-  until WO-5 can provision them.
+- ``harness_app`` setup steps are provisioned for real (WO-5): the
+  step's source is written to a file under the harness workdir and
+  started as a loopback process, which becomes the probe's target for
+  the rest of the run. Without a harness config this is INCONCLUSIVE
+  (reason ``environment``).
 - A setup HTTP step whose response is not 2xx makes the probe
   INCONCLUSIVE, with precise typing: 401/403 -> ``auth``, other 4xx ->
   ``probe``, 5xx -> ``environment``.
@@ -42,17 +45,25 @@ fails an assertion and hits an inconclusive condition reports FAIL.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import shutil
+import socket
 import sqlite3
+import subprocess
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
-from proofdeploy.probe import ProbeRejected, validate_probe
+from proofdeploy.probe import SCHEMA_VERSION, ProbeRejected, validate_probe
 from proofdeploy.setup_auth import (
     CredentialProvider,
     PlaceholderError,
@@ -130,6 +141,7 @@ class ProbeResult:
 
     def to_dict(self) -> dict:
         return {
+            "schema_version": SCHEMA_VERSION,
             "probe_index": self.probe_index,
             "verdict": self.verdict.value,
             "reason": self.reason.value if self.reason else None,
@@ -351,6 +363,31 @@ def _check_remote_method(method: str, url: str) -> tuple[bool, str]:
 
 
 @dataclass
+class HarnessAppConfig:
+    """How the executor provisions ``harness_app`` setup steps (WO-5).
+
+    The step's ``source`` is written to a file under ``workdir`` and
+    started as a process on a free loopback port. The process becomes
+    the probe's target for the rest of the run and is stopped when the
+    probe run ends.
+
+    ``python``/``node`` select the interpreter for that language (falling
+    back to ``sys.executable`` / ``shutil.which("node")``). ``extra_env``
+    and ``cwd`` let the orchestrator point the harness app at a
+    provisioned library (e.g. NODE_PATH at the snapshot's node_modules).
+    Only ``python`` and ``node`` are supported; anything else fails
+    closed at step time.
+    """
+
+    workdir: Path
+    python: str | None = None
+    node: str | None = None
+    extra_env: dict[str, str] = field(default_factory=dict)
+    cwd: Path | None = None
+    startup_timeout_s: float = 30.0
+
+
+@dataclass
 class Executor:
     """Runs validated probes against a live target."""
 
@@ -383,6 +420,34 @@ class Executor:
     #   expiry. The provider runs BEFORE requests are sent; it never reacts
     #   to a response and never re-sends a request.
     credential_config: dict[str, Any] | None = None
+    # Harness-app provisioning (WO-5, dev-set library repos only). When
+    # None, a harness_app setup step is INCONCLUSIVE (environment):
+    # there is nothing to run the author's app with.
+    harness: HarnessAppConfig | None = None
+    # Processes started by harness_app setup steps, across probe runs.
+    # Stopped by close(); run_probe also stops each run's processes.
+    _harness_procs: list[Any] = field(default_factory=list, repr=False)
+
+    def _base_url(self, ctx: SetupContext) -> str:
+        """Probe target for this run: the harness app when one is up."""
+        return ctx.target_override or self.target_url
+
+    def close(self) -> None:
+        """Stop any harness-app processes still tracked by this executor."""
+        for proc in self._harness_procs:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        for proc in self._harness_procs:
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._harness_procs = []
 
     def _log_write(
         self, method: str, url: str, status: int | None, writes: list[str], details: list[str]
@@ -560,6 +625,174 @@ class Executor:
         details.append("credential provider: token acquired")
         return None
 
+    def _run_harness_app(
+        self,
+        step: dict[str, Any],
+        i: int,
+        ctx: SetupContext,
+        logs: list[str],
+    ) -> tuple[InconclusiveReason | None, str | None]:
+        """Provision a harness_app setup step for real (WO-5).
+
+        Writes the step's ``source`` to a file under the harness workdir,
+        starts it as a process on a free loopback port with the
+        configured interpreter, and waits until the port accepts
+        connections. The process's URL becomes ``ctx.target_override``:
+        the rest of this probe run (later setup steps and the act)
+        targets the harness app instead of the provisioned target.
+
+        Fail-closed: unsupported language, missing harness config,
+        missing interpreter, a process that exits early, or a readiness
+        timeout all return an InconclusiveReason. The caller stops the
+        process when the probe run ends.
+
+        Returns (None, None) on success.
+        """
+        language = step.get("language")
+        if language not in ("python", "node"):
+            return (
+                InconclusiveReason.PROBE,
+                f"setup[{i}]: unsupported harness_app language {language!r} "
+                "(only 'python' and 'node' are provisioned)",
+            )
+        if self.harness is None:
+            return (
+                InconclusiveReason.ENVIRONMENT,
+                f"setup[{i}]: harness_app requested but the executor has no "
+                "harness config",
+            )
+        cfg = self.harness
+        interpreter: str | None
+        if language == "python":
+            interpreter = cfg.python or sys.executable
+            ext = "py"
+        else:
+            interpreter = cfg.node or shutil.which("node")
+            ext = "js"
+        if not interpreter:
+            return (
+                InconclusiveReason.ENVIRONMENT,
+                f"setup[{i}]: no {language} interpreter available for harness_app",
+            )
+        source = step.get("source") or ""
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+        app_dir = Path(cfg.workdir) / "harness_apps"
+        try:
+            app_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return (
+                InconclusiveReason.ENVIRONMENT,
+                f"setup[{i}]: cannot create harness workdir: {e}",
+            )
+        app_file = app_dir / f"harness-{digest}.{ext}"
+        log_file = app_dir / f"harness-{digest}.log"
+        try:
+            app_file.write_text(source, encoding="utf-8")
+        except OSError as e:
+            return (
+                InconclusiveReason.ENVIRONMENT,
+                f"setup[{i}]: cannot write harness app source: {e}",
+            )
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+            "PORT": str(port),
+        }
+        env.update(cfg.extra_env)
+        try:
+            log_fh = open(log_file, "w", encoding="utf-8")
+        except OSError as e:
+            return (
+                InconclusiveReason.ENVIRONMENT,
+                f"setup[{i}]: cannot open harness log file: {e}",
+            )
+        try:
+            proc = subprocess.Popen(
+                [interpreter, str(app_file)],
+                cwd=str(cfg.cwd or cfg.workdir),
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+        except OSError as e:
+            log_fh.close()
+            return (
+                InconclusiveReason.ENVIRONMENT,
+                f"setup[{i}]: harness app failed to start: {e}",
+            )
+        finally:
+            log_fh.close()
+        deadline = time.time() + cfg.startup_timeout_s
+        listening = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                tail = self._file_tail(log_file)
+                self._forget_proc(proc)
+                return (
+                    InconclusiveReason.ENVIRONMENT,
+                    f"setup[{i}]: harness app exited with code "
+                    f"{proc.returncode} before listening{tail}",
+                )
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    listening = True
+                    break
+            except OSError:
+                time.sleep(0.2)
+        if not listening:
+            tail = self._file_tail(log_file)
+            self._stop_proc(proc)
+            return (
+                InconclusiveReason.ENVIRONMENT,
+                f"setup[{i}]: harness app did not listen on 127.0.0.1:{port} "
+                f"within {cfg.startup_timeout_s}s{tail}",
+            )
+        ctx.target_override = f"http://127.0.0.1:{port}"
+        ctx.harness_procs.append(proc)
+        self._harness_procs.append(proc)
+        logs.append(
+            f"setup[{i}]: harness_app ({language}) listening at {ctx.target_override}"
+        )
+        return None, None
+
+    @staticmethod
+    def _file_tail(path: Path, n: int = 10) -> str:
+        """Last n lines of a file, for failure details."""
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+        tail = "\n".join(lines[-n:])
+        return f"\n--- harness log tail ---\n{tail}" if tail else ""
+
+    @staticmethod
+    def _stop_proc(proc: Any) -> None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _forget_proc(self, proc: Any) -> None:
+        if proc in self._harness_procs:
+            self._harness_procs.remove(proc)
+
+    def _stop_run_harness_procs(self, ctx: SetupContext) -> None:
+        for proc in ctx.harness_procs:
+            self._stop_proc(proc)
+            self._forget_proc(proc)
+        ctx.harness_procs = []
+
     def run_setup(
         self, setup_steps: list[dict[str, Any]], ctx: SetupContext | None = None
     ) -> tuple[list[str], InconclusiveReason | None, str | None, list[str], list[dict[str, Any]]]:
@@ -570,7 +803,6 @@ class Executor:
         request actually sent (method, url, headers, body), in order,
         for replayability.
 
-        harness_app steps are INCONCLUSIVE (environment) until WO-5.
         A failed step is INCONCLUSIVE, not silently continued:
         - unknown step type -> reason PROBE
         - unknown/missing ${NAME} placeholder -> reason PROBE (fail-closed)
@@ -592,15 +824,11 @@ class Executor:
         for i, step in enumerate(setup_steps):
             stype = step.get("type")
             if stype == "harness_app":
-                # harness_app provisioning is not available until WO-5.
-                logs.append(f"setup[{i}]: harness_app provisioning not yet available (WO-5)")
-                return (
-                    logs,
-                    InconclusiveReason.ENVIRONMENT,
-                    f"setup[{i}]: harness_app provisioning not yet available (WO-5)",
-                    writes,
-                    setup_requests,
-                )
+                reason, detail = self._run_harness_app(step, i, ctx, logs)
+                if reason is not None:
+                    logs.append(f"setup[{i}]: {detail}")
+                    return logs, reason, detail, writes, setup_requests
+                continue
             if stype == "http":
                 raw_act = step.get("act", {})
                 # Proactive credential provider: mint/refresh BEFORE the
@@ -628,7 +856,7 @@ class Executor:
                     )
                 method = act.get("method", "GET")
                 path = act.get("path", "/")
-                url = self.target_url.rstrip("/") + path
+                url = self._base_url(ctx).rstrip("/") + path
                 allowed, detail = _check_remote_method(method, url)
                 if not allowed:
                     return (
@@ -706,7 +934,21 @@ class Executor:
 
         The probe is schema-validated before any HTTP call. Verdict
         precedence: FAIL first, then INCONCLUSIVE, then PASS.
+
+        A harness_app setup step starts a process for the rest of the
+        run; it is stopped here on every exit path.
         """
+        ctx_box: list[SetupContext] = []
+        try:
+            return self._run_probe_impl(probe, index, ctx_box)
+        finally:
+            for ctx in ctx_box:
+                self._stop_run_harness_procs(ctx)
+
+    def _run_probe_impl(
+        self, probe: dict[str, Any], index: int, ctx_box: list[SetupContext]
+    ) -> ProbeResult:
+        """run_probe body; ctx_box receives the run's SetupContext."""
         details: list[str] = []
         writes: list[str] = []
         # No setup requests yet (setup runs after the fail-closed pre-checks).
@@ -727,6 +969,9 @@ class Executor:
             )
 
         # 1. Remote-method policy on the act, before setup runs.
+        # Note: the harness_app override is not known yet (setup runs
+        # below), so this pre-check uses the provisioned target; the
+        # post-setup act below re-resolves against the harness app.
         act = probe.get("act", {})
         method = act.get("method", "GET")
         path = act.get("path", "/")
@@ -759,6 +1004,7 @@ class Executor:
         # 1c. Build the setup/auth context: contract env, fixture keys,
         # AUTH_TOKEN, and declared capture names are known bindings.
         ctx = self._make_context(probe.get("setup", []))
+        ctx_box.append(ctx)
 
         def _attach_secrets(pr: ProbeResult) -> ProbeResult:
             """Copy this run's captured/minted secrets onto the result.
@@ -832,7 +1078,7 @@ class Executor:
             )
         method = act.get("method", "GET")
         path = act.get("path", "/")
-        url = self.target_url.rstrip("/") + path
+        url = self._base_url(ctx).rstrip("/") + path
 
         # 3. The act: one HTTP request (redirects are never followed).
         # It is sent exactly once, whatever the response status.

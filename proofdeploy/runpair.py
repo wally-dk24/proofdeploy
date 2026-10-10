@@ -34,12 +34,20 @@ The only scoring version is ``v2-per-probe`` (the registered rule).
 Unknown versions raise.
 
 Records:
+- Every record (evidence, score, judgment) and every per-probe result
+  carries ``schema_version`` (currently ``"1.0.0"``). Bump it when the
+  record format changes; readers must refuse unknown versions.
 - Every run writes an evidence record BEFORE any scoring. The evidence
   record holds the prompt, the raw model response, the parsed probes
   (verbatim) and their hash, the bundle manifest (skill hash or no-skill
   marker), the harness version, both provisioning results (logs, runtime
   versions, lockfile hashes), and the per-probe results with typed
   reasons and the recorded requests (act and setup steps).
+- The evidence record also holds ``author_prompt_sha256``: the SHA-256
+  of the frozen author-prompt template (``proofdeploy/author_prompt_v3.md``)
+  that built the prompt, and ``model_request``: the exact model request
+  as sent (model, temperature, per-message hashes, and the seed/tools
+  fields as sent).
 - Writing the evidence record makes a git commit; the commit SHA is
   recorded. Scoring reads the evidence record back AT that commit,
   rebuilds the per-probe results, and scores them: any caller-passed
@@ -73,7 +81,7 @@ from pathlib import Path
 from typing import Any
 
 from proofdeploy.executor import InconclusiveReason, ProbeResult, Verdict
-from proofdeploy.probe import HARNESS_VERSION
+from proofdeploy.probe import HARNESS_VERSION, SCHEMA_VERSION
 
 # The only scoring version: the registered per-probe rule (2026-10-09,
 # PR #38). There is no legacy version; unregistered rules must not be
@@ -387,6 +395,10 @@ def build_evidence_record(
     clean_id: str | None = None,
     fix_sha: str | None = None,
     fix_parent_sha: str | None = None,
+    # B (bug-introducing commit) and B^, resolved separately from fix^.
+    # The run pair compares fix^ vs fix; B/B^ are recorded for provenance.
+    b_sha: str | None = None,
+    b_parent_sha: str | None = None,
     # Clean-diff runs use these explicit fields (never the fix_* ones).
     c_sha: str | None = None,
     c_provision: dict[str, Any] | None = None,
@@ -395,7 +407,43 @@ def build_evidence_record(
     raw_model_response: str | None = None,
     parsed_probes: list[dict[str, Any]] | None = None,
     bundle_manifest: dict[str, Any] | None = None,
+    bundle_manifest_sha256: str | None = None,
     skill_sha256: str | None = None,
+    model_id: str | None = None,
+    model_temperature: float | None = None,
+    model_attempts: int | None = None,
+    # The exact model request as sent (model, temperature, message
+    # hashes, seed/tools as sent). None when the model was not called
+    # through the in-repo client.
+    model_request: dict[str, Any] | None = None,
+    # SHA-256 of the frozen author-prompt template file
+    # (proofdeploy/author_prompt_v4.md). The template is versioned and
+    # must be registered before any measured run.
+    author_prompt_sha256: str | None = None,
+    # SHA-256 of the prompt builder module (proofdeploy/model_client.py).
+    # Recorded next to author_prompt_sha256 so the exact rendering code
+    # is pinned in every evidence record.
+    author_prompt_builder_sha256: str | None = None,
+    # Model call attempt log (for INCONCLUSIVE runs): list of strings like
+    # "attempt_1: model_transport: ...", "attempt_2: success".
+    model_call_attempts: list[str] | None = None,
+    # Truncation flags from prompt construction: which caps applied
+    # (diff_files_truncated, file_bytes_truncated, listed_files_truncated).
+    truncation_flags: dict[str, Any] | None = None,
+    # Isolation actually in effect for the sandbox apps (per side:
+    # network mode, userns mode, uid the app ran as). Empty when the
+    # sandbox was not used.
+    sandbox_evidence: dict[str, Any] | None = None,
+    # Whether the measured sides ran inside the sandbox. False only via
+    # the explicit dev flag ``allow_unsandboxed``.
+    sandboxed: bool = True,
+    # Whether this record counts as a measured result. An unsandboxed
+    # dev run is marked measured_result=False and must never be treated
+    # as a measured result.
+    measured_result: bool = True,
+    # Provenance for CI-driven runs: Actions run URL/ID, runner image,
+    # and the capability probe output. Empty when not provided.
+    provenance: dict[str, Any] | None = None,
     harness_version: str = HARNESS_VERSION,
     scoring_version: str = DEFAULT_SCORING_VERSION,
     fix_parent_provision: dict[str, Any] | None = None,
@@ -456,11 +504,14 @@ def build_evidence_record(
         "record_id": uuid.uuid4().hex,
         "timestamp": _utc_now(),
         "record_type": "evidence",
+        "schema_version": SCHEMA_VERSION,
         "run_kind": run_kind,
         "bug_id": bug_id,
         "clean_id": clean_id,
         "fix_sha": fix_sha,
         "fix_parent_sha": fix_parent_sha,
+        "b_sha": b_sha,
+        "b_parent_sha": b_parent_sha,
         "c_sha": c_sha,
         "c_provision": c_provision or {},
         "c_results": [r.to_dict() for r in (c_results or [])],
@@ -470,7 +521,20 @@ def build_evidence_record(
         "parsed_probes": parsed,
         "parsed_probes_sha256": _sha256_canonical(parsed),
         "bundle_manifest": bundle_manifest or {},
+        "bundle_manifest_sha256": bundle_manifest_sha256,
         "skill_sha256": skill_sha256,
+        "model_id": model_id,
+        "model_temperature": model_temperature,
+        "model_attempts": model_attempts,
+        "model_call_attempts": model_call_attempts,
+        "model_request": model_request or {},
+        "author_prompt_sha256": author_prompt_sha256,
+        "author_prompt_builder_sha256": author_prompt_builder_sha256,
+        "truncation_flags": truncation_flags or {},
+        "sandbox_evidence": sandbox_evidence or {},
+        "sandboxed": sandboxed,
+        "measured_result": measured_result,
+        "provenance": provenance or {},
         "harness_version": harness_version,
         "scoring_version": scoring_version,
         "fix_parent_provision": fix_parent_provision or {},
@@ -646,6 +710,7 @@ def build_score_record(
         "record_id": uuid.uuid4().hex,
         "timestamp": _utc_now(),
         "record_type": "score",
+        "schema_version": SCHEMA_VERSION,
         "run_kind": run_kind,
         "bug_id": bug_id,
         "clean_id": clean_id,
@@ -813,6 +878,7 @@ def build_judgment_record(
         "record_id": uuid.uuid4().hex,
         "timestamp": _utc_now(),
         "record_type": "judgment",
+        "schema_version": SCHEMA_VERSION,
         "run_kind": run_kind,
         "bug_id": bug_id,
         "clean_id": clean_id,

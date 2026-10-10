@@ -209,6 +209,7 @@ def create_snapshot(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    stderr = b""
     try:
         assert proc.stdout is not None  # for mypy: Popen with PIPE sets it
         with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
@@ -221,10 +222,20 @@ def create_snapshot(
                 if not str(target).startswith(str(out_resolved) + "/"):
                     raise ValueError(f"archive member escapes snapshot dir: {member.name}")
                 tf.extract(member, out)
-    finally:
-        # If validation raised mid-stream, stop the producer.
+    except Exception:
+        # Validation failed mid-stream: the producer may be blocked writing
+        # to the pipe we stopped reading, so stop it before reaping.
         if proc.poll() is None:
             proc.kill()
+        _, stderr = proc.communicate()
+        raise
+    # The stream is fully consumed; the producer is exiting on its own.
+    # Reap it without killing: killing here races the producer's exit and
+    # turns a healthy run into returncode -9 (empty stderr).
+    try:
+        _, stderr = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
         _, stderr = proc.communicate()
     if proc.returncode != 0:
         raise ValueError(f"git archive {sha} failed in {repo}: {stderr.decode().strip()}")
