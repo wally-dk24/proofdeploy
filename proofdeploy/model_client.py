@@ -51,7 +51,7 @@ TEMPERATURE = 0.2
 
 # Frozen author-prompt template. The file is versioned; its hash is in
 # every evidence record.
-PROMPT_TEMPLATE_FILENAME = "author_prompt_v5.md"
+PROMPT_TEMPLATE_FILENAME = "author_prompt_v6.md"
 
 _GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_ALLOWED_HOSTS = ["api.groq.com"]
@@ -73,6 +73,11 @@ def author_prompt_sha256(path: str | Path | None = None) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def author_prompt_builder_sha256() -> str:
+    """SHA-256 of the prompt builder module itself (goes in the record)."""
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
 # Top-level template sections, in order. A ``## <name>`` line starts a
 # new section only when <name> is in this set; any other ``## `` line is
 # content of the current section. That is what lets the ``## Body``
@@ -85,6 +90,8 @@ _TEMPLATE_SECTIONS = (
     "File entry",
     "Unavailable file",
     "More files",
+    "Caps line",
+    "Diff files omitted",
     "Closing",
 )
 
@@ -99,6 +106,10 @@ _PLACEHOLDERS = (
     "skill_text",
     "fixture_description",
     "diff_text",
+    "max_diff_files",
+    "max_file_bytes",
+    "max_listed_files",
+    "remaining",
     "diff_fence_open",
     "diff_fence_close",
     "snapshot_file_list",
@@ -150,6 +161,8 @@ def _parse_template(text: str) -> dict[str, Any]:
         "file_entry": "\n".join(sections["File entry"]).strip(),
         "unavailable_file": "\n".join(sections["Unavailable file"]).strip(),
         "more_files": "\n".join(sections["More files"]).strip(),
+        "caps_line": "\n".join(sections["Caps line"]).strip(),
+        "diff_files_omitted": "\n".join(sections["Diff files omitted"]).strip(),
         "closing": "\n".join(sections["Closing"]).strip(),
         "caps": caps,
     }
@@ -292,10 +305,13 @@ def build_author_prompt(
         touched_parts.append(entry)
     touched_text = "\n\n".join(touched_parts)
     # Explicit marker when the diff-files cap truncated the list.
+    # Rendered from the template's "Diff files omitted" section.
     if truncation_flags["diff_files_truncated"]:
         omitted = len(all_touched) - caps["max_diff_files"]
-        cap = caps["max_diff_files"]
-        touched_text += f"\n\n... ({omitted} more diff files omitted: cap is {cap})"
+        marker = tpl["diff_files_omitted"]
+        marker = marker.replace("[[remaining]]", str(omitted))
+        marker = marker.replace("[[max_diff_files]]", str(caps["max_diff_files"]))
+        touched_text += "\n\n" + marker
 
     # Diff fence adapts to backtick runs in the diff.
     diff_open, diff_close = _fence_for(diff_text, "diff")
@@ -309,10 +325,13 @@ def build_author_prompt(
         "framing": tpl["framing"],
         "contract": tpl["contract"],
         "closing": tpl["closing"],
+        # Caps line rendered from the template's "Caps line" section.
+        # Uses "Caps:" (the approved framing says "caps").
         "caps": (
-            f"Size limits: at most {caps['max_diff_files']} diff files, "
-            f"at most {caps['max_file_bytes']} bytes per touched file, "
-            f"at most {caps['max_listed_files']} files listed."
+            tpl["caps_line"]
+            .replace("[[max_diff_files]]", str(caps["max_diff_files"]))
+            .replace("[[max_file_bytes]]", str(caps["max_file_bytes"]))
+            .replace("[[max_listed_files]]", str(caps["max_listed_files"]))
         ),
         "skill_text": rendered_skill,
         "fixture_description": fixture_description.rstrip(),

@@ -262,8 +262,8 @@ def test_credential_unavailable_raises(monkeypatch):
         raise AssertionError("expected RuntimeError")
 
 
-def test_template_v5_hash_and_content():
-    """The v5 template is the registered file: hash matches, the
+def test_template_v6_hash_and_content():
+    """The v6 template is the registered file: hash matches, the
     harness example shows python|node, and the assertion wording is
     Master-approved v5 text (v4 wording plus caps placeholder)."""
     import hashlib
@@ -272,8 +272,8 @@ def test_template_v5_hash_and_content():
 
     import proofdeploy.model_client as mc
 
-    assert mc.PROMPT_TEMPLATE_FILENAME == "author_prompt_v5.md"
-    path = Path(mc.__file__).with_name("author_prompt_v5.md")
+    assert mc.PROMPT_TEMPLATE_FILENAME == "author_prompt_v6.md"
+    path = Path(mc.__file__).with_name("author_prompt_v6.md")
     text = path.read_text(encoding="utf-8")
     assert hashlib.sha256(text.encode("utf-8")).hexdigest() == mc.author_prompt_sha256()
     assert '"language": "python|node"' in text

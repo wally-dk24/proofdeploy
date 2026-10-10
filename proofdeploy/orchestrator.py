@@ -59,6 +59,7 @@ from proofdeploy.model_client import (
     TEMPERATURE,
     ModelResponse,
     ModelRunner,
+    author_prompt_builder_sha256,
     author_prompt_sha256,
     build_author_prompt,
     call_model,
@@ -125,7 +126,9 @@ class MeasureConfig:
     repo_dir: Path
     output_dir: Path  # records live here; it is (or becomes) a git repo
     workdir: Path
-    skill_path: Path
+    skill_path: Path | None = None
+    # No-skill (baseline) arm: exactly one of skill_path / no_skill is set.
+    no_skill: bool = False
     # Bug runs: rev_bug_base (B^), rev_bug (B), rev_fix (fix).
     # Clean runs: rev_clean (C); the fix_* revs stay None.
     bug_id: str | None = None
@@ -249,6 +252,7 @@ class Orchestrator:
             source_sha=snapshot.sha,
             diff_range=f"{base_sha}..{tip_sha}",
             skill_path=cfg.skill_path,
+            no_skill=cfg.no_skill,
         )
         manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
         # Pass None for no-skill; the builder renders "(none)" itself.
@@ -303,6 +307,7 @@ class Orchestrator:
             fix_sha=fix_sha,
             fix_subject=fix_subject,
             expected_skill_hash=EXPECTED_SKILL_HASH,
+            no_skill=self.cfg.no_skill,
         )
         self._say(f"answer-key check passed; bundle manifest {manifest_sha[:12]}")
         return manifest_sha
@@ -689,6 +694,7 @@ class Orchestrator:
                 model_attempts=1,
                 model_request=raw.request_record,
                 author_prompt_sha256=author_prompt_sha256(),
+                author_prompt_builder_sha256=author_prompt_builder_sha256(),
                 skill_sha256=manifest.get("skill_sha256"),
                 truncation_flags=truncation_flags,
                 sandbox_evidence={
@@ -844,6 +850,7 @@ class Orchestrator:
                 model_attempts=1,
                 model_request=raw.request_record,
                 author_prompt_sha256=author_prompt_sha256(),
+                author_prompt_builder_sha256=author_prompt_builder_sha256(),
                 skill_sha256=manifest.get("skill_sha256"),
                 truncation_flags=truncation_flags,
                 sandbox_evidence={"c": side.sandbox_evidence or {}},

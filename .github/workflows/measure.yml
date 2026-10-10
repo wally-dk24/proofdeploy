@@ -13,8 +13,9 @@
 # to the `records/run-<run-id>` branch. The runner's disk is wiped after
 # the run; the branch is the durable store.
 #
-# Provenance: every evidence record carries the Actions run URL and ID,
-# the runner image ($ImageOS/$ImageVersion), and the capability probe output.
+# Provenance: passed to `measure` itself via --provenance-* args, so the
+# evidence record carries the Actions run URL/ID, runner image, and the
+# capability probe output.
 #
 # DO NOT TRIGGER before the reviewer has seen the exact contents.
 # Any change to this workflow goes back to review.
@@ -24,6 +25,13 @@ name: measure
 on:
   workflow_dispatch:
     inputs:
+      arm:
+        description: "Probe-authoring arm: skill or no-skill"
+        required: true
+        type: choice
+        options:
+          - skill
+          - no-skill
       target_repo:
         description: "Target app repo URL (e.g. https://github.com/org/app.git)"
         required: true
@@ -65,6 +73,8 @@ jobs:
     environment: measurement
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -103,64 +113,80 @@ jobs:
           "
 
       - name: Run measured unit
+        id: measure
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          TARGET_REPO: ${{ inputs.target_repo }}
+          ARM: ${{ inputs.arm }}
           BUG_ID: ${{ inputs.bug_id }}
           BASE: ${{ inputs.base }}
           BUG: ${{ inputs.bug }}
           FIX: ${{ inputs.fix }}
           CLEAN_ID: ${{ inputs.clean_id }}
           CLEAN: ${{ inputs.clean }}
-          # Provenance: runner image from the GitHub-provided env vars.
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_ID: ${{ github.run_id }}
+          RUNNER_IMAGE: ${{ runner.os }}-${{ runner.arch }}
+          # Note: $ImageOS/$ImageVersion are available in the runner env;
+          # we pass them via env below for provenance.
         run: |
           # The key is available to `proofdeploy measure` on the host only.
           # It never enters containers, never appears in prompts, and is
           # redacted by value in records.
           mkdir -p /tmp/workdir /tmp/output
-          # The skill file must be the registered copy; it is hash-verified
-          # at bundle time. For WO-5, the skill is empty (no-skill arm).
-          touch /tmp/empty-skill.md
+          # Provenance goes to `measure` itself via --provenance-* args,
+          # so the evidence record carries them (not via GITHUB_ENV after).
+          PROV_ARGS="--provenance-run-url $RUN_URL --provenance-run-id $RUN_ID --provenance-runner-image $ImageOS-$ImageVersion"
+          if [ "$ARM" = "skill" ]; then
+            # The skill arm uses the registered skill file from the repo.
+            SKILL_ARGS="--skill $GITHUB_WORKSPACE/docs/evaluation/skill/skill-author.md"
+          else
+            SKILL_ARGS="--no-skill"
+          fi
           if [ -n "$BUG_ID" ]; then
-            python -m proofdeploy.cli measure \
+            OUTPUT=$(python -m proofdeploy.cli measure \
               --repo /tmp/target-repo \
               --workdir /tmp/workdir \
               --output-dir /tmp/output \
-              --skill /tmp/empty-skill.md \
+              $SKILL_ARGS \
               --bug-id "$BUG_ID" \
               --base "$BASE" \
               --bug "$BUG" \
-              --fix "$FIX"
+              --fix "$FIX" \
+              $PROV_ARGS 2>&1)
           else
-            python -m proofdeploy.cli measure \
+            OUTPUT=$(python -m proofdeploy.cli measure \
               --repo /tmp/target-repo \
               --workdir /tmp/workdir \
               --output-dir /tmp/output \
-              --skill /tmp/empty-skill.md \
+              $SKILL_ARGS \
               --clean-id "$CLEAN_ID" \
-              --clean "$CLEAN"
+              --clean "$CLEAN" \
+              $PROV_ARGS 2>&1)
           fi
-          # Record provenance for the evidence record.
-          echo "PROOFDEPLOY_RUN_URL=$RUN_URL" >> "$GITHUB_ENV"
-          echo "PROOFDEPLOY_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
-          echo "PROOFDEPLOY_RUNNER_IMAGE=$ImageOS-$ImageVersion" >> "$GITHUB_ENV"
+          echo "$OUTPUT"
+          # Take the evidence and score SHAs from measure's own output.
+          EVIDENCE_SHA=$(echo "$OUTPUT" | grep -oP 'evidence committed: \K[0-9a-f]{40}' | head -1)
+          SCORE_SHA=$(echo "$OUTPUT" | grep -oP 'score committed: \K[0-9a-f]{40}' | head -1)
+          echo "evidence_sha=$EVIDENCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "score_sha=$SCORE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Push records to durable branch
         env:
+          GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
+          EVIDENCE_SHA: ${{ steps.measure.outputs.evidence_sha }}
+          SCORE_SHA: ${{ steps.measure.outputs.score_sha }}
         run: |
           # Push the evidence commit first, then the score commit, to the
           # records branch. The runner's disk is wiped after the run;
           # the branch is the durable store.
+          # Use an explicit token URL (checkout used persist-credentials: false).
           RECORDS_BRANCH="records/run-$RUN_ID"
           cd /tmp/output
           git config user.name "proofdeploy-measure"
           git config user.email "proofdeploy-measure@users.noreply.github.com"
-          # The output dir is a git repo with evidence and score commits.
-          # Push the current branch to the records branch.
-          git push origin "HEAD:$RECORDS_BRANCH"
+          REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$REPO_URL" "HEAD:refs/heads/$RECORDS_BRANCH"
           echo "Pushed records to $RECORDS_BRANCH"
-          echo "Evidence SHA: $(git log --format=%H -n 2 | tail -1)"
-          echo "Score SHA: $(git log --format=%H -n 1)"
+          echo "Evidence SHA: $EVIDENCE_SHA"
+          echo "Score SHA: $SCORE_SHA"

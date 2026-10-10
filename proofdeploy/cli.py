@@ -69,8 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     m.add_argument(
         "--skill",
-        required=True,
+        default=None,
         help="Registered author skill copy (hash-verified at bundle time).",
+    )
+    m.add_argument(
+        "--no-skill",
+        action="store_true",
+        help="Run the no-skill (baseline) arm: no skill file is bundled.",
     )
     m.add_argument("--bug-id", default=None, help="Bug run id (requires --base/--bug/--fix).")
     m.add_argument("--base", default=None, help="B^: parent of the bug-introducing commit.")
@@ -151,6 +156,13 @@ def cmd_measure(args: argparse.Namespace) -> int:
     else:
         print("proofdeploy: need --bug-id or --clean-id", file=sys.stderr)
         return 2
+    # Exactly one of --skill / --no-skill.
+    if bool(args.skill) == bool(args.no_skill):
+        print(
+            "proofdeploy: need exactly one of --skill <path> or --no-skill",
+            file=sys.stderr,
+        )
+        return 2
     # The Groq key (when provided via env for CI) is redacted by value
     # in every record. It never enters a prompt or a container; this is
     # defense in depth so no accidental serialization can leak it.
@@ -159,7 +171,8 @@ def cmd_measure(args: argparse.Namespace) -> int:
         repo_dir=Path(args.repo),
         output_dir=Path(args.output_dir),
         workdir=Path(args.workdir),
-        skill_path=Path(args.skill),
+        skill_path=Path(args.skill) if args.skill else None,
+        no_skill=args.no_skill,
         bug_id=args.bug_id,
         clean_id=args.clean_id,
         rev_bug_base=args.base,

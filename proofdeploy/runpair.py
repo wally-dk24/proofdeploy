@@ -420,6 +420,10 @@ def build_evidence_record(
     # (proofdeploy/author_prompt_v4.md). The template is versioned and
     # must be registered before any measured run.
     author_prompt_sha256: str | None = None,
+    # SHA-256 of the prompt builder module (proofdeploy/model_client.py).
+    # Recorded next to author_prompt_sha256 so the exact rendering code
+    # is pinned in every evidence record.
+    author_prompt_builder_sha256: str | None = None,
     # Truncation flags from prompt construction: which caps applied
     # (diff_files_truncated, file_bytes_truncated, listed_files_truncated).
     truncation_flags: dict[str, Any] | None = None,
@@ -521,6 +525,7 @@ def build_evidence_record(
         "model_attempts": model_attempts,
         "model_request": model_request or {},
         "author_prompt_sha256": author_prompt_sha256,
+        "author_prompt_builder_sha256": author_prompt_builder_sha256,
         "truncation_flags": truncation_flags or {},
         "sandbox_evidence": sandbox_evidence or {},
         "sandboxed": sandboxed,

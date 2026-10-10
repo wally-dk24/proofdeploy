@@ -476,3 +476,33 @@ def test_evidence_record_carries_provenance():
     record = build_evidence_record(run_kind="bug", provenance=prov)
     assert record["provenance"] == prov
     assert build_evidence_record(run_kind="bug")["provenance"] == {}
+
+
+def test_measure_bug_no_skill_arm_end_to_end(tmp_path):
+    """The no-skill arm passes the leak check end-to-end through measure."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=None,
+        no_skill=True,
+        bug_id="mini-noskill",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    # Must not raise AnswerKeyLeakError: the builder renders "(none)" and
+    # the leak check rebuilds the identical prompt.
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "candidate_catch"
+    records = read_records(out)
+    evidence = records[0]
+    assert "(none)" in evidence["prompt"]
+    # Builder hash is recorded.
+    assert evidence["author_prompt_builder_sha256"]
