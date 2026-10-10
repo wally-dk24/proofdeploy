@@ -1052,7 +1052,6 @@ def test_target_process_stopped_after_crash(tmp_path):
     orch = Orchestrator(cfg)
     # Monkeypatch the executor's run_probe to raise after provisioning.
     # This simulates a crash after the targets are READY.
-    from proofdeploy import orchestrator as orch_module
     orig_make_executor = orch._make_executor
     def bad_make_executor(side):
         ex = orig_make_executor(side)
