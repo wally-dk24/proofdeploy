@@ -1,7 +1,7 @@
 # WO-1 Milestone: Provisioner
 
 **Date:** 2026-10-10
-**Branch:** `feat/runner-provisioner` (head `13bf622`, awaiting Master's merge)
+**Branch:** `feat/runner-provisioner` (merged head `13bf622`, PR #34)
 **Accepted by:** Orchestrator (Master's other agent) on 2026-10-09
 **Work order:** WO-1 from brief 2026-10-10
 
