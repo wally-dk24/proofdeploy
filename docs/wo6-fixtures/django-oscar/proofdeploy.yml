@@ -1,18 +1,17 @@
 # Generic fixture for django-oscar/django-oscar
 # Written before WO-6 selection runs. Describes how to build, start, and
 # seed the app. Not tied to any specific bug.
+# Validated with the real loader.
 
-build: "pip install -r requirements.txt && python manage.py migrate"
-start: "python manage.py runserver 0.0.0.0:8000"
+repo_name: django-oscar/django-oscar
+# The runnable app is in sandbox/ (the repo root is the framework).
+app_dir: sandbox
+build: "python manage.py migrate"
+migrate: "python manage.py migrate"
 seed: "python manage.py oscar_populate_countries"
-
-fixture:
-  description: |
-    Repository: django-oscar/django-oscar
-    Target: http://localhost:8000
-    This is a Django-based e-commerce framework. The app serves HTTP on
-    port 8000. Authentication is via Django session (login at /accounts/login/).
-    The database is SQLite by default (or PostgreSQL if configured).
-  auth:
-    type: session
-    login_path: /accounts/login/
+start: "python manage.py runserver 0.0.0.0:$PORT"
+readiness: /
+seed_note: "Populates countries via oscar_populate_countries."
+auth_mechanism: "session"
+auth_scope: "Django session; login at /accounts/login/"
+flags_note: "SQLite by default."

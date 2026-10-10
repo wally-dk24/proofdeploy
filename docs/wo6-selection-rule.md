@@ -1,4 +1,4 @@
-# WO-6 Selection Rule (v4, redrafted 2026-10-10)
+# WO-6 Selection Rule (v5, redrafted 2026-10-10)
 
 > This rule is mechanical. No human picks the app, the bug, or the base
 > commit. The script and its output are committed. WO-6 is an acceptance
@@ -26,15 +26,55 @@ exclusion list above. Each candidate:
 - is Python or Node,
 - has a lockfile (requirements.txt, package-lock.json, yarn.lock, etc.),
 - has >= 1000 GitHub stars,
-- had a commit in the last 90 days (active).
+- had a commit in the last 90 days (active),
+- is provisionable by the current runner (SQLite or no external services;
+  no PostgreSQL, Redis, or other external services required).
 
 The list is fixed; it does not change during selection. Ordered
 deterministically by repository name (lexicographic, case-insensitive):
 
-1. `django-oscar/django-oscar` (Python, e-commerce)
+1. `django-oscar/django-oscar` (Python, e-commerce; runnable app in `sandbox/`)
 2. `keystonejs/keystone` (Node, CMS)
-3. `medusajs/medusa` (Node, e-commerce)
-4. `saleor/saleor` (Python, e-commerce)
+
+Note: Saleor (needs PostgreSQL) and Medusa (needs PostgreSQL and Redis)
+were removed; they are not provisionable by the current runner. Two more
+candidates meeting all criteria (including SQLite-only) are to be added
+before sign-off, for a total of 4-5.
+
+## Generic fixtures (committed before selection)
+
+For each candidate, `docs/wo6-fixtures/<name>/proofdeploy.yml` is committed
+on this branch before the selection runs. Each fixture:
+
+- uses the five registered template fields: `repo_name`, `seed_note`,
+  `auth_mechanism`, `auth_scope`, `flags_note` (not free-form `description`);
+- includes `readiness` (required by the loader; a `/path` joined to the
+  assigned target URL);
+- has NO `npm install` or `pip install` in `build` (the provisioner
+  installs from the lockfile; `build`, `migrate`, `seed` are app commands
+  only);
+- uses the assigned `PORT` env var, not a hard-coded port;
+- points at the real runnable app inside the repo (e.g. django-oscar's
+  `sandbox/` project, not the repo root).
+
+Each fixture is validated with the real loader (`load_contract`).
+
+## Fixture proof (before sign-off)
+
+Each candidate is provisioned **at its current HEAD** (never at any bug
+commit) through the real provisioner. The provisioning log and the READY
+status are recorded on this branch. Only candidates that reach READY stay
+on the list. This looks at no bugs, so the blindness holds.
+
+## Bug selection (mechanical)
+
+For each candidate in order:
+
+1. Find the default branch.
+2. Take the first commit on the default branch with committer date
+   strictly after 2026-07-01 (after the model's June 2024 cutoff, and
+   recent enough that a fixture written for 2026 will build; this date
+   is fixed) whose subject line matches `(?i)\bfix\b`.
 
 ## Generic fixtures first (rule 2)
 
@@ -50,8 +90,9 @@ For each candidate in order:
 
 1. Find the default branch.
 2. Take the first commit on the default branch with committer date
-   strictly after 2024-07-01 (after the model's June 2024 cutoff; this
-   date is fixed) whose subject line matches `(?i)\bfix\b`.
+   strictly after 2026-07-01 (after the model's June 2024 cutoff, and
+   recent enough that a fixture written for 2026 will build; this date
+   is fixed) whose subject line matches `(?i)\bfix\b`.
 3. Exclude the commit if:
    - it is a merge commit (more than one parent),
    - it is a revert commit (subject matches `(?i)^revert\b`),
@@ -102,7 +143,7 @@ The script writes `wo6-selection.json`:
   "fix_parent": "...",
   "b": "...",
   "b_parent": "...",
-  "cutoff": "2024-07-01",
+  "cutoff": "2026-07-01",
   "fallbacks": [
     {"candidate": "...", "fix": "...", "reason": "..."}
   ]

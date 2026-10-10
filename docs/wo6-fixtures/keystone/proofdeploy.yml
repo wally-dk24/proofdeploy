@@ -1,18 +1,16 @@
 # Generic fixture for keystonejs/keystone
 # Written before WO-6 selection runs. Describes how to build, start, and
 # seed the app. Not tied to any specific bug.
+# Validated with the real loader.
+# Note: Keystone is a monorepo; the runnable app location must be verified
+# during provisioning proof. If no app is provisionable at the root,
+# this candidate is dropped per the rule.
 
-build: "npm install"
-start: "npm run dev -- --port 8000"
-seed: "npm run seed"
-
-fixture:
-  description: |
-    Repository: keystonejs/keystone
-    Target: http://localhost:8000
-    This is a Node.js headless CMS. The app serves HTTP on port 8000.
-    Authentication is via session (Admin UI at /admin). The database is
-    configurable (SQLite/PostgreSQL).
-  auth:
-    type: session
-    login_path: /admin
+repo_name: keystonejs/keystone
+build: "npm run build"
+start: "npm run start -- --port $PORT"
+readiness: /
+seed_note: "No seed step; admin user created on first run."
+auth_mechanism: "session"
+auth_scope: "Session; Admin UI at /admin"
+flags_note: "SQLite supported."
