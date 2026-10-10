@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from proofdeploy.executor import Executor, InconclusiveReason, Verdict
+from proofdeploy.executor import Executor, HarnessAppConfig, InconclusiveReason, Verdict
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -447,16 +447,17 @@ def test_write_setup_on_non_provisioned_target_is_inconclusive_probe(server):
     assert r.writes == []
 
 
-def test_harness_app_setup_is_inconclusive_environment(server):
-    # run_setup fails closed on harness_app even when validate_probe would
-    # have allowed it (allow_harness_app=True).
+def test_harness_app_without_config_is_inconclusive_environment(server):
+    # run_setup fails closed on harness_app when the executor has no
+    # harness config, even when validate_probe would have allowed it
+    # (allow_harness_app=True).
     ex = Executor(target_url=server, allow_harness_app=True)
     logs, reason, detail, _, _ = ex.run_setup(
         [{"type": "harness_app", "language": "python", "source": "x", "entrypoint": "a"}]
     )
     assert reason == InconclusiveReason.ENVIRONMENT
-    assert detail is not None and "WO-5" in detail
-    assert any("WO-5" in line for line in logs)
+    assert detail is not None and "no harness config" in detail
+    assert any("no harness config" in line for line in logs)
 
     # And through run_probe: the probe is INCONCLUSIVE, not executed.
     p = _probe(
@@ -467,6 +468,93 @@ def test_harness_app_setup_is_inconclusive_environment(server):
     assert r.verdict == Verdict.INCONCLUSIVE
     assert r.reason == InconclusiveReason.ENVIRONMENT
     assert not any(d.startswith("act:") for d in r.details)
+
+
+# ---------------------------------------------------------------------------
+# WO-5: harness_app provisioning is real.
+# ---------------------------------------------------------------------------
+
+
+_HARNESS_SOURCE = """\
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"hello": "harness"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+HTTPServer(("127.0.0.1", int(os.environ["PORT"])), Handler).serve_forever()
+"""
+
+
+def _harness_step(**kw):
+    step = {
+        "type": "harness_app",
+        "language": "python",
+        "source": _HARNESS_SOURCE,
+        "entrypoint": "app.py",
+    }
+    step.update(kw)
+    return step
+
+
+def test_harness_app_provisions_and_serves(tmp_path):
+    ex = Executor(
+        target_url="http://127.0.0.1:1",
+        allow_harness_app=True,
+        provisioned=True,
+        harness=HarnessAppConfig(workdir=tmp_path),
+    )
+    p = _probe(
+        setup=[_harness_step()],
+        act={"method": "GET", "path": "/"},
+        assert_=[
+            {"type": "status", "equals": 200},
+            {"type": "body", "contains": "harness"},
+        ],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS, r.details
+    assert any("harness_app (python) listening at http://127.0.0.1:" in d for d in r.details)
+    assert any(d.startswith("act: GET / -> 200") for d in r.details)
+    # The harness process is stopped when the probe run ends.
+    assert ex._harness_procs == []
+    ex.close()
+
+
+def test_harness_app_unsupported_language_is_probe_inconclusive(tmp_path):
+    ex = Executor(
+        target_url="http://127.0.0.1:1",
+        allow_harness_app=True,
+        harness=HarnessAppConfig(workdir=tmp_path),
+    )
+    logs, reason, detail, _, _ = ex.run_setup([_harness_step(language="ruby")])
+    assert reason == InconclusiveReason.PROBE
+    assert detail is not None and "unsupported harness_app language" in detail
+
+
+def test_harness_app_failing_source_is_environment_inconclusive(tmp_path):
+    ex = Executor(
+        target_url="http://127.0.0.1:1",
+        allow_harness_app=True,
+        harness=HarnessAppConfig(workdir=tmp_path, startup_timeout_s=3),
+    )
+    logs, reason, detail, _, _ = ex.run_setup(
+        [_harness_step(source="import sys; sys.exit(3)")]
+    )
+    assert reason == InconclusiveReason.ENVIRONMENT
+    assert detail is not None and "exited with code 3" in detail
+    ex.close()
 
 
 # ---------------------------------------------------------------------------

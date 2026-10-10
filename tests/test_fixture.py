@@ -130,7 +130,7 @@ def _snapshot(tmp_path):
     return snap
 
 
-def test_assemble_bundle_happy_path(tmp_path):
+def test_assemble_bundle_happy_path(tmp_path, monkeypatch):
     yml = _write_yml(tmp_path)
     diff = tmp_path / "b.patch"
     diff.write_text("diff --git a/x b/x\n", encoding="utf-8")
@@ -140,7 +140,9 @@ def test_assemble_bundle_happy_path(tmp_path):
 
     c = load_contract(yml)
     expected_tree_hash = fixture._tree_hash(snap)
-    fixture.EXPECTED_SKILL_HASH = fixture._sha256_file(skill)
+    monkeypatch.setattr(
+        fixture, "EXPECTED_SKILL_HASH", fixture._sha256_file(skill)
+    )
     bundle = fixture.assemble_author_bundle(
         diff_path=diff,
         snapshot_dir=snap,
@@ -193,12 +195,12 @@ def test_assemble_rejects_template_hash_mismatch(tmp_path):
         )
 
 
-def test_assemble_rejects_skill_hash_mismatch(tmp_path):
+def test_assemble_rejects_skill_hash_mismatch(tmp_path, monkeypatch):
     """The skill hash is verified fail-closed: a different skill is a different measurement."""
     yml = _write_yml(tmp_path)
     diff = tmp_path / "b.patch"
     diff.write_text("x", encoding="utf-8")
-    fixture.EXPECTED_SKILL_HASH = "f" * 64
+    monkeypatch.setattr(fixture, "EXPECTED_SKILL_HASH", "f" * 64)
     with pytest.raises(ValueError, match="skill hash mismatch"):
         fixture.assemble_author_bundle(
             diff_path=diff,
@@ -428,7 +430,7 @@ def test_create_snapshot_rejects_nonempty_output_dir(tmp_path):
         fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=out)
 
 
-def test_create_snapshot_feeds_bundle_with_recorded_sha(tmp_path):
+def test_create_snapshot_feeds_bundle_with_recorded_sha(tmp_path, monkeypatch):
     """End to end: scripted snapshot -> bundle, manifest records source_sha."""
     repo, sha = _git_repo(tmp_path)
     snap = fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
@@ -436,7 +438,9 @@ def test_create_snapshot_feeds_bundle_with_recorded_sha(tmp_path):
     diff = tmp_path / "b.patch"
     diff.write_text("diff --git a/x b/x\n", encoding="utf-8")
     skill = _write_skill(tmp_path)
-    fixture.EXPECTED_SKILL_HASH = fixture._sha256_file(skill)
+    monkeypatch.setattr(
+        fixture, "EXPECTED_SKILL_HASH", fixture._sha256_file(skill)
+    )
     bundle = fixture.assemble_author_bundle(
         diff_path=diff,
         snapshot_dir=snap.dir,

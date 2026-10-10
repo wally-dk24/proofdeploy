@@ -29,8 +29,10 @@ Credential provider (proactive, never reactive):
   token or a provider-issued token nears expiry. Fixture tokens have no
   known expiry and are never refreshed proactively.
 
-harness_app setup steps are INCONCLUSIVE (reason `environment`) until
-WO-5 can provision them.
+harness_app setup steps are provisioned for real by the executor
+(WO-5): the step's source is written to a file and started as a process
+on a loopback port, which becomes the probe's target for the rest of the
+run.
 """
 
 from __future__ import annotations
@@ -165,6 +167,13 @@ class SetupContext:
     # results instead of trusting the caller to pass them in.
     run_captures: dict[str, str] = field(default_factory=dict, repr=False)
     run_minted: list[str] = field(default_factory=list, repr=False)
+    # Set by a harness_app setup step (WO-5): subsequent setup steps and
+    # the probe's act target the harness app instead of the provisioned
+    # target. None when no harness_app step ran.
+    target_override: str | None = None
+    # Processes started by harness_app setup steps during this probe run.
+    # The executor stops them when the probe run ends.
+    harness_procs: list[Any] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         if self.effective_token() is not None:
