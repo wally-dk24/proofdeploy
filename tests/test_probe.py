@@ -176,3 +176,51 @@ def test_one_bad_probe_rejects_all():
     bad = "```json\n" + json.dumps({"act": {"method": "GET", "path": "/x"}}) + "\n```"
     with pytest.raises(ProbeRejected):
         parse_probes(good + "\n" + bad)
+
+
+def test_lenient_parse_keeps_valid_and_records_invalid():
+    """Addendum 11 rule 6: per-block validation. Valid blocks run;
+    invalid blocks are recorded with their rejection reason, never sent."""
+    from proofdeploy.probe import parse_probes_lenient
+
+    good = _fenced(_valid_probe())
+    bad_json = "```json\n{not json}\n```"
+    bad_schema = "```json\n" + json.dumps({"act": {"method": "GET", "path": "/x"}}) + "\n```"
+    valid, invalid = parse_probes_lenient(good + "\n" + bad_json + "\n" + bad_schema)
+    assert len(valid) == 1
+    assert valid[0]["act"]["method"] == "GET"
+    assert len(invalid) == 2
+    assert invalid[0]["block_index"] == 1
+    assert "invalid JSON" in invalid[0]["rejection_reason"]
+    assert invalid[0]["raw_text"].strip() == "{not json}"
+    assert invalid[1]["block_index"] == 2
+    assert "assert" in invalid[1]["rejection_reason"]
+
+
+def test_lenient_parse_no_blocks_records_reason():
+    from proofdeploy.probe import parse_probes_lenient
+
+    valid, invalid = parse_probes_lenient("just some prose, no blocks")
+    assert valid == []
+    assert len(invalid) == 1
+    assert invalid[0]["block_index"] == -1
+    assert "no fenced" in invalid[0]["rejection_reason"]
+
+
+def test_probeset_keeps_invalid_blocks():
+    """ProbeSet.from_author_output never raises for bad blocks."""
+    good = _fenced(_valid_probe())
+    bad = "```json\n" + json.dumps({"act": {"method": "GET", "path": "/x"}}) + "\n```"
+    ps = ProbeSet.from_author_output(good + "\n" + bad)
+    assert len(ps.probes) == 1
+    assert len(ps.invalid_blocks) == 1
+    assert ps.has_valid_probes
+    assert ps.manifest()["invalid_block_count"] == 1
+
+    ps2 = ProbeSet.from_author_output("no blocks here")
+    assert not ps2.has_valid_probes
+    assert len(ps2.invalid_blocks) == 1
+
+    ps3 = ProbeSet.from_author_output("   \n  ")
+    assert not ps3.has_valid_probes
+    assert ps3.invalid_blocks[0]["rejection_reason"] == "model returned empty content"

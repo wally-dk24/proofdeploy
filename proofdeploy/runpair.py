@@ -406,6 +406,10 @@ def build_evidence_record(
     prompt: str | None = None,
     raw_model_response: str | None = None,
     parsed_probes: list[dict[str, Any]] | None = None,
+    # Addendum 11 rule 6: author blocks that failed validation, recorded
+    # verbatim with their rejection reason. Entries: {"block_index",
+    # "raw_text", "rejection_reason"}. Never sent as probes.
+    invalid_probe_blocks: list[dict[str, Any]] | None = None,
     bundle_manifest: dict[str, Any] | None = None,
     bundle_manifest_sha256: str | None = None,
     skill_sha256: str | None = None,
@@ -527,6 +531,7 @@ def build_evidence_record(
         "raw_model_response": raw_model_response,
         "parsed_probes": parsed,
         "parsed_probes_sha256": _sha256_canonical(parsed),
+        "invalid_probe_blocks": invalid_probe_blocks or [],
         "bundle_manifest": bundle_manifest or {},
         "bundle_manifest_sha256": bundle_manifest_sha256,
         "skill_sha256": skill_sha256,

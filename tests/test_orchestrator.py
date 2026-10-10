@@ -1064,7 +1064,7 @@ def test_target_process_stopped_after_crash(tmp_path):
     # The crash should be recorded as INCONCLUSIVE, not propagate.
     summary = orch.measure_bug()
     assert summary["verdict"] == "inconclusive"
-    assert summary["cause"] == "orchestrator_crash"
+    assert summary["cause"] == "tool_failure"
     import time
     time.sleep(2)
     after = _count_app_processes()
@@ -1101,7 +1101,7 @@ def test_crash_after_authoring_records_inconclusive(tmp_path):
     orch._provision_side = bad_provision
     summary = orch.measure_bug()
     assert summary["verdict"] == "inconclusive"
-    assert summary["cause"] == "orchestrator_crash"
+    assert summary["cause"] == "tool_failure"
     # The evidence record exists with the prompt and raw response.
     records = read_records(out)
     evidence = records[0]
@@ -1141,7 +1141,7 @@ def test_sandboxed_crash_records_measured(tmp_path, monkeypatch):
     orch._provision_side_sandbox = bad_provision_sandbox
     summary = orch.measure_bug()
     assert summary["verdict"] == "inconclusive"
-    assert summary["cause"] == "orchestrator_crash"
+    assert summary["cause"] == "tool_failure"
     records = read_records(out)
     evidence = records[0]
     assert evidence["measured_result"] is True
@@ -1550,3 +1550,202 @@ def test_target_process_group_killed(tmp_path):
 
     # Clean up the run's scratch dirs.
     prov.cleanup_run(result.run_id, logs=[])
+
+
+# ---------------------------------------------------------------------------
+# Addendum 10/11: invalid author output never crashes or loses the record.
+# Each invalid block is validated on its own; valid blocks run, invalid
+# blocks are recorded verbatim as INCONCLUSIVE probe results, never sent.
+# ---------------------------------------------------------------------------
+
+def _mixed_probes(prompt: str) -> ModelResponse:
+    """One valid status probe plus one invalid block (missing assert)."""
+    return ModelResponse(
+        content=(
+            "Here are my probes.\n"
+            "```json\n"
+            '{"setup": [], '
+            '"act": {"method": "GET", "path": "/value"}, '
+            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+            "\n```\n"
+            "And a second one:\n"
+            "```json\n"
+            '{"act": {"method": "GET", "path": "/x"}}'
+            "\n```\n"
+        ),
+        finish_reason="stop",
+    )
+
+
+def _no_block_probes(prompt: str) -> ModelResponse:
+    return ModelResponse(
+        content="I looked at the app and could not devise a probe.",
+        finish_reason="stop",
+    )
+
+
+def _non_json_probes(prompt: str) -> ModelResponse:
+    return ModelResponse(
+        content="```json\n{this is not valid json\n```\n",
+        finish_reason="stop",
+    )
+
+
+def _all_invalid_probes(prompt: str) -> ModelResponse:
+    return ModelResponse(
+        content=(
+            "```json\n"
+            '{"act": {"method": "BREW", "path": "/x"}, '
+            '"assert": [{"type": "status", "equals": 200}]}'
+            "\n```\n"
+        ),
+        finish_reason="stop",
+    )
+
+
+def _bug_cfg_invalid(tmp_path, info, bug_id, runner):
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    return (
+        MeasureConfig(
+            repo_dir=Path(info["repo"]),
+            output_dir=out,
+            workdir=work,
+            skill_path=skill_path(),
+            bug_id=bug_id,
+            rev_bug_base=info["base"],
+            rev_bug=info["bug"],
+            rev_fix=info["fix"],
+            model_runner=runner,
+            public_contract_env_keys=["APP_ENV"],
+            allow_unsandboxed=True,
+        ),
+        out,
+    )
+
+
+def test_mixed_valid_invalid_blocks(tmp_path):
+    """Addendum 11 rule 6: the valid block runs and can catch; the
+    invalid block is recorded verbatim as an INCONCLUSIVE probe result,
+    never sent."""
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-mixed-blocks", _mixed_probes)
+    summary = Orchestrator(cfg).measure_bug()
+    # The valid probe still caught the bug (FAIL at fix^, PASS at fix).
+    assert summary["verdict"] == "candidate_catch"
+    assert summary["candidate_catch"] == [0]
+    assert summary["probe_count"] == 1
+    # The invalid block was recorded verbatim with its rejection reason.
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["record_type"] == "evidence"
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    bad = evidence["invalid_probe_blocks"][0]
+    assert bad["block_index"] == 1
+    assert bad["raw_text"].strip() == '{"act": {"method": "GET", "path": "/x"}}'
+    assert "assert" in bad["rejection_reason"]
+    # ... and reported as an INCONCLUSIVE probe result on both sides.
+    for side_key in ("fix_parent_results", "fix_results"):
+        results = evidence[side_key]
+        assert len(results) == 2
+        by_index = {r["probe_index"]: r for r in results}
+        assert by_index[1]["verdict"] == "inconclusive"
+        assert by_index[1]["reason"] == "probe"
+        assert by_index[1]["request"] is None  # never sent
+    # The score record agrees with the evidence (re-scored on write).
+    score = records[1]
+    assert score["record_type"] == "score"
+    assert score["verdict"] == "candidate_catch"
+    assert score["candidate_catch"] == [0]
+
+
+def test_no_blocks_records_author_output_invalid(tmp_path):
+    """No fenced blocks: the evidence is committed (prompt + raw
+    response), the bug unit scores as not caught with cause
+    author_output_invalid, never as pair INCONCLUSIVE."""
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-no-blocks", _no_block_probes)
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "no_catch"
+    assert summary["cause"] == "author_output_invalid"
+    assert summary["reason_class"] == "probe"
+    assert summary["counting"] == "counts_as_not_caught"
+    assert summary["candidate_catch"] == []
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["record_type"] == "evidence"
+    assert evidence["prompt"]  # not lost
+    assert evidence["raw_model_response"] == _no_block_probes("").content
+    assert evidence["inconclusive_cause"] == "author_output_invalid"
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    assert "no fenced" in evidence["invalid_probe_blocks"][0]["rejection_reason"]
+    # Unsandboxed dev run is not a measured result.
+    assert evidence["measured_result"] is False
+    score = records[1]
+    assert score["record_type"] == "score"
+    assert score["verdict"] == "no_catch"
+    assert score["candidate_catch"] == []
+
+
+def test_non_json_block_records_author_output_invalid(tmp_path):
+    """Unparseable JSON block: same no-valid-probe path as no blocks."""
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-non-json", _non_json_probes)
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "no_catch"
+    assert summary["cause"] == "author_output_invalid"
+    assert summary["counting"] == "counts_as_not_caught"
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["prompt"]
+    assert evidence["raw_model_response"] == _non_json_probes("").content
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    assert "invalid JSON" in evidence["invalid_probe_blocks"][0]["rejection_reason"]
+
+
+def test_all_blocks_invalid_records_author_output_invalid(tmp_path):
+    """Every block invalid: evidence committed, not caught, cause recorded."""
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-all-invalid", _all_invalid_probes)
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "no_catch"
+    assert summary["cause"] == "author_output_invalid"
+    assert summary["counting"] == "counts_as_not_caught"
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["prompt"]
+    assert evidence["raw_model_response"] == _all_invalid_probes("").content
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    assert "BREW" in evidence["invalid_probe_blocks"][0]["rejection_reason"]
+
+
+def test_clean_no_valid_probe_is_false_alarm(tmp_path):
+    """Addendum 11 rule 6 on a clean diff: no valid probe counts as a
+    false alarm (rule 3 counting)."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-clean-invalid",
+        rev_clean=info["fix"],
+        model_runner=_no_block_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_clean()
+    assert summary["verdict"] == "false_alarm"
+    assert summary["false_alarm"] is True
+    assert summary["cause"] == "author_output_invalid"
+    assert summary["reason_class"] == "probe"
+    assert summary["counting"] == "counts_as_false_alarm"
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["prompt"]
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    score = records[1]
+    assert score["record_type"] == "score"
+    assert score["false_alarm"] is True

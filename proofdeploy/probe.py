@@ -283,27 +283,106 @@ def harness_app_hash(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
+def parse_probes_lenient(
+    text: str, allow_harness_app: bool = False
+) -> tuple[list[dict], list[dict]]:
+    """Extract probes forgivingly: returns (valid_probes, invalid_blocks).
+
+    Every fenced ```json block is validated on its own (Addendum 11
+    rule 6). Valid blocks are returned as probes; invalid blocks are
+    returned as {"block_index": int, "raw_text": str,
+    "rejection_reason": str} and must never be sent — the caller records
+    each as an INCONCLUSIVE probe result with its rejection reason.
+
+    Never raises for author-output problems.
+    """
+    blocks = re.findall(r"```json\s*\n(.*?)```", text, re.DOTALL)
+    if not blocks:
+        return [], [
+            {
+                "block_index": -1,
+                "raw_text": text,
+                "rejection_reason": "no fenced ```json blocks found in author output",
+            }
+        ]
+    valid: list[dict] = []
+    invalid: list[dict] = []
+    for i, block in enumerate(blocks):
+        try:
+            probe = json.loads(block)
+        except json.JSONDecodeError as e:
+            invalid.append(
+                {
+                    "block_index": i,
+                    "raw_text": block,
+                    "rejection_reason": f"block {i}: invalid JSON: {e}",
+                }
+            )
+            continue
+        try:
+            validate_probe(probe, allow_harness_app=allow_harness_app)
+        except ProbeRejected as e:
+            invalid.append(
+                {
+                    "block_index": i,
+                    "raw_text": block,
+                    "rejection_reason": f"block {i}: {e}",
+                }
+            )
+            continue
+        valid.append(probe)
+    return valid, invalid
+
+
 @dataclass
 class ProbeSet:
     """A validated set of probes plus metadata for the run manifest."""
 
     probes: list[dict]
+    # Blocks that failed validation (Addendum 11 rule 6): never sent;
+    # each is recorded as an INCONCLUSIVE probe result with its
+    # rejection reason. Entries: {"block_index", "raw_text",
+    # "rejection_reason"}.
+    invalid_blocks: list[dict] = field(default_factory=list)
     harness_version: str = HARNESS_VERSION
     harness_app_hashes: list[str] = field(default_factory=list)
 
+    @property
+    def has_valid_probes(self) -> bool:
+        """True when at least one block validated and can run."""
+        return bool(self.probes)
+
     @classmethod
     def from_author_output(cls, text: str, allow_harness_app: bool = False) -> ProbeSet:
-        probes = parse_probes(text, allow_harness_app=allow_harness_app)
+        if not text.strip():
+            return cls(
+                probes=[],
+                invalid_blocks=[
+                    {
+                        "block_index": -1,
+                        "raw_text": "",
+                        "rejection_reason": "model returned empty content",
+                    }
+                ],
+            )
+        probes, invalid_blocks = parse_probes_lenient(
+            text, allow_harness_app=allow_harness_app
+        )
         hashes = []
         for p in probes:
             for step in p.get("setup", []):
                 if step.get("type") == "harness_app":
                     hashes.append(harness_app_hash(step["source"]))
-        return cls(probes=probes, harness_app_hashes=hashes)
+        return cls(
+            probes=probes,
+            invalid_blocks=invalid_blocks,
+            harness_app_hashes=hashes,
+        )
 
     def manifest(self) -> dict:
         return {
             "harness_version": self.harness_version,
             "probe_count": len(self.probes),
+            "invalid_block_count": len(self.invalid_blocks),
             "harness_app_hashes": self.harness_app_hashes,
         }
