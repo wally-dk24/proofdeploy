@@ -163,8 +163,13 @@ def test_measure_bug_end_to_end(tmp_path):
     assert not any(r["record_type"] == "judgment" for r in records)
     evidence, score = records
     assert evidence["prompt"] and evidence["raw_model_response"]
+    # The run pair compares fix^ vs fix (not B vs fix). In this toy repo,
+    # fix^ == bug (B), so fix_parent_sha == info["bug"].
     assert evidence["fix_parent_sha"] == info["bug"]
     assert evidence["fix_sha"] == info["fix"]
+    # All four SHAs are recorded.
+    assert evidence["b_sha"] == info["bug"]
+    assert evidence["b_parent_sha"] == info["base"]
     assert evidence["verdict"] is None
     # The stored score verdict stays candidate_catch: never catch.
     assert score["verdict"] == "candidate_catch"
@@ -180,6 +185,62 @@ def test_measure_bug_end_to_end(tmp_path):
     for sub in ("venvs", "runs"):
         d = prov / sub
         assert not d.exists() or list(d.iterdir()) == []
+
+
+def test_measure_bug_uses_fix_parent_not_b(tmp_path):
+    """The run pair must provision fix^, not B, for the 'before' side.
+
+    Creates a repo where B != fix^: base -> bug (B, VALUE=2) ->
+    middle (VALUE=3, unrelated) -> fix (VALUE=1). The fix-parent side
+    must run at fix^ (middle, VALUE=3), not at B (VALUE=2).
+    """
+    repo = tmp_path / "mini-app2"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@test")
+    (repo / "requirements.txt").write_text("# no third-party deps\n")
+    (repo / "proofdeploy.yml").write_text(MINI_YML)
+    shas = {}
+    # base (VALUE=1) -> bug B (VALUE=2) -> middle (VALUE=3) -> fix (VALUE=1)
+    for tag, value in (("base", 1), ("bug", 2), ("middle", 3), ("fix", 1)):
+        (repo / "app.py").write_text(MINI_APP.replace("__VALUE__", str(value)))
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", tag)
+        shas[tag] = _git(repo, "rev-parse", "HEAD")
+    # fix^ is the middle commit, not the bug commit.
+    fix_parent = _git(repo, "rev-parse", "HEAD^")
+    assert fix_parent == shas["middle"]
+    assert fix_parent != shas["bug"]
+
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=repo,
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini2",
+        rev_bug_base=shas["base"],
+        rev_bug=shas["bug"],
+        rev_fix=shas["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    Orchestrator(cfg).measure_bug()
+    # The probe asserts VALUE==1. At fix^ (middle, VALUE=3), it fails;
+    # at fix (VALUE=1), it passes. If we had (incorrectly) used B (VALUE=2)
+    # for the before side, it would also fail — but the SHAs prove we
+    # used fix^.
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["fix_parent_sha"] == shas["middle"]
+    assert evidence["fix_sha"] == shas["fix"]
+    assert evidence["b_sha"] == shas["bug"]
+    assert evidence["b_parent_sha"] == shas["base"]
+    # The recorded fix_parent_sha must NOT be B.
+    assert evidence["fix_parent_sha"] != shas["bug"]
 
 
 def test_measure_bug_provisioning_failure_is_inconclusive(tmp_path):

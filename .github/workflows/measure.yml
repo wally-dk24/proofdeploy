@@ -10,11 +10,11 @@
 # prompt, and is redacted by value in every record.
 #
 # Records: the evidence commit is pushed first, then the score commit,
-# to the `records/run-<run-id>` branch. A runner's disk is wiped after
-# each run; the branch is the durable store.
+# to the `records/run-<run-id>` branch. The runner's disk is wiped after
+# the run; the branch is the durable store.
 #
 # Provenance: every evidence record carries the Actions run URL and ID,
-# the runner image, and the capability probe output.
+# the runner image ($ImageOS/$ImageVersion), and the capability probe output.
 #
 # DO NOT TRIGGER before the reviewer has seen the exact contents.
 # Any change to this workflow goes back to review.
@@ -24,45 +24,44 @@ name: measure
 on:
   workflow_dispatch:
     inputs:
-      unit_id:
-        description: "Unit ID for this measured run (e.g. wo5-acceptance)"
+      target_repo:
+        description: "Target app repo URL (e.g. https://github.com/org/app.git)"
         required: true
         type: string
       bug_id:
-        description: "Bug ID (for measure_bug; leave empty for measure_clean)"
+        description: "Bug ID (for bug runs; leave empty for clean runs)"
         required: false
         type: string
-      rev_bug_base:
-        description: "Base revision (parent of bug)"
+      base:
+        description: "B^: parent of the bug-introducing commit"
         required: false
         type: string
-      rev_bug:
-        description: "Bug revision"
+      bug:
+        description: "B: the bug-introducing commit"
         required: false
         type: string
-      rev_fix:
-        description: "Fix revision"
+      fix:
+        description: "The fix commit"
         required: false
         type: string
       clean_id:
-        description: "Clean ID (for measure_clean; leave empty for measure_bug)"
+        description: "Clean ID (for clean runs; leave empty for bug runs)"
         required: false
         type: string
-      rev_clean:
-        description: "Clean revision"
+      clean:
+        description: "C: the clean-diff commit"
         required: false
         type: string
 
-# No repository-level secrets. The GROQ_API_KEY comes from the
-# `measurement` environment, where Master is the required reviewer.
-# The workflow cannot start until Master approves it there.
-environment: measurement
+# Least privilege: only need to push records to this repo.
+permissions:
+  contents: write
 
 jobs:
   measure:
     runs-on: ubuntu-latest
     # The environment gate: Master must approve before this runs.
-    # This is where the GROQ_API_KEY lives.
+    # GROQ_API_KEY lives in the `measurement` environment.
     environment: measurement
     steps:
       - uses: actions/checkout@v4
@@ -82,62 +81,86 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
+      - name: Check out target repo
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          # Quote the input via env to avoid shell injection.
+          git clone "$TARGET_REPO" /tmp/target-repo
+
       - name: Capability probe (fail-closed gate)
         id: probe
         run: |
           python -c "
-          from proofdeploy.sandbox import check_sandbox_capabilities, assert_measurement_gate
-          from proofdeploy.sandbox import SandboxConfig
-          import json
-          # The gate refuses (raises) if the host cannot meet the requirements.
-          # This step fails the workflow if the gate fails. No fallback.
-          cfg = SandboxConfig()
-          probe = assert_measurement_gate(cfg)
+          from proofdeploy.sandbox import assert_measurement_gate
+          # Fail-closed: raises if the host cannot meet the requirements.
+          # No config arg needed; uses defaults. This step fails the
+          # workflow if the gate fails. No fallback.
+          probe = assert_measurement_gate()
           print('GATE PASSED')
+          import json
           print(json.dumps(probe, indent=2))
           "
 
       - name: Run measured unit
         env:
-          # The key is available to the `proofdeploy measure` command on the
-          # host only. It is never passed to containers (the sandbox strips
-          # it), never appears in prompts, and is redacted by value in records.
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          BUG_ID: ${{ inputs.bug_id }}
+          BASE: ${{ inputs.base }}
+          BUG: ${{ inputs.bug }}
+          FIX: ${{ inputs.fix }}
+          CLEAN_ID: ${{ inputs.clean_id }}
+          CLEAN: ${{ inputs.clean }}
+          # Provenance: runner image from the GitHub-provided env vars.
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          # Record provenance for the evidence record.
-          echo "PROOFDEPLOY_RUN_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
-          echo "PROOFDEPLOY_RUN_ID=${{ github.run_id }}" >> $GITHUB_ENV
-          echo "PROOFDEPLOY_RUNNER_IMAGE=${{ runner.os }}-${{ runner.arch }}" >> $GITHUB_ENV
-          if [ -n "${{ inputs.bug_id }}" ]; then
-            python -m proofdeploy measure-bug \
-              --unit-id "${{ inputs.unit_id }}" \
-              --bug-id "${{ inputs.bug_id }}" \
-              --rev-bug-base "${{ inputs.rev_bug_base }}" \
-              --rev-bug "${{ inputs.rev_bug }}" \
-              --rev-fix "${{ inputs.rev_fix }}" \
-              --provenance-run-url "$PROOFDEPLOY_RUN_URL" \
-              --provenance-run-id "$PROOFDEPLOY_RUN_ID" \
-              --provenance-runner-image "$PROOFDEPLOY_RUNNER_IMAGE"
+          # The key is available to `proofdeploy measure` on the host only.
+          # It never enters containers, never appears in prompts, and is
+          # redacted by value in records.
+          mkdir -p /tmp/workdir /tmp/output
+          # The skill file must be the registered copy; it is hash-verified
+          # at bundle time. For WO-5, the skill is empty (no-skill arm).
+          touch /tmp/empty-skill.md
+          if [ -n "$BUG_ID" ]; then
+            python -m proofdeploy.cli measure \
+              --repo /tmp/target-repo \
+              --workdir /tmp/workdir \
+              --output-dir /tmp/output \
+              --skill /tmp/empty-skill.md \
+              --bug-id "$BUG_ID" \
+              --base "$BASE" \
+              --bug "$BUG" \
+              --fix "$FIX"
           else
-            python -m proofdeploy measure-clean \
-              --unit-id "${{ inputs.unit_id }}" \
-              --clean-id "${{ inputs.clean_id }}" \
-              --rev-clean "${{ inputs.rev_clean }}" \
-              --provenance-run-url "$PROOFDEPLOY_RUN_URL" \
-              --provenance-run-id "$PROOFDEPLOY_RUN_ID" \
-              --provenance-runner-image "$PROOFDEPLOY_RUNNER_IMAGE"
+            python -m proofdeploy.cli measure \
+              --repo /tmp/target-repo \
+              --workdir /tmp/workdir \
+              --output-dir /tmp/output \
+              --skill /tmp/empty-skill.md \
+              --clean-id "$CLEAN_ID" \
+              --clean "$CLEAN"
           fi
+          # Record provenance for the evidence record.
+          echo "PROOFDEPLOY_RUN_URL=$RUN_URL" >> "$GITHUB_ENV"
+          echo "PROOFDEPLOY_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "PROOFDEPLOY_RUNNER_IMAGE=$ImageOS-$ImageVersion" >> "$GITHUB_ENV"
 
       - name: Push records to durable branch
+        env:
+          RUN_ID: ${{ github.run_id }}
         run: |
-          # The evidence commit is pushed first, then the score commit.
-          # The runner's disk is wiped after the run; the branch is durable.
-          RECORDS_BRANCH="records/run-${{ github.run_id }}"
+          # Push the evidence commit first, then the score commit, to the
+          # records branch. The runner's disk is wiped after the run;
+          # the branch is the durable store.
+          RECORDS_BRANCH="records/run-$RUN_ID"
+          cd /tmp/output
           git config user.name "proofdeploy-measure"
           git config user.email "proofdeploy-measure@users.noreply.github.com"
-          # The measure command creates the records repo; push its branches.
-          # (Exact push commands depend on the records repo layout; the
-          # orchestrator reviews this before the first trigger.)
-          echo "Records branch: $RECORDS_BRANCH"
-          echo "Evidence and score commits are in the local records repo."
-          echo "Push them to $RECORDS_BRANCH before the runner is destroyed."
+          # The output dir is a git repo with evidence and score commits.
+          # Push the current branch to the records branch.
+          git push origin "HEAD:$RECORDS_BRANCH"
+          echo "Pushed records to $RECORDS_BRANCH"
+          echo "Evidence SHA: $(git log --format=%H -n 2 | tail -1)"
+          echo "Score SHA: $(git log --format=%H -n 1)"

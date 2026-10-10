@@ -395,6 +395,10 @@ def build_evidence_record(
     clean_id: str | None = None,
     fix_sha: str | None = None,
     fix_parent_sha: str | None = None,
+    # B (bug-introducing commit) and B^, resolved separately from fix^.
+    # The run pair compares fix^ vs fix; B/B^ are recorded for provenance.
+    b_sha: str | None = None,
+    b_parent_sha: str | None = None,
     # Clean-diff runs use these explicit fields (never the fix_* ones).
     c_sha: str | None = None,
     c_provision: dict[str, Any] | None = None,
@@ -499,6 +503,8 @@ def build_evidence_record(
         "clean_id": clean_id,
         "fix_sha": fix_sha,
         "fix_parent_sha": fix_parent_sha,
+        "b_sha": b_sha,
+        "b_parent_sha": b_parent_sha,
         "c_sha": c_sha,
         "c_provision": c_provision or {},
         "c_results": [r.to_dict() for r in (c_results or [])],

@@ -51,7 +51,7 @@ TEMPERATURE = 0.2
 
 # Frozen author-prompt template. The file is versioned; its hash is in
 # every evidence record.
-PROMPT_TEMPLATE_FILENAME = "author_prompt_v4.md"
+PROMPT_TEMPLATE_FILENAME = "author_prompt_v5.md"
 
 _GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_ALLOWED_HOSTS = ["api.groq.com"]
@@ -95,10 +95,12 @@ _PLACEHOLDERS = (
     "framing",
     "contract",
     "closing",
+    "caps",
     "skill_text",
     "fixture_description",
     "diff_text",
-    "diff_fence",
+    "diff_fence_open",
+    "diff_fence_close",
     "snapshot_file_list",
     "touched_file_contents",
 )
@@ -185,11 +187,13 @@ def _read_text_capped(path: Path, cap: int) -> str | None:
         return None
 
 
-def _fence_for(content: str, info: str = "") -> str:
+def _fence_for(content: str, info: str = "") -> tuple[str, str]:
     """Code fence longer than any backtick run in the content.
 
-    Prevents the content from accidentally closing the fence. The
-    info string (e.g. "diff", "json") follows the opening fence.
+    Prevents the content from accidentally closing the fence. Returns
+    (opening, closing): the opening fence carries the info string
+    (e.g. "diff"), the closing is the bare backtick run.
+    Fence length = max(3, longest backtick run + 1).
     """
     max_run = 0
     run = 0
@@ -199,20 +203,26 @@ def _fence_for(content: str, info: str = "") -> str:
             max_run = max(max_run, run)
         else:
             run = 0
-    # Fence must be strictly longer than the longest backtick run.
-    fence = "`" * (max_run + 1)
-    return f"{fence}{info}" if info else fence
+    # Fence must be strictly longer than the longest backtick run,
+    # and at least 3 (a valid Markdown code fence).
+    fence = "`" * max(3, max_run + 1)
+    opening = f"{fence}{info}" if info else fence
+    return opening, fence
 
 
 def build_author_prompt(
     *,
-    skill_text: str,
+    skill_text: str | None,
     fixture_description: str,
     diff_text: str,
     snapshot_dir: str | Path,
     template_path: str | Path | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Compose the blind author's prompt from bundle inputs only.
+
+    The builder is the single source for the no-skill rendering: a None
+    or empty skill_text is rendered as "(none)". Callers pass None/empty
+    for "no skill"; they do not pre-render "(none)" themselves.
 
     Framing, output contract, and truncation caps come from the frozen
     template file. Deterministic: same bundle in, same prompt out. The
@@ -271,35 +281,60 @@ def build_author_prompt(
                 pass
             entry = tpl["unavailable_file"].replace("[[path]]", rel)
         else:
-            file_fence = _fence_for(content)
+            file_open, file_close = _fence_for(content)
             entry = (
                 tpl["file_entry"]
                 .replace("[[path]]", rel)
-                .replace("[[file_fence]]", file_fence)
+                .replace("[[file_fence_open]]", file_open)
+                .replace("[[file_fence_close]]", file_close)
                 .replace("[[content]]", content.rstrip())
             )
         touched_parts.append(entry)
     touched_text = "\n\n".join(touched_parts)
+    # Explicit marker when the diff-files cap truncated the list.
+    if truncation_flags["diff_files_truncated"]:
+        omitted = len(all_touched) - caps["max_diff_files"]
+        cap = caps["max_diff_files"]
+        touched_text += f"\n\n... ({omitted} more diff files omitted: cap is {cap})"
 
     # Diff fence adapts to backtick runs in the diff.
-    diff_fence = _fence_for(diff_text, "diff")
+    diff_open, diff_close = _fence_for(diff_text, "diff")
 
-    prompt: str = tpl["body"]
-    prompt = prompt.replace("[[framing]]", tpl["framing"])
-    prompt = prompt.replace("[[contract]]", tpl["contract"])
-    prompt = prompt.replace("[[closing]]", tpl["closing"])
-    prompt = prompt.replace("[[skill_text]]", skill_text.rstrip())
-    prompt = prompt.replace("[[fixture_description]]", fixture_description.rstrip())
-    prompt = prompt.replace("[[diff_fence]]", diff_fence)
-    prompt = prompt.replace("[[diff_text]]", diff_text.rstrip())
-    prompt = prompt.replace("[[snapshot_file_list]]", file_list)
-    prompt = prompt.replace("[[touched_file_contents]]", touched_text)
-    # Fail-closed: no placeholder may survive substitution.
-    leftover = re.findall(r"\[\[([a-z_]+)\]\]", prompt)
-    if leftover:
+    # Single-pass substitution: build the value map, then substitute each
+    # [[placeholder]] in the template exactly once. Values are not re-scanned,
+    # so content containing [[...]] (e.g. in a diff) is not expanded.
+    # Single source for no-skill rendering: None/empty -> "(none)".
+    rendered_skill = "(none)" if not skill_text or not skill_text.strip() else skill_text.rstrip()
+    values = {
+        "framing": tpl["framing"],
+        "contract": tpl["contract"],
+        "closing": tpl["closing"],
+        "caps": (
+            f"Size limits: at most {caps['max_diff_files']} diff files, "
+            f"at most {caps['max_file_bytes']} bytes per touched file, "
+            f"at most {caps['max_listed_files']} files listed."
+        ),
+        "skill_text": rendered_skill,
+        "fixture_description": fixture_description.rstrip(),
+        "diff_fence_open": diff_open,
+        "diff_fence_close": diff_close,
+        "diff_text": diff_text.rstrip(),
+        "snapshot_file_list": file_list,
+        "touched_file_contents": touched_text,
+    }
+    # Fail-closed: every [[...]] in the template must be a known placeholder.
+    # Check the template, not the output: values may legitimately contain
+    # [[...]] (e.g. a diff mentioning a placeholder name).
+    template_placeholders = set(re.findall(r"\[\[([a-z_]+)\]\]", tpl["body"]))
+    unknown = template_placeholders - set(values.keys())
+    if unknown:
         raise ValueError(
-            f"prompt has unsubstituted placeholders: {sorted(set(leftover))}"
+            f"prompt template Body uses unknown placeholders: {sorted(unknown)}"
         )
+    def _sub(m: re.Match[str]) -> str:
+        v: str = values[m.group(1)]
+        return v
+    prompt = re.sub(r"\[\[([a-z_]+)\]\]", _sub, tpl["body"])
     return prompt, truncation_flags
 
 

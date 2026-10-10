@@ -262,18 +262,18 @@ def test_credential_unavailable_raises(monkeypatch):
         raise AssertionError("expected RuntimeError")
 
 
-def test_template_v4_hash_and_content():
-    """The v4 template is the registered file: hash matches, the
+def test_template_v5_hash_and_content():
+    """The v5 template is the registered file: hash matches, the
     harness example shows python|node, and the assertion wording is
-    Master's approved v4 text."""
+    Master-approved v5 text (v4 wording plus caps placeholder)."""
     import hashlib
     import re
     from pathlib import Path
 
     import proofdeploy.model_client as mc
 
-    assert mc.PROMPT_TEMPLATE_FILENAME == "author_prompt_v4.md"
-    path = Path(mc.__file__).with_name("author_prompt_v4.md")
+    assert mc.PROMPT_TEMPLATE_FILENAME == "author_prompt_v5.md"
+    path = Path(mc.__file__).with_name("author_prompt_v5.md")
     text = path.read_text(encoding="utf-8")
     assert hashlib.sha256(text.encode("utf-8")).hexdigest() == mc.author_prompt_sha256()
     assert '"language": "python|node"' in text
@@ -290,3 +290,47 @@ def test_template_v4_hash_and_content():
     assert "a list of the repository's files at the changed commit" in flat
     # v4 credential wording.
     assert "You may choose credentials for users you create in setup." in flat
+
+
+def test_fence_minimum_length_three(tmp_path):
+    """With no backticks in content, the fence must be at least 3 backticks."""
+    from proofdeploy.model_client import _fence_for
+    opening, closing = _fence_for("no backticks here", "diff")
+    assert opening == "```diff"
+    assert closing == "```"
+    # Bare fence (no info) also minimum 3.
+    opening2, closing2 = _fence_for("plain")
+    assert opening2 == "```"
+    assert closing2 == "```"
+
+
+def test_fence_adapts_to_backtick_runs(tmp_path):
+    """Fence length = max(3, longest backtick run + 1). Closing is bare."""
+    from proofdeploy.model_client import _fence_for
+    # Content with 4 backticks in a row needs 5-backtick fence.
+    content = "here is ```` four backticks"
+    opening, closing = _fence_for(content, "diff")
+    assert opening == "`````diff"
+    assert closing == "`````"
+    assert len(closing) == 5
+
+
+def test_rendered_prompt_fences_correct(tmp_path):
+    """Rendered prompt has correct opening/closing fences."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "app.py").write_text("print('hi')\n")
+    diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-print('hi')\n+print('bye')\n"
+    prompt, _ = build_author_prompt(
+        skill_text="SKILL",
+        fixture_description="Repository: demo",
+        diff_text=diff,
+        snapshot_dir=snap,
+    )
+    # Opening has info string, closing is bare.
+    assert "```diff\n" in prompt
+    # The diff content is fenced correctly.
+    assert prompt.count("```diff") == 1
+    # Closing fence (bare ```) appears after the diff.
+    diff_section = prompt.split("```diff\n")[1].split("```\n")[0]
+    assert "print('bye')" in diff_section

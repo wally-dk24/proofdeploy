@@ -208,14 +208,14 @@ class Orchestrator:
         unit_id: str,
         rev_base: str,
         rev_tip: str,
-    ) -> tuple[Any, dict[str, Any], str, str, str, str]:
+    ) -> tuple[Any, dict[str, Any], str, str, str, str, dict[str, Any]]:
         """Assemble the author bundle.
 
-        Returns (bundle, manifest, prompt, raw_diff, base_sha, tip_sha).
-        The prompt is a pure function of the verified bundle plus the
-        frozen template: no run metadata ("run kind", unit id) is
-        included, so the orchestrator's knowledge cannot leak to the
-        model through the prompt.
+        Returns (bundle, manifest, prompt, raw_diff, base_sha, tip_sha,
+        truncation_flags). The prompt is a pure function of the verified
+        bundle plus the frozen template: no run metadata ("run kind",
+        unit id) is included, so the orchestrator's knowledge cannot leak
+        to the model through the prompt.
         Fail-closed: empty diff, bad template hash, or a secret in the
         prompt/bundle aborts before any model call. The answer-key check
         is a separate step (``_check_answer_key``) so tests can seed a
@@ -251,8 +251,9 @@ class Orchestrator:
             skill_path=cfg.skill_path,
         )
         manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+        # Pass None for no-skill; the builder renders "(none)" itself.
         skill_text = (
-            bundle.skill.read_text(encoding="utf-8") if bundle.skill else "(none)"
+            bundle.skill.read_text(encoding="utf-8") if bundle.skill else None
         )
         description = bundle.description.read_text(encoding="utf-8")
         prompt, truncation_flags = build_author_prompt(
@@ -619,18 +620,32 @@ class Orchestrator:
         prov_workdir = cfg.workdir / "provisioner"
         prov_workdir.mkdir(parents=True, exist_ok=True)
         runner = Provisioner(workdir=prov_workdir)
+        # CRITICAL: The run pair compares fix^ vs fix (the registered rule).
+        # Do NOT use cfg.rev_bug (B, the bug-introducing commit) for the
+        # "fix-parent" side. For real bugs, B can be years before fix^.
+        fix_parent_rev = f"{cfg.rev_fix}^"
+        # Resolve all four SHAs separately for the evidence record.
+        repo_dir = self.cfg.repo_dir
+        b_sha = _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_bug}^{{commit}}")
+        b_parent_sha = _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_bug_base}^{{commit}}")
+        fix_sha = _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_fix}^{{commit}}")
+        fix_parent_sha = _git(repo_dir, "rev-parse", "--verify", f"{fix_parent_rev}^{{commit}}")
         sides: list[_Side] = []
         try:
             if use_sandbox:
                 sides.append(
-                    self._provision_side_sandbox(cfg.rev_bug, _free_port(), unit_dir, "fix-parent")
+                    self._provision_side_sandbox(
+                        fix_parent_rev, _free_port(), unit_dir, "fix-parent"
+                    )
                 )
                 sides.append(
                     self._provision_side_sandbox(cfg.rev_fix, _free_port(), unit_dir, "fix")
                 )
             else:
                 sides.append(
-                    self._provision_side(runner, cfg.rev_bug, _free_port(), unit_dir, "fix-parent")
+                    self._provision_side(
+                        runner, fix_parent_rev, _free_port(), unit_dir, "fix-parent"
+                    )
                 )
                 sides.append(
                     self._provision_side(runner, cfg.rev_fix, _free_port(), unit_dir, "fix")
@@ -660,8 +675,10 @@ class Orchestrator:
             record = build_evidence_record(
                 run_kind="bug",
                 bug_id=cfg.bug_id,
-                fix_sha=fix.sha,
-                fix_parent_sha=parent.sha,
+                fix_sha=fix_sha,
+                fix_parent_sha=fix_parent_sha,
+                b_sha=b_sha,
+                b_parent_sha=b_parent_sha,
                 prompt=prompt,
                 raw_model_response=raw.content,
                 parsed_probes=probeset.probes,
