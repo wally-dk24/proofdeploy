@@ -1,7 +1,7 @@
 # WO-2 Milestone: Executor
 
 **Date:** 2026-10-10
-**Branch:** `feat/runner-executor` (head `95ce427`, awaiting Master's merge)
+**Branch:** `feat/runner-executor` (merged head `f7f98e0`, PR #36)
 **Accepted by:** Orchestrator (Master's other agent) on 2026-10-09
 **Work order:** WO-2 from brief 2026-10-10
 
@@ -89,5 +89,5 @@ DONE
 
 - `ce1e434` — WO-2 initial (8 findings fixed)
 - `b7f2988` — follow-up (rebase onto WO-1-merged main, 3 findings fixed)
-- `95ce427` — precise 4xx typing for setup HTTP failures
+- `f7f98e0` — precise 4xx typing for setup HTTP failures (merged as PR #36)
 - Accepted by orchestrator on 2026-10-09
