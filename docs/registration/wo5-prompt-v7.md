@@ -146,7 +146,7 @@ Write your probes now: one fenced ```json block per probe.
 ## 2. Prompt builder
 
 - **Path:** `proofdeploy/model_client.py`
-- **SHA-256:** `4f5bad03206d0d7b8963a455fa24364b595f5b46074708804873585af38208ce`
+- **SHA-256:** `55b7d93283d511b681f7af24dd78aafc0cc750d652ed965f94fe7a4ab1d28598`
   (at the commit that will merge; see below)
 
 **Statement:** Any change to the template (`proofdeploy/author_prompt_v7.md`)
@@ -161,13 +161,13 @@ Master's principle: a result we're unsure of is stated as such. When
 something external fails, say so plainly, and never guess pass or fail.
 
 1. **Labelling.** A unit whose model call produces no completion is
-   INCONCLUSIVE, reason class environment, with the cause recorded as
-   model_overflow (the prompt exceeds the model's context) or
-   model_transport (no response, or a transport error). It is never
+   INCONCLUSIVE, reason class `environment`, with the cause recorded as
+   `model_overflow` (the prompt exceeds the model's context) or
+   `model_transport` (no response, or a transport error). It is never
    reported as PASS, FAIL, catch or no-catch, and the per-unit report
    states the cause in plain words.
-2. **Retry.** model_transport: exactly one retry, with both attempts
-   recorded in the evidence. model_overflow: no retry.
+2. **Retry.** `model_transport`: exactly one retry, with both attempts
+   recorded in the evidence. `model_overflow`: no retry.
 3. **Counting.** For the registered rates and the checkpoint bar, such a
    unit counts against the tool: a bug unit counts as not caught, and a
    clean-diff unit counts as a false alarm.
