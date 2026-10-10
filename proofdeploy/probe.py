@@ -37,10 +37,10 @@ ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "O
 # Assertion types the schema allows.
 ALLOWED_ASSERT_TYPES = frozenset(
     {
-        "status",           # {"type": "status", "equals": 200}
-        "header",           # {"type": "header", "name": "...", "equals"|"contains"|"matches": ...}
-        "body",             # {"type": "body", "equals"|"contains"|"matches"|"json_path": ...}
-        "db",               # {"type": "db", "query": "SELECT ...", "equals"|"count": ...}
+        "status",  # {"type": "status", "equals": 200}
+        "header",  # {"type": "header", "name": "...", "equals"|"contains"|"matches": ...}
+        "body",  # {"type": "body", "equals"|"contains"|"matches"|"json_path": ...}
+        "db",  # {"type": "db", "query": "SELECT ...", "equals"|"count": ...}
     }
 )
 
@@ -165,9 +165,42 @@ def _validate_setup_step(s: Any, i: int, allow_harness_app: bool = False) -> Non
         if "act" not in s:
             _reject(f"{where}: http setup step needs 'act'")
         _validate_act(s["act"])
-    unknown = set(s) - {"type", "language", "source", "entrypoint", "act", "note"}
+        if "capture" in s:
+            _validate_capture(s["capture"], f"{where}.capture")
+    unknown = set(s) - {"type", "language", "source", "entrypoint", "act", "note", "capture"}
     if unknown:
         _reject(f"{where} has unknown fields: {sorted(unknown)}")
+
+
+def _validate_capture(capture: Any, where: str) -> None:
+    """Validate a setup step's capture spec.
+
+    Shape: {NAME: {"from": "body", "json_path": "dotted.path"}}
+        or {NAME: {"from": "header", "name": "X-Token"}}
+    """
+    if not isinstance(capture, dict) or not capture:
+        _reject(f"{where} must be a non-empty object")
+    for name, spec in capture.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            _reject(f"{where}: invalid capture name {name!r}")
+        if not isinstance(spec, dict):
+            _reject(f"{where}.{name} must be an object")
+        source = spec.get("from")
+        if source == "body":
+            path = spec.get("json_path")
+            if not isinstance(path, str) or not path:
+                _reject(f"{where}.{name}: body capture needs non-empty 'json_path'")
+            unknown = set(spec) - {"from", "json_path"}
+        elif source == "header":
+            hname = spec.get("name")
+            if not isinstance(hname, str) or not hname:
+                _reject(f"{where}.{name}: header capture needs non-empty 'name'")
+            unknown = set(spec) - {"from", "name"}
+        else:
+            _reject(f"{where}.{name}: 'from' must be 'body' or 'header', got {source!r}")
+            continue
+        if unknown:
+            _reject(f"{where}.{name} has unknown fields: {sorted(unknown)}")
 
 
 def validate_probe(probe: Any, allow_harness_app: bool = False) -> dict[str, Any]:
