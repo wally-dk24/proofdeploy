@@ -113,12 +113,16 @@ class ProbeResult:
     http_headers: dict[str, str] = field(default_factory=dict)
     http_body: str = ""
     writes: list[str] = field(default_factory=list)  # every write, logged
+    # The act request actually sent (method, url, headers, body), for
+    # replayability. None when no request was sent (fail-closed before it).
+    request: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         return {
             "probe_index": self.probe_index,
             "verdict": self.verdict.value,
             "reason": self.reason.value if self.reason else None,
+            "request": self.request,
             "http_status": self.http_status,
             "http_headers": self.http_headers,
             "http_body": self.http_body[:2000],
@@ -742,14 +746,24 @@ class Executor:
 
         # 3. The act: one HTTP request (redirects are never followed).
         # It is sent exactly once, whatever the response status.
+        act_headers = act.get("headers") or {}
+        act_body = act.get("body")
         status, headers, body, req_logs = _do_http(
-            method, url, act.get("headers"), act.get("body"), self.http_timeout
+            method, url, act_headers, act_body, self.http_timeout
         )
         details.extend(req_logs)
         if method.upper() in WRITE_METHODS:
             self._log_write(method, url, status, writes, details)
         else:
             details.append(f"act: {method} {path} -> {status}")
+        # Record the request that was actually sent, for replayability.
+        # (Redacted by value when the result is stored in a record.)
+        sent_request: dict[str, Any] = {
+            "method": method,
+            "url": url,
+            "headers": dict(act_headers),
+            "body": act_body,
+        }
 
         if status is None:
             details.append("target unreachable")
@@ -759,6 +773,7 @@ class Executor:
                 reason=InconclusiveReason.ENVIRONMENT,
                 details=details,
                 writes=writes,
+                request=sent_request,
             )
 
         # 4. Substitute ${NAME} placeholders in the assertions, failing
@@ -772,6 +787,7 @@ class Executor:
                 verdict=Verdict.INCONCLUSIVE,
                 reason=InconclusiveReason.PROBE,
                 details=details,
+                request=sent_request,
                 http_status=status,
                 http_headers=headers,
                 http_body=body,
@@ -788,6 +804,7 @@ class Executor:
                     verdict=Verdict.INCONCLUSIVE,
                     reason=InconclusiveReason.ENVIRONMENT,
                     details=details,
+                    request=sent_request,
                     http_status=status,
                     http_headers=headers,
                     http_body=body,
@@ -827,6 +844,7 @@ class Executor:
             verdict=verdict,
             reason=reason,
             details=details,
+            request=sent_request,
             http_status=status,
             http_headers=headers,
             http_body=body,
