@@ -57,39 +57,56 @@ probe selects the strongest available isolation.
 ## GitHub Actions (for Master to add)
 
 The repo's GitHub token lacks the `workflow` scope, so the workflow
-file cannot be created from here. Master can add
-`.github/workflows/sandbox.yml` in the web UI:
-
-```yaml
-name: sandbox
-on: [push, pull_request]
-jobs:
-  sandbox:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install podman
-        run: sudo apt-get update && sudo apt-get install -y podman
-      - name: Run sandbox tests
-        run: python -m pytest tests/test_sandbox.py -v
-```
-
-`ubuntu-latest` runners have working netavark and userns, so the
-`isolated` network mode and `--uidmap` paths get exercised there.
+file cannot be pushed from here. The file is committed on the branch
+at `.github/workflows/sandbox-tests.yml`; Master can add it via the
+web UI (copy the file contents into a new workflow file with the same
+path).
 
 ## Unattended-run gate
 
-The WO-5 brief requires the sandbox (rootless container, checkout-only
-mount, network cut after install, no secrets in env) before any
-unattended run. The sandbox enforces:
+The WO-5 brief requires the sandbox before any unattended run. The
+sandbox enforces, fail-closed:
 
-- Never `--net=host` for the app (`network_mode="host"` is refused).
+- Never `--net=host`: not for the app, and not for the install phase.
+  The install runs untrusted install scripts on a bridge network
+  (`pd-build`) with the proxy; when the host cannot create a bridge
+  network, measured runs are refused.
 - Never proxy variables in the app container environment.
-- `require_userns=True` fails closed when userns remapping is
-  unavailable. The default (`False`) logs a prominent warning and
-  uses `--user 65534`; do not run unattended on an untrusted host
-  in that mode.
+- `require_userns=True` is the default: when the host cannot remap
+  container root away from host root (`--uidmap`), the run is refused.
+  The only way past is the explicit dev flag `allow_no_userns=True`,
+  which falls back to `--user 65534` (nobody) and records the opt-out
+  in the evidence record.
 
-Sandbox capability evidence (`proofdeploy.sandbox.sandbox_evidence`)
-is available for the record so a reviewer can see what isolation was
-actually in effect.
+`assert_measurement_gate()` (in `proofdeploy.sandbox`) refuses a
+measured run when podman is unavailable, userns remapping is
+unavailable (without the explicit opt-out), or no bridge network can
+be created for the install phase. The orchestrator calls it at the
+start of every sandboxed measured run.
+
+Every evidence record carries `sandbox_evidence`: the network mode
+actually used, the userns mode actually used, whether the dev opt-out
+was used, and the uid the app ran as.
+
+## What the first CI run must show
+
+Do not claim CI works until a real run log exists. The first real run
+of `.github/workflows/sandbox-tests.yml` must show:
+
+1. The sandbox tests ran (not skipped): look for the 5
+   `test_sandbox_*` tests passing, which proves podman was present.
+2. Which isolation modes the runner actually supports. The capability
+   probe logs one of:
+   - `userns remapping: --uidmap 0:1:65536` (userns works), and
+     `isolated network: pd-isolated (--internal, no external route)`
+     (netavark works); or
+   - `WARNING: userns remapping unavailable ...` with
+     `Explicit dev opt-out (allow_no_userns=True)` (the CI workflow
+     passes the dev flag explicitly), and/or the `none+socket` bridge
+     path.
+3. Recent Ubuntu runners may restrict user namespaces; if the log shows
+   the fallback path, measured runs on that runner would carry
+   `userns_opt_out: true` in their records. That is honest and
+   auditable, but not the full isolation story: prefer a runner (or a
+   small cloud VM) where the probe shows `--uidmap` working before
+   running measured units there.
