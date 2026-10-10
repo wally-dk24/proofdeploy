@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +39,24 @@ def _node_snapshot(
     (snap / "package.json").write_text(json.dumps(pkg) + "\n", encoding="utf-8")
     (snap / lockfile).write_text("{}\n", encoding="utf-8")
     return snap
+
+
+def _no_corepack(monkeypatch) -> None:
+    """Make shutil.which report corepack as missing.
+
+    select_package_manager routes through corepack when it is on PATH and
+    packageManager pins a version, so tests asserting the plain command
+    fail on machines with corepack installed. This keeps only the corepack
+    lookup host-independent; all other binaries resolve normally.
+    """
+    real_which = shutil.which
+
+    def fake_which(name, *args, **kwargs):
+        if name == "corepack":
+            return None
+        return real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "which", fake_which)
 
 
 def _python_snapshot(
@@ -167,7 +186,8 @@ def test_select_yarn_classic_uses_frozen_lockfile(tmp_path):
     assert cmd == ["yarn", "install", "--frozen-lockfile"]
 
 
-def test_select_yarn_berry_uses_immutable(tmp_path):
+def test_select_yarn_berry_uses_immutable(tmp_path, monkeypatch):
+    _no_corepack(monkeypatch)
     snap = _node_snapshot(
         tmp_path,
         lockfile="yarn.lock",
@@ -496,7 +516,8 @@ def test_find_lockfile_prefers_package_manager(tmp_path):
     assert found[0] == "pnpm-lock.yaml"
 
 
-def test_provision_prefers_package_manager_lockfile(tmp_path):
+def test_provision_prefers_package_manager_lockfile(tmp_path, monkeypatch):
+    _no_corepack(monkeypatch)
     recorded: list[str] = []
     prov = _provisioner_with_fake_exec(tmp_path, recorded)
     snap = _node_snapshot(
