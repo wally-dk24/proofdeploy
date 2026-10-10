@@ -1055,7 +1055,6 @@ def test_target_process_stopped_after_crash(tmp_path):
     orig_make_executor = orch._make_executor
     def bad_make_executor(side):
         ex = orig_make_executor(side)
-        orig_run = ex.run_probe
         def crashing_run(*args, **kwargs):
             raise RuntimeError("simulated crash during probe")
         ex.run_probe = crashing_run
@@ -1096,7 +1095,6 @@ def test_crash_after_authoring_records_inconclusive(tmp_path):
     )
     orch = Orchestrator(cfg)
     # Crash during probe execution (after authoring).
-    orig = orch._provision_side
     def bad_provision(*args, **kwargs):
         raise RuntimeError("simulated post-authoring crash")
     orch._provision_side = bad_provision
