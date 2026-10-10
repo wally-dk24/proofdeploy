@@ -37,7 +37,6 @@ future work.
 
 from __future__ import annotations
 
-import hashlib
 import shutil
 import socket
 import subprocess
@@ -265,7 +264,7 @@ class _TcpToUnixProxy:
         while not self._stop.is_set():
             try:
                 client, _ = self._srv.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break
@@ -524,11 +523,12 @@ class Sandbox:
         if not ok:
             raise SandboxError(f"sandbox start failed: {reason}")
         # Container IP on the isolated network.
+        network_name = self._ensure_isolated_network()
         ok, out = _run(
             _podman_base()
             + [
                 "inspect", name, "--format",
-                "{{.NetworkSettings.Networks." + self._network_name + ".IPAddress}}",
+                "{{.NetworkSettings.Networks." + network_name + ".IPAddress}}",
             ],
             30,
             self.log,

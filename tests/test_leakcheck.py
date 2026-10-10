@@ -1,6 +1,5 @@
 """Tests for proofdeploy.leakcheck (WO-5)."""
 
-import json
 import subprocess
 from pathlib import Path
 
@@ -137,7 +136,6 @@ def _eq_repo(root: Path) -> dict[str, str]:
 def _eq_bundle(root: Path, info: dict[str, str]) -> dict:
     """Build a real bundle (B^->B diff + B snapshot) and its prompt."""
     from proofdeploy.fixture import (
-        EXPECTED_SKILL_HASH,
         assemble_author_bundle,
         template_hash,
     )
@@ -171,7 +169,7 @@ def _eq_bundle(root: Path, info: dict[str, str]) -> dict:
 
     skill_hash = hashlib.sha256(skill_path.read_bytes()).hexdigest()
     bundle_dir = work / "bundle"
-    bundle = assemble_author_bundle(
+    assemble_author_bundle(
         diff_path=diff_path,
         snapshot_dir=snap_src,
         yml_fixture={
