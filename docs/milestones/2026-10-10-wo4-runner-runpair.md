@@ -7,7 +7,7 @@
 
 ## What WO-4 delivered
 
-The run-pair runner (`proofdeploy/runpair.py` and supporting modules): bug-pair runs (B and B^) and clean-diff runs (C), evidence records, scoring against the registered rule, and a validated judgment gate.
+The run-pair runner (`proofdeploy/runpair.py` and supporting modules): fix^ vs fix run pairs and clean-diff runs (C), evidence records, scoring against the registered rule, and a validated judgment gate. (B^→B is only the author's diff, supplied to the model through the assembler; the measured run pair is fix^ vs fix.)
 
 ### Review history
 
@@ -23,7 +23,7 @@ At `c961ecc` and again at the accepted head:
 
 1. **Scoring matches the registered rule.** `docs/evaluation/scoring-rule-run-pair-2026-10-09.md` (plus the start-failure addendum `025222d`) is the only rule; the unregistered `v1-all-probes` rule is gone.
 2. **Probes stay verbatim and hash-valid.** Parsed probes are stored exactly as run; hashes validate.
-3. **Evidence is committed before scoring.** The score is committed later and tied to the committed evidence.
+3. **Evidence is committed before scoring.** `write_score_record` writes the score record but does not commit it; committing the score is the orchestrator's job (WO-5). The committed score is tied to the committed evidence.
 4. **Clean diffs use explicit fields.** `c_sha`, `c_provision`, and `c_results` are explicit, never inferred from bug-run fields.
 5. **Redaction needs no caller help.** Fixture, contract-env, captured, bearer, JWT, and minted values are redacted by value. Ordinary-named fixture and contract values are caught too.
 6. **Scores are recomputed from committed evidence.** The scorer reads the committed record, not the live run objects.
@@ -51,7 +51,7 @@ The orchestrator re-ran both repros against live servers at the accepted head, w
 
 Real throwaway-app records were generated under `c961ecc` and held as the packet source:
 
-- `wo4-bug-runs.jsonl` — bug-pair records with committed evidence, scores, and verdicts
+- `wo4-bug-runs.jsonl` — run-pair records (fix^ vs fix) with committed evidence, scores, and verdicts
 - `wo4-clean-runs.jsonl` — clean-diff records with explicit `c_*` fields
 
 The review packet (`wo4-review-packet.md`) drew its identifiers from those records. One warning carried forward: the packet's handwritten header cited the wrong `fix^` SHA; future packets must generate identifiers from record data and current test output, never from memory.
