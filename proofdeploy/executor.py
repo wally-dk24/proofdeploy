@@ -3,14 +3,17 @@
 Runs schema-validated probes against a live target and produces
 deterministic verdicts. No model is involved in verdict decisions.
 
-Verdicts:
-- PASS: all assertions held.
-- FAIL: at least one assertion did not hold.
-- INCONCLUSIVE: the probe could not be evaluated (target unreachable,
-  DB unavailable, assertion references missing data, API drift).
+Fail-closed rules:
+- Every probe is validated with ``validate_probe`` before any HTTP call.
+  A schema-invalid probe is INCONCLUSIVE (reason ``probe``), not executed.
+- Unknown setup types are INCONCLUSIVE (reason ``probe``), never skipped.
+- Only GET and HEAD are allowed against remote (non-localhost) targets;
+  anything else is INCONCLUSIVE (reason ``probe``).
+- Redirects are never followed; a 3xx response is evaluated as-is.
+- The HTTP client never executes code inside the target process.
 
-The executor only sends HTTP requests and read-only DB queries. It never
-executes code inside the target process.
+Verdict precedence: FAIL beats INCONCLUSIVE beats PASS. A probe that both
+fails an assertion and hits an inconclusive condition reports FAIL.
 """
 
 from __future__ import annotations
@@ -19,10 +22,13 @@ import json
 import re
 import sqlite3
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+from proofdeploy.probe import ProbeRejected, validate_probe
 
 
 class Verdict(Enum):
@@ -31,26 +37,68 @@ class Verdict(Enum):
     INCONCLUSIVE = "inconclusive"
 
 
+class InconclusiveReason(Enum):
+    """Typed reason for an INCONCLUSIVE verdict."""
+
+    ENVIRONMENT = "environment"  # target/db/setup could not be evaluated
+    AUTH = "auth"  # credential missing or expired (fixture/auth flow)
+    DRIFT = "drift"  # target API shape drifted from what the probe expects
+    PROBE = "probe"  # the probe itself is defective
+
+
+# Only GET and HEAD may hit a remote (non-localhost) target.
+SAFE_REMOTE_METHODS = frozenset({"GET", "HEAD"})
+
+# Write methods are logged on every request (disposable targets).
+WRITE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects; evaluate 3xx responses as-is."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+# Module-level opener that refuses to follow redirects.
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 @dataclass
 class ProbeResult:
     """The outcome of running one probe."""
 
     probe_index: int
     verdict: Verdict
+    reason: InconclusiveReason | None = None  # set when verdict is INCONCLUSIVE
     details: list[str] = field(default_factory=list)
     http_status: int | None = None
     http_headers: dict[str, str] = field(default_factory=dict)
     http_body: str = ""
+    writes: list[str] = field(default_factory=list)  # every write, logged
 
     def to_dict(self) -> dict:
         return {
             "probe_index": self.probe_index,
             "verdict": self.verdict.value,
+            "reason": self.reason.value if self.reason else None,
             "http_status": self.http_status,
             "http_headers": self.http_headers,
             "http_body": self.http_body[:2000],
+            "writes": self.writes,
             "details": self.details,
         }
+
+
+def _is_local_url(url: str) -> bool:
+    """True for localhost targets (provisioned instances); False for remote."""
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except Exception:
+        return False
+    return host.lower() in _LOCAL_HOSTS
 
 
 def _do_http(
@@ -60,7 +108,11 @@ def _do_http(
     body: Any = None,
     timeout: int = 30,
 ) -> tuple[int | None, dict[str, str], str, list[str]]:
-    """Perform one HTTP request. Returns (status, headers, body, log lines)."""
+    """Perform one HTTP request, never following redirects.
+
+    Returns (status, headers, body, log lines). HTTP error statuses
+    (including 3xx) are valid responses for assertions.
+    """
     logs: list[str] = []
     data: bytes | None = None
     req_headers = dict(headers or {})
@@ -74,12 +126,13 @@ def _do_http(
             data = bytes(body)
     req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             raw_headers = {k.lower(): v for k, v in resp.headers.items()}
             raw_body = resp.read().decode("utf-8", errors="replace")
             return resp.status, raw_headers, raw_body, logs
     except urllib.error.HTTPError as e:
-        # HTTP error statuses are valid responses for assertions.
+        # HTTP error statuses (4xx, 5xx) — and 3xx when the redirect
+        # handler refuses to follow — are valid responses for assertions.
         try:
             raw_body = e.read().decode("utf-8", errors="replace")
         except Exception:
@@ -135,68 +188,96 @@ def _check_assertion(
     headers: dict[str, str],
     body: str,
     db_result: Any,
-) -> tuple[bool | None, str]:
-    """Check one assertion. Returns (passed|None for inconclusive, detail).
+) -> tuple[bool | None, str, InconclusiveReason | None]:
+    """Check one assertion.
 
-    True = held, False = did not hold, None = could not evaluate.
+    Returns (passed, detail, inconclusive_reason):
+    - (True, detail, None): assertion held.
+    - (False, detail, None): assertion did not hold (FAIL).
+    - (None, detail, reason): could not evaluate (INCONCLUSIVE with reason).
     """
     atype = assertion.get("type")
 
     if atype == "status":
         expected = assertion.get("equals")
         if status is None:
-            return None, "status assertion: no HTTP response (inconclusive)"
+            return None, "status assertion: no HTTP response", InconclusiveReason.ENVIRONMENT
         ok = status == expected
-        return ok, f"status: got {status}, expected {expected} -> {'PASS' if ok else 'FAIL'}"
+        return ok, f"status: got {status}, expected {expected} -> {'PASS' if ok else 'FAIL'}", None
 
     if atype == "header":
         name = str(assertion.get("name", "")).lower()
         actual = headers.get(name)
         if actual is None:
-            return False, f"header '{name}': missing -> FAIL"
+            return False, f"header '{name}': missing -> FAIL", None
         if "equals" in assertion:
             ok = actual == assertion["equals"]
-            return ok, f"header '{name}': got {actual!r} -> {'PASS' if ok else 'FAIL'}"
+            return ok, f"header '{name}': got {actual!r} -> {'PASS' if ok else 'FAIL'}", None
         if "contains" in assertion:
             ok = assertion["contains"] in actual
-            return ok, f"header '{name}' contains -> {'PASS' if ok else 'FAIL'}"
+            return ok, f"header '{name}' contains -> {'PASS' if ok else 'FAIL'}", None
         if "matches" in assertion:
             ok = re.search(assertion["matches"], actual) is not None
-            return ok, f"header '{name}' matches -> {'PASS' if ok else 'FAIL'}"
-        return None, f"header '{name}': no comparator (inconclusive)"
+            return ok, f"header '{name}' matches -> {'PASS' if ok else 'FAIL'}", None
+        # validate_probe requires a comparator; this is defense in depth.
+        return None, f"header '{name}': no comparator", InconclusiveReason.PROBE
 
     if atype == "body":
         if "equals" in assertion:
             ok = body == assertion["equals"]
-            return ok, f"body equals -> {'PASS' if ok else 'FAIL'}"
+            return ok, f"body equals -> {'PASS' if ok else 'FAIL'}", None
         if "contains" in assertion:
             ok = assertion["contains"] in body
-            return ok, f"body contains -> {'PASS' if ok else 'FAIL'}"
+            return ok, f"body contains -> {'PASS' if ok else 'FAIL'}", None
         if "matches" in assertion:
             ok = re.search(assertion["matches"], body) is not None
-            return ok, f"body matches -> {'PASS' if ok else 'FAIL'}"
+            return ok, f"body matches -> {'PASS' if ok else 'FAIL'}", None
         if "json_path" in assertion:
             jp = assertion["json_path"]
             val, found = _get_json_path(body, jp.get("path", ""))
             if not found:
-                return None, f"body json_path '{jp.get('path')}': not found (inconclusive)"
+                # The API shape drifted from what the probe expects.
+                return (
+                    None,
+                    f"body json_path '{jp.get('path')}': not found",
+                    InconclusiveReason.DRIFT,
+                )
             expected = jp.get("equals")
             ok = val == expected
-            return ok, f"body json_path: got {val!r} -> {'PASS' if ok else 'FAIL'}"
-        return None, "body: no comparator (inconclusive)"
+            return ok, f"body json_path: got {val!r} -> {'PASS' if ok else 'FAIL'}", None
+        return None, "body: no comparator", InconclusiveReason.PROBE
 
     if atype == "db":
         if db_result is None:
-            return None, "db assertion: query failed or was rejected (inconclusive)"
+            return (
+                None,
+                "db assertion: query failed or was rejected",
+                InconclusiveReason.ENVIRONMENT,
+            )
         if "count" in assertion:
             ok = len(db_result) == assertion["count"]
-            return ok, f"db count: got {len(db_result)} -> {'PASS' if ok else 'FAIL'}"
+            return ok, f"db count: got {len(db_result)} -> {'PASS' if ok else 'FAIL'}", None
         if "equals" in assertion:
             ok = db_result == assertion["equals"]
-            return ok, f"db equals -> {'PASS' if ok else 'FAIL'}"
-        return None, "db: no comparator (inconclusive)"
+            return ok, f"db equals -> {'PASS' if ok else 'FAIL'}", None
+        return None, "db: no comparator", InconclusiveReason.PROBE
 
-    return None, f"unknown assertion type '{atype}' (inconclusive)"
+    return None, f"unknown assertion type '{atype}'", InconclusiveReason.PROBE
+
+
+def _check_remote_method(method: str, url: str) -> tuple[bool, str]:
+    """Fail-closed policy: only GET/HEAD on remote targets.
+
+    Returns (allowed, detail).
+    """
+    if _is_local_url(url):
+        return True, ""
+    if method.upper() in SAFE_REMOTE_METHODS:
+        return True, ""
+    return False, (
+        f"method {method} not allowed on remote target "
+        f"(only {sorted(SAFE_REMOTE_METHODS)}); failing closed"
+    )
 
 
 @dataclass
@@ -206,13 +287,30 @@ class Executor:
     target_url: str
     db_path: str | None = None
     http_timeout: int = 30
+    # Fail-closed: harness_app setup steps are rejected unless the caller
+    # explicitly opts in (dev-set library repos only).
+    allow_harness_app: bool = False
 
-    def run_setup(self, setup_steps: list[dict[str, Any]]) -> list[str]:
-        """Run setup steps (HTTP calls). Returns log lines.
+    def _log_write(
+        self, method: str, url: str, status: int | None, writes: list[str], details: list[str]
+    ) -> None:
+        """Log every write operation (disposable provisioned instances)."""
+        line = f"write: {method} {url} -> {status}"
+        writes.append(line)
+        details.append(line)
+
+    def run_setup(
+        self, setup_steps: list[dict[str, Any]]
+    ) -> tuple[list[str], InconclusiveReason | None, str | None, list[str]]:
+        """Run setup steps. Returns (logs, failure_reason, failure_detail, writes).
 
         harness_app steps are handled by the provisioner, not here.
+        A failed step is INCONCLUSIVE, not silently continued:
+        - unknown step type -> reason PROBE
+        - unreachable target or 5xx from a setup HTTP call -> reason ENVIRONMENT
         """
         logs: list[str] = []
+        writes: list[str] = []
         for i, step in enumerate(setup_steps):
             stype = step.get("type")
             if stype == "harness_app":
@@ -223,81 +321,169 @@ class Executor:
                 method = act.get("method", "GET")
                 path = act.get("path", "/")
                 url = self.target_url.rstrip("/") + path
+                allowed, detail = _check_remote_method(method, url)
+                if not allowed:
+                    return logs, InconclusiveReason.PROBE, f"setup[{i}]: {detail}", writes
                 status, _, _, req_logs = _do_http(
                     method, url, act.get("headers"), act.get("body"), self.http_timeout
                 )
                 logs.extend(req_logs)
-                logs.append(f"setup[{i}]: {method} {path} -> {status}")
-            else:
-                logs.append(f"setup[{i}]: unknown type '{stype}', skipping")
-        return logs
+                if method.upper() in WRITE_METHODS:
+                    self._log_write(method, url, status, writes, logs)
+                else:
+                    logs.append(f"setup[{i}]: {method} {path} -> {status}")
+                if status is None:
+                    return (
+                        logs,
+                        InconclusiveReason.ENVIRONMENT,
+                        f"setup[{i}]: target unreachable during setup",
+                        writes,
+                    )
+                if status >= 500:
+                    return (
+                        logs,
+                        InconclusiveReason.ENVIRONMENT,
+                        f"setup[{i}]: setup call returned {status}",
+                        writes,
+                    )
+                continue
+            # Fail closed: unknown setup types are INCONCLUSIVE, never skipped.
+            return (
+                logs,
+                InconclusiveReason.PROBE,
+                f"setup[{i}]: unknown setup type '{stype}'",
+                writes,
+            )
+        return logs, None, None, writes
 
     def run_probe(self, probe: dict[str, Any], index: int = 0) -> ProbeResult:
-        """Run one validated probe and return its verdict."""
+        """Run one probe and return its verdict.
+
+        The probe is schema-validated before any HTTP call. Verdict
+        precedence: FAIL first, then INCONCLUSIVE, then PASS.
+        """
         details: list[str] = []
+        writes: list[str] = []
 
-        # 1. Setup steps.
-        setup_logs = self.run_setup(probe.get("setup", []))
-        details.extend(setup_logs)
+        # 0. Schema validation before any HTTP call.
+        try:
+            validate_probe(probe, allow_harness_app=self.allow_harness_app)
+        except ProbeRejected as e:
+            details.append(f"probe rejected by schema: {e}")
+            return ProbeResult(
+                probe_index=index,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=InconclusiveReason.PROBE,
+                details=details,
+                writes=writes,
+            )
 
-        # 2. The act: one HTTP request.
+        # 1. Remote-method policy on the act, before setup runs.
         act = probe.get("act", {})
         method = act.get("method", "GET")
         path = act.get("path", "/")
         url = self.target_url.rstrip("/") + path
+        allowed, detail = _check_remote_method(method, url)
+        if not allowed:
+            details.append(detail)
+            return ProbeResult(
+                probe_index=index,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=InconclusiveReason.PROBE,
+                details=details,
+                writes=writes,
+            )
+
+        # 2. Setup steps. A failed step is INCONCLUSIVE, not silently continued.
+        setup_logs, setup_reason, setup_detail, setup_writes = self.run_setup(
+            probe.get("setup", [])
+        )
+        details.extend(setup_logs)
+        writes.extend(setup_writes)
+        if setup_reason is not None:
+            details.append(setup_detail or "setup failed")
+            return ProbeResult(
+                probe_index=index,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=setup_reason,
+                details=details,
+                writes=writes,
+            )
+
+        # 3. The act: one HTTP request (redirects are never followed).
         status, headers, body, req_logs = _do_http(
             method, url, act.get("headers"), act.get("body"), self.http_timeout
         )
         details.extend(req_logs)
-        details.append(f"act: {method} {path} -> {status}")
+        if method.upper() in WRITE_METHODS:
+            self._log_write(method, url, status, writes, details)
+        else:
+            details.append(f"act: {method} {path} -> {status}")
 
         if status is None:
-            details.append("target unreachable: INCONCLUSIVE")
+            details.append("target unreachable")
             return ProbeResult(
                 probe_index=index,
                 verdict=Verdict.INCONCLUSIVE,
+                reason=InconclusiveReason.ENVIRONMENT,
                 details=details,
+                writes=writes,
             )
 
-        # 3. DB queries for db assertions (run once, share across assertions).
-        db_result: Any = None
-        db_queries = [
-            a.get("query") for a in probe.get("assert", []) if a.get("type") == "db"
-        ]
-        if db_queries:
+        # 4. DB queries: one independent result per db assertion.
+        assertions = probe.get("assert", [])
+        db_results: dict[int, Any] = {}
+        if any(a.get("type") == "db" for a in assertions):
             if self.db_path is None:
-                details.append("db assertion but no db_path: INCONCLUSIVE")
+                details.append("db assertion but no db_path")
                 return ProbeResult(
                     probe_index=index,
                     verdict=Verdict.INCONCLUSIVE,
+                    reason=InconclusiveReason.ENVIRONMENT,
                     details=details,
                     http_status=status,
                     http_headers=headers,
                     http_body=body,
+                    writes=writes,
                 )
-            # All db assertions in one probe share the first query's result.
-            # (Multi-query probes are a future extension.)
-            db_result, db_logs = _do_db_query(self.db_path, db_queries[0])
-            details.extend(db_logs)
+            for ai, a in enumerate(assertions):
+                if a.get("type") != "db":
+                    continue
+                db_result, db_logs = _do_db_query(self.db_path, a.get("query", ""))
+                details.extend(db_logs)
+                db_results[ai] = db_result
 
-        # 4. Evaluate assertions.
-        verdict = Verdict.PASS
-        for a in probe.get("assert", []):
-            passed, detail = _check_assertion(a, status, headers, body, db_result)
+        # 5. Evaluate assertions. Precedence: FAIL > INCONCLUSIVE > PASS.
+        saw_fail = False
+        saw_inconclusive = False
+        inconclusive_reason: InconclusiveReason | None = None
+        for ai, a in enumerate(assertions):
+            passed, detail, ireason = _check_assertion(a, status, headers, body, db_results.get(ai))
             details.append(detail)
             if passed is None:
-                verdict = Verdict.INCONCLUSIVE
+                saw_inconclusive = True
+                if inconclusive_reason is None:
+                    inconclusive_reason = ireason or InconclusiveReason.ENVIRONMENT
             elif not passed:
-                verdict = Verdict.FAIL
-                # Continue checking to log all assertion outcomes.
+                saw_fail = True
+            # Continue checking to log all assertion outcomes.
+
+        if saw_fail:
+            verdict, reason = Verdict.FAIL, None
+        elif saw_inconclusive:
+            verdict, reason = Verdict.INCONCLUSIVE, inconclusive_reason
+        else:
+            verdict, reason = Verdict.PASS, None
 
         return ProbeResult(
             probe_index=index,
             verdict=verdict,
+            reason=reason,
             details=details,
             http_status=status,
             http_headers=headers,
             http_body=body,
+            writes=writes,
         )
 
     def run_all(self, probes: list[dict[str, Any]]) -> list[ProbeResult]:

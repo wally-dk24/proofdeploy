@@ -108,8 +108,10 @@ def test_body_contains(server):
 
 def test_post_act(server):
     ex = Executor(target_url=server)
-    p = {"act": {"method": "POST", "path": "/ok", "body": "hi"},
-         "assert": [{"type": "status", "equals": 201}]}
+    p = {
+        "act": {"method": "POST", "path": "/ok", "body": "hi"},
+        "assert": [{"type": "status", "equals": 201}],
+    }
     r = ex.run_probe(p)
     assert r.verdict == Verdict.PASS
     assert r.http_status == 201
@@ -166,3 +168,190 @@ def test_result_to_dict(server):
     d = r.to_dict()
     assert d["verdict"] == "pass"
     assert d["http_status"] == 200
+    assert d["reason"] is None
+    assert d["writes"] == []
+
+
+# --- WO-2: fail-closed executor tests ---
+
+from proofdeploy.executor import InconclusiveReason  # noqa: E402
+
+
+class _Handler2(_Handler):
+    def do_GET(self):
+        if self.path == "/redir":
+            self.send_response(302)
+            self.send_header("Location", "/ok")
+            self.end_headers()
+        elif self.path == "/boom":
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"setup exploded")
+        else:
+            super().do_GET()
+
+
+@pytest.fixture()
+def server2():
+    srv = HTTPServer(("127.0.0.1", 0), _Handler2)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{port}"
+    srv.shutdown()
+
+
+def test_invalid_probe_rejected_before_http():
+    # Unreachable target + invalid probe: schema validation must run first,
+    # so the reason is PROBE, not ENVIRONMENT.
+    ex = Executor(target_url="http://127.0.0.1:1", http_timeout=2)
+    r = ex.run_probe({"act": {"method": "GET", "path": "/ok"}})  # no 'assert'
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.PROBE
+    assert any("rejected by schema" in d for d in r.details)
+
+
+def test_unknown_setup_type_is_inconclusive_probe(server):
+    # validate_probe rejects unknown setup types at the schema gate first...
+    ex = Executor(target_url=server)
+    p = _probe(
+        setup=[{"type": "bogus_step"}],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.PROBE
+    # ...and run_setup itself fails closed if called directly.
+    logs, reason, detail, _ = ex.run_setup([{"type": "bogus_step"}])
+    assert reason == InconclusiveReason.PROBE
+    assert detail is not None and "unknown setup type" in detail
+
+
+def test_setup_failure_is_inconclusive_environment(server2):
+    ex = Executor(target_url=server2)
+    p = _probe(
+        setup=[{"type": "http", "act": {"method": "GET", "path": "/boom"}}],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.ENVIRONMENT
+    # The act must not run after a failed setup.
+    assert not any(d.startswith("act:") for d in r.details)
+
+
+def test_verdict_precedence_fail_beats_inconclusive(server):
+    ex = Executor(target_url=server)
+    p = _probe(
+        assert_=[
+            {"type": "status", "equals": 404},  # FAIL (target returns 200)
+            {"type": "body", "json_path": {"path": "nope.missing", "equals": 1}},
+            # INCONCLUSIVE (drift): path not in the JSON body
+        ]
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.FAIL
+    assert r.reason is None
+
+
+def test_verdict_precedence_inconclusive_beats_pass(server):
+    ex = Executor(target_url=server)
+    p = _probe(
+        assert_=[
+            {"type": "status", "equals": 200},  # PASS
+            {"type": "body", "json_path": {"path": "nope.missing", "equals": 1}},
+            # INCONCLUSIVE (drift)
+        ]
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.DRIFT
+
+
+def test_db_assertions_get_independent_results(tmp_path, server):
+    import sqlite3
+
+    db = tmp_path / "t.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE t (a INT)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.execute("INSERT INTO t VALUES (2)")
+    conn.commit()
+    conn.close()
+    ex = Executor(target_url=server, db_path=str(db))
+    p = _probe(
+        assert_=[
+            {"type": "db", "query": "SELECT a FROM t", "count": 2},
+            {"type": "db", "query": "SELECT a FROM t WHERE a = 999", "count": 0},
+        ]
+    )
+    r = ex.run_probe(p)
+    # Under the old shared-result code, the second assertion would see the
+    # first query's 2 rows and FAIL. Independent results: both PASS.
+    assert r.verdict == Verdict.PASS
+
+
+def test_redirect_not_followed(server2):
+    ex = Executor(target_url=server2)
+    p = _probe(assert_=[{"type": "status", "equals": 302}])
+    p["act"] = {"method": "GET", "path": "/redir"}
+    r = ex.run_probe(p)
+    assert r.http_status == 302
+    assert r.verdict == Verdict.PASS
+
+
+def test_remote_post_rejected_before_http():
+    # Remote target (not localhost): POST must be refused without any request.
+    ex = Executor(target_url="http://example.invalid", http_timeout=2)
+    p = {
+        "act": {"method": "POST", "path": "/x", "body": "hi"},
+        "assert": [{"type": "status", "equals": 200}],
+    }
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.PROBE
+    assert any("not allowed on remote target" in d for d in r.details)
+
+
+def test_remote_get_allowed_policy_only():
+    # GET on a remote target passes the policy gate (it then fails to
+    # connect, which is ENVIRONMENT — proving the gate let it through).
+    ex = Executor(target_url="http://example.invalid", http_timeout=2)
+    p = _probe(assert_=[{"type": "status", "equals": 200}])
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.ENVIRONMENT
+
+
+def test_writes_are_logged(server):
+    ex = Executor(target_url=server)
+    p = {
+        "act": {"method": "POST", "path": "/ok", "body": "hi"},
+        "assert": [{"type": "status", "equals": 201}],
+    }
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS
+    assert len(r.writes) == 1
+    assert r.writes[0].startswith("write: POST ")
+    assert "-> 201" in r.writes[0]
+    d = r.to_dict()
+    assert d["writes"] == r.writes
+
+
+def test_setup_write_is_logged(server):
+    ex = Executor(target_url=server)
+    p = _probe(
+        setup=[{"type": "http", "act": {"method": "POST", "path": "/ok", "body": "s"}}],
+        assert_=[{"type": "status", "equals": 200}],
+    )
+    r = ex.run_probe(p)
+    assert r.verdict == Verdict.PASS
+    assert any(w.startswith("write: POST ") for w in r.writes)
+
+
+def test_inconclusive_reason_in_to_dict():
+    ex = Executor(target_url="http://127.0.0.1:1", http_timeout=2)
+    r = ex.run_probe(_probe(assert_=[{"type": "status", "equals": 200}]))
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.ENVIRONMENT
+    assert r.to_dict()["reason"] == "environment"
