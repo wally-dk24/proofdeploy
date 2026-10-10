@@ -61,8 +61,9 @@ class ProvisionResult:
     package_manager: str | None = None
     reason: str | None = None  # human-readable cause for BUILD_FAILED/START_FAILED
     target_log_path: str | None = None  # captured target stdout/stderr
+    run_id: str | None = None  # per-run scratch dirs: workdir/venvs/<run_id>, workdir/runs/<run_id>
     # Live process handle on READY. Caller-owned: the caller must terminate
-    # it when done. Excluded from to_dict.
+    # it when done and call cleanup_run(run_id). Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
 
     @property
@@ -79,6 +80,7 @@ class ProvisionResult:
             "package_manager": self.package_manager,
             "reason": self.reason,
             "target_log_path": self.target_log_path,
+            "run_id": self.run_id,
             "logs": self.logs,
         }
 
@@ -659,6 +661,7 @@ class Provisioner:
         package_manager: str | None = None,
         lockfile_sha256: str | None = None,
         target_log_path: str | None = None,
+        run_id: str | None = None,
     ) -> ProvisionResult:
         logs.append(reason)
         return ProvisionResult(
@@ -670,6 +673,7 @@ class Provisioner:
             package_manager=package_manager,
             reason=reason,
             target_log_path=target_log_path,
+            run_id=run_id,
         )
 
     def _make_venv(
@@ -698,6 +702,86 @@ class Provisioner:
             return None
         return venv_dir
 
+    def _make_run_bin(
+        self,
+        runtime_bin: str,
+        run_id: str,
+        logs: list[str],
+        env: dict[str, str],
+    ) -> Path | None:
+        """Create a per-run bin/ dir pinning the selected Node runtime.
+
+        Blockers fix: selecting `node24` is not enough — install, build
+        and start must actually run it. This dir holds symlinks
+        `node`/`npm`/`npx` resolving to the selected install, and goes
+        first on PATH for every step, so the recorded version is the
+        version the target really uses.
+        """
+        bin_dir = self.workdir / "runs" / run_id / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        node_path = shutil.which(runtime_bin, path=env.get("PATH"))
+        if node_path is None:
+            logs.append(f"cannot resolve selected runtime binary: {runtime_bin}")
+            return None
+        node_dir = str(Path(node_path).parent)
+        linked = 0
+        # `node` must point at the SELECTED binary, not just any node on PATH.
+        targets = {"node": node_path}
+        for name in ("npm", "npx"):
+            # Prefer the tool alongside the selected node; fall back to PATH.
+            found = shutil.which(
+                name, path=node_dir + os.pathsep + env.get("PATH", "")
+            )
+            if found is not None:
+                targets[name] = found
+            else:
+                logs.append(f"warning: {name} not found for selected runtime")
+        for name, target in targets.items():
+            link = bin_dir / name
+            try:
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                link.symlink_to(target)
+                linked += 1
+            except OSError as e:
+                logs.append(f"warning: cannot link {name}: {e}")
+        if linked == 0:
+            return None
+        logs.append(f"run bin: {bin_dir} (node -> {node_path})")
+        return bin_dir
+
+    def _effective_runtime_version(
+        self, runtime: str, env: dict[str, str], logs: list[str]
+    ) -> str | None:
+        """Re-probe the runtime version through the step PATH.
+
+        Blocker fix: the recorded version must be the one the target
+        really runs. Resolves `node` (or `python3`) via the same PATH
+        every step uses and returns its `--version` output.
+        """
+        name = "node" if runtime == "node" else "python3"
+        path = shutil.which(name, path=env.get("PATH"))
+        if path is None:
+            logs.append(f"effective runtime probe: {name} not found on step PATH")
+            return None
+        ver = _binary_version(path, env)
+        logs.append(f"effective runtime: {name} -> {path} ({ver})")
+        return ver
+
+    def cleanup_run(self, run_id: str, logs: list[str] | None = None) -> None:
+        """Delete a run's scratch dirs: venvs/<run_id> and runs/<run_id>.
+
+        Called automatically on every failure path. On READY the caller
+        owns the target process and must call this when done with it.
+        Tolerates missing dirs.
+        """
+        for sub in ("venvs", "runs"):
+            d = self.workdir / sub / run_id
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+                if logs is not None:
+                    logs.append(f"cleaned up: {d}")
+
     def provision(
         self,
         snapshot_dir: Path,
@@ -722,7 +806,9 @@ class Provisioner:
             reason: str,
             **kw: Any,
         ) -> ProvisionResult:
-            return self._fail(status, reason, logs, **kw)
+            # Failure path: nothing is running; remove the run's scratch dirs.
+            self.cleanup_run(run_id, logs)
+            return self._fail(status, reason, logs, run_id=run_id, **kw)
 
         # 1. Detect runtime and declared version range.
         try:
@@ -735,7 +821,9 @@ class Provisioner:
         probe_env = build_env(contract_env)
 
         # 2. Select an installed binary satisfying the declared range
-        # (finding 2). Records the ACTUAL version, not the range.
+        # (finding 2). actual_version is the probed version here; it is
+        # re-probed through the final step PATH below, so the recorded
+        # version is the one the target really runs.
         runtime_bin, actual_version, bin_reason = select_runtime_binary(
             runtime, declared_range, probe_env, logs
         )
@@ -747,7 +835,24 @@ class Provisioner:
                 runtime=runtime,
                 runtime_version=None,
             )
-        logs.append(f"runtime version in use: {actual_version}")
+
+        # 2b. Pin the selected runtime first on PATH for EVERY step.
+        #
+        # Blocker fix: selecting `node24` meant nothing while install,
+        # build and start ran whichever `node` was first on PATH. The
+        # per-run bin/ dir holds symlinks to the selected install, so the
+        # version we record is the version the target really uses.
+        run_bin: str | None = None
+        if runtime == "node":
+            run_bin_dir = self._make_run_bin(runtime_bin, run_id, logs, probe_env)
+            if run_bin_dir is None:
+                return _bail(
+                    ProvisionStatus.BUILD_FAILED,
+                    f"could not pin selected node runtime {runtime_bin!r}",
+                    runtime=runtime,
+                    runtime_version=None,
+                )
+            run_bin = str(run_bin_dir)
 
         # 3. Find the frozen lockfile, preferring the packageManager's
         # lockfile when several exist (finding 3).
@@ -818,8 +923,9 @@ class Provisioner:
         logs.append(f"package manager: {package_manager}")
         logs.append(f"install command: {' '.join(install_cmd)}")
 
-        # Step environment: allowlist + contract env. For Python the fresh
-        # per-run venv's bin goes first on PATH (finding 5).
+        # Step environment: allowlist + contract env. The selected runtime
+        # goes first on PATH for EVERY step: the per-run bin/ dir for Node
+        # (blocker fix), the fresh per-run venv's bin for pip Python.
         venv_bin: str | None = None
         if package_manager == "pip":
             venv_dir = self._make_venv(runtime_bin, run_id, logs, probe_env)
@@ -834,7 +940,47 @@ class Provisioner:
                 )
             venv_bin = str(venv_dir / "bin")
             logs.append(f"venv: {venv_dir} (bin first on PATH)")
-        step_env = build_env(contract_env, prepend_path=venv_bin)
+        first_on_path = run_bin or venv_bin
+        step_env = build_env(contract_env, prepend_path=first_on_path)
+
+        # 6b. Re-probe the runtime version through the final step PATH.
+        # This is the version the target will actually run — not just the
+        # binary we selected, but the one PATH resolves for every step.
+        effective = self._effective_runtime_version(runtime, step_env, logs)
+        if effective is None:
+            return _bail(
+                ProvisionStatus.BUILD_FAILED,
+                f"selected {runtime} runtime {runtime_bin!r} not usable "
+                f"via step PATH",
+                runtime=runtime,
+                runtime_version=actual_version,
+                package_manager=package_manager,
+                lockfile_sha256=lockfile_sha,
+            )
+        actual_version = effective
+        logs.append(f"runtime version in use: {actual_version}")
+
+        # 6c. Tools that choose their own Python must use the selected one.
+        if package_manager == "uv":
+            install_cmd = [*install_cmd, "--python", runtime_bin]
+            logs.append(f"uv pinned to python: {runtime_bin}")
+        elif package_manager == "poetry":
+            ok, reason = self._exec(
+                ["poetry", "env", "use", runtime_bin],
+                snap,
+                self.build_timeout,
+                logs,
+                step_env,
+            )
+            if not ok:
+                return _bail(
+                    ProvisionStatus.BUILD_FAILED,
+                    f"poetry env use failed: {reason}",
+                    runtime=runtime,
+                    runtime_version=actual_version,
+                    package_manager=package_manager,
+                    lockfile_sha256=lockfile_sha,
+                )
 
         # 7. Install (frozen). Python pip installs into the per-run venv,
         # never the host environment.
@@ -890,7 +1036,7 @@ class Provisioner:
             )
         target_url = f"http://127.0.0.1:{port}"
         start_env = build_env(
-            {**contract_env, "PORT": str(port)}, prepend_path=venv_bin
+            {**contract_env, "PORT": str(port)}, prepend_path=first_on_path
         )
         logs.append(f"starting: {start_cmd} -> {target_url}")
 
@@ -962,6 +1108,10 @@ class Provisioner:
 
             logs.append("target ready")
             keep_proc = True
+            logs.append(
+                f"run scratch kept for caller cleanup: {run_id} "
+                f"(call cleanup_run when done with the target)"
+            )
             return ProvisionResult(
                 status=ProvisionStatus.READY,
                 target_url=target_url,
@@ -971,6 +1121,7 @@ class Provisioner:
                 runtime_version=actual_version,
                 package_manager=package_manager,
                 target_log_path=str(target_log_path),
+                run_id=run_id,
                 proc=proc,
             )
         finally:

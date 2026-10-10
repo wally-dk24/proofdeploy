@@ -367,7 +367,11 @@ def test_provision_missing_binary_in_install(tmp_path, monkeypatch):
         expected_lockfile_sha256=verify_lockfile(snap, "node"),
     )
     assert result.status == ProvisionStatus.BUILD_FAILED
-    assert result.reason is not None and "missing binary: npm" in result.reason
+    # With every subprocess call failing, the effective-version re-probe
+    # fails before install is reached. Either reason is BUILD_FAILED.
+    assert result.reason is not None and (
+        "missing binary" in result.reason or "not usable via step PATH" in result.reason
+    )
 
 
 def test_provision_result_fields():
@@ -622,3 +626,129 @@ def test_start_failure_captures_target_log(tmp_path):
     assert result.target_log_path is not None
     assert Path(result.target_log_path).is_file()
     assert "target_log_path" in result.to_dict()
+
+
+# --- blocker fix: selected runtime must actually be used ---
+
+
+def _mock_node_tree(tmp_path: Path, monkeypatch) -> Path:
+    """Create fake node/node24 binaries with different versions.
+
+    Returns a bin dir with:
+    - `node` reporting v22.22.0 (the "default" that must NOT be used)
+    - `node24` reporting v99.1.0 (uniquely satisfies `engines: >=99`;
+      no real system binary reports v99)
+    - `npm`/`npx` shims alongside node24
+    Prepends the bin dir to PATH via monkeypatch.
+    """
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    (bindir / "node").write_text(
+        '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "v22.22.0"; fi\n',
+        encoding="utf-8",
+    )
+    (bindir / "node24").write_text(
+        '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "v99.1.0"; fi\n',
+        encoding="utf-8",
+    )
+    for tool in ("npm", "npx"):
+        (bindir / tool).write_text('#!/bin/sh\necho "mock"\n', encoding="utf-8")
+    for f in bindir.iterdir():
+        f.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+    return bindir
+
+
+def test_selected_node_version_is_actually_used(tmp_path, monkeypatch):
+    """Blocker: with engines >=99 and only mock node24 satisfying it, the
+    recorded version must be v99.1.0 (from node24), proving the re-probe
+    ran through the pinned PATH."""
+    _mock_node_tree(tmp_path, monkeypatch)
+    recorded: list[str] = []
+    prov = _provisioner_with_fake_exec(tmp_path, recorded)
+    snap = _node_snapshot(tmp_path, package_json={"engines": {"node": ">=99"}})
+    result = prov.provision(
+        snapshot_dir=snap,
+        contract=_contract(start=""),  # missing start -> BUILD_FAILED after version probe
+        port=18098,
+        expected_lockfile_sha256=verify_lockfile(snap, "node"),
+    )
+    assert result.status == ProvisionStatus.BUILD_FAILED
+    assert result.runtime_version == "v99.1.0", (
+        f"expected v99.1.0 from mock node24, got {result.runtime_version!r}"
+    )
+
+
+def test_run_bin_pins_node_npm_npx(tmp_path, monkeypatch):
+    """The per-run bin/ dir symlinks node/npm/npx to the selected install."""
+    bindir = _mock_node_tree(tmp_path, monkeypatch)
+    prov = Provisioner(workdir=tmp_path)
+    logs: list[str] = []
+    env = build_env()
+    run_bin = prov._make_run_bin("node24", "testrun123", logs, env)
+    assert run_bin is not None
+    assert (run_bin / "node").is_symlink()
+    assert (run_bin / "npm").is_symlink()
+    # The node symlink resolves to our mock node24, not the default node.
+    resolved = os.readlink(run_bin / "node")
+    assert resolved == str(bindir / "node24"), f"node -> {resolved}"
+
+
+def test_effective_version_comes_from_step_path(tmp_path, monkeypatch):
+    """_effective_runtime_version resolves via the given PATH."""
+    _mock_node_tree(tmp_path, monkeypatch)
+    prov = Provisioner(workdir=tmp_path)
+    logs: list[str] = []
+    # Default PATH: mock node (v22) is first.
+    env = build_env()
+    assert prov._effective_runtime_version("node", env, logs) == "v22.22.0"
+    # Pinned PATH: run bin with node24 (v99) first.
+    run_bin = prov._make_run_bin("node24", "testrun456", logs, env)
+    assert run_bin is not None
+    pinned_env = build_env(prepend_path=str(run_bin))
+    assert prov._effective_runtime_version("node", pinned_env, logs) == "v99.1.0"
+
+
+def test_failed_provision_cleans_up_scratch_dirs(tmp_path):
+    """Minor: venvs/<run_id> and runs/<run_id> are deleted on failure."""
+    recorded: list[str] = []
+    prov = Provisioner(workdir=tmp_path)
+
+    def fake_exec_with_venv(cmd, cwd, timeout, logs, env):
+        recorded.append(" ".join(cmd))
+        # Actually create the venv dir so cleanup has something to delete.
+        if cmd[:3] == ["python3", "-m", "venv"]:
+            Path(cmd[3]).mkdir(parents=True, exist_ok=True)
+        logs.append(f"$ {' '.join(cmd)} (mocked)")
+        return True, None
+
+    prov._exec = fake_exec_with_venv  # type: ignore[method-assign]
+    snap = _python_snapshot(
+        tmp_path, pyproject='[project]\nname = "t"\nrequires-python = ">=3.10"\n'
+    )
+    (snap / "requirements.txt").write_text("requests==2.32.3\n", encoding="utf-8")
+    sha = verify_lockfile(snap, "python")
+    result = prov.provision(
+        snapshot_dir=snap,
+        contract=_contract(start=""),  # missing start -> BUILD_FAILED after venv
+        port=18099,
+        expected_lockfile_sha256=sha,
+    )
+    assert result.status == ProvisionStatus.BUILD_FAILED
+    assert result.run_id is not None
+    venv_dir = tmp_path / "venvs" / result.run_id
+    # The venv was created (mock made the dir), then cleaned up on failure.
+    assert not venv_dir.exists(), f"venv not cleaned up: {venv_dir}"
+    assert not (tmp_path / "runs" / result.run_id).exists(), "runs dir not cleaned up"
+
+
+def test_cleanup_run_is_idempotent(tmp_path):
+    prov = Provisioner(workdir=tmp_path)
+    prov.cleanup_run("nonexistent-id", [])  # must not raise
+    (tmp_path / "venvs" / "abc").mkdir(parents=True)
+    (tmp_path / "runs" / "abc").mkdir(parents=True)
+    logs: list[str] = []
+    prov.cleanup_run("abc", logs)
+    assert not (tmp_path / "venvs" / "abc").exists()
+    assert not (tmp_path / "runs" / "abc").exists()
+    assert len(logs) == 2
