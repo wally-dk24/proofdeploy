@@ -639,8 +639,7 @@ class Orchestrator:
         # Item 5: fail closed when the image's runtime doesn't satisfy the
         # repo's declared version (requires-python / engines). Record the
         # image digest and the runtime version in the evidence.
-        from proofdeploy.runner import _requires_python_from_toml
-        from proofdeploy.runner import satisfies_range
+        from proofdeploy.runner import _requires_python_from_toml, satisfies_range
 
         _sandbox_requires_python = _requires_python_from_toml
         declared_range = None
