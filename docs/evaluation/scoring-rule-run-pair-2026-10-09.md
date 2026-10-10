@@ -3,7 +3,7 @@
 **Date:** 2026-10-09
 **Approved by:** Master
 **Recommended by:** Reviewer (brief 2026-10-10, Part 1a)
-**Status:** Registered — applies to all measured runs from this date
+**Status:** Pending merge — takes effect for all measured runs once merged
 
 ## Bugs: Per-Probe Catches
 
@@ -19,7 +19,7 @@ A sibling probe that is INCONCLUSIVE or FAILs on both sides does **not** cancel 
 
 ## Whole-Side Failure: Pair INCONCLUSIVE
 
-If fix^ or fix cannot build or start, or the target is unreachable for every probe, the pair is INCONCLUSIVE. There is nothing to compare. (Already registered: `4d4b71d`.)
+If fix^ or fix cannot build or start, or the target is unreachable for every probe, the pair is INCONCLUSIVE. There is nothing to compare. (Already registered: `025222d`, the start-failure addendum.)
 
 ## Clean Diffs: Strict
 
@@ -31,7 +31,7 @@ The same rule applies to the skill arm and the no-skill baseline arm.
 
 ## Probe Cap
 
-No cap is registered at this time. Master may add one later.
+No cap is registered at this time. A cap may only be added by an append-only addendum merged before any measured run.
 
 ## Product Verdicts (Separate)
 
