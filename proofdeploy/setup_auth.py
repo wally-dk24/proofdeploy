@@ -157,6 +157,14 @@ class SetupContext:
     # Unix timestamp when the provider-issued token expires (None when the
     # provider did not report an expiry, or no provider token is set).
     token_expires_at: float | None = field(default=None, repr=False)
+    # Secrets accumulated during THIS probe run, for the record's
+    # fail-closed redaction. run_captures holds setup-step captures
+    # (populated by add()); run_minted holds provider-issued tokens
+    # (populated by provide_token()). The executor copies these onto the
+    # ProbeResult so build_evidence_record can collect them from the
+    # results instead of trusting the caller to pass them in.
+    run_captures: dict[str, str] = field(default_factory=dict, repr=False)
+    run_minted: list[str] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         if self.effective_token() is not None:
@@ -179,9 +187,11 @@ class SetupContext:
         """Add captured bindings (later captures overwrite earlier ones).
 
         AUTH_TOKEN is special: the fixture's token (or a provider-issued
-        one) always wins over a setup-step capture.
+        one) always wins over a setup-step capture. Captures are also
+        recorded in run_captures for the record's fail-closed redaction.
         """
         self.bindings.update(new)
+        self.run_captures.update(new)
         token = self.effective_token()
         if token is not None:
             self.bindings["AUTH_TOKEN"] = token
@@ -191,11 +201,13 @@ class SetupContext:
 
         This is the one sanctioned override of the fixture token. When
         `expires_in_seconds` is given, the provider-issued token is
-        refreshed proactively as it nears expiry.
+        refreshed proactively as it nears expiry. Minted tokens are
+        recorded in run_minted for the record's fail-closed redaction.
         """
         self._provided_token = new_token
         self.bindings["AUTH_TOKEN"] = new_token
         self.known_names.add("AUTH_TOKEN")
+        self.run_minted.append(new_token)
         self.token_expires_at = (
             time.time() + expires_in_seconds if expires_in_seconds is not None else None
         )

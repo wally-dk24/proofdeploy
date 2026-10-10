@@ -232,7 +232,7 @@ def test_unknown_setup_type_is_inconclusive_probe(server):
     assert r.verdict == Verdict.INCONCLUSIVE
     assert r.reason == InconclusiveReason.PROBE
     # ...and run_setup itself fails closed if called directly.
-    logs, reason, detail, _ = ex.run_setup([{"type": "bogus_step"}])
+    logs, reason, detail, _, _ = ex.run_setup([{"type": "bogus_step"}])
     assert reason == InconclusiveReason.PROBE
     assert detail is not None and "unknown setup type" in detail
 
@@ -451,7 +451,7 @@ def test_harness_app_setup_is_inconclusive_environment(server):
     # run_setup fails closed on harness_app even when validate_probe would
     # have allowed it (allow_harness_app=True).
     ex = Executor(target_url=server, allow_harness_app=True)
-    logs, reason, detail, _ = ex.run_setup(
+    logs, reason, detail, _, _ = ex.run_setup(
         [{"type": "harness_app", "language": "python", "source": "x", "entrypoint": "a"}]
     )
     assert reason == InconclusiveReason.ENVIRONMENT
