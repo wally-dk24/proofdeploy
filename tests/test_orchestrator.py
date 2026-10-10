@@ -1185,7 +1185,7 @@ def test_no_auth_app_model_failure(tmp_path):
         allow_unsandboxed=True,
     )
     summary = Orchestrator(cfg).measure_bug()
-    assert summary["verdict"] == "INCONCLUSIVE"
+    assert summary["verdict"] == "inconclusive"
 
 
 def _sandbox_caps():

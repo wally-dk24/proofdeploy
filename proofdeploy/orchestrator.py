@@ -950,6 +950,8 @@ class Orchestrator:
         fix_sha = _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_fix}^{{commit}}")
         fix_parent_sha = _git(repo_dir, "rev-parse", "--verify", f"{fix_parent_rev}^{{commit}}")
         sides: list[_Side] = []
+        parent_results = None
+        fix_results = None
         try:
             if use_sandbox:
                 sides.append(
@@ -970,7 +972,6 @@ class Orchestrator:
                     self._provision_side(runner, cfg.rev_fix, _free_port(), unit_dir, "fix")
                 )
             parent, fix = sides
-            parent_results = fix_results = None
             if parent.provision.ready and fix.provision.ready:
                 # Auth comes from the contract's declared credential
                 # provider (O1). Absent means no token; the executor
@@ -1192,6 +1193,7 @@ class Orchestrator:
         prov_workdir.mkdir(parents=True, exist_ok=True)
         runner = Provisioner(workdir=prov_workdir)
         sides: list[_Side] = []
+        c_results = None
         try:
             if use_sandbox:
                 sides.append(
@@ -1202,7 +1204,6 @@ class Orchestrator:
                     self._provision_side(runner, cfg.rev_clean, _free_port(), unit_dir, "clean")
                 )
             (side,) = sides
-            c_results = None
             if side.provision.ready:
                 # Auth comes from the contract's declared credential
                 # provider (O1). Absent means no token.
