@@ -6,6 +6,7 @@ Exit codes: 0 = all claims PASS; 1 = any FAIL/INCONCLUSIVE; 2 = tool error.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from proofdeploy import __version__
@@ -93,13 +94,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     m.add_argument(
-        "--sandbox",
+        "--no-sandbox",
         action="store_true",
         help=(
-            "Run the app in a de-privileged sandbox container (non-root, "
-            "checkout-only mount, no external network, no secrets in env). "
-            "Required for unattended runs."
+            "DEV ONLY: run the app on the host without the sandbox "
+            "container. The run is marked unsandboxed in the evidence "
+            "record and never counts as a measured result."
         ),
+    )
+    m.add_argument(
+        "--provenance-run-url",
+        default=None,
+        help="CI run URL recorded in the evidence provenance.",
+    )
+    m.add_argument(
+        "--provenance-run-id",
+        default=None,
+        help="CI run ID recorded in the evidence provenance.",
+    )
+    m.add_argument(
+        "--provenance-runner-image",
+        default=None,
+        help="CI runner image recorded in the evidence provenance.",
     )
     m.add_argument("--note", default="", help="Free-text note stored in the run log.")
     return p
@@ -135,6 +151,10 @@ def cmd_measure(args: argparse.Namespace) -> int:
     else:
         print("proofdeploy: need --bug-id or --clean-id", file=sys.stderr)
         return 2
+    # The Groq key (when provided via env for CI) is redacted by value
+    # in every record. It never enters a prompt or a container; this is
+    # defense in depth so no accidental serialization can leak it.
+    extra_secrets = [v for v in [os.environ.get("GROQ_API_KEY")] if v]
     cfg = MeasureConfig(
         repo_dir=Path(args.repo),
         output_dir=Path(args.output_dir),
@@ -148,7 +168,11 @@ def cmd_measure(args: argparse.Namespace) -> int:
         rev_clean=args.clean,
         allow_harness_app=args.allow_harness_app,
         public_contract_env_keys=list(args.public_env_key),
-        sandbox=args.sandbox,
+        extra_secrets=extra_secrets,
+        allow_unsandboxed=args.no_sandbox,
+        provenance_run_url=args.provenance_run_url,
+        provenance_run_id=args.provenance_run_id,
+        provenance_runner_image=args.provenance_runner_image,
         note=args.note,
     )
     orch = Orchestrator(cfg)

@@ -12,7 +12,7 @@ touches). The snapshot directory itself never leaves the machine; only
 this prompt string is sent to the model.
 
 The author prompt's framing text, output contract, and truncation caps
-live in the frozen template ``proofdeploy/author_prompt_v2.md``. Its
+live in the frozen template ``proofdeploy/author_prompt_v3.md``. Its
 SHA-256 (``author_prompt_sha256()``) is recorded in every evidence
 record; any change to the template is a new version that must be
 re-registered before any measured run.
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import urllib.request
 from collections.abc import Callable
@@ -50,7 +51,7 @@ TEMPERATURE = 0.2
 
 # Frozen author-prompt template. The file is versioned; its hash is in
 # every evidence record.
-PROMPT_TEMPLATE_FILENAME = "author_prompt_v2.md"
+PROMPT_TEMPLATE_FILENAME = "author_prompt_v3.md"
 
 _GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_ALLOWED_HOSTS = ["api.groq.com"]
@@ -290,6 +291,30 @@ def _credential_surrogate() -> Callable[[urllib.request.Request], None]:
     return apply
 
 
+def _apply_credential(req: urllib.request.Request) -> str:
+    """Attach the Groq credential to the request; return its source.
+
+    Primary path is the authd surrogate (the same mechanism as the Groq
+    skill): the raw key never exists in this process. On hosts without
+    authd (e.g. GitHub Actions), fall back to the ``GROQ_API_KEY``
+    environment variable. The key value is never logged and never
+    enters the request record; only the source is recorded.
+    """
+    try:
+        _credential_surrogate()(req)
+        return "authd-surrogate"
+    except Exception:
+        pass
+    key = os.environ.get("GROQ_API_KEY", "")
+    if not key:
+        raise RuntimeError(
+            "Groq credential unavailable: no authd surrogate and "
+            "GROQ_API_KEY is not set"
+        )
+    req.add_header("Authorization", f"Bearer {key}")
+    return "env"
+
+
 def groq_runner(prompt: str) -> ModelResponse:
     """Default runner: the registered model via Groq's API, in-repo.
 
@@ -321,7 +346,7 @@ def groq_runner(prompt: str) -> ModelResponse:
             "User-Agent": _GROQ_USER_AGENT,
         },
     )
-    _credential_surrogate()(req)
+    request_record["credential_source"] = _apply_credential(req)
     try:
         with urllib.request.urlopen(req, timeout=240) as resp:
             out = json.loads(resp.read().decode("utf-8"))

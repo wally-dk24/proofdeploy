@@ -17,6 +17,7 @@ machines without a container runtime.
 import json
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import urllib.request
@@ -442,3 +443,418 @@ def test_evidence_record_carries_sandbox_evidence():
     # Absent when the sandbox was not used.
     record2 = build_evidence_record(run_kind="bug")
     assert record2["sandbox_evidence"] == {}
+
+
+# ---------------------------------------------------------------------------
+# No podman needed: capability probe branches, network-mode resolution,
+# the TCP proxy, install/start/stop paths, and secret-env stripping, all
+# with faked subprocess/runner. These raise the no-runtime coverage over
+# the 80% gate.
+# ---------------------------------------------------------------------------
+
+
+def _completed(args, returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+
+def _probe_run(scenario):
+    """Fake subprocess.run for check_sandbox_capabilities."""
+
+    def fake(cmd, **kwargs):
+        text = " ".join(cmd)
+        if "--version" in text:
+            if scenario == "version-fail":
+                raise OSError("boom")
+            if scenario == "version-nonzero":
+                return _completed(cmd, 1, "", "bad")
+            return _completed(cmd, 0, "podman version 4.9.3\n", "")
+        if "network" in text and "create" in text and "--internal" in text:
+            if scenario == "net-create-fail":
+                return _completed(cmd, 1, "", "create failed")
+            return _completed(cmd, 0, "pd-capability-probe\n", "")
+        if "network" in text and "create" in text:
+            if scenario == "build-create-fail":
+                return _completed(cmd, 1, "", "create failed")
+            return _completed(cmd, 0, "pd-capability-probe-build\n", "")
+        if "network" in text and "rm" in text:
+            return _completed(cmd, 0, "", "")
+        if "--uidmap" in text:
+            if scenario == "userns-fail":
+                return _completed(cmd, 1, "", "newuidmap: EPERM")
+            return _completed(cmd, 0, "", "")
+        if "--net" in text and "pd-capability-probe" in text:
+            if scenario == "isolated-run-fail":
+                return _completed(cmd, 1, "", "netavark: setns: EPERM")
+            if scenario == "build-run-fail":
+                return _completed(cmd, 1, "", "netavark: setns: EPERM")
+            return _completed(cmd, 0, "", "")
+        return _completed(cmd, 0, "", "")
+
+    return fake
+
+
+def test_capability_probe_no_podman(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: None)
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.podman is False
+    assert "podman not found" in caps.reason
+
+
+def test_capability_probe_version_failure(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
+    monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("version-fail"))
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.podman is False
+    assert "podman --version failed" in caps.reason
+
+
+def test_capability_probe_version_nonzero(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
+    monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("version-nonzero"))
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.podman is False
+
+
+def test_capability_probe_network_create_fails(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
+    monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("net-create-fail"))
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.podman is True
+    assert caps.isolated_network is False
+    assert "isolated network unavailable" in caps.reason
+
+
+def test_capability_probe_isolated_run_fails(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
+    monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("isolated-run-fail"))
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.isolated_network is False
+    assert "setns" in caps.reason
+
+
+def test_capability_probe_userns_fails(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
+    monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("userns-fail"))
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.userns_remap is False
+    assert "userns" in caps.reason.lower() or "isolated" in caps.reason.lower()
+
+
+def test_capability_probe_all_capable(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
+    monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("all-ok"))
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.podman is True
+    assert caps.isolated_network is True
+    assert caps.userns_remap is True
+    assert caps.build_network is True
+
+
+def test_capability_probe_build_create_fails(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
+    monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("build-create-fail"))
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.build_network is False
+
+
+def test_resolve_network_mode_host_refused(monkeypatch):
+    _patch_sandbox_caps(monkeypatch, userns_remap=True)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"], network_mode="host"))
+    with pytest.raises(SandboxError, match="must not share"):
+        sb._resolve_network_mode()
+
+
+def test_resolve_network_mode_auto_isolated(monkeypatch):
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, isolated_network=True)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    assert sb._resolve_network_mode() == "isolated"
+
+
+def test_resolve_network_mode_auto_none_socket(monkeypatch):
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, isolated_network=False)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    assert sb._resolve_network_mode() == "none+socket"
+
+
+def test_resolve_network_mode_isolated_unavailable(monkeypatch):
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, isolated_network=False)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"], network_mode="isolated"))
+    with pytest.raises(SandboxError, match="cannot"):
+        sb._resolve_network_mode()
+
+
+def test_ensure_isolated_network_create_fails(monkeypatch):
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, isolated_network=True)
+    fake = _FakeRun(fail_on=("network exists", "network create"))
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    with pytest.raises(SandboxError, match="could not create isolated network"):
+        sb._ensure_isolated_network()
+
+
+def test_ensure_isolated_network_reuses(monkeypatch):
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, isolated_network=True)
+    fake = _FakeRun(fail_on=("network exists",))
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    assert sb._ensure_isolated_network() == "pd-isolated"
+    assert sb._ensure_isolated_network() == "pd-isolated"
+    creates = [c for c in fake.calls if "network" in c and "create" in c]
+    assert len(creates) == 1
+
+
+def test_tcp_proxy_bridges_data(tmp_path):
+    """The host-side TCP proxy forwards bytes to the Unix socket."""
+    from proofdeploy.sandbox import _TcpToUnixProxy
+
+    sock_path = tmp_path / "app.sock"
+    received: list[bytes] = []
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        received.append(conn.recv(65536))
+        conn.close()
+        srv.close()
+
+    import threading
+
+    threading.Thread(target=serve, daemon=True).start()
+    proxy = _TcpToUnixProxy(sock_path)
+    proxy.start()
+    try:
+        client = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+        client.sendall(b"hello-proxy")
+        client.close()
+    finally:
+        proxy.stop()
+    import time
+
+    deadline = time.time() + 5
+    while not received and time.time() < deadline:
+        time.sleep(0.05)
+    assert received and received[0] == b"hello-proxy"
+
+
+def test_tcp_proxy_stop_is_clean(tmp_path):
+    from proofdeploy.sandbox import _TcpToUnixProxy
+
+    proxy = _TcpToUnixProxy(tmp_path / "nope.sock")
+    proxy.start()
+    proxy.stop()  # must not hang or raise
+
+
+def test_install_command_failure_returns_false(monkeypatch, tmp_path):
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, build_network=True)
+    fake = _FakeRun(fail_on=("bash",))
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    assert sb.install(checkout, ["exit 1"], env={}, proxy_env={}) is False
+
+
+def test_run_file_not_found(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    def boom(*a, **k):
+        raise FileNotFoundError("nope")
+
+    monkeypatch.setattr(sb_mod.subprocess, "run", boom)
+    ok, reason = sb_mod._run(["podman", "--version"], 30, [])
+    assert ok is False
+    assert "podman not found" in reason
+
+
+def test_run_timeout(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd=a[0], timeout=30)
+
+    monkeypatch.setattr(sb_mod.subprocess, "run", boom)
+    ok, reason = sb_mod._run(["podman", "--version"], 30, [])
+    assert ok is False
+    assert "timed out" in reason
+
+
+def test_run_nonzero_exit(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(
+        sb_mod.subprocess, "run", lambda *a, **k: _completed(a[0], 1, "", "err")
+    )
+    ok, reason = sb_mod._run(["podman", "--version"], 30, [])
+    assert ok is False
+    assert "exit 1" in reason
+
+
+def test_wait_ready_true():
+    """wait_ready returns True against a live HTTP server."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from proofdeploy.sandbox import SandboxApp
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        app = SandboxApp(
+            name="t",
+            sandbox=None,  # type: ignore[arg-type]
+            target_url=f"http://127.0.0.1:{srv.server_port}",
+        )
+        assert app.wait_ready("/health", timeout=10) is True
+    finally:
+        srv.shutdown()
+
+
+def test_wait_ready_false_on_dead_port():
+    from proofdeploy.sandbox import SandboxApp
+
+    app = SandboxApp(
+        name="t",
+        sandbox=None,  # type: ignore[arg-type]
+        target_url="http://127.0.0.1:1",
+    )
+    assert app.wait_ready("/health", timeout=1) is False
+
+
+def test_sandbox_stop_records_call(monkeypatch):
+    _patch_sandbox_caps(monkeypatch, userns_remap=True)
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    sb.stop("myapp")
+    assert any("rm" in c and "myapp" in c for c in fake.calls)
+
+
+def test_prepare_checkout_chmod_failure_logs(monkeypatch, tmp_path):
+    import proofdeploy.sandbox as sb_mod
+
+    def boom(*a, **k):
+        raise OSError("chmod denied")
+
+    monkeypatch.setattr(sb_mod.subprocess, "run", boom)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    sb._prepare_checkout(checkout)  # must not raise
+    assert any("chmod checkout failed" in line for line in sb.log)
+
+
+def test_sandbox_evidence_fn(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(
+        sb_mod, "check_sandbox_capabilities", lambda: _fake_caps(userns_remap=True)
+    )
+    ev = sb_mod.sandbox_evidence()
+    assert ev["userns_remap"] is True
+    assert ev["podman"] is True
+
+
+def test_check_podman_true_and_false(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(
+        sb_mod, "check_sandbox_capabilities", lambda: _fake_caps()
+    )
+    assert sb_mod.check_podman() == (True, "podman version 4.9.3")
+    monkeypatch.setattr(
+        sb_mod,
+        "check_sandbox_capabilities",
+        lambda: _fake_caps(podman=False, reason="podman not found"),
+    )
+    ok, reason = sb_mod.check_podman()
+    assert ok is False
+    assert "podman not found" in reason
+
+
+def test_groq_key_stripped_from_install_env(monkeypatch, tmp_path):
+    """GROQ_API_KEY never enters the install container's environment."""
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, build_network=True)
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    env = {"APP_ENV": "test", "GROQ_API_KEY": "sk-secret-value"}
+    assert sb.install(checkout, ["echo hi"], env=env, proxy_env={})
+    args = _install_run_args(fake)
+    env_args = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+    assert not any(a.startswith("GROQ_API_KEY=") for a in env_args)
+    assert any(a.startswith("APP_ENV=") for a in env_args)
+
+
+def test_groq_key_stripped_from_app_env(monkeypatch, tmp_path):
+    """GROQ_API_KEY never enters the app container's environment."""
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, isolated_network=True)
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    env = {"APP_ENV": "test", "GROQ_API_KEY": "sk-secret-value"}
+    # _start_isolated builds the container args from run_env; the fake
+    # runner records them and the inspect returns no IP (refusal is
+    # fine: we only need the recorded args).
+    with pytest.raises(SandboxError, match="no container IP"):
+        sb._start_isolated(checkout, "python app.py", dict(env), "keyprobe")
+    run_calls = [c for c in fake.calls if "bash" in c]
+    assert run_calls, f"no container run recorded: {fake.calls}"
+    args = run_calls[0]
+    env_args = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+    assert not any(a.startswith("GROQ_API_KEY=") for a in env_args)
+    assert any(a.startswith("APP_ENV=") for a in env_args)
+
+
+def test_start_isolated_no_container_ip(monkeypatch, tmp_path):
+    """_start_isolated refuses when the container has no IP on the bridge."""
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, isolated_network=True)
+
+    def fake_run(args, timeout, logs):
+        logs.append(f"$ {' '.join(args)}")
+        return True, ""  # inspect returns empty: no IP
+
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake_run)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    with pytest.raises(SandboxError, match="no container IP"):
+        sb._start_isolated(checkout, "python app.py", {"PORT": "80"}, "noip")
+
+
+def test_measurement_gate_returns_caps_dict(monkeypatch):
+    """The gate returns the capability probe result for the record."""
+    _patch_probe_caps(monkeypatch, userns_remap=True, build_network=True)
+    caps = assert_measurement_gate()
+    assert caps["userns_remap"] is True
+    assert caps["build_network"] is True
+    assert caps["podman"] is True

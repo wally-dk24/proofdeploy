@@ -224,3 +224,64 @@ def test_call_model_default_runner_is_groq(monkeypatch):
     assert rec["seed"] is None
     assert rec["tools"] is None
     assert len(rec["message_hashes"]) == 1 and len(rec["message_hashes"][0]) == 64
+
+
+def test_credential_env_fallback(monkeypatch):
+    """Without authd, the Groq key comes from GROQ_API_KEY; the key value
+    never enters the request record, only the source is recorded."""
+    import urllib.request
+
+    import proofdeploy.model_client as mc
+
+    def no_authd():
+        raise RuntimeError("no authd here")
+
+    monkeypatch.setattr(mc, "_credential_surrogate", no_authd)
+    monkeypatch.setenv("GROQ_API_KEY", "sk-test-key-123")
+    req = urllib.request.Request("https://api.groq.com/openai/v1/chat/completions")
+    assert mc._apply_credential(req) == "env"
+    assert req.get_header("Authorization") == "Bearer sk-test-key-123"
+
+
+def test_credential_unavailable_raises(monkeypatch):
+    import urllib.request
+
+    import proofdeploy.model_client as mc
+
+    def no_authd():
+        raise RuntimeError("no authd here")
+
+    monkeypatch.setattr(mc, "_credential_surrogate", no_authd)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    req = urllib.request.Request("https://api.groq.com/openai/v1/chat/completions")
+    try:
+        mc._apply_credential(req)
+    except RuntimeError as e:
+        assert "GROQ_API_KEY" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_template_v3_hash_and_content():
+    """The v3 template is the registered file: hash matches, the
+    harness example shows python|node, and the assertion sentence is
+    Master's verbatim wording."""
+    import hashlib
+    import re
+    from pathlib import Path
+
+    import proofdeploy.model_client as mc
+
+    assert mc.PROMPT_TEMPLATE_FILENAME == "author_prompt_v3.md"
+    path = Path(mc.__file__).with_name("author_prompt_v3.md")
+    text = path.read_text(encoding="utf-8")
+    assert hashlib.sha256(text.encode("utf-8")).hexdigest() == mc.author_prompt_sha256()
+    assert '"language": "python|node"' in text
+    flat = re.sub(r"\s+", " ", text)
+    want = (
+        "Every probe must exercise at least one behavior the diff changed, and "
+        "assert how a correct implementation of the change should behave, not "
+        "merely what the code currently does. A probe that passes identically "
+        "with and without the diff tells us nothing."
+    )
+    assert want in flat

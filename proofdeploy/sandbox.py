@@ -61,6 +61,18 @@ IMAGES = {
 PLATFORM_CA_HOST = "/usr/local/share/ca-certificates/hatch-egress-ca.crt"
 PLATFORM_CA_CONTAINER = "/ca/hatch-egress-ca.crt"
 
+# Env vars that must never enter a container, even if present in the
+# caller's environment or contract env. The Groq key authenticates the
+# model client on the host; the container has no use for it and must
+# never see it.
+_SECRET_ENV_BLOCKLIST = frozenset({"GROQ_API_KEY"})
+
+
+def _strip_secret_env(env: dict[str, str]) -> dict[str, str]:
+    """Remove blocklisted secret env vars before they reach a container."""
+    return {k: v for k, v in env.items() if k not in _SECRET_ENV_BLOCKLIST}
+
+
 # Unix socket (in the shared checkout) bridging the executor to an
 # app in a --net=none container.
 _BRIDGE_SOCK_NAME = ".pd-app.sock"
@@ -558,7 +570,7 @@ class Sandbox:
         the egress proxy for the install only.
         """
         self._prepare_checkout(checkout)
-        full_env = dict(env)
+        full_env = _strip_secret_env(dict(env))
         full_env.update(proxy_env)
         # Trust the platform CA for the install phase.
         full_env["SSL_CERT_FILE"] = PLATFORM_CA_CONTAINER
@@ -598,7 +610,7 @@ class Sandbox:
         """
         self._prepare_checkout(checkout)
         mode = self._resolve_network_mode()
-        env = dict(env)
+        env = _strip_secret_env(dict(env))
         env.setdefault("HOME", "/checkout/.sandbox-home")
         # No proxy variables, ever, for the app.
         env = {k: v for k, v in env.items() if "proxy" not in k.lower()}
@@ -631,7 +643,7 @@ class Sandbox:
         name: str,
     ) -> SandboxApp:
         args = self._common_args(checkout, name, False, detach=True)
-        for k, v in run_env.items():
+        for k, v in _strip_secret_env(run_env).items():
             args += ["-e", f"{k}={v}"]
         args += [self.config.image, "bash", "-c", command]
         ok, reason = _run(args, 60, self.log)
@@ -648,7 +660,8 @@ class Sandbox:
             30,
             self.log,
         )
-        ip = out.strip().splitlines()[-1] if ok else ""
+        lines = out.strip().splitlines()
+        ip = lines[-1] if ok and lines else ""
         if not ip:
             self.stop(name)
             raise SandboxError("sandbox start: no container IP on isolated network")
@@ -698,7 +711,7 @@ class Sandbox:
         args += ["-v", f"{checkout}:/checkout", "-w", "/checkout"]
         for host_path, container_path in self.config.extra_mounts:
             args += ["-v", f"{host_path}:{container_path}:ro"]
-        for k, v in run_env.items():
+        for k, v in _strip_secret_env(run_env).items():
             args += ["-e", f"{k}={v}"]
         args += [self.config.image, "bash", "-c", wrapped]
         ok, reason = _run(args, 60, self.log)
@@ -787,7 +800,9 @@ def sandbox_evidence() -> dict[str, object]:
     }
 
 
-def assert_measurement_gate(config: SandboxConfig | None = None) -> None:
+def assert_measurement_gate(
+    config: SandboxConfig | None = None,
+) -> dict[str, object]:
     """Fail-closed gate for measured runs: refuse unless the host can
     meet the isolation requirements.
 
@@ -799,8 +814,9 @@ def assert_measurement_gate(config: SandboxConfig | None = None) -> None:
     - the host cannot create a bridge network for the install phase
       (the install must not use ``--net=host``).
 
-    Raises SandboxError on refusal. The orchestrator calls this before
-    provisioning any measured side.
+    Raises SandboxError on refusal. Returns the capability probe
+    result as a dict (for the evidence record's provenance). The
+    orchestrator calls this before provisioning any measured side.
     """
     cfg = config or SandboxConfig()
     caps = check_sandbox_capabilities()
@@ -819,3 +835,11 @@ def assert_measurement_gate(config: SandboxConfig | None = None) -> None:
             "measured run refused: no bridge network for the install phase "
             f"({caps.reason}); the install must not use --net=host"
         )
+    return {
+        "podman": caps.podman,
+        "podman_version": caps.podman_version,
+        "isolated_network": caps.isolated_network,
+        "build_network": caps.build_network,
+        "userns_remap": caps.userns_remap,
+        "reason": caps.reason,
+    }

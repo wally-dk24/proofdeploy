@@ -141,7 +141,17 @@ class MeasureConfig:
     # (mirrors the record's public_contract_env_keys).
     public_contract_env_keys: list[str] = field(default_factory=list)
     # Sandbox unattended runs in a de-privileged container (WO-5 brief).
-    sandbox: bool = False
+    # Sandboxed by default: untrusted code must never run on the host.
+    # An unsandboxed run is allowed only through the explicit dev flag
+    # ``allow_unsandboxed``; it is marked in the evidence record and
+    # never counts as a measured result.
+    sandbox: bool = True
+    allow_unsandboxed: bool = False
+    # Provenance for CI-driven measured runs (GitHub Actions run URL/ID,
+    # runner image). Recorded verbatim in the evidence record.
+    provenance_run_url: str | None = None
+    provenance_run_id: str | None = None
+    provenance_runner_image: str | None = None
     note: str = ""
 
     @property
@@ -174,6 +184,18 @@ class Orchestrator:
 
     def _say(self, msg: str) -> None:
         self.log.append(msg)
+
+    def _provenance(self, capability_probe: dict[str, object]) -> dict[str, object]:
+        """Provenance for the evidence record: CI run identity (when
+        provided via the CLI) plus the capability probe output from the
+        measurement gate. Empty capability_probe means the gate did not
+        run (unsandboxed dev run)."""
+        return {
+            "actions_run_url": self.cfg.provenance_run_url,
+            "actions_run_id": self.cfg.provenance_run_id,
+            "runner_image": self.cfg.provenance_runner_image,
+            "capability_probe": capability_probe,
+        }
 
     # ------------------------------------------------------------------
     # Bundle and authoring (steps a-c).
@@ -551,12 +573,20 @@ class Orchestrator:
         cfg = self.cfg
         if not (cfg.bug_id and cfg.rev_bug_base and cfg.rev_bug and cfg.rev_fix):
             raise OrchestratorError("measure_bug needs bug_id, rev_bug_base, rev_bug, rev_fix")
-        if cfg.sandbox:
+        use_sandbox = cfg.sandbox and not cfg.allow_unsandboxed
+        capability_probe: dict[str, object] = {}
+        if use_sandbox:
             # Fail-closed isolation gate: refuse the measured run unless
             # the host meets the sandbox requirements (userns remapping,
             # bridge network for the install phase).
-            assert_measurement_gate()
+            capability_probe = assert_measurement_gate()
             self._say("sandbox measurement gate passed")
+        elif cfg.allow_unsandboxed:
+            self._say(
+                "WARNING: unsandboxed dev run (allow_unsandboxed=True): "
+                "untrusted code runs on the host; this run is marked and "
+                "never counts as a measured result"
+            )
         unit_dir = cfg.workdir / f"bug-{cfg.bug_id}"
         unit_dir.mkdir(parents=True, exist_ok=True)
         repo = self._init_records_repo()
@@ -577,7 +607,7 @@ class Orchestrator:
         runner = Provisioner(workdir=prov_workdir)
         sides: list[_Side] = []
         try:
-            if cfg.sandbox:
+            if use_sandbox:
                 sides.append(
                     self._provision_side_sandbox(cfg.rev_bug, _free_port(), unit_dir, "fix-parent")
                 )
@@ -633,6 +663,9 @@ class Orchestrator:
                     "fix_parent": parent.sandbox_evidence or {},
                     "fix": fix.sandbox_evidence or {},
                 },
+                sandboxed=use_sandbox,
+                measured_result=use_sandbox,
+                provenance=self._provenance(capability_probe),
                 fix_parent_provision=parent.provision.to_dict(),
                 fix_provision=fix.provision.to_dict(),
                 fix_parent_results=parent_results,
@@ -698,11 +731,19 @@ class Orchestrator:
         cfg = self.cfg
         if not (cfg.clean_id and cfg.rev_clean):
             raise OrchestratorError("measure_clean needs clean_id and rev_clean")
-        if cfg.sandbox:
+        use_sandbox = cfg.sandbox and not cfg.allow_unsandboxed
+        capability_probe: dict[str, object] = {}
+        if use_sandbox:
             # Fail-closed isolation gate: refuse the measured run unless
             # the host meets the sandbox requirements.
-            assert_measurement_gate()
+            capability_probe = assert_measurement_gate()
             self._say("sandbox measurement gate passed")
+        elif cfg.allow_unsandboxed:
+            self._say(
+                "WARNING: unsandboxed dev run (allow_unsandboxed=True): "
+                "untrusted code runs on the host; this run is marked and "
+                "never counts as a measured result"
+            )
         unit_dir = cfg.workdir / f"clean-{cfg.clean_id}"
         unit_dir.mkdir(parents=True, exist_ok=True)
         repo = self._init_records_repo()
@@ -724,7 +765,7 @@ class Orchestrator:
         runner = Provisioner(workdir=prov_workdir)
         sides: list[_Side] = []
         try:
-            if cfg.sandbox:
+            if use_sandbox:
                 sides.append(
                     self._provision_side_sandbox(cfg.rev_clean, _free_port(), unit_dir, "clean")
                 )
@@ -765,6 +806,9 @@ class Orchestrator:
                 author_prompt_sha256=author_prompt_sha256(),
                 skill_sha256=manifest.get("skill_sha256"),
                 sandbox_evidence={"c": side.sandbox_evidence or {}},
+                sandboxed=use_sandbox,
+                measured_result=use_sandbox,
+                provenance=self._provenance(capability_probe),
                 runner_log=list(self.log),
                 fixture=dict(side.contract.fixture),
                 contract_env=dict(side.contract.env),

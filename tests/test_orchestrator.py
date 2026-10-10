@@ -146,7 +146,8 @@ def test_measure_bug_end_to_end(tmp_path):
         rev_fix=info["fix"],
         model_runner=canned_probes,
         public_contract_env_keys=["APP_ENV"],
-    )
+        allow_unsandboxed=True,
+)
     summary = Orchestrator(cfg).measure_bug()
     assert summary["verdict"] == "candidate_catch"
     assert summary["candidate_catch"] == [0]
@@ -196,7 +197,8 @@ def test_measure_bug_provisioning_failure_is_inconclusive(tmp_path):
         rev_fix=info["fix"],
         model_runner=canned_probes,
         public_contract_env_keys=["APP_ENV"],
-    )
+        allow_unsandboxed=True,
+)
     summary = Orchestrator(cfg).measure_bug()
     assert summary["verdict"] == "inconclusive"
     assert not summary["parent_ready"]
@@ -238,7 +240,8 @@ def test_measure_bug_leak_check_fails_closed(tmp_path):
         rev_bug=leak_sha,
         rev_fix=info["fix"],
         model_runner=must_not_run,
-    )
+        allow_unsandboxed=True,
+)
     with pytest.raises(SecretLeakError):
         Orchestrator(cfg).measure_bug()
 
@@ -256,7 +259,8 @@ def test_measure_clean_end_to_end(tmp_path):
         rev_clean=info["fix"],
         model_runner=canned_probes,
         public_contract_env_keys=["APP_ENV"],
-    )
+        allow_unsandboxed=True,
+)
     summary = Orchestrator(cfg).measure_clean()
     assert summary["run_kind"] == "clean"
     assert summary["false_alarm"] is False
@@ -280,7 +284,8 @@ def test_measure_needs_revs():
         workdir=Path("/tmp"),
         skill_path=Path("/tmp"),
         bug_id="x",
-    )
+        allow_unsandboxed=True,
+)
     with pytest.raises(OrchestratorError):
         Orchestrator(cfg).measure_bug()
 
@@ -303,7 +308,8 @@ def test_measure_bug_refuses_seeded_fix_diff(tmp_path, monkeypatch):
         rev_fix=info["fix"],
         model_runner=canned_probes,
         public_contract_env_keys=["APP_ENV"],
-    )
+        allow_unsandboxed=True,
+)
     orch = Orchestrator(cfg)
     orig_build = orch._build_bundle
 
@@ -344,7 +350,8 @@ def test_measure_bug_refuses_fix_sha_in_snapshot(tmp_path, monkeypatch):
         rev_fix=info["fix"],
         model_runner=canned_probes,
         public_contract_env_keys=["APP_ENV"],
-    )
+        allow_unsandboxed=True,
+)
     orch = Orchestrator(cfg)
     orig_build = orch._build_bundle
 
@@ -363,3 +370,48 @@ def test_measure_bug_refuses_fix_sha_in_snapshot(tmp_path, monkeypatch):
     with pytest.raises(AnswerKeyLeakError, match="!= B version"):
         orch.measure_bug()
     assert not (out / RUNS_LOG_NAME).exists()
+
+
+def test_measure_config_sandbox_on_by_default():
+    """Sandbox is the default: untrusted code never runs on the host
+    unless the explicit dev flag is set."""
+    from proofdeploy.orchestrator import MeasureConfig
+
+    cfg = MeasureConfig(
+        repo_dir=Path("/tmp/r"),
+        output_dir=Path("/tmp/o"),
+        workdir=Path("/tmp/w"),
+        skill_path=Path("/tmp/s.md"),
+    )
+    assert cfg.sandbox is True
+    assert cfg.allow_unsandboxed is False
+
+
+def test_unsandboxed_run_is_marked_not_measured():
+    """An unsandboxed dev run is marked in the evidence record and never
+    counts as a measured result."""
+    from proofdeploy.runpair import build_evidence_record
+
+    record = build_evidence_record(
+        run_kind="bug", sandboxed=False, measured_result=False
+    )
+    assert record["sandboxed"] is False
+    assert record["measured_result"] is False
+    # A normal (sandboxed) run counts.
+    record2 = build_evidence_record(run_kind="bug")
+    assert record2["sandboxed"] is True
+    assert record2["measured_result"] is True
+
+
+def test_evidence_record_carries_provenance():
+    from proofdeploy.runpair import build_evidence_record
+
+    prov = {
+        "actions_run_url": "https://example.com/runs/1",
+        "actions_run_id": "123",
+        "runner_image": "ubuntu-24.04",
+        "capability_probe": {"userns_remap": True},
+    }
+    record = build_evidence_record(run_kind="bug", provenance=prov)
+    assert record["provenance"] == prov
+    assert build_evidence_record(run_kind="bug")["provenance"] == {}
