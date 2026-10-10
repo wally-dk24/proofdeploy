@@ -6,12 +6,19 @@ or start yields INCONCLUSIVE (per the start-failure scoring rule), not an
 exception escaping the runner.
 
 The provisioner:
-- detects the runtime and its version from the repo manifests
-  (`engines.node` / `packageManager` for Node, `requires-python` for Python);
-- verifies the frozen lockfile (mismatch = build failure);
-- installs with the package manager matching the lockfile;
+- detects the runtime and SELECTS an installed binary satisfying the
+  declared range (`engines.node` / `packageManager` for Node,
+  `requires-python` for Python); records the actual version used
+  (unsatisfiable range = BUILD_FAILED);
+- verifies the frozen lockfile, preferring the `packageManager` lockfile
+  when several exist (mismatch = build failure); rejects unpinned
+  requirements.txt;
+- installs with the package manager matching the lockfile (Python pip
+  goes into a fresh per-run venv, never the host);
 - runs the contract's `build`, `migrate`, and `seed` steps in order;
-- starts the target and waits for the readiness check.
+- captures target stdout/stderr to a per-run log file;
+- starts the target and waits for the readiness check (a `/path`
+  readiness is joined to the assigned target URL).
 """
 
 from __future__ import annotations
@@ -21,9 +28,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
+import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -47,9 +57,10 @@ class ProvisionResult:
     logs: list[str] = field(default_factory=list)
     lockfile_sha256: str | None = None
     runtime: str | None = None
-    runtime_version: str | None = None
+    runtime_version: str | None = None  # actual version used, from `--version`
     package_manager: str | None = None
     reason: str | None = None  # human-readable cause for BUILD_FAILED/START_FAILED
+    target_log_path: str | None = None  # captured target stdout/stderr
     # Live process handle on READY. Caller-owned: the caller must terminate
     # it when done. Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
@@ -67,6 +78,7 @@ class ProvisionResult:
             "runtime_version": self.runtime_version,
             "package_manager": self.package_manager,
             "reason": self.reason,
+            "target_log_path": self.target_log_path,
             "logs": self.logs,
         }
 
@@ -152,9 +164,279 @@ def _requires_python_from_toml(pyproject: Path) -> str | None:
     return None
 
 
-def find_lockfile(snapshot_dir: Path, runtime: str) -> tuple[str, str] | None:
-    """Find the frozen lockfile. Returns (lockfile_name, sha256) or None."""
-    for name in LOCKFILES.get(runtime, ()):
+# --- version range matching (finding 2: select, don't just record) ---
+
+
+def _parse_version(v: str) -> tuple[int, int, int]:
+    """Parse a version string into a (major, minor, patch) tuple.
+
+    Strips leading 'v', prerelease/build suffixes, and non-numeric tails.
+    """
+    v = v.strip().lstrip("vV")
+    v = re.split(r"[-+]", v, maxsplit=1)[0]
+    parts: list[int] = []
+    for p in v.split("."):
+        m = re.match(r"\d+", p)
+        parts.append(int(m.group()) if m else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return (parts[0], parts[1], parts[2])
+
+
+def _eval_cmp(
+    op: str, ver: tuple[int, int, int], ref: tuple[int, ...]
+) -> bool:
+    n = len(ref)
+    if op == "==":
+        return ver == ref  # type: ignore[comparison-overlap]
+    if op == "!=":
+        return ver != ref  # type: ignore[comparison-overlap]
+    if op == ">=":
+        return ver >= ref  # type: ignore[operator]
+    if op == "<=":
+        return ver <= ref  # type: ignore[operator]
+    if op == ">":
+        return ver > ref  # type: ignore[operator]
+    if op == "<":
+        return ver < ref  # type: ignore[operator]
+    if op == "prefix==":
+        return ver[:n] == ref
+    if op == "prefix!=":
+        return ver[:n] != ref
+    raise ValueError(f"unknown comparator: {op}")
+
+
+def _expand_caret(t: tuple[int, int, int]) -> list[tuple[str, tuple[int, ...]]]:
+    """npm ^x.y.z semantics."""
+    if t[0] != 0:
+        return [(">=", t), ("<", (t[0] + 1, 0, 0))]
+    if t[1] != 0:
+        return [(">=", t), ("<", (0, t[1] + 1, 0))]
+    return [(">=", t), ("<", (0, 0, t[2] + 1))]
+
+
+def _expand_tilde(
+    t: tuple[int, int, int], specified: int
+) -> list[tuple[str, tuple[int, ...]]]:
+    """npm ~x.y.z semantics (patch-level changes allowed)."""
+    if specified >= 3:
+        return [(">=", t), ("<", (t[0], t[1] + 1, 0))]
+    if specified == 2:
+        return [(">=", (t[0], t[1], 0)), ("<", (t[0] + 1, 0, 0))]
+    return [(">=", (t[0], 0, 0)), ("<", (t[0] + 1, 0, 0))]
+
+
+def _expand_compatible(
+    t: tuple[int, int, int], specified: int
+) -> list[tuple[str, tuple[int, ...]]]:
+    """PEP 440 ~= semantics: ~= X.Y means >=X.Y, ==X.*; ~= X.Y.Z means
+    >=X.Y.Z, ==X.Y.*."""
+    if specified >= 3:
+        return [(">=", t), ("prefix==", t[:2])]
+    return [(">=", (t[0], t[1], 0)), ("prefix==", t[:1])]
+
+
+def _parse_token(
+    tok: str, ecosystem: str
+) -> list[tuple[str, tuple[int, ...]]]:
+    """Parse one range token into comparators."""
+    if tok in ("*", "x", "X", "latest"):
+        return []
+    m = re.match(r"^(>=|<=|!=|==|~=|>|<|=|\^|~)?\s*(.+?)\s*$", tok)
+    if not m:
+        return []
+    op, ver = m.group(1) or "", m.group(2)
+    # Wildcards: 1.x, 1.2.x
+    low = ver.lower()
+    if "x" in low or low == "*":
+        nums = [p for p in re.split(r"[.]", low) if p not in ("x", "*")]
+        t = _parse_version(".".join(nums) if nums else "0")
+        if len(nums) <= 1:
+            return [(">=", (t[0], 0, 0)), ("<", (t[0] + 1, 0, 0))]
+        return [(">=", (t[0], t[1], 0)), ("<", (t[0], t[1] + 1, 0))]
+    # PEP 440 == with .* suffix
+    if op == "==" and ver.endswith(".*"):
+        prefix = tuple(int(p) for p in ver[:-2].split(".") if p.isdigit())
+        return [("prefix==", prefix)]
+    if op == "!=" and ver.endswith(".*"):
+        prefix = tuple(int(p) for p in ver[:-2].split(".") if p.isdigit())
+        return [("prefix!=", prefix)]
+    t = _parse_version(ver)
+    specified = len([p for p in ver.split(".") if p.strip()])
+    if op == "^":
+        return _expand_caret(t)
+    if op == "~" and ecosystem == "node":
+        return _expand_tilde(t, specified)
+    if op == "~=":
+        return _expand_compatible(t, specified)
+    if op in ("", "="):
+        return [("==", t)]
+    return [(op, t)]
+
+
+def _parse_range(
+    spec: str, ecosystem: str
+) -> list[list[tuple[str, tuple[int, ...]]]]:
+    """Parse a range spec into OR-groups of AND-comparators."""
+    groups: list[list[tuple[str, tuple[int, ...]]]] = []
+    for group_str in spec.split("||"):
+        group_str = group_str.strip()
+        if not group_str:
+            continue
+        # npm hyphen range: "1.2.3 - 2.3.4"
+        if ecosystem == "node" and " - " in group_str:
+            lo, hi = group_str.split(" - ", 1)
+            groups.append(
+                [(">=", _parse_version(lo)), ("<=", _parse_version(hi))]
+            )
+            continue
+        comparators: list[tuple[str, tuple[int, ...]]] = []
+        for tok in re.split(r"[,\s]+", group_str):
+            if tok:
+                comparators.extend(_parse_token(tok, ecosystem))
+        groups.append(comparators)
+    return groups
+
+
+def satisfies_range(version: str, range_spec: str, ecosystem: str = "node") -> bool:
+    """True if `version` satisfies the declared range spec.
+
+    Supports the common npm (`engines`) and PEP 440 (`requires-python`)
+    range syntax: >=, <=, >, <, ==, !=, ^, ~, ~=, x-wildcards, hyphen
+    ranges, comma AND, || OR.
+    """
+    spec = (range_spec or "").strip()
+    if not spec or spec in ("*", "x", "X", "latest"):
+        return True
+    ver = _parse_version(version)
+    try:
+        groups = _parse_range(spec, ecosystem)
+    except Exception:
+        return False
+    if not groups:
+        return True
+    return any(
+        all(_eval_cmp(op, ver, ref) for op, ref in group) for group in groups
+    )
+
+
+_NODE_BINARIES = ["node", "nodejs", "node24", "node22", "node20", "node18", "node16"]
+_PYTHON_BINARIES = [
+    "python3",
+    "python3.12",
+    "python3.11",
+    "python3.10",
+    "python3.9",
+    "python3.8",
+]
+
+
+def _binary_version(binary: str, env: dict[str, str]) -> str | None:
+    """Return `binary --version` output, or None if unavailable."""
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or proc.stderr or "").strip()
+    if not out:
+        return None
+    # "v24.20.0" -> "v24.20.0"; "Python 3.12.3" -> "3.12.3"
+    first = out.split()[0]
+    if first.lower() == "python" and len(out.split()) > 1:
+        return out.split()[1]
+    return first
+
+
+def select_runtime_binary(
+    runtime: str,
+    declared_range: str | None,
+    env: dict[str, str],
+    logs: list[str],
+) -> tuple[str | None, str | None, str | None]:
+    """Pick an installed binary satisfying the declared range.
+
+    Returns (binary, actual_version, failure_reason). failure_reason is
+    None on success. With no declared range, uses the default binary
+    without probing (the install step reports a missing binary).
+    """
+    default = "node" if runtime == "node" else "python3"
+    if declared_range is None:
+        ver = _binary_version(default, env)
+        if ver is not None:
+            logs.append(f"runtime binary: {default} ({ver}), no declared range")
+        return default, ver, None
+    candidates = _NODE_BINARIES if runtime == "node" else _PYTHON_BINARIES
+    probed: list[str] = []
+    for binary in candidates:
+        ver = _binary_version(binary, env)
+        if ver is None:
+            continue
+        probed.append(f"{binary}={ver}")
+        if satisfies_range(ver, declared_range, runtime):
+            logs.append(
+                f"runtime binary: {binary} ({ver}) satisfies {declared_range!r}"
+            )
+            return binary, ver, None
+    if not probed:
+        return None, None, f"no {runtime} binary found on PATH"
+    return (
+        None,
+        None,
+        f"no installed {runtime} satisfies declared range {declared_range!r} "
+        f"(found: {', '.join(probed)})",
+    )
+
+
+def read_package_manager(snapshot_dir: Path) -> tuple[str | None, str | None]:
+    """Read the `packageManager` field: (name, version) or (None, None)."""
+    pkg = snapshot_dir / "package.json"
+    try:
+        data = json.loads(pkg.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None, None
+    pm = data.get("packageManager")
+    if not isinstance(pm, str) or "@" not in pm:
+        return None, None
+    name, _, version = pm.partition("@")
+    name, version = name.strip(), version.strip()
+    if not name:
+        return None, None
+    return name, version or None
+
+
+# packageManager name -> preferred lockfile(s)
+_PM_LOCKFILES: dict[str, tuple[str, ...]] = {
+    "npm": ("package-lock.json",),
+    "yarn": ("yarn.lock",),
+    "pnpm": ("pnpm-lock.yaml",),
+    "bun": ("bun.lock", "bun.lockb"),
+}
+
+
+def find_lockfile(
+    snapshot_dir: Path,
+    runtime: str,
+    preferred: list[str] | None = None,
+) -> tuple[str, str] | None:
+    """Find the frozen lockfile. Returns (lockfile_name, sha256) or None.
+
+    When `preferred` names exist, they are tried first (finding 3: the
+    lockfile matching `packageManager` wins over the hard-coded order).
+    """
+    names = list(LOCKFILES.get(runtime, ()))
+    if preferred:
+        names = [n for n in preferred if n in names] + [
+            n for n in names if n not in preferred
+        ]
+    for name in names:
         p = snapshot_dir / name
         if p.is_file():
             return name, _sha256_file(p)
@@ -172,6 +454,29 @@ def verify_lockfile(snapshot_dir: Path, runtime: str) -> str:
             f"no frozen lockfile found in {snapshot_dir} for runtime {runtime!r}"
         )
     return found[1]
+
+
+def check_requirements_frozen(req_path: Path) -> str | None:
+    """Check that requirements.txt is frozen. Returns a reason if not.
+
+    Finding 4: every package-spec line must be pinned with `==`. Blank
+    lines, `#` comments, and `-`/`--` option directives (e.g. `--index-url`,
+    `-r includes`) are not package specs and are exempt.
+    """
+    try:
+        lines = req_path.read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        return f"cannot read requirements.txt: {e}"
+    for lineno, line in enumerate(lines, 1):
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("-"):
+            continue
+        if "==" not in s:
+            return (
+                f"requirements.txt line {lineno} is not pinned with '==': "
+                f"{s[:60]} (not a frozen lockfile)"
+            )
+    return None
 
 
 def _is_yarn_berry(snapshot_dir: Path) -> bool:
@@ -197,16 +502,36 @@ def select_package_manager(
 
     Returns (manager_name, install_argv). Raises ValueError for an
     unsupported lockfile.
+
+    Finding 2: when `packageManager` pins a version (e.g. `pnpm@9.1.0`) and
+    corepack is available, the install runs through corepack so the pinned
+    version is used. Otherwise the plain binary is used and a note is
+    logged by the caller.
     """
+    pm_name, pm_version = (
+        read_package_manager(snapshot_dir) if runtime == "node" else (None, None)
+    )
+    corepack = shutil.which("corepack")
+
+    def _cmd(manager: str, args: list[str]) -> list[str]:
+        if (
+            corepack
+            and pm_name == manager
+            and pm_version
+            and manager in ("pnpm", "yarn", "npm")
+        ):
+            return ["corepack", f"{manager}@{pm_version}", *args]
+        return [manager, *args]
+
     if runtime == "node":
         if lockfile_name == "package-lock.json":
-            return "npm", ["npm", "ci", "--no-audit", "--no-fund"]
+            return "npm", _cmd("npm", ["ci", "--no-audit", "--no-fund"])
         if lockfile_name == "yarn.lock":
             if _is_yarn_berry(snapshot_dir):
-                return "yarn", ["yarn", "install", "--immutable"]
-            return "yarn", ["yarn", "install", "--frozen-lockfile"]
+                return "yarn", _cmd("yarn", ["install", "--immutable"])
+            return "yarn", _cmd("yarn", ["install", "--frozen-lockfile"])
         if lockfile_name == "pnpm-lock.yaml":
-            return "pnpm", ["pnpm", "install", "--frozen-lockfile"]
+            return "pnpm", _cmd("pnpm", ["install", "--frozen-lockfile"])
         if lockfile_name in ("bun.lock", "bun.lockb"):
             return "bun", ["bun", "install", "--frozen-lockfile"]
     else:
@@ -220,24 +545,65 @@ def select_package_manager(
     raise ValueError(f"unsupported lockfile: {lockfile_name}")
 
 
-def build_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+def build_env(
+    extra: dict[str, str] | None = None,
+    prepend_path: str | None = None,
+) -> dict[str, str]:
     """Build the subprocess environment from an allowlist.
 
     Copies PATH and HOME from the current environment, sets CI and
     DEBIAN_FRONTEND, then applies `extra` (contract env, PORT, ...).
     Never an empty dict: a missing binary becomes BUILD_FAILED, not a
     FileNotFoundError escaping the runner.
+
+    Finding 5: `prepend_path` (the per-run venv's bin dir) goes first on
+    PATH so build/migrate/seed/start use the isolated Python.
     """
     env: dict[str, str] = {}
     for key in ("PATH", "HOME"):
         val = os.environ.get(key)
         if val:
             env[key] = val
+    if prepend_path:
+        env["PATH"] = prepend_path + os.pathsep + env.get("PATH", "")
     env["CI"] = "true"
     env["DEBIAN_FRONTEND"] = "noninteractive"
     if extra:
         env.update(extra)
     return env
+
+
+def _resolve_readiness(readiness: str, port: int, logs: list[str]) -> str:
+    """Resolve the readiness check URL (finding 6).
+
+    A readiness starting with `/` is joined to the assigned target URL.
+    A full URL is used as-is, with a warning if its port differs from the
+    assigned port. Empty readiness falls back to the target root.
+    """
+    target_url = f"http://127.0.0.1:{port}"
+    if not readiness:
+        return target_url
+    if readiness.startswith("/"):
+        return target_url + readiness
+    try:
+        parsed = urllib.parse.urlparse(readiness)
+        if parsed.port and parsed.port != port:
+            logs.append(
+                f"warning: readiness URL port {parsed.port} != "
+                f"assigned port {port}; using readiness as-is"
+            )
+    except Exception:
+        pass
+    return readiness
+
+
+def _target_log_tail(log_path: Path, n: int = 40) -> str:
+    """Read the last n lines of a target log file (finding 7)."""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-n:])
 
 
 @dataclass
@@ -292,6 +658,7 @@ class Provisioner:
         runtime_version: str | None = None,
         package_manager: str | None = None,
         lockfile_sha256: str | None = None,
+        target_log_path: str | None = None,
     ) -> ProvisionResult:
         logs.append(reason)
         return ProvisionResult(
@@ -302,13 +669,25 @@ class Provisioner:
             runtime_version=runtime_version,
             package_manager=package_manager,
             reason=reason,
+            target_log_path=target_log_path,
         )
 
-    def _make_venv(self, logs: list[str], env: dict[str, str]) -> Path | None:
-        """Create an isolated venv under workdir. Returns its dir, or None."""
-        venv_dir = self.workdir / "venvs" / "runner-venv"
+    def _make_venv(
+        self,
+        python_bin: str,
+        run_id: str,
+        logs: list[str],
+        env: dict[str, str],
+    ) -> Path | None:
+        """Create a fresh isolated venv for this run (finding 5).
+
+        One venv per provision call at workdir/venvs/<run_id>/, never
+        reused across runs, so fix^ and fix cannot share installed
+        packages.
+        """
+        venv_dir = self.workdir / "venvs" / run_id
         ok, reason = self._exec(
-            ["python3", "-m", "venv", str(venv_dir)],
+            [python_bin, "-m", "venv", str(venv_dir)],
             self.workdir,
             self.build_timeout,
             logs,
@@ -333,159 +712,217 @@ class Provisioner:
         failure — those become BUILD_FAILED / START_FAILED, which the
         scorer maps to INCONCLUSIVE.
         """
-        logs: list[str] = []
+        run_id = uuid.uuid4().hex[:12]
+        logs: list[str] = [f"run_id: {run_id}"]
         snap = Path(snapshot_dir)
         contract_env: dict[str, str] = dict(getattr(contract, "env", None) or {})
 
-        # 1. Detect runtime and version.
-        try:
-            runtime, runtime_version = detect_runtime(snap)
-        except ValueError as e:
-            return self._fail(ProvisionStatus.BUILD_FAILED, str(e), logs)
-        logs.append(f"runtime: {runtime} (declared version: {runtime_version})")
+        def _bail(
+            status: ProvisionStatus,
+            reason: str,
+            **kw: Any,
+        ) -> ProvisionResult:
+            return self._fail(status, reason, logs, **kw)
 
-        # 2. Find the frozen lockfile.
-        found = find_lockfile(snap, runtime)
+        # 1. Detect runtime and declared version range.
+        try:
+            runtime, declared_range = detect_runtime(snap)
+        except ValueError as e:
+            return _bail(ProvisionStatus.BUILD_FAILED, str(e))
+        logs.append(f"runtime: {runtime} (declared range: {declared_range})")
+
+        # Base environment for probing (allowlist + contract env).
+        probe_env = build_env(contract_env)
+
+        # 2. Select an installed binary satisfying the declared range
+        # (finding 2). Records the ACTUAL version, not the range.
+        runtime_bin, actual_version, bin_reason = select_runtime_binary(
+            runtime, declared_range, probe_env, logs
+        )
+        if runtime_bin is None:
+            assert bin_reason is not None
+            return _bail(
+                ProvisionStatus.BUILD_FAILED,
+                bin_reason,
+                runtime=runtime,
+                runtime_version=None,
+            )
+        logs.append(f"runtime version in use: {actual_version}")
+
+        # 3. Find the frozen lockfile, preferring the packageManager's
+        # lockfile when several exist (finding 3).
+        preferred: list[str] | None = None
+        if runtime == "node":
+            pm_name, _ = read_package_manager(snap)
+            if pm_name and pm_name in _PM_LOCKFILES:
+                preferred = list(_PM_LOCKFILES[pm_name])
+                logs.append(
+                    f"packageManager declares {pm_name}; "
+                    f"preferring lockfile(s) {preferred}"
+                )
+        found = find_lockfile(snap, runtime, preferred)
         if found is None:
-            return self._fail(
+            return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 f"no frozen lockfile found in {snap} for runtime {runtime!r}",
-                logs,
                 runtime=runtime,
-                runtime_version=runtime_version,
+                runtime_version=actual_version,
             )
         lockfile_name, lockfile_sha = found
         logs.append(f"lockfile: {lockfile_name} sha256: {lockfile_sha[:16]}...")
 
-        # 3. Lockfile match check (required for measured runs).
+        # 4. requirements.txt must be frozen (finding 4).
+        if lockfile_name == "requirements.txt":
+            not_frozen = check_requirements_frozen(snap / "requirements.txt")
+            if not_frozen is not None:
+                return _bail(
+                    ProvisionStatus.BUILD_FAILED,
+                    not_frozen,
+                    runtime=runtime,
+                    runtime_version=actual_version,
+                    lockfile_sha256=lockfile_sha,
+                )
+
+        # 5. Lockfile match check (required for measured runs).
         if require_lockfile_match and expected_lockfile_sha256 is None:
-            return self._fail(
+            return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 "lockfile hash required for measured runs "
                 "(expected_lockfile_sha256 is None)",
-                logs,
                 runtime=runtime,
-                runtime_version=runtime_version,
+                runtime_version=actual_version,
                 lockfile_sha256=lockfile_sha,
             )
         if expected_lockfile_sha256 is not None and lockfile_sha != expected_lockfile_sha256:
-            return self._fail(
+            return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 "lockfile mismatch: frozen lockfile changed",
-                logs,
                 runtime=runtime,
-                runtime_version=runtime_version,
+                runtime_version=actual_version,
                 lockfile_sha256=lockfile_sha,
             )
 
-        # 4. Select the package manager matching the lockfile.
+        # 6. Select the package manager matching the lockfile.
         try:
             package_manager, install_cmd = select_package_manager(
                 snap, runtime, lockfile_name
             )
         except ValueError as e:
-            return self._fail(
+            return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 str(e),
-                logs,
                 runtime=runtime,
-                runtime_version=runtime_version,
+                runtime_version=actual_version,
                 lockfile_sha256=lockfile_sha,
             )
         logs.append(f"package manager: {package_manager}")
+        logs.append(f"install command: {' '.join(install_cmd)}")
 
-        # Base environment: allowlist + contract env.
-        env = build_env(contract_env)
-
-        # 5. Install (frozen). Python pip installs into an isolated venv,
-        # never the host environment.
+        # Step environment: allowlist + contract env. For Python the fresh
+        # per-run venv's bin goes first on PATH (finding 5).
+        venv_bin: str | None = None
         if package_manager == "pip":
-            venv_dir = self._make_venv(logs, env)
+            venv_dir = self._make_venv(runtime_bin, run_id, logs, probe_env)
             if venv_dir is None:
-                return self._fail(
+                return _bail(
                     ProvisionStatus.BUILD_FAILED,
                     "could not create isolated venv",
-                    logs,
                     runtime=runtime,
-                    runtime_version=runtime_version,
+                    runtime_version=actual_version,
                     package_manager=package_manager,
                     lockfile_sha256=lockfile_sha,
                 )
-            pip_bin = str(venv_dir / "bin" / "pip")
+            venv_bin = str(venv_dir / "bin")
+            logs.append(f"venv: {venv_dir} (bin first on PATH)")
+        step_env = build_env(contract_env, prepend_path=venv_bin)
+
+        # 7. Install (frozen). Python pip installs into the per-run venv,
+        # never the host environment.
+        if package_manager == "pip":
+            assert venv_bin is not None
             req_file = snap / "requirements.txt"
-            cmd = [pip_bin, "install", "-r", str(req_file)]
+            cmd = [os.path.join(venv_bin, "pip"), "install", "-r", str(req_file)]
             if "--hash" in req_file.read_text(encoding="utf-8"):
                 cmd.append("--require-hashes")
         else:
             cmd = install_cmd
-        ok, reason = self._exec(cmd, snap, self.build_timeout, logs, env)
+        ok, reason = self._exec(cmd, snap, self.build_timeout, logs, step_env)
         if not ok:
-            return self._fail(
+            return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 f"install failed: {reason}",
-                logs,
                 runtime=runtime,
-                runtime_version=runtime_version,
+                runtime_version=actual_version,
                 package_manager=package_manager,
                 lockfile_sha256=lockfile_sha,
             )
 
-        # 6. Contract steps in order: build, migrate, seed.
+        # 8. Contract steps in order: build, migrate, seed.
         for step_name in ("build", "migrate", "seed"):
             step_cmd = getattr(contract, step_name, None)
             if not step_cmd:
                 continue
             logs.append(f"contract step: {step_name}")
             ok, reason = self._exec(
-                shlex.split(step_cmd), snap, self.build_timeout, logs, env
+                shlex.split(step_cmd), snap, self.build_timeout, logs, step_env
             )
             if not ok:
-                return self._fail(
+                return _bail(
                     ProvisionStatus.BUILD_FAILED,
                     f"contract step '{step_name}' failed: {reason}",
-                    logs,
                     runtime=runtime,
-                    runtime_version=runtime_version,
+                    runtime_version=actual_version,
                     package_manager=package_manager,
                     lockfile_sha256=lockfile_sha,
                 )
 
-        # 7. Start the target.
+        # 9. Start the target. Output is captured to a per-run log file
+        # (finding 7), not thrown away.
         start_cmd = getattr(contract, "start", "")
         if not start_cmd:
-            return self._fail(
+            return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 "contract missing 'start' command",
-                logs,
                 runtime=runtime,
-                runtime_version=runtime_version,
+                runtime_version=actual_version,
                 package_manager=package_manager,
                 lockfile_sha256=lockfile_sha,
             )
         target_url = f"http://127.0.0.1:{port}"
-        start_env = build_env({**contract_env, "PORT": str(port)})
+        start_env = build_env(
+            {**contract_env, "PORT": str(port)}, prepend_path=venv_bin
+        )
         logs.append(f"starting: {start_cmd} -> {target_url}")
 
+        log_dir = self.workdir / "target-logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        target_log_path = log_dir / f"{run_id}.log"
+
         def _start_failed(reason: str) -> ProvisionResult:
+            tail = _target_log_tail(target_log_path)
+            if tail:
+                logs.append(f"target output (tail):\n{tail}")
             return self._fail(
                 ProvisionStatus.START_FAILED,
                 reason,
                 logs,
                 runtime=runtime,
-                runtime_version=runtime_version,
+                runtime_version=actual_version,
                 package_manager=package_manager,
                 lockfile_sha256=lockfile_sha,
+                target_log_path=str(target_log_path),
             )
 
         proc: subprocess.Popen[str] | None = None
         keep_proc = False  # set True on READY to transfer ownership to caller
         try:
+            log_fh = open(target_log_path, "w", encoding="utf-8")
             try:
                 proc = subprocess.Popen(
                     shlex.split(start_cmd),
                     cwd=snap,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     env=start_env,
                 )
@@ -493,9 +930,17 @@ class Provisioner:
                 return _start_failed(f"missing binary for start command: {e.filename}")
             except OSError as e:
                 return _start_failed(f"start failed: {e}")
+            finally:
+                # The child inherited its own dup of the fd; the parent's
+                # copy can be closed immediately.
+                log_fh.close()
 
-            # 8. Wait for readiness.
-            readiness = getattr(contract, "readiness", "")
+            # 10. Wait for readiness (finding 6: path joined to the
+            # assigned target URL).
+            readiness_url = _resolve_readiness(
+                getattr(contract, "readiness", ""), port, logs
+            )
+            logs.append(f"readiness: {readiness_url}")
             deadline = time.time() + self.readiness_timeout
             ready = False
             while time.time() < deadline:
@@ -505,9 +950,7 @@ class Provisioner:
                         f"target exited with code {proc.returncode} before ready"
                     )
                 try:
-                    with urllib.request.urlopen(
-                        readiness or target_url, timeout=5
-                    ) as r:
+                    with urllib.request.urlopen(readiness_url, timeout=5) as r:
                         if r.status < 500:
                             ready = True
                             break
@@ -525,8 +968,9 @@ class Provisioner:
                 logs=logs,
                 lockfile_sha256=lockfile_sha,
                 runtime=runtime,
-                runtime_version=runtime_version,
+                runtime_version=actual_version,
                 package_manager=package_manager,
+                target_log_path=str(target_log_path),
                 proc=proc,
             )
         finally:
