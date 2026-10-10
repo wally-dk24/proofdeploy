@@ -33,13 +33,65 @@ exclusion list above. Each candidate:
 The list is fixed; it does not change during selection. Ordered
 deterministically by repository name (lexicographic, case-insensitive):
 
-1. `django-oscar/django-oscar` (Python, e-commerce; runnable app in `sandbox/`)
-2. `keystonejs/keystone` (Node, CMS)
+(No candidates currently meet all criteria. See "Provisioning proofs"
+below for the full research record.)
 
-Note: Saleor (needs PostgreSQL) and Medusa (needs PostgreSQL and Redis)
-were removed; they are not provisionable by the current runner. Two more
-candidates meeting all criteria (including SQLite-only) are to be added
-before sign-off, for a total of 4-5.
+## Provisioning proofs (2026-10-10)
+
+Each candidate below was cloned at HEAD and checked against the
+provisioner's hard requirements (frozen lockfile: `uv.lock`,
+`poetry.lock`, or frozen `requirements.txt` for Python;
+`package-lock.json`/`yarn.lock`/`pnpm-lock.yaml` for Node; SQLite or no
+external services; runnable on the current runner's Node 24 / Python
+3.12). None reached READY.
+
+### Dropped candidates
+
+1. `django-oscar/django-oscar` (Python, 7k+ stars, active) — DROPPED.
+   No frozen lockfile. The repo uses `pyproject.toml` with version
+   ranges (`django>=4.2,<6.2`); there is no `uv.lock`, `poetry.lock`,
+   or frozen `requirements.txt` anywhere in the repo. The provisioner
+   bails with BUILD_FAILED ("no frozen lockfile found"). The existing
+   fixture (`docs/wo6-fixtures/django-oscar/proofdeploy.yml`) was
+   written before the lockfile requirement was understood.
+
+2. `keystonejs/keystone` (Node, 8k+ stars, active) — DROPPED. pnpm
+   monorepo (`pnpm-lock.yaml` + `pnpm-workspace.yaml` at root; no
+   standalone app with its own lockfile). The examples under
+   `examples/` have no `package-lock.json` and depend on the workspace.
+   Not provisionable by the runner's simple snapshot model.
+
+### New candidates researched (none met all criteria)
+
+- `louislam/uptime-kuma` (Node, 92k stars, active, SQLite default,
+  `package-lock.json`) — DROPPED. Requires Node >= 26.2.0
+  (`engines` in package.json); the runner has Node 24 only and the
+  provisioner's `_NODE_BINARIES` list tops out at `node24`.
+- `pretix/pretix` (Python, 2.5k stars, active, SQLite for dev) —
+  DROPPED. Uses `pyproject.toml`; no frozen lockfile. Also documents
+  Redis as required for production (runs without it only for dev).
+- `nocodb/nocodb` (Node/TypeScript, 65k stars, active, SQLite default)
+  — DROPPED. Complex monorepo; not a simple provisionable app.
+- `simonw/datasette` (Python, 11k stars, active, SQLite-native) —
+  DROPPED. Uses `pyproject.toml`; no frozen lockfile.
+- `apostrophecms/apostrophe` (Node, 4.6k stars, active, SQLite
+  supported) — DROPPED. The repo is the CMS framework, not a runnable
+  app; the runnable demo (`apostrophecms/public-demo`) has 5 stars
+  (< 1000).
+- `wagtail/wagtail` (Python, 20k stars, active, SQLite for dev) —
+  DROPPED. Framework/library, not a standalone runnable web app.
+
+### Finding
+
+No real open-source web app with >= 1000 stars, a frozen lockfile, and
+SQLite-only provisioning was found that the current runner can
+provision. Popular Python apps use `pyproject.toml` (not frozen);
+popular Node apps are monorepos, need newer Node, or need external
+services. The candidate list is therefore EMPTY. WO-6 selection cannot
+proceed until either (a) the runner gains support for `pyproject.toml`
+-based installs or newer Node, or (b) the criteria are revised. This
+is reported honestly per the no-rushed-verdicts rule; no candidate was
+forced onto the list.
 
 ## Generic fixtures (committed before selection)
 
