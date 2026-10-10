@@ -116,6 +116,10 @@ class ProbeResult:
     # The act request actually sent (method, url, headers, body), for
     # replayability. None when no request was sent (fail-closed before it).
     request: dict[str, Any] | None = None
+    # Every setup-step HTTP request actually sent (method, url, headers,
+    # body), in order, for replayability. Empty when the probe has no
+    # setup HTTP steps.
+    setup_requests: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -123,12 +127,32 @@ class ProbeResult:
             "verdict": self.verdict.value,
             "reason": self.reason.value if self.reason else None,
             "request": self.request,
+            "setup_requests": self.setup_requests,
             "http_status": self.http_status,
             "http_headers": self.http_headers,
             "http_body": self.http_body[:2000],
             "writes": self.writes,
             "details": self.details,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ProbeResult:
+        """Rebuild a ProbeResult from a stored record dict."""
+        verdict = Verdict(d["verdict"])
+        reason_raw = d.get("reason")
+        reason = InconclusiveReason(reason_raw) if reason_raw else None
+        return cls(
+            probe_index=int(d["probe_index"]),
+            verdict=verdict,
+            reason=reason,
+            details=list(d.get("details") or []),
+            http_status=d.get("http_status"),
+            http_headers=dict(d.get("http_headers") or {}),
+            http_body=str(d.get("http_body") or ""),
+            writes=list(d.get("writes") or []),
+            request=d.get("request"),
+            setup_requests=d.get("setup_requests"),
+        )
 
 
 def _is_local_url(url: str) -> bool:
@@ -531,8 +555,13 @@ class Executor:
 
     def run_setup(
         self, setup_steps: list[dict[str, Any]], ctx: SetupContext | None = None
-    ) -> tuple[list[str], InconclusiveReason | None, str | None, list[str]]:
-        """Run setup steps. Returns (logs, failure_reason, failure_detail, writes).
+    ) -> tuple[list[str], InconclusiveReason | None, str | None, list[str], list[dict[str, Any]]]:
+        """Run setup steps.
+
+        Returns (logs, failure_reason, failure_detail, writes,
+        setup_requests). setup_requests holds every setup-step HTTP
+        request actually sent (method, url, headers, body), in order,
+        for replayability.
 
         harness_app steps are INCONCLUSIVE (environment) until WO-5.
         A failed step is INCONCLUSIVE, not silently continued:
@@ -550,6 +579,7 @@ class Executor:
         """
         logs: list[str] = []
         writes: list[str] = []
+        setup_requests: list[dict[str, Any]] = []
         if ctx is None:
             ctx = self._make_context(setup_steps)
         for i, step in enumerate(setup_steps):
@@ -562,6 +592,7 @@ class Executor:
                     InconclusiveReason.ENVIRONMENT,
                     f"setup[{i}]: harness_app provisioning not yet available (WO-5)",
                     writes,
+                    setup_requests,
                 )
             if stype == "http":
                 raw_act = step.get("act", {})
@@ -571,7 +602,13 @@ class Executor:
                 # data, never a refresh signal; the request is never re-sent.
                 provider_reason = self._ensure_credential(ctx, logs, writes)
                 if provider_reason is not None:
-                    return logs, provider_reason, "credential provider failed", writes
+                    return (
+                        logs,
+                        provider_reason,
+                        "credential provider failed",
+                        writes,
+                        setup_requests,
+                    )
                 try:
                     act = ctx.apply_strict(raw_act)
                 except PlaceholderError as e:
@@ -580,20 +617,37 @@ class Executor:
                         InconclusiveReason.PROBE,
                         f"setup[{i}]: {e}",
                         writes,
+                        setup_requests,
                     )
                 method = act.get("method", "GET")
                 path = act.get("path", "/")
                 url = self.target_url.rstrip("/") + path
                 allowed, detail = _check_remote_method(method, url)
                 if not allowed:
-                    return logs, InconclusiveReason.PROBE, f"setup[{i}]: {detail}", writes
+                    return (
+                        logs,
+                        InconclusiveReason.PROBE,
+                        f"setup[{i}]: {detail}",
+                        writes,
+                        setup_requests,
+                    )
                 allowed, detail = self._check_write_allowed(method, f"setup[{i}]")
                 if not allowed:
-                    return logs, InconclusiveReason.PROBE, detail, writes
+                    return logs, InconclusiveReason.PROBE, detail, writes, setup_requests
                 status, headers, body, req_logs = _do_http(
                     method, url, act.get("headers"), act.get("body"), self.http_timeout
                 )
                 logs.extend(req_logs)
+                # Record the setup request that was actually sent, for
+                # replayability (redacted by value when stored in a record).
+                setup_requests.append(
+                    {
+                        "method": method,
+                        "url": url,
+                        "headers": dict(act.get("headers") or {}),
+                        "body": act.get("body"),
+                    }
+                )
                 if method.upper() in WRITE_METHODS:
                     self._log_write(method, url, status, writes, logs)
                 else:
@@ -604,6 +658,7 @@ class Executor:
                         InconclusiveReason.ENVIRONMENT,
                         f"setup[{i}]: target unreachable during setup",
                         writes,
+                        setup_requests,
                     )
                 if not (200 <= status < 300):
                     # Precise INCONCLUSIVE typing for setup failures:
@@ -621,6 +676,7 @@ class Executor:
                         reason,
                         f"setup[{i}]: setup call returned {status}",
                         writes,
+                        setup_requests,
                     )
                 # 2xx: extract declared captures for later steps.
                 captured = capture_bindings(body, headers, step.get("capture") or {})
@@ -634,8 +690,9 @@ class Executor:
                 InconclusiveReason.PROBE,
                 f"setup[{i}]: unknown setup type '{stype}'",
                 writes,
+                setup_requests,
             )
-        return logs, None, None, writes
+        return logs, None, None, writes, setup_requests
 
     def run_probe(self, probe: dict[str, Any], index: int = 0) -> ProbeResult:
         """Run one probe and return its verdict.
@@ -645,6 +702,8 @@ class Executor:
         """
         details: list[str] = []
         writes: list[str] = []
+        # No setup requests yet (setup runs after the fail-closed pre-checks).
+        setup_requests: list[dict[str, Any]] = []
 
         # 0. Schema validation before any HTTP call.
         try:
@@ -657,6 +716,7 @@ class Executor:
                 reason=InconclusiveReason.PROBE,
                 details=details,
                 writes=writes,
+                setup_requests=setup_requests,
             )
 
         # 1. Remote-method policy on the act, before setup runs.
@@ -673,6 +733,7 @@ class Executor:
                 reason=InconclusiveReason.PROBE,
                 details=details,
                 writes=writes,
+                setup_requests=setup_requests,
             )
 
         # 1b. Write gate on the act: writes need a provisioned target.
@@ -685,6 +746,7 @@ class Executor:
                 reason=InconclusiveReason.PROBE,
                 details=details,
                 writes=writes,
+                setup_requests=setup_requests,
             )
 
         # 1c. Build the setup/auth context: contract env, fixture keys,
@@ -693,7 +755,7 @@ class Executor:
 
         # 2. Setup steps. A failed step is INCONCLUSIVE, not silently continued.
         # Captures from setup steps land in ctx for the act below.
-        setup_logs, setup_reason, setup_detail, setup_writes = self.run_setup(
+        setup_logs, setup_reason, setup_detail, setup_writes, setup_requests = self.run_setup(
             probe.get("setup", []), ctx
         )
         details.extend(setup_logs)
@@ -706,6 +768,7 @@ class Executor:
                 reason=setup_reason,
                 details=details,
                 writes=writes,
+                setup_requests=setup_requests,
             )
 
         # 2b. Proactive credential provider: mint/refresh BEFORE the act is
@@ -722,6 +785,7 @@ class Executor:
                 reason=provider_reason,
                 details=details,
                 writes=writes,
+                setup_requests=setup_requests,
             )
 
         # 2c. Substitute ${NAME} placeholders in the act, failing closed on
@@ -739,6 +803,7 @@ class Executor:
                 reason=InconclusiveReason.PROBE,
                 details=details,
                 writes=writes,
+                setup_requests=setup_requests,
             )
         method = act.get("method", "GET")
         path = act.get("path", "/")
@@ -773,6 +838,7 @@ class Executor:
                 reason=InconclusiveReason.ENVIRONMENT,
                 details=details,
                 writes=writes,
+                setup_requests=setup_requests,
                 request=sent_request,
             )
 
@@ -792,6 +858,7 @@ class Executor:
                 http_headers=headers,
                 http_body=body,
                 writes=writes,
+                setup_requests=setup_requests,
             )
 
         # 4. DB queries: one independent result per db assertion.
@@ -809,6 +876,7 @@ class Executor:
                     http_headers=headers,
                     http_body=body,
                     writes=writes,
+                    setup_requests=setup_requests,
                 )
             for ai, a in enumerate(assertions):
                 if a.get("type") != "db":
@@ -849,6 +917,7 @@ class Executor:
             http_headers=headers,
             http_body=body,
             writes=writes,
+            setup_requests=setup_requests,
         )
 
     def run_all(self, probes: list[dict[str, Any]]) -> list[ProbeResult]:

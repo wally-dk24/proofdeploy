@@ -10,10 +10,14 @@ Scoring implements the registered run-pair rule exactly
 - Bugs are scored per probe: a bug is caught if at least one probe
   FAILs on fix^ and PASSes on fix. The score record carries
   ``candidate_catch``: the indices of EVERY probe that went FAIL->PASS.
+  The stored score verdict is ``candidate_catch``, never ``catch``.
   Condition 3 of the registered rule ("targets behavior the fix actually
   changed") is a reviewer judgment: the final CATCH is a separate,
   append-only judgment record that cites the evidence and score records
-  and holds the probe index, the judge, and the condition-3 decision.
+  and holds the probe index, the judge, the judge's role, and the
+  condition-3 decision. Judgments are validated: the probe must be in
+  the score's candidate_catch, condition3_met must be a bool, and
+  ``wally`` may not judge measured (bug) runs.
 - A sibling probe that is INCONCLUSIVE or FAILs on both sides does not
   cancel the catch.
 - Pair INCONCLUSIVE only when a side's provisioning isn't READY (no
@@ -33,18 +37,23 @@ Records:
   (verbatim) and their hash, the bundle manifest (skill hash or no-skill
   marker), the harness version, both provisioning results (logs, runtime
   versions, lockfile hashes), and the per-probe results with typed
-  reasons and the recorded requests.
+  reasons and the recorded requests (act and setup steps).
 - Writing the evidence record makes a git commit; the commit SHA is
-  recorded. Scoring refuses unless the evidence record is present in a
-  commit. The score goes in a later commit that cites the evidence
-  commit.
+  recorded. Scoring reads the evidence record back AT that commit,
+  rebuilds the per-probe results, and scores them: any caller-passed
+  verdict, candidate_catch, false_alarm, bug_id, clean_id, or run_kind
+  that disagrees with the evidence is refused. The score goes in a
+  later commit that cites the evidence commit.
 - Records are append-only: each record gets a unique id and is appended
   to a JSONL log. Repeats never overwrite.
-- Records are secret-redacted by value: every fixture and contract-env
-  secret value, every captured value, and every minted token is replaced
-  wherever it appears. Pattern matching (JWT shape, "Bearer <token>")
-  is a backstop. ``parsed_probes`` is stored verbatim so the stored hash
-  still matches after redaction.
+- Records are secret-redacted by value, fail-closed: every fixture and
+  contract-env value is secret unless its key is explicitly declared
+  public in the record; captured values and minted tokens are always
+  secret. Pattern matching (JWT shape, "Bearer <token>") is a backstop.
+  Authorization headers keep their scheme ("Bearer ***REDACTED***").
+  ``parsed_probes`` is stored VERBATIM and is never redacted: placeholders
+  like ``Bearer ${USER_TOKEN}`` and capture specs are structure, not
+  secrets, and the stored ``parsed_probes_sha256`` must still match.
 """
 
 from __future__ import annotations
@@ -254,6 +263,51 @@ def collect_secret_values(
     return out
 
 
+def collect_record_secret_values(record: dict[str, Any]) -> list[str]:
+    """Fail-closed secret collection from an evidence record.
+
+    Every fixture and contract-env string VALUE is a secret unless its
+    key is explicitly declared public in ``public_fixture_keys`` /
+    ``public_contract_env_keys``. Key names are never trusted: a fixture
+    key called ``STAFF_KEY`` or ``DIRECTUS_STATIC`` is redacted just like
+    ``ADMIN_KEY``. Captured values and minted tokens are always secret.
+
+    Non-string fixture/contract-env values (ints, bools) are kept as-is
+    and are not secret-collected: replacing a number everywhere would
+    shred innocent text (ports, status codes).
+    """
+    values: list[str] = []
+    public_fixture = set(record.get("public_fixture_keys") or [])
+    public_env = set(record.get("public_contract_env_keys") or [])
+    fixture = record.get("fixture") or {}
+    contract_env = record.get("contract_env") or {}
+    if isinstance(fixture, dict):
+        for k, v in fixture.items():
+            if k not in public_fixture and isinstance(v, str):
+                values.append(v)
+    if isinstance(contract_env, dict):
+        for k, v in contract_env.items():
+            if k not in public_env and isinstance(v, str):
+                values.append(v)
+    captured = record.get("captured_values") or {}
+    if isinstance(captured, dict):
+        for v in captured.values():
+            if isinstance(v, str):
+                values.append(v)
+    minted = record.get("minted_tokens") or []
+    if isinstance(minted, list):
+        for v in minted:
+            if isinstance(v, str):
+                values.append(v)
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in sorted(values, key=len, reverse=True):
+        if len(v) >= _MIN_SECRET_LEN and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 class SecretRedactor:
     """Redact known secret values plus pattern backstops."""
 
@@ -274,7 +328,12 @@ class SecretRedactor:
             out: dict[Any, Any] = {}
             for k, v in obj.items():
                 if isinstance(k, str) and _is_secret_key(k):
-                    out[k] = REDACTED
+                    if isinstance(k, str) and k.lower() in ("authorization", "proxy-authorization"):
+                        # Keep the auth scheme ("Bearer ***REDACTED***"):
+                        # the scheme is structure, the credential is secret.
+                        out[k] = self._redact_string(v) if isinstance(v, str) else REDACTED
+                    else:
+                        out[k] = REDACTED
                 else:
                     out[k] = self.redact(v)
             return out
@@ -342,6 +401,20 @@ def build_evidence_record(
     fix_parent_results: list[ProbeResult] | None = None,
     fix_results: list[ProbeResult] | None = None,
     runner_log: list[str] | None = None,
+    # Fixture and contract-env values used by the run. EVERY value is
+    # treated as a secret for redaction unless its key is listed in the
+    # matching public_*_keys (fail-closed). Non-string values are kept
+    # as-is and are not secret-collected.
+    fixture: dict[str, Any] | None = None,
+    contract_env: dict[str, Any] | None = None,
+    public_fixture_keys: list[str] | None = None,
+    public_contract_env_keys: list[str] | None = None,
+    # Every capture binding collected during the run (name -> value):
+    # all values are secret-collected.
+    captured_values: dict[str, str] | None = None,
+    # Every token minted by the credential provider during the run:
+    # all are secret-collected.
+    minted_tokens: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the evidence record for a run pair (before scoring).
 
@@ -350,7 +423,7 @@ def build_evidence_record(
     their hash, the bundle manifest (skill hash or no-skill marker), the
     harness version, both provisioning results (logs, runtime versions,
     lockfile hashes), and the per-probe results with typed reasons and
-    the recorded requests.
+    the recorded requests (act and setup steps).
 
     ``skill_sha256`` is None for no-skill baseline runs. For clean-diff
     runs (``run_kind="clean"``), the probes run against C only: use
@@ -384,6 +457,12 @@ def build_evidence_record(
         "fix_parent_results": [r.to_dict() for r in (fix_parent_results or [])],
         "fix_results": [r.to_dict() for r in (fix_results or [])],
         "runner_log": runner_log or [],
+        "fixture": fixture or {},
+        "contract_env": contract_env or {},
+        "public_fixture_keys": public_fixture_keys or [],
+        "public_contract_env_keys": public_contract_env_keys or [],
+        "captured_values": captured_values or {},
+        "minted_tokens": minted_tokens or [],
         "verdict": None,
     }
     return record
@@ -463,12 +542,20 @@ def write_evidence_record(
 ) -> tuple[str, Path, str]:
     """Append the evidence record and commit it. Returns (record_id, path, commit_sha).
 
+    Secret collection is fail-closed: every fixture and contract-env
+    value in the record is treated as secret unless its key is declared
+    public, plus every captured value and minted token. The optional
+    ``secret_values`` adds extra values on top; the record is never
+    trusted to be secret-free on its own.
+
     The record is secret-redacted before it is written, with
     ``parsed_probes`` kept verbatim. The commit is the enforcement of
     "evidence before score": scoring refuses unless the evidence record
     is present in a commit.
     """
-    redacted = redact_record(record, secret_values)
+    collected = collect_record_secret_values(record)
+    extra = [v for v in (secret_values or []) if isinstance(v, str)]
+    redacted = redact_record(record, collected + extra)
     record_id, path = _append_record(redacted, output_dir)
     rel = _rel_log_path(repo, output_dir)
     _git(Path(repo), "add", rel)
@@ -477,13 +564,53 @@ def write_evidence_record(
     return record_id, path, commit_sha
 
 
+class ScoreMismatchError(ValueError):
+    """A caller-supplied score claim disagrees with the committed evidence."""
+
+
+def _read_record_at_commit(
+    repo: str | Path, output_dir: str | Path, commit_sha: str, record_id: str
+) -> dict[str, Any] | None:
+    """Read one record from the JSONL log as it exists at a commit."""
+    repo = Path(repo)
+    rel = _rel_log_path(repo, output_dir)
+    try:
+        content = _git(repo, "show", f"{commit_sha}:{rel}")
+    except RuntimeError:
+        return None
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and rec.get("record_id") == record_id:
+            return rec
+    return None
+
+
+def _find_record_in_log(output_dir: str | Path, record_id: str) -> dict[str, Any] | None:
+    """Find one record in the working-tree JSONL log."""
+    for rec in read_records(output_dir):
+        if rec.get("record_id") == record_id:
+            return rec
+    return None
+
+
 def build_score_record(
     *,
     evidence_record_id: str,
+    evidence_commit_sha: str,
     run_kind: str,
     bug_id: str | None = None,
     clean_id: str | None = None,
-    verdict: RunPairVerdict | None = None,
+    # Stored verdict for a bug run: "candidate_catch" | "no_catch" |
+    # "inconclusive". It is "candidate_catch", never "catch": only a
+    # judgment makes it a catch. None for clean runs (they score
+    # false_alarm instead).
+    score_verdict: str | None = None,
     candidate_catch: list[int] | None = None,
     false_alarm: bool | None = None,
     scoring_version: str = DEFAULT_SCORING_VERSION,
@@ -491,8 +618,8 @@ def build_score_record(
 ) -> dict[str, Any]:
     """Build the score record for a run pair (after the evidence record).
 
-    For bug runs: ``verdict`` plus ``candidate_catch`` (indices of every
-    probe that went FAIL->PASS). For clean runs: ``false_alarm``.
+    For bug runs: ``score_verdict`` plus ``candidate_catch`` (indices of
+    every probe that went FAIL->PASS). For clean runs: ``false_alarm``.
     """
     return {
         "record_id": uuid.uuid4().hex,
@@ -502,8 +629,8 @@ def build_score_record(
         "bug_id": bug_id,
         "clean_id": clean_id,
         "evidence_record_id": evidence_record_id,
-        "evidence_commit_sha": None,  # filled in by write_score_record
-        "verdict": verdict.value if verdict is not None else None,
+        "evidence_commit_sha": evidence_commit_sha,
+        "verdict": score_verdict,
         "candidate_catch": candidate_catch or [],
         "false_alarm": false_alarm,
         "scoring_version": scoring_version,
@@ -512,19 +639,34 @@ def build_score_record(
 
 
 def write_score_record(
-    record: dict[str, Any],
     output_dir: str | Path,
     repo: str | Path,
     *,
     evidence_record_id: str,
+    run_kind: str,
+    bug_id: str | None = None,
+    clean_id: str | None = None,
+    # Caller claims: every one is validated against the committed
+    # evidence and refused (ScoreMismatchError) on disagreement.
+    verdict: RunPairVerdict | None = None,
+    candidate_catch: list[int] | None = None,
+    false_alarm: bool | None = None,
+    note: str | None = None,
     secret_values: Iterable[str] | None = None,
 ) -> tuple[str, Path]:
-    """Append the score record. Refuses unless the evidence is committed.
+    """Score the run pair from the COMMITTED evidence. Never trusts claims.
 
-    The evidence commit SHA is recorded in the score record; the caller
-    commits the score in a later commit. Raises
-    EvidenceNotCommittedError if the evidence record is not in any
-    commit.
+    1. Refuses (EvidenceNotCommittedError) unless the evidence record is
+       in a commit.
+    2. Reads the evidence record back at that commit, rebuilds the
+       per-probe results, and scores them.
+    3. Refuses (ScoreMismatchError) any caller-passed verdict,
+       candidate_catch, false_alarm, bug_id, clean_id, or run_kind that
+       does not match what the evidence shows.
+
+    The stored verdict for a bug run is "candidate_catch", never
+    "catch": only a judgment record makes it a catch. The caller commits
+    the score in a later commit via commit_records().
     """
     sha = evidence_commit_sha(evidence_record_id, repo, output_dir)
     if sha is None:
@@ -532,9 +674,78 @@ def write_score_record(
             f"evidence record {evidence_record_id} is not in any commit; "
             "write and commit the evidence record before scoring"
         )
-    record["evidence_commit_sha"] = sha
-    redacted = redact_record(record, secret_values)
+    evidence = _read_record_at_commit(repo, output_dir, sha, evidence_record_id)
+    if evidence is None or evidence.get("record_type") != "evidence":
+        raise EvidenceNotCommittedError(
+            f"evidence record {evidence_record_id} not found at commit {sha}"
+        )
+    if evidence.get("run_kind") != run_kind:
+        raise ScoreMismatchError(
+            f"run_kind {run_kind!r} does not match evidence {evidence.get('run_kind')!r}"
+        )
+    if bug_id is not None and evidence.get("bug_id") != bug_id:
+        raise ScoreMismatchError(
+            f"bug_id {bug_id!r} does not match evidence {evidence.get('bug_id')!r}"
+        )
+    if clean_id is not None and evidence.get("clean_id") != clean_id:
+        raise ScoreMismatchError(
+            f"clean_id {clean_id!r} does not match evidence {evidence.get('clean_id')!r}"
+        )
+
+    if run_kind == "clean":
+        c_results = [ProbeResult.from_dict(d) for d in (evidence.get("c_results") or [])]
+        expected_alarm = score_clean_diff(c_results)
+        if false_alarm is not None and false_alarm != expected_alarm:
+            raise ScoreMismatchError(
+                f"false_alarm={false_alarm} does not match evidence ({expected_alarm})"
+            )
+        record = build_score_record(
+            evidence_record_id=evidence_record_id,
+            evidence_commit_sha=sha,
+            run_kind="clean",
+            clean_id=evidence.get("clean_id"),
+            score_verdict=None,
+            candidate_catch=[],
+            false_alarm=expected_alarm,
+            scoring_version=evidence.get("scoring_version", DEFAULT_SCORING_VERSION),
+            note=note,
+        )
+    else:
+        parent = [ProbeResult.from_dict(d) for d in (evidence.get("fix_parent_results") or [])]
+        fix = [ProbeResult.from_dict(d) for d in (evidence.get("fix_results") or [])]
+        detailed = score_run_pair_detailed(parent, fix)
+        if verdict is not None and verdict != detailed.verdict:
+            raise ScoreMismatchError(
+                f"verdict {verdict.value!r} does not match evidence ({detailed.verdict.value!r})"
+            )
+        if candidate_catch is not None and list(candidate_catch) != detailed.candidate_catch:
+            raise ScoreMismatchError(
+                f"candidate_catch {candidate_catch} does not match "
+                f"evidence ({detailed.candidate_catch})"
+            )
+        score_verdict = (
+            "candidate_catch"
+            if detailed.verdict == RunPairVerdict.CATCH
+            else detailed.verdict.value
+        )
+        record = build_score_record(
+            evidence_record_id=evidence_record_id,
+            evidence_commit_sha=sha,
+            run_kind=run_kind,
+            bug_id=evidence.get("bug_id"),
+            score_verdict=score_verdict,
+            candidate_catch=detailed.candidate_catch,
+            scoring_version=evidence.get("scoring_version", DEFAULT_SCORING_VERSION),
+            note=note,
+        )
+
+    extra = [v for v in (secret_values or []) if isinstance(v, str)]
+    redacted = redact_record(record, extra)
     return _append_record(redacted, output_dir)
+
+
+class JudgmentRejectedError(ValueError):
+    """A judgment record failed validation."""
 
 
 def build_judgment_record(
@@ -547,6 +758,7 @@ def build_judgment_record(
     clean_id: str | None = None,
     probe_index: int | None = None,
     judge: str | None = None,
+    judge_role: str | None = None,
     condition3_met: bool | None = None,
     note: str | None = None,
 ) -> dict[str, Any]:
@@ -558,7 +770,15 @@ def build_judgment_record(
     evidence and score records (and the evidence commit). ``verdict``
     is "catch" only when the reviewer judges condition 3 met for the
     cited probe.
+
+    ``condition3_met`` must be a bool and ``judge_role`` must be
+    recorded; anything else raises. ("wally" may not judge measured
+    runs; that is enforced in write_judgment_record.)
     """
+    if not isinstance(condition3_met, bool):
+        raise JudgmentRejectedError(f"condition3_met must be a bool, got {condition3_met!r}")
+    if not judge_role:
+        raise JudgmentRejectedError("judge_role is required")
     return {
         "record_id": uuid.uuid4().hex,
         "timestamp": _utc_now(),
@@ -571,6 +791,7 @@ def build_judgment_record(
         "evidence_commit_sha": evidence_commit_sha,
         "probe_index": probe_index,
         "judge": judge,
+        "judge_role": judge_role,
         "condition3_met": condition3_met,
         "verdict": "catch" if condition3_met else "no_catch",
         "note": note,
@@ -580,10 +801,45 @@ def build_judgment_record(
 def write_judgment_record(
     record: dict[str, Any],
     output_dir: str | Path,
+    repo: str | Path,
+    *,
+    score_record_id: str,
     secret_values: Iterable[str] | None = None,
 ) -> tuple[str, Path]:
-    """Append the judgment record. The reviewer commits it separately."""
-    redacted = redact_record(record, secret_values)
+    """Validate and append the judgment record.
+
+    - The score record must exist in the log.
+    - ``probe_index`` must be in the score's ``candidate_catch``.
+    - ``condition3_met`` must be a bool.
+    - ``judge_role`` is required.
+    - ``wally`` may not judge measured (bug) runs.
+
+    The reviewer commits the judgment separately. Raises
+    JudgmentRejectedError on any violation.
+    """
+    score = _find_record_in_log(output_dir, score_record_id)
+    if score is None or score.get("record_type") != "score":
+        raise JudgmentRejectedError(f"score record {score_record_id} not found in log")
+    candidates = score.get("candidate_catch") or []
+    if record.get("probe_index") not in candidates:
+        raise JudgmentRejectedError(
+            f"probe_index {record.get('probe_index')!r} is not in the score's "
+            f"candidate_catch {candidates}"
+        )
+    if not isinstance(record.get("condition3_met"), bool):
+        raise JudgmentRejectedError(
+            f"condition3_met must be a bool, got {record.get('condition3_met')!r}"
+        )
+    if not record.get("judge_role"):
+        raise JudgmentRejectedError("judge_role is required")
+    if score.get("run_kind") == "bug" and record.get("judge") == "wally":
+        raise JudgmentRejectedError("'wally' may not judge measured (bug) runs")
+    if record.get("run_kind") != score.get("run_kind"):
+        raise JudgmentRejectedError(
+            f"run_kind {record.get('run_kind')!r} does not match score {score.get('run_kind')!r}"
+        )
+    extra = [v for v in (secret_values or []) if isinstance(v, str)]
+    redacted = redact_record(record, extra)
     return _append_record(redacted, output_dir)
 
 

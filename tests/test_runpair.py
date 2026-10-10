@@ -11,11 +11,13 @@ from proofdeploy.runpair import (
     DEFAULT_SCORING_VERSION,
     SCORING_VERSION,
     EvidenceNotCommittedError,
+    JudgmentRejectedError,
     PairScore,
     RunPairVerdict,
+    ScoreMismatchError,
     build_evidence_record,
     build_judgment_record,
-    build_score_record,
+    collect_record_secret_values,
     collect_secret_values,
     commit_records,
     evidence_commit_sha,
@@ -339,6 +341,12 @@ def test_evidence_record_has_all_required_fields():
         "fix_parent_results",
         "fix_results",
         "runner_log",
+        "fixture",
+        "contract_env",
+        "public_fixture_keys",
+        "public_contract_env_keys",
+        "captured_values",
+        "minted_tokens",
         "verdict",
     ):
         assert f in record, f"missing field {f}"
@@ -347,6 +355,7 @@ def test_evidence_record_has_all_required_fields():
     assert record["fix_parent_results"][0]["verdict"] == "fail"
     assert "reason" in record["fix_parent_results"][0]
     assert "request" in record["fix_parent_results"][0]  # replayability
+    assert "setup_requests" in record["fix_parent_results"][0]  # setup replayability
     assert record["fix_parent_provision"]["runtime_version"] == "v20.20.0"
 
 
@@ -365,37 +374,120 @@ def test_clean_diff_uses_explicit_c_fields():
     assert record["fix_results"] == []
 
 
-def test_evidence_write_commits_and_score_requires_it(tmp_path):
+def _write_evidence(tmp_path, **over):
+    """Write an evidence record to a fresh git repo; return (repo, out, ev_id, commit)."""
     repo = _git_repo(tmp_path)
     out = tmp_path / "runs"
-    record = build_evidence_record(**_evidence_kwargs())
-    ev_id, path, commit_sha = write_evidence_record(record, out, repo, ["s3cr3t"])
+    record = build_evidence_record(**_evidence_kwargs(**over))
+    ev_id, path, commit_sha = write_evidence_record(record, out, repo)
+    return repo, out, ev_id, commit_sha
+
+
+def test_evidence_write_commits_and_score_requires_it(tmp_path):
+    repo, out, ev_id, commit_sha = _write_evidence(tmp_path)
     assert evidence_commit_sha(ev_id, repo, out) == commit_sha
     # Score refuses without committed evidence.
     with pytest.raises(EvidenceNotCommittedError):
-        write_score_record(
-            build_score_record(evidence_record_id="nope", run_kind="bug"),
-            out,
-            repo,
-            evidence_record_id="nope",
-        )
-    # With committed evidence it writes and cites the commit.
-    score = build_score_record(
-        evidence_record_id=ev_id,
-        run_kind="bug",
-        bug_id="THROWAWAY-1",
-        verdict=RunPairVerdict.CATCH,
-        candidate_catch=[0],
-    )
-    score_id, _ = write_score_record(score, out, repo, evidence_record_id=ev_id)
+        write_score_record(out, repo, evidence_record_id="nope", run_kind="bug")
+    # With committed evidence the score is COMPUTED from it: CATCH on
+    # probe 0, stored as "candidate_catch" (not "catch").
+    score_id, _ = write_score_record(out, repo, evidence_record_id=ev_id, run_kind="bug")
     records = read_records(out)
+    assert records[1]["record_type"] == "score"
     assert records[1]["evidence_commit_sha"] == commit_sha
+    assert records[1]["verdict"] == "candidate_catch"
     assert records[1]["candidate_catch"] == [0]
     assert records[1]["record_id"] == score_id
     # Score goes in a LATER commit.
     score_commit = commit_records(repo, out, f"score: {score_id}")
     assert score_commit != commit_sha
     assert evidence_commit_sha(ev_id, repo, out) == commit_sha  # evidence commit unchanged
+
+
+def test_score_refuses_claims_that_disagree_with_evidence(tmp_path):
+    # The orchestrator's repro: a CATCH on probe 7 was accepted for
+    # evidence with zero probes. Now the score is computed from the
+    # committed evidence; any disagreeing claim is refused.
+    repo, out, ev_id, _ = _write_evidence(tmp_path)
+    with pytest.raises(ScoreMismatchError):
+        write_score_record(
+            out,
+            repo,
+            evidence_record_id=ev_id,
+            run_kind="bug",
+            verdict=RunPairVerdict.NO_CATCH,  # evidence says CATCH
+        )
+    with pytest.raises(ScoreMismatchError):
+        write_score_record(
+            out,
+            repo,
+            evidence_record_id=ev_id,
+            run_kind="bug",
+            candidate_catch=[7],  # evidence says [0]
+        )
+    with pytest.raises(ScoreMismatchError):
+        write_score_record(
+            out,
+            repo,
+            evidence_record_id=ev_id,
+            run_kind="bug",
+            bug_id="OTHER",  # evidence says THROWAWAY-1
+        )
+    # Correct claims pass.
+    score_id, _ = write_score_record(
+        out,
+        repo,
+        evidence_record_id=ev_id,
+        run_kind="bug",
+        bug_id="THROWAWAY-1",
+        verdict=RunPairVerdict.CATCH,
+        candidate_catch=[0],
+    )
+    assert read_records(out)[1]["record_id"] == score_id
+
+
+def test_score_computed_from_empty_evidence_is_inconclusive_not_catch(tmp_path):
+    repo = _git_repo(tmp_path)
+    out = tmp_path / "runs"
+    record = build_evidence_record(**_evidence_kwargs(fix_parent_results=[], fix_results=[]))
+    ev_id, _, _ = write_evidence_record(record, out, repo)
+    # A CATCH claim on empty evidence is refused; the computed verdict
+    # is INCONCLUSIVE.
+    with pytest.raises(ScoreMismatchError):
+        write_score_record(
+            out,
+            repo,
+            evidence_record_id=ev_id,
+            run_kind="bug",
+            verdict=RunPairVerdict.CATCH,
+            candidate_catch=[7],
+        )
+    score_id, _ = write_score_record(out, repo, evidence_record_id=ev_id, run_kind="bug")
+    assert read_records(out)[1]["verdict"] == "inconclusive"
+
+
+def test_score_verdict_is_candidate_catch_not_catch(tmp_path):
+    # Before judgment, the score record says "candidate_catch"; only the
+    # judgment record can say "catch".
+    repo, out, ev_id, ev_commit = _write_evidence(tmp_path)
+    score_id, _ = write_score_record(out, repo, evidence_record_id=ev_id, run_kind="bug")
+    assert read_records(out)[1]["verdict"] == "candidate_catch"
+    assert "catch" != read_records(out)[1]["verdict"]
+    # The judgment turns it into a catch.
+    judgment = build_judgment_record(
+        evidence_record_id=ev_id,
+        score_record_id=score_id,
+        evidence_commit_sha=ev_commit,
+        run_kind="bug",
+        bug_id="THROWAWAY-1",
+        probe_index=0,
+        judge="reviewer",
+        judge_role="orchestrator",
+        condition3_met=True,
+    )
+    j_id, _ = write_judgment_record(judgment, out, repo, score_record_id=score_id)
+    assert read_records(out)[-1]["record_id"] == j_id
+    assert read_records(out)[-1]["verdict"] == "catch"
 
 
 def test_records_are_unique_and_append_only(tmp_path):
@@ -410,49 +502,173 @@ def test_records_are_unique_and_append_only(tmp_path):
     assert [r["record_id"] for r in records] == [id1, id2]
 
 
-def test_evidence_is_secret_redacted_on_write(tmp_path):
+# ---------------------------------------------------------------------------
+# Item 1: fail-closed redaction
+# ---------------------------------------------------------------------------
+
+
+def test_fail_closed_redaction_collects_plain_named_keys(tmp_path):
+    # The orchestrator's repro: STAFF_KEY and DIRECTUS_STATIC leaked
+    # because redaction only caught secret-looking names. Now every
+    # fixture/contract-env value is secret unless declared public.
     repo = _git_repo(tmp_path)
     out = tmp_path / "runs"
     record = build_evidence_record(
         **_evidence_kwargs(
-            bundle_manifest={"ADMIN_KEY": "sk-admin-xyz"},
-            prompt="login with sk-admin-xyz",
-            fix_parent_results=[
+            fixture={
+                "STAFF_KEY": "staff-secret-value-1",
+                "DIRECTUS_STATIC": "directus-token-9",
+                "APP_NAME": "throwaway",
+            },
+            contract_env={"API_URL": "https://example.invalid"},
+            public_fixture_keys=["APP_NAME"],
+            public_contract_env_keys=["API_URL"],
+            prompt="login with staff-secret-value-1 and directus-token-9",
+            runner_log=["using throwaway", "key directus-token-9 used"],
+        )
+    )
+    _, path, _ = write_evidence_record(record, out, repo)  # no caller secret_values
+    data = json.loads(path.read_text(encoding="utf-8").strip().split("\n")[0])
+    blob = json.dumps(data)
+    assert "staff-secret-value-1" not in blob
+    assert "directus-token-9" not in blob
+    # Declared-public values are untouched.
+    assert data["contract_env"]["API_URL"] == "https://example.invalid"
+    # Non-secret fixture keys stay readable too.
+    assert data["fixture"]["APP_NAME"] == "throwaway"
+    assert "throwaway" in data["runner_log"][0]
+
+
+def test_captured_values_and_minted_tokens_are_collected(tmp_path):
+    repo = _git_repo(tmp_path)
+    out = tmp_path / "runs"
+    record = build_evidence_record(
+        **_evidence_kwargs(
+            captured_values={"TOKEN": "captured-session-abc"},
+            minted_tokens=["minted-jwt-value"],
+            prompt="token captured-session-abc used; minted minted-jwt-value",
+        )
+    )
+    _, path, _ = write_evidence_record(record, out, repo)
+    blob = path.read_text(encoding="utf-8")
+    assert "captured-session-abc" not in blob
+    assert "minted-jwt-value" not in blob
+
+
+def test_collect_record_secret_values_fail_closed():
+    record = {
+        "fixture": {"STAFF_KEY": "staff-one", "NAME": "myapp", "TTL": 300},
+        "public_fixture_keys": ["NAME"],
+        "contract_env": {"DIRECTUS_STATIC": "directus-two"},
+        "public_contract_env_keys": [],
+        "captured_values": {"T": "captured-three"},
+        "minted_tokens": ["minted-four"],
+    }
+    vals = collect_record_secret_values(record)
+    assert "staff-one" in vals
+    assert "directus-two" in vals
+    assert "captured-three" in vals
+    assert "minted-four" in vals
+    assert "myapp" not in vals  # declared public
+    # non-string TTL is not collected
+    assert not any("300" == v for v in vals)
+
+
+def test_probes_stored_verbatim_placeholders_not_redacted(tmp_path):
+    # Placeholders and capture specs are structure, not secrets: the
+    # stored parsed_probes must still hash to parsed_probes_sha256.
+    repo = _git_repo(tmp_path)
+    out = tmp_path / "runs"
+    probes = [
+        {
+            "setup": [
+                {
+                    "type": "http",
+                    "act": {"method": "GET", "path": "/login"},
+                    "capture": {"TOKEN": {"from": "body", "json_path": "token"}},
+                }
+            ],
+            "act": {
+                "method": "GET",
+                "path": "/admin",
+                "headers": {"Authorization": "Bearer ${TOKEN}"},
+            },
+            "assert": [{"type": "status", "equals": 200}],
+        }
+    ]
+    record = build_evidence_record(
+        **_evidence_kwargs(
+            parsed_probes=probes,
+            fixture={"ADMIN_KEY": "admin-secret"},
+        )
+    )
+    _, path, _ = write_evidence_record(record, out, repo)
+    data = json.loads(path.read_text(encoding="utf-8").strip().split("\n")[0])
+    assert data["parsed_probes"] == probes
+    import hashlib as _hl
+
+    assert (
+        _hl.sha256(json.dumps(probes, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        == data["parsed_probes_sha256"]
+    )
+
+
+def test_authorization_header_keeps_scheme_when_redacted(tmp_path):
+    # "Bearer ***REDACTED***": the scheme is structure, the credential
+    # is secret.
+    repo = _git_repo(tmp_path)
+    out = tmp_path / "runs"
+    record = build_evidence_record(
+        **_evidence_kwargs(
+            fixture={"ADMIN_KEY": "admin-secret-value"},
+            fix_results=[
                 ProbeResult(
                     probe_index=0,
                     verdict=Verdict.PASS,
-                    http_headers={"Authorization": "Bearer tok123"},
                     request={
                         "method": "GET",
                         "url": "http://x/admin",
-                        "headers": {"Authorization": "Bearer tok123"},
+                        "headers": {"Authorization": "Bearer admin-secret-value"},
                         "body": None,
                     },
                 )
             ],
         )
     )
-    _, path, _ = write_evidence_record(record, out, repo, ["sk-admin-xyz", "tok123"])
+    _, path, _ = write_evidence_record(record, out, repo)
     data = json.loads(path.read_text(encoding="utf-8").strip().split("\n")[0])
-    assert data["bundle_manifest"]["ADMIN_KEY"] == "***REDACTED***"
-    assert "sk-admin-xyz" not in data["prompt"]
-    res = data["fix_parent_results"][0]
-    assert "tok123" not in json.dumps(res["request"])
+    auth = data["fix_results"][0]["request"]["headers"]["Authorization"]
+    assert auth == "Bearer ***REDACTED***"
+    assert "admin-secret-value" not in json.dumps(data)
+
+
+def test_jwt_pattern_backstop(tmp_path):
+    # A JWT-shaped string the collector never saw is still redacted by
+    # the pattern backstop.
+    from proofdeploy.runpair import redact_secrets
+
+    red = redact_secrets(
+        {"details": ["minted eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjEyM30.c2ln for setup"]},
+        [],
+    )
+    assert "eyJhbGci" not in red["details"][0]
+    assert "***REDACTED_JWT***" in red["details"][0]
+
+
+# ---------------------------------------------------------------------------
+# Item 4: judgment validation
+# ---------------------------------------------------------------------------
+
+
+def _bug_score(tmp_path):
+    """Write evidence + score for a bug run; return (repo, out, ev_id, ev_commit, score_id)."""
+    repo, out, ev_id, ev_commit = _write_evidence(tmp_path)
+    score_id, _ = write_score_record(out, repo, evidence_record_id=ev_id, run_kind="bug")
+    return repo, out, ev_id, ev_commit, score_id
 
 
 def test_judgment_record_shape(tmp_path):
-    repo = _git_repo(tmp_path)
-    out = tmp_path / "runs"
-    ev = build_evidence_record(**_evidence_kwargs())
-    ev_id, _, ev_commit = write_evidence_record(ev, out, repo)
-    score = build_score_record(
-        evidence_record_id=ev_id,
-        run_kind="bug",
-        bug_id="THROWAWAY-1",
-        verdict=RunPairVerdict.CATCH,
-        candidate_catch=[0],
-    )
-    score_id, _ = write_score_record(score, out, repo, evidence_record_id=ev_id)
+    repo, out, ev_id, ev_commit, score_id = _bug_score(tmp_path)
     judgment = build_judgment_record(
         evidence_record_id=ev_id,
         score_record_id=score_id,
@@ -461,16 +677,18 @@ def test_judgment_record_shape(tmp_path):
         bug_id="THROWAWAY-1",
         probe_index=0,
         judge="reviewer",
+        judge_role="orchestrator",
         condition3_met=True,
         note="probe targets the auth check the fix added",
     )
-    j_id, _ = write_judgment_record(judgment, out)
+    j_id, _ = write_judgment_record(judgment, out, repo, score_record_id=score_id)
     records = read_records(out)
     assert records[-1]["record_type"] == "judgment"
     assert records[-1]["record_id"] == j_id
     assert records[-1]["verdict"] == "catch"
     assert records[-1]["condition3_met"] is True
     assert records[-1]["probe_index"] == 0
+    assert records[-1]["judge_role"] == "orchestrator"
     assert records[-1]["evidence_commit_sha"] == ev_commit
     # A rejected judgment is no_catch.
     j2 = build_judgment_record(
@@ -481,9 +699,96 @@ def test_judgment_record_shape(tmp_path):
         bug_id="B",
         probe_index=0,
         judge="reviewer",
+        judge_role="orchestrator",
         condition3_met=False,
     )
     assert j2["verdict"] == "no_catch"
+
+
+def test_judgment_refuses_probe_not_in_candidate_catch(tmp_path):
+    # The orchestrator's repro: probe 99 was accepted. Now the probe
+    # must be in the score's candidate_catch.
+    repo, out, ev_id, ev_commit, score_id = _bug_score(tmp_path)
+    judgment = build_judgment_record(
+        evidence_record_id=ev_id,
+        score_record_id=score_id,
+        evidence_commit_sha=ev_commit,
+        run_kind="bug",
+        probe_index=99,
+        judge="reviewer",
+        judge_role="orchestrator",
+        condition3_met=True,
+    )
+    with pytest.raises(JudgmentRejectedError):
+        write_judgment_record(judgment, out, repo, score_record_id=score_id)
+
+
+def test_judgment_requires_boolean_condition3(tmp_path):
+    # The orchestrator's repro: condition3_met=None was accepted.
+    repo, out, ev_id, ev_commit, score_id = _bug_score(tmp_path)
+    with pytest.raises(JudgmentRejectedError):
+        build_judgment_record(
+            evidence_record_id=ev_id,
+            score_record_id=score_id,
+            evidence_commit_sha=ev_commit,
+            run_kind="bug",
+            probe_index=0,
+            judge="reviewer",
+            judge_role="orchestrator",
+            condition3_met=None,
+        )
+    # ...and a hand-built record with None is refused at write time too.
+    bad = {
+        "record_id": "x",
+        "record_type": "judgment",
+        "run_kind": "bug",
+        "probe_index": 0,
+        "judge": "reviewer",
+        "judge_role": "orchestrator",
+        "condition3_met": None,
+        "verdict": "no_catch",
+    }
+    with pytest.raises(JudgmentRejectedError):
+        write_judgment_record(bad, out, repo, score_record_id=score_id)
+
+
+def test_judgment_requires_judge_role_and_refuses_wally_on_bug_runs(tmp_path):
+    repo, out, ev_id, ev_commit, score_id = _bug_score(tmp_path)
+    base = dict(
+        evidence_record_id=ev_id,
+        score_record_id=score_id,
+        evidence_commit_sha=ev_commit,
+        run_kind="bug",
+        probe_index=0,
+        condition3_met=True,
+    )
+    with pytest.raises(JudgmentRejectedError):
+        build_judgment_record(**base, judge="reviewer", judge_role=None)
+    # "wally" may not judge measured (bug) runs.
+    wally = build_judgment_record(**base, judge="wally", judge_role="builder")
+    with pytest.raises(JudgmentRejectedError):
+        write_judgment_record(wally, out, repo, score_record_id=score_id)
+    # A named human reviewer passes.
+    ok = build_judgment_record(**base, judge="reviewer", judge_role="orchestrator")
+    j_id, _ = write_judgment_record(ok, out, repo, score_record_id=score_id)
+    assert read_records(out)[-1]["record_id"] == j_id
+
+
+def test_judgment_refuses_missing_score_record(tmp_path):
+    repo = _git_repo(tmp_path)
+    out = tmp_path / "runs"
+    judgment = build_judgment_record(
+        evidence_record_id="ev",
+        score_record_id="nope",
+        evidence_commit_sha="c" * 40,
+        run_kind="bug",
+        probe_index=0,
+        judge="reviewer",
+        judge_role="orchestrator",
+        condition3_met=True,
+    )
+    with pytest.raises(JudgmentRejectedError):
+        write_judgment_record(judgment, out, repo, score_record_id="nope")
 
 
 def test_clean_diff_score_record(tmp_path):
@@ -494,14 +799,63 @@ def test_clean_diff_score_record(tmp_path):
         clean_id="c1",
         c_sha="c" * 40,
         c_provision={"status": "ready"},
-        c_results=[_result(Verdict.PASS)],
+        c_results=[ProbeResult(probe_index=0, verdict=Verdict.PASS)],
     )
     ev_id, _, _ = write_evidence_record(ev, out, repo)
-    alarm = score_clean_diff([_result(Verdict.PASS)])
-    score = build_score_record(
-        evidence_record_id=ev_id, run_kind="clean", clean_id="c1", false_alarm=alarm
-    )
-    write_score_record(score, out, repo, evidence_record_id=ev_id)
+    # Computed from the committed evidence: no false alarm.
+    score_id, _ = write_score_record(out, repo, evidence_record_id=ev_id, run_kind="clean")
     records = read_records(out)
+    assert records[1]["record_id"] == score_id
     assert records[1]["false_alarm"] is False
     assert records[1]["verdict"] is None
+    # A disagreeing claim is refused.
+    with pytest.raises(ScoreMismatchError):
+        write_score_record(out, repo, evidence_record_id=ev_id, run_kind="clean", false_alarm=True)
+
+
+def test_clean_diff_false_alarm_computed(tmp_path):
+    repo = _git_repo(tmp_path)
+    out = tmp_path / "runs"
+    ev = build_evidence_record(
+        run_kind="clean",
+        clean_id="c2",
+        c_sha="c" * 40,
+        c_provision={"status": "ready"},
+        c_results=[ProbeResult(probe_index=0, verdict=Verdict.FAIL)],
+    )
+    ev_id, _, _ = write_evidence_record(ev, out, repo)
+    _, _ = write_score_record(out, repo, evidence_record_id=ev_id, run_kind="clean")
+    assert read_records(out)[1]["false_alarm"] is True
+
+
+def test_probe_result_round_trip_preserves_verdict_and_reason():
+    r = ProbeResult(
+        probe_index=3,
+        verdict=Verdict.INCONCLUSIVE,
+        reason=InconclusiveReason.ENVIRONMENT,
+        details=["x"],
+        http_status=500,
+        request={"method": "GET", "url": "http://x/", "headers": {}, "body": None},
+        setup_requests=[{"method": "POST", "url": "http://x/login", "headers": {}, "body": {}}],
+    )
+    r2 = ProbeResult.from_dict(r.to_dict())
+    assert r2.probe_index == 3
+    assert r2.verdict == Verdict.INCONCLUSIVE
+    assert r2.reason == InconclusiveReason.ENVIRONMENT
+    assert r2.request["url"] == "http://x/"
+    assert r2.setup_requests[0]["method"] == "POST"
+
+
+def test_score_reads_evidence_at_commit_not_working_tree(tmp_path):
+    # The score is computed from the evidence AT the commit, so a
+    # working-tree mutation after the commit cannot change the score.
+    repo, out, ev_id, _ = _write_evidence(tmp_path)
+    # Mutate the working tree: append a tampered evidence-looking line.
+    log = out / "runs.jsonl"
+    with log.open("a", encoding="utf-8") as f:
+        f.write('{"record_id":"tamper","record_type":"evidence"}\n')
+    score_id, _ = write_score_record(out, repo, evidence_record_id=ev_id, run_kind="bug")
+    records = read_records(out)
+    score = next(r for r in records if r.get("record_id") == score_id)
+    assert score["candidate_catch"] == [0]
+    assert score["verdict"] == "candidate_catch"
