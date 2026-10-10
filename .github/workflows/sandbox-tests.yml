@@ -1,0 +1,63 @@
+# Sandbox container tests (WO-5).
+#
+# Do NOT claim CI works until a real run log exists; see
+# docs/sandbox-ci.md "What the first CI run must show".
+
+name: sandbox-tests
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sandbox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint and typecheck
+        run: |
+          python -m ruff check proofdeploy tests
+          python -m mypy proofdeploy
+
+      - name: Run full test suite
+        # The full suite (not just the sandbox tests): the sandbox
+        # tests must actually RUN here rather than skip, proving the
+        # runner can do real container isolation.
+        run: |
+          python -m pytest tests/ -v
+
+      - name: Show sandbox capability probe
+        # The probe output says which isolation modes this runner
+        # actually supports (userns remapping, bridge network for the
+        # install phase, isolated app network). A reviewer needs these
+        # before trusting measured runs here: recent Ubuntu runners may
+        # restrict user namespaces, in which case the measurement gate
+        # refuses and a different runner/VM is needed.
+        run: |
+          python -c "
+          from proofdeploy.sandbox import check_sandbox_capabilities
+          caps = check_sandbox_capabilities()
+          print('podman:', caps.podman, caps.podman_version)
+          print('isolated_network:', caps.isolated_network)
+          print('build_network:', caps.build_network)
+          print('userns_remap:', caps.userns_remap)
+          print('reason:', caps.reason)
+          "
