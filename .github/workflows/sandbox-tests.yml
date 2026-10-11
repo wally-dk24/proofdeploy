@@ -41,8 +41,29 @@ jobs:
         # The full suite (not just the sandbox tests): the sandbox
         # tests must actually RUN here rather than skip, proving the
         # runner can do real container isolation.
+        #
+        # B3 (Addendum 16): PD_REQUIRE_SANDBOX=1 turns any sandbox
+        # test skip into a failure. A silently-skipping sandbox test
+        # hides real bugs (the T1 miss); this job must prove the
+        # tests ran.
+        env:
+          PD_REQUIRE_SANDBOX: "1"
         run: |
           python -m pytest tests/ -v
+
+      - name: Verify sandbox tests ran (not skipped)
+        # B3: belt-and-braces check that the key sandbox tests were
+        # collected and ran. Fails the job if they skipped.
+        run: |
+          python -m pytest tests/test_sandbox.py::test_sandbox_install_and_run tests/test_orchestrator.py::test_sandboxed_provision_keeps_installed_dependencies tests/test_orchestrator.py::test_sandboxed_failed_start_captures_app_log -v --no-header -q 2>&1 | tee /tmp/sandbox-verify.log
+          if grep -q "SKIPPED" /tmp/sandbox-verify.log; then
+            echo "B3: expected sandbox tests SKIPPED — failing the job"
+            exit 1
+          fi
+          if ! grep -q "3 passed" /tmp/sandbox-verify.log; then
+            echo "B3: expected 3 sandbox tests to pass"
+            exit 1
+          fi
 
       - name: Show sandbox capability probe
         # The probe output says which isolation modes this runner
