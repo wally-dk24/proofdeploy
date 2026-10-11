@@ -48,9 +48,12 @@ the prompt teaches the author to write.
 
 - The fail-closed placeholder rules are unchanged: unknown names and
   declared-but-unset captures still raise.
-- Secret redaction already ignores non-string captured values
-  (`collect_secret_values` guards on `isinstance(v, str)`), matching
-  the standing policy that numbers are not redacted by value.
+- Typed captures keep the redaction guarantee (Addendum 21): both
+  secret collectors treat non-bool int/float captures as secrets in
+  their text form, so a numeric session id or API key is redacted from
+  the written record — including the `captured_values` leaf itself —
+  exactly as a string capture is. (Fixture and contract-env numbers
+  remain uncollected: they are configuration, not secrets.)
 - Tests: `tests/test_executor_addendum20.py`, including a replay of
   acceptance run 38152175992's real probes and recorded responses
   (probe 0 PASSes both sides; probe 1 PASSes at fix^, FAILs at fix).
