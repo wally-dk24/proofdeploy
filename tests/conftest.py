@@ -13,6 +13,7 @@ was silently skipping in CI due to a broken import, hiding real bugs.
 """
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -109,4 +110,31 @@ def _no_lingering_targets(tmp_path_factory):
         f"T5: {len(lingering)} suite target process(es) still alive after "
         f"test session: PIDs {lingering}. The O2 process-group cleanup is "
         f"incomplete."
+    )
+
+
+def _bridge_sock_dirs() -> set[str]:
+    """Host paths of per-run bridge socket dirs (/tmp/pd-*)."""
+    try:
+        return {str(p) for p in Path("/tmp").glob("pd-*")}
+    except OSError:
+        return set()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_leftover_bridge_sockets():
+    """SB5 (Addendum 18): fail if the suite leaves /tmp/pd-* behind.
+
+    The bridge socket lives in a short per-run dir under /tmp; every
+    exit path (stop(), failed start) must remove it. The reviewer found
+    13 such dirs piled up with cleanup disabled, which the old T5
+    process check could not see.
+    """
+    before = _bridge_sock_dirs()
+    yield
+    leftover = _bridge_sock_dirs() - before
+    assert not leftover, (
+        f"SB5: {len(leftover)} bridge socket dir(s) left behind after "
+        f"the test session: {sorted(leftover)}. The per-run socket dir "
+        "must be removed on every exit path."
     )
