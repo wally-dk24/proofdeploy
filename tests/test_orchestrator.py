@@ -1782,3 +1782,52 @@ def test_clean_no_valid_probe_is_false_alarm(tmp_path):
     score = records[1]
     assert score["record_type"] == "score"
     assert score["false_alarm"] is True
+
+
+def test_unreachable_target_with_invalid_block_scores_inconclusive(tmp_path, monkeypatch):
+    """Addendum 13: target unreachable after READY plus one invalid block.
+
+    The evidence keeps sent=False on the invalid-block result, and
+    re-scoring from the committed evidence gives pair INCONCLUSIVE --
+    an infrastructure failure is not relabeled an author miss.
+    """
+    import socket
+
+    from proofdeploy.executor import ProbeResult
+    from proofdeploy.runpair import RunPairVerdict, score_run_pair
+
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-unreachable-invalid", _mixed_probes)
+
+    # Closed port: provisioning still sees READY, but every probe fails
+    # to connect -> INCONCLUSIVE environment on both sides.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    dead_url = f"http://127.0.0.1:{s.getsockname()[1]}"
+    s.close()
+
+    orig = Orchestrator._make_executor
+
+    def dead_executor(self, side):
+        ex = orig(self, side)
+        ex.target_url = dead_url
+        return ex
+
+    monkeypatch.setattr(Orchestrator, "_make_executor", dead_executor)
+
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "inconclusive"
+
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["record_type"] == "evidence"
+    # The invalid block is recorded with sent=False on both sides.
+    for side_key in ("fix_parent_results", "fix_results"):
+        by_index = {r["probe_index"]: r for r in evidence[side_key]}
+        assert by_index[1]["sent"] is False
+        assert by_index[1]["verdict"] == "inconclusive"
+        assert by_index[1]["reason"] == "probe"
+    # Re-score from the committed evidence: still pair INCONCLUSIVE.
+    parent = [ProbeResult.from_dict(r) for r in evidence["fix_parent_results"]]
+    fix = [ProbeResult.from_dict(r) for r in evidence["fix_results"]]
+    assert score_run_pair(parent, fix) == RunPairVerdict.INCONCLUSIVE
