@@ -203,7 +203,7 @@ def _stub_provision_side(monkeypatch, snap: Path, install=None):
         Sandbox, "_capabilities", lambda self: _fake_caps()
     )
     if install is not None:
-        monkeypatch.setattr(Sandbox, "install", install)
+        monkeypatch.setattr(Sandbox, "install_steps", install)
 
     cfg = MeasureConfig(
         repo_dir=snap,
@@ -383,14 +383,21 @@ def test_bridge_socket_dir_cleaned_up(monkeypatch, tmp_path):
 
 
 class _CaptureInstall:
-    """Fake Sandbox.install: records commands, reports success."""
+    """Fake Sandbox.install_steps (WO-7 PR 2 signature): records the
+    step commands, reports every step as exit code 0."""
 
     def __init__(self):
-        self.commands: list[str] = []
+        self.descriptors: list[dict] = []
 
-    def __call__(self, checkout, commands, env, proxy_env, timeout=600):
-        self.commands.extend(commands)
-        return True
+    @property
+    def commands(self) -> list[str]:
+        return [d["command"] for d in self.descriptors]
+
+    def __call__(self, checkout, steps, env, proxy_env, timeout=600):
+        self.descriptors.extend(steps)
+        return [
+            {"phase": s["phase"], "exit_code": 0} for s in steps
+        ]
 
 
 def _pip_install_cmd(commands: list[str]) -> str:
@@ -481,7 +488,7 @@ def _build_test_wheel(tmp_path: Path) -> Path:
 
 
 class _RealPipInstall:
-    """Fake Sandbox.install that runs the REAL pip hash check locally.
+    """Fake Sandbox.install_steps that runs the REAL pip hash check locally.
 
     Stands in for the install container: it takes the pip command the
     orchestrator generated (honoring its flags, including
@@ -497,9 +504,23 @@ class _RealPipInstall:
         self.commands: list[str] = []
         self.n = 0
 
-    def __call__(self, checkout, commands, env, proxy_env, timeout=600):
+    def __call__(self, checkout, steps, env, proxy_env, timeout=600):
+        # WO-7 PR 2: install_steps signature — per-step results,
+        # stopping after the pip step if it fails.
+        commands = [d["command"] for d in steps]
         self.commands.extend(commands)
-        pip_cmd = _pip_install_cmd(commands)
+        results = []
+        for d in steps:
+            if "/bin/pip install" not in d["command"]:
+                results.append({"phase": d["phase"], "exit_code": 0})
+                continue
+            rc = self._run_pip(checkout, d["command"])
+            results.append({"phase": d["phase"], "exit_code": rc})
+            if rc != 0:
+                return results
+        return results
+
+    def _run_pip(self, checkout, pip_cmd: str) -> int:
         before, _, after = pip_cmd.partition("-r")
         flags = before.split("install", 1)[1].split()
         req_name = after.strip().split()[0]
@@ -514,7 +535,7 @@ class _RealPipInstall:
         r = subprocess.run(
             cmd, capture_output=True, text=True, timeout=300
         )
-        return r.returncode == 0
+        return r.returncode
 
 
 def test_sandboxed_tampered_hash_fails_install(monkeypatch, tmp_path):

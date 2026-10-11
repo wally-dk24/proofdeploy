@@ -535,7 +535,12 @@ def test_provision_prefers_package_manager_lockfile(tmp_path, monkeypatch):
         )[1],
     )
     assert result.package_manager == "pnpm"
-    assert recorded[0].startswith("pnpm install")
+    # WO-7 PR 2: a packageManager pin renders the install through
+    # corepack at the exact pinned version (plan data, independent of
+    # the planning host's own corepack) — never a silent fall-back to
+    # whatever pnpm happens to be on PATH.
+    assert recorded[0].startswith("corepack pnpm@9.1.0 install")
+    assert "--frozen-lockfile" in recorded[0]
 
 
 # --- frozen requirements.txt (finding 4) ---

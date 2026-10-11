@@ -37,8 +37,11 @@ for build/migrate/seed/start, the lockfile sha256 recorded and
 verified, seed runs, and unsupported lockfiles refused by the sandbox
 executor with BUILD_FAILED "not yet supported in the sandbox".
 Unlocked repos stay refused until WO-8 (REG-A). The Node adapter
-covers the host path's existing behavior; sandbox Node support is
-WO-7 PR 2.
+plans frozen installs from the lockfile for both executors: npm ci /
+pnpm install --frozen-lockfile / yarn classic --frozen-lockfile or
+berry --immutable, a packageManager pin rendered through corepack,
+node_modules persisted inside the checkout; workspaces and
+packageManager/lockfile mismatches are typed refusals (WO-7 PR 2).
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ from typing import Any, Protocol
 
 from proofdeploy.runner import (
     _PM_LOCKFILES,
+    LOCKFILES,
     _parse_version,
     check_requirements_frozen,
     detect_runtime,
@@ -373,12 +377,27 @@ class PythonAdapter:
 
 
 class NodeAdapter:
-    """Node: the host path's existing behavior behind the interface.
+    """Node: frozen installs planned from the lockfile.
 
-    The frozen install command comes from the lockfile via
-    select_package_manager (npm ci / yarn / pnpm / bun, corepack for a
-    pinned packageManager). Sandbox Node support is WO-7 PR 2; the
-    sandbox executor refuses Node plans until then.
+    Detection/planning rules (WO-7 PR 2):
+
+    - ``package-lock.json`` -> ``npm ci``; ``pnpm-lock.yaml`` ->
+      ``pnpm install --frozen-lockfile``; ``yarn.lock`` -> ``yarn
+      install --frozen-lockfile`` (classic) or ``--immutable``
+      (berry), via runner.select_package_manager.
+    - A ``packageManager`` pin renders the install through corepack
+      at the exact pinned version (deterministically, as plan data —
+      never dependent on the planning host's own corepack), with
+      ``COREPACK_ENABLE_DOWNLOAD_PROMPT=0`` in the step env; the
+      pinned version is recorded on the plan.
+    - A ``packageManager`` that disagrees with the lockfile present
+      (it pins pnpm, only package-lock.json exists) is a typed
+      refusal — never a silent fall-back to the other manager.
+    - Monorepo workspaces (a ``workspaces`` field in package.json,
+      or a ``pnpm-workspace.yaml``) are refused with the registered
+      wording: "workspaces not yet supported".
+    - ``node_modules`` lives in the checkout (persisted_dirs), so it
+      survives from the install container to the app container.
     """
 
     name = "node"
@@ -397,17 +416,43 @@ class NodeAdapter:
         det = self.detect(snapshot_dir)
         assert det is not None, "plan() called without a node detection"
         image = _image_fields("node", det.declared_range)
+        base: dict[str, Any] = {
+            "adapter": self.name,
+            "runtime": "node",
+            "declared_range": det.declared_range,
+            **image,
+        }
+        # Monorepo workspaces: refused, with the registered wording.
+        if self._declares_workspaces(snapshot_dir):
+            return InstallPlan(**base, refusal="workspaces not yet supported")
         pm_name, pm_version = read_package_manager(snapshot_dir)
+        # A packageManager that disagrees with the lockfile present
+        # is a typed refusal. Checked against the lockfiles actually
+        # in the snapshot, before any preference is applied.
+        if pm_name and pm_name in _PM_LOCKFILES:
+            present = [
+                name
+                for name in LOCKFILES["node"]
+                if (snapshot_dir / name).is_file()
+            ]
+            expected = _PM_LOCKFILES[pm_name]
+            if present and not any(name in expected for name in present):
+                return InstallPlan(
+                    **base,
+                    refusal=(
+                        f"packageManager {pm_name}@{pm_version} disagrees "
+                        f"with the lockfile present in the snapshot "
+                        f"({present[0]}); refusing to install with a "
+                        "different package manager than the one pinned"
+                    ),
+                )
         preferred: list[str] | None = None
         if pm_name and pm_name in _PM_LOCKFILES:
             preferred = list(_PM_LOCKFILES[pm_name])
         found = find_lockfile(snapshot_dir, "node", preferred)
         if found is None:
             return InstallPlan(
-                adapter=self.name,
-                runtime="node",
-                declared_range=det.declared_range,
-                **image,
+                **base,
                 refusal=(
                     "no frozen lockfile found in snapshot "
                     "for runtime 'node'"
@@ -417,23 +462,48 @@ class NodeAdapter:
         manager, argv = select_package_manager(
             snapshot_dir, "node", lockfile_name
         )
+        step_env: dict[str, str] = {}
+        if pm_name == manager and pm_version and manager in (
+            "pnpm", "yarn", "npm",
+        ):
+            # The pin renders through corepack, as plan data: strip
+            # whatever prefix select_package_manager chose (plain
+            # binary, or corepack when the planning host has it) and
+            # prepend the deterministic corepack form.
+            frozen_args = list(argv)
+            corepack_prefix = ["corepack", f"{manager}@{pm_version}"]
+            if frozen_args[:2] == corepack_prefix:
+                frozen_args = frozen_args[2:]
+            elif frozen_args[:1] == [manager]:
+                frozen_args = frozen_args[1:]
+            argv = [*corepack_prefix, *frozen_args]
+            step_env = {"COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
         return InstallPlan(
-            adapter=self.name,
-            runtime="node",
-            declared_range=det.declared_range,
+            **base,
             lockfile_name=lockfile_name,
             lockfile_sha256=lockfile_sha,
             package_manager=manager,
             package_manager_version=(
                 pm_version if pm_name == manager else None
             ),
-            **image,
             steps=[
-                PlanStep(phase="install", argv=argv),
+                PlanStep(phase="install", argv=argv, env=step_env),
                 *_contract_steps(contract),
             ],
             persisted_dirs=["node_modules"],
         )
+
+    @staticmethod
+    def _declares_workspaces(snapshot_dir: Path) -> bool:
+        """True for monorepo workspace declarations (refused)."""
+        if (snapshot_dir / "pnpm-workspace.yaml").is_file():
+            return True
+        pkg = snapshot_dir / "package.json"
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        return isinstance(data, dict) and "workspaces" in data
 
 
 _ADAPTERS: dict[str, ProvisioningAdapter] = {

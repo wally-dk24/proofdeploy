@@ -68,6 +68,12 @@ class ProvisionResult:
     # Recorded in the evidence on every path that planned.
     install_plan: dict | None = None
     install_plan_sha256: str | None = None
+    # Addendum 31: the commands that actually ran, per executed
+    # step: {"phase", "executor", "argv_rendered" | "shell",
+    # "exit_code"}. The plan holds placeholders and executors render
+    # them differently (pip flags differ host vs sandbox), so the
+    # record — not the plan — is what proves what ran.
+    executed_steps: list[dict] = field(default_factory=list)
     # Live process handle on READY. Caller-owned: the caller must terminate
     # it when done and call cleanup_run(run_id). Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
@@ -90,6 +96,7 @@ class ProvisionResult:
             "run_id": self.run_id,
             "install_plan": self.install_plan,
             "install_plan_sha256": self.install_plan_sha256,
+            "executed_steps": self.executed_steps,
             "logs": self.logs,
         }
 
@@ -105,6 +112,25 @@ LOCKFILES = {
     ),
     "python": ("uv.lock", "poetry.lock", "requirements.txt"),
 }
+
+
+def _exit_code_from_reason(ok: bool, reason: str | None) -> int | None:
+    """The exit code behind an _exec result (Addendum 31 recording).
+
+    _exec's failure reasons are this module's own contract:
+    "command failed with code N: ..." carries the process's code.
+    Anything else (missing binary, timeout) means no process ran to
+    completion: None.
+    """
+    if ok:
+        return 0
+    prefix = "command failed with code "
+    if reason and reason.startswith(prefix):
+        try:
+            return int(reason[len(prefix):].split(":", 1)[0])
+        except ValueError:
+            return None
+    return None
 
 
 def _sha256_file(p: Path) -> str:
@@ -876,6 +902,36 @@ class Provisioner:
         """
         run_id = uuid.uuid4().hex[:12]
         logs: list[str] = [f"run_id: {run_id}"]
+        # Addendum 31: the executed steps of this provision, recorded
+        # as they run and attached to every result on every path.
+        executed: list[dict] = []
+
+        def _run_step(
+            cmd: list[str],
+            cwd: Path,
+            timeout: int,
+            env: dict[str, str],
+            *,
+            phase: str,
+            shell: str | None = None,
+        ) -> tuple[bool, str | None]:
+            """Run one plan step through _exec and record it
+            (Addendum 31): the rendered argv (or the originating
+            shell string for shell-declared steps) and the real exit
+            code — recovered from _exec's own failure contract
+            ("command failed with code N"), None when no process ran
+            to completion (missing binary, timeout).
+            """
+            ok, reason = self._exec(cmd, cwd, timeout, logs, env)
+            entry: dict = {"phase": phase, "executor": "host"}
+            if shell is not None:
+                entry["shell"] = shell
+            else:
+                entry["argv_rendered"] = list(cmd)
+            entry["exit_code"] = _exit_code_from_reason(ok, reason)
+            executed.append(entry)
+            return ok, reason
+
         snap = Path(snapshot_dir)
         contract_env: dict[str, str] = dict(getattr(contract, "env", None) or {})
 
@@ -898,6 +954,7 @@ class Provisioner:
             # Failure path: nothing is running; remove the run's scratch dirs.
             self.cleanup_run(run_id, logs)
             result = self._fail(status, reason, logs, run_id=run_id, **kw)
+            result.executed_steps = executed
             if _plan is not None:
                 result.install_plan = _plan.to_dict()
                 result.install_plan_sha256 = _plan.sha256()
@@ -1032,6 +1089,18 @@ class Provisioner:
         venv_dir: Path | None = None
         if package_manager == "pip":
             venv_dir = self._make_venv(runtime_bin, run_id, logs, probe_env)
+            # Addendum 31: the venv step is recorded like every other
+            # executed step (its exit code is not surfaced by
+            # _make_venv: 0 on success, None when it failed).
+            executed.append({
+                "phase": "venv",
+                "executor": "host",
+                "argv_rendered": [
+                    runtime_bin, "-m", "venv",
+                    str(venv_dir or (self.workdir / "venvs" / run_id)),
+                ],
+                "exit_code": 0 if venv_dir is not None else None,
+            })
             if venv_dir is None:
                 return _bail(
                     ProvisionStatus.BUILD_FAILED,
@@ -1106,9 +1175,13 @@ class Provisioner:
                 )
 
         # 7. Install (frozen). Python pip installs into the per-run venv,
-        # never the host environment.
-        ok, reason = self._exec(
-            install_cmd, snap, self.build_timeout, logs, step_env
+        # never the host environment. The plan step's own env rides
+        # along (e.g. COREPACK_ENABLE_DOWNLOAD_PROMPT=0 for a
+        # packageManager-pinned Node install).
+        install_env = {**step_env, **install_step.env}
+        ok, reason = _run_step(
+            install_cmd, snap, self.build_timeout, install_env,
+            phase="install",
         )
         if not ok:
             return _bail(
@@ -1131,8 +1204,10 @@ class Provisioner:
             assert step.shell is not None
             step_name = step.phase
             logs.append(f"contract step: {step_name}")
-            ok, reason = self._exec(
-                shlex.split(step.shell), snap, self.build_timeout, logs, step_env
+            ok, reason = _run_step(
+                shlex.split(step.shell), snap, self.build_timeout,
+                {**step_env, **step.env},
+                phase=step.phase, shell=step.shell,
             )
             if not ok:
                 return _bail(
@@ -1187,8 +1262,19 @@ class Provisioner:
             )
             result.install_plan = plan.to_dict()
             result.install_plan_sha256 = plan.sha256()
+            result.executed_steps = executed
             return result
 
+        # Addendum 31: the start step is recorded as it is issued;
+        # its exit_code stays None while the target runs (READY) and
+        # is filled in when the target exits before readiness.
+        start_record: dict = {
+            "phase": "start",
+            "executor": "host",
+            "shell": start_cmd,
+            "exit_code": None,
+        }
+        executed.append(start_record)
         proc: subprocess.Popen[str] | None = None
         keep_proc = False  # set True on READY to transfer ownership to caller
         try:
@@ -1225,6 +1311,7 @@ class Provisioner:
             while time.time() < deadline:
                 assert proc is not None
                 if proc.poll() is not None:
+                    start_record["exit_code"] = proc.returncode
                     return _start_failed(
                         f"target exited with code {proc.returncode} before ready"
                     )
@@ -1257,6 +1344,7 @@ class Provisioner:
                 run_id=run_id,
                 install_plan=plan.to_dict(),
                 install_plan_sha256=plan.sha256(),
+                executed_steps=executed,
                 proc=proc,
             )
         finally:

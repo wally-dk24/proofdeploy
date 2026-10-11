@@ -1,0 +1,13 @@
+{
+  "name": "pd-golden-pnpm",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "dependencies": {
+    "express": "^5.0.0",
+    "better-sqlite3": "^11.3.0"
+  }
+}

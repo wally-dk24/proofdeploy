@@ -1,0 +1,12 @@
+{
+  "name": "pd-golden-express",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "dependencies": {
+    "express": "^5.0.0",
+    "better-sqlite3": "^11.3.0"
+  }
+}

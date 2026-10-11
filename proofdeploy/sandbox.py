@@ -31,8 +31,9 @@ Secrets never enter the container environment. The contract env passed
 to the sandbox must already be secret-free (the orchestrator passes
 only declared-public config); auth tokens travel over HTTP, not env.
 
-Python is supported now (venv inside the checkout). Node support is
-future work.
+Python is supported (venv inside the checkout), and Node too
+(node_modules inside the checkout, frozen installs from the lockfile,
+WO-7 PR 2).
 """
 
 from __future__ import annotations
@@ -320,26 +321,64 @@ def _podman_base() -> list[str]:
     return list(PODMAN)
 
 
-def _run(
+def _run_rc(
     args: list[str], timeout: int, logs: list[str]
-) -> tuple[bool, str]:
-    """Run a podman command; never raises. Returns (ok, reason)."""
+) -> int:
+    """Run a podman command and return its real exit code.
+
+    Output is appended to ``logs``; a failure never raises. Synthetic
+    codes for "no process ran to completion": -1 on timeout, -2 when
+    podman is missing — never confused with a container's own code.
+    """
     logs.append(f"$ {' '.join(args)}")
     try:
         proc = subprocess.run(
             args, capture_output=True, text=True, timeout=timeout
         )
     except FileNotFoundError:
-        return False, "podman not found"
+        logs.append("podman not found")
+        return -2
     except subprocess.TimeoutExpired:
-        return False, f"timed out after {timeout}s"
+        logs.append(f"timed out after {timeout}s")
+        return -1
     if proc.stdout:
         logs.append(proc.stdout[-2000:])
     if proc.stderr:
         logs.append(proc.stderr[-2000:])
-    if proc.returncode != 0:
-        return False, f"exit {proc.returncode}"
+    return proc.returncode
+
+
+def _run(
+    args: list[str], timeout: int, logs: list[str]
+) -> tuple[bool, str]:
+    """Run a podman command; never raises. Returns (ok, reason)."""
+    rc = _run_rc(args, timeout, logs)
+    if rc == -2:
+        return False, "podman not found"
+    if rc == -1:
+        return False, f"timed out after {timeout}s"
+    if rc != 0:
+        return False, f"exit {rc}"
     return True, ""
+
+
+def _exit_code_from_run(ok: bool, reason: str) -> int:
+    """The exit code behind a _run result (Addendum 31 recording).
+
+    _run's failure reasons are this module's own contract: "exit N"
+    carries the container's code; the two synthetic failures map to
+    _run_rc's synthetic codes (-2 podman missing, -1 timeout).
+    """
+    if ok:
+        return 0
+    if reason.startswith("exit "):
+        try:
+            return int(reason[5:])
+        except ValueError:
+            return -1
+    if reason == "podman not found":
+        return -2
+    return -1
 
 
 def _tcp_reachable(host: str, port: int, timeout: int = 10) -> bool:
@@ -666,6 +705,33 @@ class Sandbox:
         ``env`` is the secret-free contract env. ``proxy_env`` carries
         the egress proxy for the install only.
         """
+        steps = [{"phase": "install", "command": c} for c in commands]
+        results = self.install_steps(checkout, steps, env, proxy_env, timeout)
+        return len(results) == len(commands) and all(
+            r["exit_code"] == 0 for r in results
+        )
+
+    def install_steps(
+        self,
+        checkout: Path,
+        steps: list[dict],
+        env: dict[str, str],
+        proxy_env: dict[str, str],
+        timeout: int = 600,
+    ) -> list[dict]:
+        """Run install-phase step commands, one container each, WITH
+        network (proxy enabled), and report every step's exit code.
+
+        ``steps`` are descriptors: ``{"phase": str, "command": str,
+        "env": {..} optional}`` — a step's own env rides on top of the
+        base env for that step's container only (e.g.
+        COREPACK_ENABLE_DOWNLOAD_PROMPT=0 for a pinned Node install).
+        Returns ``[{"phase": ..., "exit_code": int}]`` for the steps
+        ATTEMPTED, stopping after the first failure: a step that
+        never ran is not reported as run (Addendum 31).
+        ``env`` is the secret-free contract env; ``proxy_env`` carries
+        the egress proxy for the install only.
+        """
         self._prepare_checkout(checkout)
         full_env = _strip_secret_env(dict(env))
         full_env.update(proxy_env)
@@ -682,16 +748,23 @@ class Sandbox:
         # The sandbox user has no home; give it a writable one inside
         # the checkout.
         full_env["HOME"] = "/checkout/.sandbox-home"
-        for i, cmd in enumerate(commands):
+        results: list[dict] = []
+        for i, step in enumerate(steps):
+            step_env = dict(full_env)
+            step_env.update(step.get("env") or {})
             args = self._common_args(checkout, f"sandbox-install-{i}", True)
-            for k, v in full_env.items():
+            for k, v in step_env.items():
                 args += ["-e", f"{k}={v}"]
-            args += [self.config.image, "bash", "-c", cmd]
+            args += [self.config.image, "bash", "-c", step["command"]]
             ok, reason = _run(args, timeout, self.log)
-            if not ok:
-                self.log.append(f"install step {i} failed: {reason}")
-                return False
-        return True
+            rc = _exit_code_from_run(ok, reason)
+            results.append({"phase": step["phase"], "exit_code": rc})
+            if rc != 0:
+                self.log.append(
+                    f"install step {i} ({step['phase']}) failed: exit {rc}"
+                )
+                break
+        return results
 
     def start(
         self,
