@@ -192,6 +192,12 @@ class SetupContext:
     # ProbeResult so build_evidence_record can collect them from the
     # results instead of trusting the caller to pass them in.
     run_captures: dict[str, Any] = field(default_factory=dict, repr=False)
+    # Every DISTINCT value captured under each name during THIS probe
+    # run. run_captures keeps only the latest value per name (that is
+    # what substitution needs), but a name captured more than once —
+    # e.g. a re-login — produced one secret per capture, and all of
+    # them must reach the record's redaction (Addendum 23 R1).
+    run_captures_all: dict[str, list[Any]] = field(default_factory=dict, repr=False)
     run_minted: list[str] = field(default_factory=list, repr=False)
     # Set by a harness_app setup step (WO-5): subsequent setup steps and
     # the probe's act target the harness app instead of the provisioned
@@ -223,10 +229,16 @@ class SetupContext:
 
         AUTH_TOKEN is special: the fixture's token (or a provider-issued
         one) always wins over a setup-step capture. Captures are also
-        recorded in run_captures for the record's fail-closed redaction.
+        recorded in run_captures for the record's fail-closed redaction,
+        and every distinct value per name in run_captures_all: an
+        overwritten capture was still a live secret during this run.
         """
         self.bindings.update(new)
         self.run_captures.update(new)
+        for _k, _v in new.items():
+            _bucket = self.run_captures_all.setdefault(_k, [])
+            if _v not in _bucket:
+                _bucket.append(_v)
         token = self.effective_token()
         if token is not None:
             self.bindings["AUTH_TOKEN"] = token

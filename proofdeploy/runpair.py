@@ -35,8 +35,10 @@ Unknown versions raise.
 
 Records:
 - Every record (evidence, score, judgment) and every per-probe result
-  carries ``schema_version`` (currently ``"1.0.0"``). Bump it when the
-  record format changes; readers must refuse unknown versions.
+  carries ``schema_version`` (currently ``"1.1.0"``). Bump it when the
+  record format changes; readers must refuse unknown versions. Records
+  written at 1.0.0 (scalar ``captured_values``, no harness provenance)
+  still load and re-score.
 - Every run writes an evidence record BEFORE any scoring. The evidence
   record holds the prompt, the raw model response, the parsed probes
   (verbatim) and their hash, the bundle manifest (skill hash or no-skill
@@ -48,6 +50,12 @@ Records:
   that built the prompt, and ``model_request``: the exact model request
   as sent (model, temperature, per-message hashes, and the seed/tools
   fields as sent).
+- The evidence record's ``provenance`` also holds ``harness``: the
+  ProofDeploy commit that produced the record, its source, a dirty
+  flag, and the workflow ref (Addendum 24). The commit comes from git
+  only when the package's parent directory is the repo's toplevel —
+  never from an environment variable — so the audit trail names the
+  code version directly instead of inferring it from behavior.
 - Writing the evidence record makes a git commit; the commit SHA is
   recorded. Scoring reads the evidence record back AT that commit,
   rebuilds the per-probe results, and scores them: any caller-passed
@@ -70,6 +78,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import uuid
@@ -263,6 +272,23 @@ def _capture_secret_text(value: Any) -> str | None:
     return None
 
 
+def _flatten_captured(captured: dict[str, Any]) -> list[Any]:
+    """Every captured value in a name -> value(s) mapping.
+
+    A capture name bound more than once (several probes, both sides of
+    the pair, a re-login) holds a LIST of its distinct values
+    (Addendum 23 R1); a name bound once holds the value itself. Either
+    way, every value is returned: redaction must see all of them.
+    """
+    out: list[Any] = []
+    for v in captured.values():
+        if isinstance(v, list):
+            out.extend(v)
+        else:
+            out.append(v)
+    return out
+
+
 def collect_secret_values(
     *,
     fixture: dict[str, Any] | None = None,
@@ -274,7 +300,8 @@ def collect_secret_values(
 
     - Fixture and contract-env values whose KEY looks secret.
     - Every captured binding value (tokens, session ids from setup),
-      including numeric captures in their text form.
+      including numeric captures in their text form and every value of
+      a repeatedly bound capture name.
     - Every minted token (credential provider output).
     Values shorter than _MIN_SECRET_LEN are skipped.
     """
@@ -283,7 +310,7 @@ def collect_secret_values(
         for k, v in mapping.items():
             if isinstance(k, str) and _is_secret_key(k) and isinstance(v, str):
                 values.append(v)
-    for v in (captured or {}).values():
+    for v in _flatten_captured(captured or {}):
         text = _capture_secret_text(v)
         if text is not None:
             values.append(text)
@@ -313,7 +340,9 @@ def collect_record_secret_values(record: dict[str, Any]) -> list[str]:
     shred innocent text (ports, status codes). Captured values are the
     exception: they keep their JSON type (ADR-0011), and numeric
     captures are collected in their text form — a capture is a value
-    the target handed back during setup, not configuration.
+    the target handed back during setup, not configuration. A capture
+    name bound more than once holds a list of its distinct values
+    (Addendum 23 R1); every one of them is collected.
     """
     values: list[str] = []
     public_fixture = set(record.get("public_fixture_keys") or [])
@@ -330,7 +359,7 @@ def collect_record_secret_values(record: dict[str, Any]) -> list[str]:
                 values.append(v)
     captured = record.get("captured_values") or {}
     if isinstance(captured, dict):
-        for v in captured.values():
+        for v in _flatten_captured(captured):
             text = _capture_secret_text(v)
             if text is not None:
                 values.append(text)
@@ -420,6 +449,113 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class CommitGateError(RuntimeError):
+    """A measured run was refused: the harness commit is not proven."""
+
+
+def _git_stdout(args: list[str], cwd: Path) -> str | None:
+    """Run git and return stripped stdout, or None on any failure."""
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
+def harness_provenance() -> dict[str, Any]:
+    """Provenance of the running ProofDeploy code (Addendum 24).
+
+    Returns ``{commit, source, dirty, workflow_ref}``:
+
+    - ``commit``: ``git rev-parse HEAD`` of the checkout containing
+      this package, taken ONLY when the package's parent directory is
+      that repo's toplevel (``git rev-parse --show-toplevel``). Any
+      other layout — a package installed inside another project's git
+      checkout, e.g. in a venv — yields None: that repo's commit is
+      not ProofDeploy's. ``source`` is ``"git"`` when the commit came
+      from git, else None.
+    - No environment variable supplies or overrides the commit. The
+      round-1 ``PROOFDEPLOY_COMMIT`` override is dropped entirely (an
+      env var can claim any commit), and ``GITHUB_SHA`` is only a
+      cross-check for the measurement gate, never a source.
+    - ``dirty``: True when any tracked file differs from HEAD
+      (``git diff --quiet HEAD``); untracked files do not count.
+      False when there is no proven commit.
+    - ``workflow_ref``: ``GITHUB_WORKFLOW_REF``, or ``GITHUB_REF``
+      when the former is absent; None outside GitHub Actions.
+    """
+    workflow_ref = (
+        os.environ.get("GITHUB_WORKFLOW_REF") or os.environ.get("GITHUB_REF") or None
+    )
+    commit: str | None = None
+    source: str | None = None
+    dirty = False
+    pkg_root = Path(__file__).resolve().parent.parent
+    toplevel = _git_stdout(["rev-parse", "--show-toplevel"], pkg_root)
+    if toplevel is not None and Path(toplevel).resolve() == pkg_root:
+        head = _git_stdout(["rev-parse", "HEAD"], pkg_root)
+        if head:
+            commit = head
+            source = "git"
+            try:
+                r = subprocess.run(
+                    ["git", "diff", "--quiet", "HEAD"],
+                    cwd=pkg_root,
+                    capture_output=True,
+                    timeout=10,
+                )
+                dirty = r.returncode != 0
+            except (OSError, subprocess.SubprocessError):
+                dirty = True
+    return {
+        "commit": commit,
+        "source": source,
+        "dirty": dirty,
+        "workflow_ref": workflow_ref,
+    }
+
+
+def assert_harness_commit_gate() -> dict[str, Any]:
+    """Fail-closed gate for measured runs (Addendum 24).
+
+    A measured run refuses to start unless the running code's commit
+    is known (``harness_provenance``), the working tree is clean, and
+    — when GitHub Actions provides ``GITHUB_SHA`` — the git commit
+    matches it exactly. Unmeasured dev runs never call this gate: they
+    record whatever provenance is true and continue.
+
+    Returns the harness provenance dict on success.
+    """
+    harness = harness_provenance()
+    if harness["commit"] is None:
+        raise CommitGateError(
+            "measured run refused: the ProofDeploy commit is unknown "
+            "(the package is not at the root of its own git checkout); "
+            "a measured run must name the exact code that produced it"
+        )
+    if harness["dirty"]:
+        raise CommitGateError(
+            "measured run refused: the ProofDeploy working tree has "
+            "uncommitted changes to tracked files; a measured run must "
+            "run exactly the recorded commit"
+        )
+    github_sha = os.environ.get("GITHUB_SHA") or None
+    if github_sha is not None and github_sha != harness["commit"]:
+        raise CommitGateError(
+            "measured run refused: the ProofDeploy commit "
+            f"{harness['commit']} does not match GITHUB_SHA {github_sha}"
+        )
+    return harness
+
+
 def _sha256_canonical(obj: Any) -> str:
     return hashlib.sha256(
         json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -501,9 +637,12 @@ def build_evidence_record(
     contract_env: dict[str, Any] | None = None,
     public_fixture_keys: list[str] | None = None,
     public_contract_env_keys: list[str] | None = None,
-    # Every capture binding collected during the run (name -> value):
-    # all values are secret-collected. Captures keep their JSON type
-    # (ADR-0011); numeric captures are collected in text form.
+    # Every capture binding collected during the run. A name bound
+    # once maps to its value; a name bound more than once (several
+    # probes, both sides, a re-login) maps to the list of its distinct
+    # values, so no value is dropped before redaction (Addendum 23
+    # R1). All values are secret-collected. Captures keep their JSON
+    # type (ADR-0011); numeric captures are collected in text form.
     captured_values: dict[str, Any] | None = None,
     # Every token minted by the credential provider during the run:
     # all are secret-collected.
@@ -536,14 +675,37 @@ def build_evidence_record(
     # tokens to the ProbeResult (never serialized); we collect them
     # here so a caller that forgets to pass captured_values cannot
     # leak a session token into the committed record.
-    auto_captured: dict[str, Any] = {}
+    #
+    # Every DISTINCT value of every capture name is kept (Addendum 23
+    # R1): the same name is routinely bound in several probes and on
+    # both sides — each side logs in separately — and each binding is
+    # a different secret. Keeping only one value per name (the old
+    # setdefault merge) left the rest unredacted in the record.
+    auto_multi: dict[str, list[Any]] = {}
+
+    def _accumulate(name: str, value: Any) -> None:
+        # A list value is the multi-value form: flatten it so every
+        # distinct value is kept exactly once.
+        for _v in value if isinstance(value, list) else [value]:
+            bucket = auto_multi.setdefault(name, [])
+            if _v not in bucket:
+                bucket.append(_v)
+
     auto_minted: list[str] = []
     for _r in (fix_parent_results or []) + (fix_results or []) + (c_results or []):
         for _k, _v in _r.captured_bindings.items():
-            auto_captured.setdefault(_k, _v)
+            _accumulate(_k, _v)
         auto_minted.extend(_r.minted_tokens)
-    # Caller-supplied values are explicit and win on name conflicts.
-    merged_captured = {**auto_captured, **(captured_values or {})}
+    # Caller-supplied values are added too, never replacing the
+    # auto-collected ones: dropping a value that occurred during the
+    # run would leave it unredacted in the written record.
+    for _k, _v in (captured_values or {}).items():
+        _accumulate(_k, _v)
+    # One distinct value keeps the plain name -> value shape; several
+    # distinct values are stored as a list so none is lost.
+    merged_captured: dict[str, Any] = {
+        _k: (_vs[0] if len(_vs) == 1 else list(_vs)) for _k, _vs in auto_multi.items()
+    }
     _seen_minted = set(minted_tokens or [])
     merged_minted = list(minted_tokens or [])
     for _t in auto_minted:
@@ -585,7 +747,13 @@ def build_evidence_record(
         "sandbox_evidence": sandbox_evidence or {},
         "sandboxed": sandboxed,
         "measured_result": measured_result,
-        "provenance": provenance or {},
+        # Caller provenance (Actions run URL/ID, runner image,
+        # capability probe) plus the harness object (Addendum 24):
+        # the ProofDeploy commit that produced this record, its
+        # source, the dirty flag, and the workflow ref. The harness
+        # is computed here, never caller-supplied, so every record
+        # path (bug, clean, crash, inconclusive) carries it.
+        "provenance": {**(provenance or {}), "harness": harness_provenance()},
         "harness_version": harness_version,
         "scoring_version": scoring_version,
         "fix_parent_provision": fix_parent_provision or {},
