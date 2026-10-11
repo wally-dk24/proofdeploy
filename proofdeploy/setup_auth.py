@@ -53,6 +53,10 @@ from typing import Any
 
 # `${NAME}` placeholders in strings.
 _BINDING_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# A value that is exactly one placeholder, e.g. "${ITEM_ID}". These
+# substitute the typed binding value (ADR-0011); placeholders embedded in
+# a larger string substitute the binding's text form.
+_WHOLE_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 
 class PlaceholderError(ValueError):
@@ -67,20 +71,36 @@ class MissingCapture(PlaceholderError):
     """A `${NAME}` naming a declared capture that was never set."""
 
 
-def substitute_strict(value: Any, bindings: dict[str, str], known_names: set[str]) -> Any:
+def substitute_strict(value: Any, bindings: dict[str, Any], known_names: set[str]) -> Any:
     """Recursively replace `${NAME}` placeholders, failing closed.
 
     - A name in `bindings` is substituted.
     - A name in `known_names` but not `bindings` raises MissingCapture
       (a declared capture that was never set).
     - Any other name raises UnknownPlaceholder (never sent literally).
+
+    Typed substitution (ADR-0011): when the whole value is exactly one
+    placeholder (e.g. `"${ITEM_ID}"`), the binding's JSON type is kept
+    (an int capture stays an int). Placeholders embedded in a larger
+    string (e.g. `"/items/${ITEM_ID}"`) substitute the text form.
     """
     if isinstance(value, str):
+        whole = _WHOLE_PLACEHOLDER_RE.match(value)
+        if whole is not None:
+            name = whole.group(1)
+            if name in bindings:
+                return bindings[name]
+            if name in known_names:
+                raise MissingCapture(f"capture ${{{name}}} was declared but never set")
+            raise UnknownPlaceholder(
+                f"unknown placeholder ${{{name}}}: not a contract env key, "
+                "fixture key, or declared capture"
+            )
 
         def _repl(m: re.Match[str]) -> str:
             name = m.group(1)
             if name in bindings:
-                return bindings[name]
+                return str(bindings[name])
             if name in known_names:
                 raise MissingCapture(f"capture ${{{name}}} was declared but never set")
             raise UnknownPlaceholder(
@@ -100,17 +120,19 @@ def capture_bindings(
     response_body: str,
     response_headers: dict[str, str],
     capture: dict[str, dict[str, str]],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Extract named bindings from an HTTP response.
 
     `capture` maps binding name -> {"from": "body"|"header", ...}:
     - body: {"from": "body", "json_path": "dotted.path"}
     - header: {"from": "header", "name": "x-token"}
 
-    Returns the captured bindings (name -> string value). Missing values
-    are skipped, not errors.
+    Returns the captured bindings (name -> value). Captures keep their
+    JSON type (ADR-0011): an int id stays an int, so a later whole-value
+    `${NAME}` substitution compares typed values. Missing values are
+    skipped, not errors.
     """
-    out: dict[str, str] = {}
+    out: dict[str, Any] = {}
     for name, spec in capture.items():
         source = spec.get("from")
         if source == "header":
@@ -132,7 +154,7 @@ def capture_bindings(
                     found = False
                     break
             if found and isinstance(cur, (str, int, float, bool)):
-                out[name] = str(cur)
+                out[name] = cur
     return out
 
 
@@ -156,7 +178,7 @@ class SetupContext:
     """
 
     auth_token: str | None = None
-    bindings: dict[str, str] = field(default_factory=dict)
+    bindings: dict[str, Any] = field(default_factory=dict)
     known_names: set[str] = field(default_factory=set)
     # Set by the proactive credential provider; beats the fixture token.
     _provided_token: str | None = field(default=None, repr=False)
@@ -169,7 +191,7 @@ class SetupContext:
     # (populated by provide_token()). The executor copies these onto the
     # ProbeResult so build_evidence_record can collect them from the
     # results instead of trusting the caller to pass them in.
-    run_captures: dict[str, str] = field(default_factory=dict, repr=False)
+    run_captures: dict[str, Any] = field(default_factory=dict, repr=False)
     run_minted: list[str] = field(default_factory=list, repr=False)
     # Set by a harness_app setup step (WO-5): subsequent setup steps and
     # the probe's act target the harness app instead of the provisioned
@@ -196,7 +218,7 @@ class SetupContext:
         """Register every capture name declared by the setup steps."""
         self.declare(collect_capture_names(setup_steps))
 
-    def add(self, new: dict[str, str]) -> None:
+    def add(self, new: dict[str, Any]) -> None:
         """Add captured bindings (later captures overwrite earlier ones).
 
         AUTH_TOKEN is special: the fixture's token (or a provider-issued

@@ -501,7 +501,7 @@ def build_evidence_record(
     # tokens to the ProbeResult (never serialized); we collect them
     # here so a caller that forgets to pass captured_values cannot
     # leak a session token into the committed record.
-    auto_captured: dict[str, str] = {}
+    auto_captured: dict[str, Any] = {}
     auto_minted: list[str] = []
     for _r in (fix_parent_results or []) + (fix_results or []) + (c_results or []):
         for _k, _v in _r.captured_bindings.items():
