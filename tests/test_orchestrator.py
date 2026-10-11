@@ -1348,8 +1348,8 @@ def test_no_auth_app_model_failure(tmp_path):
 def _sandbox_caps():
     """Capability probe for sandbox tests (cached)."""
     try:
-        from proofdeploy.sandbox import capability_probe
-        return capability_probe()
+        from proofdeploy.sandbox import sandbox_evidence
+        return sandbox_evidence()
     except Exception:
         return {}
 
@@ -1464,6 +1464,178 @@ def test_sandboxed_end_to_end_orchestrator(tmp_path):
     assert evidence["sandboxed"] is True
     assert evidence["measured_result"] is True
     assert evidence["sandbox_evidence"]
+
+
+# S4 (Addendum 15): the sandbox install must persist into the app container.
+# The app imports a third-party package (six) from a hash-pinned
+# requirements.txt. On the buggy code the install runs in a --rm container
+# whose site-packages are discarded, so the app crashes on `import six`
+# and neither side becomes READY.
+
+MINI_APP_WITH_DEP = '''\
+import json
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import six
+
+VALUE = __VALUE__
+SIX_VERSION = six.__version__
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._json(200, {"ok": True})
+        elif self.path == "/value":
+            self._json(200, {"v": VALUE, "six": SIX_VERSION})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def log_message(self, *args):
+        pass
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+'''
+
+# Hash-pinned lockfile: `pip hash` of the six 1.17.0 sdist and wheel.
+SIX_REQUIREMENTS = """\
+six==1.17.0 \\
+    --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 \\
+    --hash=sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81
+"""
+
+
+def make_mini_repo_with_dep(root: Path) -> dict[str, str]:
+    """Mini app repo whose app imports a third-party package.
+
+    base (VALUE=1) -> bug (VALUE=2) -> fix (VALUE=1), all with a
+    hash-pinned requirements.txt declaring six.
+    """
+    repo = root / "mini-app-dep"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@test")
+    (repo / "requirements.txt").write_text(SIX_REQUIREMENTS)
+    (repo / "proofdeploy.yml").write_text(MINI_YML)
+    shas = {}
+    for tag, value in (("base", 1), ("bug", 2), ("fix", 1)):
+        (repo / "app.py").write_text(
+            MINI_APP_WITH_DEP.replace("__VALUE__", str(value))
+        )
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", tag)
+        shas[tag] = _git(repo, "rev-parse", "HEAD")
+    return {"repo": str(repo), **shas}
+
+
+def make_mini_repo_broken_start(root: Path) -> dict[str, str]:
+    """Mini app repo whose app crashes on startup with a marker."""
+    repo = root / "mini-app-broken"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@test")
+    (repo / "requirements.txt").write_text("# no third-party deps\n")
+    (repo / "proofdeploy.yml").write_text(MINI_YML)
+    (repo / "app.py").write_text(
+        'raise RuntimeError("S4-FORCED-START-FAILURE-marker")\n'
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    return {"repo": str(repo), "base": _git(repo, "rev-parse", "HEAD")}
+
+
+@requires_sandbox
+def test_sandboxed_provision_keeps_installed_dependencies(tmp_path):
+    """S4: the sandbox install must persist into the app container.
+
+    The app imports six from a hash-pinned requirements.txt. Asserts
+    both sides READY, the lockfile hash recorded on both sides, probe
+    results, and the score.
+    """
+    import hashlib
+
+    info = make_mini_repo_with_dep(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-sandbox-dep",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["parent_ready"] is True
+    assert summary["fix_ready"] is True
+    assert summary["verdict"] in ("candidate_catch", "no_catch")
+    assert summary["probe_count"] == 1
+
+    records = read_records(out)
+    evidence = records[0]
+    expected_sha = hashlib.sha256(SIX_REQUIREMENTS.encode()).hexdigest()
+    for side in ("fix_parent_provision", "fix_provision"):
+        prov = evidence[side]
+        assert prov["status"] == "ready", prov["reason"]
+        assert prov["lockfile_sha256"] == expected_sha
+        assert prov["runtime"] == "python"
+        assert prov["runtime_version"]
+        assert prov["image_digest"]
+    assert evidence["sandboxed"] is True
+    assert evidence["measured_result"] is True
+
+
+@requires_sandbox
+def test_sandboxed_failed_start_captures_app_log(tmp_path):
+    """S4/S2: a crashing app's output must land in the provision logs.
+
+    The app raises with a distinctive marker on startup. The readiness
+    check times out; the provision logs must contain the marker from the
+    app container's stderr. S3: runtime facts are populated on failure.
+    """
+    from proofdeploy.orchestrator import _free_port
+    from proofdeploy.runner import ProvisionStatus
+
+    info = make_mini_repo_broken_start(tmp_path)
+    unit_dir = tmp_path / "unit"
+    unit_dir.mkdir()
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=tmp_path / "records",
+        workdir=tmp_path / "work",
+        skill_path=skill_path(),
+        public_contract_env_keys=["APP_ENV"],
+    )
+    orch = Orchestrator(cfg)
+    side = orch._provision_side_sandbox(
+        info["base"], _free_port(), unit_dir, "broken"
+    )
+    assert side.provision.status == ProvisionStatus.START_FAILED
+    logs = "\n".join(side.provision.logs)
+    assert "S4-FORCED-START-FAILURE-marker" in logs
+    assert side.provision.runtime == "python"
+    assert side.provision.runtime_version
+    assert side.provision.image_digest
+    assert side.sandbox_evidence
 
 
 def test_target_process_group_killed(tmp_path):
