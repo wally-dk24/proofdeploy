@@ -475,8 +475,11 @@ def test_evidence_record_carries_provenance():
         "capability_probe": {"userns_remap": True},
     }
     record = build_evidence_record(run_kind="bug", provenance=prov)
-    assert record["provenance"] == prov
-    assert build_evidence_record(run_kind="bug")["provenance"] == {}
+    # Caller provenance is carried verbatim; the harness object
+    # (Addendum 24) is computed and added alongside it.
+    assert {k: record["provenance"][k] for k in prov} == prov
+    assert record["provenance"]["harness"]["source"] == "git"
+    assert set(build_evidence_record(run_kind="bug")["provenance"]) == {"harness"}
 
 
 def test_measure_bug_no_skill_arm_end_to_end(tmp_path):
