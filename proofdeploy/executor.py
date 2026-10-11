@@ -136,7 +136,7 @@ class ProbeResult:
     # minted_tokens holds provider-issued tokens. These are NEVER
     # serialized by to_dict(): build_evidence_record collects them from
     # the results instead of trusting the caller to pass them in.
-    captured_bindings: dict[str, str] = field(default_factory=dict, repr=False)
+    captured_bindings: dict[str, Any] = field(default_factory=dict, repr=False)
     minted_tokens: list[str] = field(default_factory=list, repr=False)
     # Whether the probe was actually sent to the target. Invalid author
     # blocks are never sent; their results are reported individually as
@@ -315,8 +315,28 @@ def _check_assertion(
 
     if atype == "body":
         if "equals" in assertion:
-            ok = body == assertion["equals"]
-            return ok, f"body equals -> {'PASS' if ok else 'FAIL'}", None
+            expected = assertion["equals"]
+            if isinstance(expected, str):
+                # Raw text comparison for string expectations.
+                ok = body == expected
+                return ok, f"body equals -> {'PASS' if ok else 'FAIL'}", None
+            # Non-string expectation: compare parsed JSON values. The
+            # registered prompt documents {"equals": ...} without limiting
+            # it to strings, so {"equals": {}} must match a body of {}.
+            try:
+                actual = json.loads(body)
+            except json.JSONDecodeError:
+                return (
+                    False,
+                    "body equals: body is not valid JSON -> FAIL",
+                    None,
+                )
+            ok = actual == expected
+            return (
+                ok,
+                f"body equals (json): got {actual!r} -> {'PASS' if ok else 'FAIL'}",
+                None,
+            )
         if "contains" in assertion:
             ok = assertion["contains"] in body
             return ok, f"body contains -> {'PASS' if ok else 'FAIL'}", None

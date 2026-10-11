@@ -243,6 +243,26 @@ def _is_secret_key(key: str) -> bool:
     return any(p in kl or p.replace("_", "") in flat for p in _SECRET_KEY_SUBSTRINGS)
 
 
+def _capture_secret_text(value: Any) -> str | None:
+    """Text form of a captured value for secret collection, or None.
+
+    Captures keep their JSON type (ADR-0011): strings are collected
+    as-is; non-bool ints/floats are collected in their text form
+    (``str`` for int, ``json.dumps`` for float) so a numeric session
+    id, OTP, or API key is redacted exactly as it was when captures
+    were strings. Bools and non-scalars are not collected.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return json.dumps(value)
+    return None
+
+
 def collect_secret_values(
     *,
     fixture: dict[str, Any] | None = None,
@@ -253,7 +273,8 @@ def collect_secret_values(
     """Collect every secret value that must be redacted from a record.
 
     - Fixture and contract-env values whose KEY looks secret.
-    - Every captured binding value (tokens, session ids from setup).
+    - Every captured binding value (tokens, session ids from setup),
+      including numeric captures in their text form.
     - Every minted token (credential provider output).
     Values shorter than _MIN_SECRET_LEN are skipped.
     """
@@ -263,8 +284,9 @@ def collect_secret_values(
             if isinstance(k, str) and _is_secret_key(k) and isinstance(v, str):
                 values.append(v)
     for v in (captured or {}).values():
-        if isinstance(v, str):
-            values.append(v)
+        text = _capture_secret_text(v)
+        if text is not None:
+            values.append(text)
     for v in minted_tokens or []:
         if isinstance(v, str):
             values.append(v)
@@ -288,7 +310,10 @@ def collect_record_secret_values(record: dict[str, Any]) -> list[str]:
 
     Non-string fixture/contract-env values (ints, bools) are kept as-is
     and are not secret-collected: replacing a number everywhere would
-    shred innocent text (ports, status codes).
+    shred innocent text (ports, status codes). Captured values are the
+    exception: they keep their JSON type (ADR-0011), and numeric
+    captures are collected in their text form — a capture is a value
+    the target handed back during setup, not configuration.
     """
     values: list[str] = []
     public_fixture = set(record.get("public_fixture_keys") or [])
@@ -306,8 +331,9 @@ def collect_record_secret_values(record: dict[str, Any]) -> list[str]:
     captured = record.get("captured_values") or {}
     if isinstance(captured, dict):
         for v in captured.values():
-            if isinstance(v, str):
-                values.append(v)
+            text = _capture_secret_text(v)
+            if text is not None:
+                values.append(text)
     minted = record.get("minted_tokens") or []
     if isinstance(minted, list):
         for v in minted:
@@ -328,6 +354,7 @@ class SecretRedactor:
     def __init__(self, secret_values: Iterable[str] | None = None):
         vals = [v for v in (secret_values or []) if v and len(v) >= _MIN_SECRET_LEN]
         self._values = sorted(set(vals), key=len, reverse=True)
+        self._value_set = set(self._values)
 
     def _redact_string(self, s: str) -> str:
         for v in self._values:
@@ -355,6 +382,13 @@ class SecretRedactor:
             return [self.redact(v) for v in obj]
         if isinstance(obj, str):
             return self._redact_string(obj)
+        if isinstance(obj, (int, float)) and not isinstance(obj, bool):
+            # A numeric leaf whose text form is a collected secret (a
+            # typed capture, e.g. in ``captured_values`` itself) becomes
+            # the redaction marker: no plaintext form survives anywhere.
+            text = _capture_secret_text(obj)
+            if text is not None and text in self._value_set:
+                return REDACTED
         return obj
 
 
@@ -468,8 +502,9 @@ def build_evidence_record(
     public_fixture_keys: list[str] | None = None,
     public_contract_env_keys: list[str] | None = None,
     # Every capture binding collected during the run (name -> value):
-    # all values are secret-collected.
-    captured_values: dict[str, str] | None = None,
+    # all values are secret-collected. Captures keep their JSON type
+    # (ADR-0011); numeric captures are collected in text form.
+    captured_values: dict[str, Any] | None = None,
     # Every token minted by the credential provider during the run:
     # all are secret-collected.
     minted_tokens: list[str] | None = None,
@@ -501,7 +536,7 @@ def build_evidence_record(
     # tokens to the ProbeResult (never serialized); we collect them
     # here so a caller that forgets to pass captured_values cannot
     # leak a session token into the committed record.
-    auto_captured: dict[str, str] = {}
+    auto_captured: dict[str, Any] = {}
     auto_minted: list[str] = []
     for _r in (fix_parent_results or []) + (fix_results or []) + (c_results or []):
         for _k, _v in _r.captured_bindings.items():

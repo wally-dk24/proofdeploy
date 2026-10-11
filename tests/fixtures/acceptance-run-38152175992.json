@@ -1,0 +1,138 @@
+{
+ "parsed_probes": [
+  {
+   "setup": [
+    {
+     "type": "http",
+     "act": {
+      "method": "POST",
+      "path": "/items",
+      "headers": {
+       "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"testitem\"}"
+     },
+     "capture": {
+      "ITEM_ID": {
+       "from": "body",
+       "json_path": "id"
+      }
+     }
+    }
+   ],
+   "act": {
+    "method": "GET",
+    "path": "/items/${ITEM_ID}"
+   },
+   "assert": [
+    {
+     "type": "status",
+     "equals": 200
+    },
+    {
+     "type": "body",
+     "json_path": {
+      "path": "id",
+      "equals": "${ITEM_ID}"
+     }
+    },
+    {
+     "type": "body",
+     "json_path": {
+      "path": "name",
+      "equals": "testitem"
+     }
+    }
+   ]
+  },
+  {
+   "setup": [
+    {
+     "type": "http",
+     "act": {
+      "method": "POST",
+      "path": "/items",
+      "headers": {
+       "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"anotheritem\"}"
+     },
+     "capture": {
+      "IGNORED_ID": {
+       "from": "body",
+       "json_path": "id"
+      }
+     }
+    }
+   ],
+   "act": {
+    "method": "GET",
+    "path": "/items/999999"
+   },
+   "assert": [
+    {
+     "type": "status",
+     "equals": 200
+    },
+    {
+     "type": "body",
+     "equals": {}
+    }
+   ]
+  }
+ ],
+ "sides": {
+  "fix_parent_results": [
+   {
+    "probe_index": 0,
+    "http_status": 200,
+    "http_headers": {
+     "server": "Werkzeug/3.1.9 Python/3.12.15",
+     "date": "Sun, 11 Oct 2026 15:41:12 GMT",
+     "content-type": "application/json",
+     "content-length": "27",
+     "connection": "close"
+    },
+    "http_body": "{\"id\":1,\"name\":\"testitem\"}\n"
+   },
+   {
+    "probe_index": 1,
+    "http_status": 200,
+    "http_headers": {
+     "server": "Werkzeug/3.1.9 Python/3.12.15",
+     "date": "Sun, 11 Oct 2026 15:41:12 GMT",
+     "content-type": "application/json",
+     "content-length": "3",
+     "connection": "close"
+    },
+    "http_body": "{}\n"
+   }
+  ],
+  "fix_results": [
+   {
+    "probe_index": 0,
+    "http_status": 200,
+    "http_headers": {
+     "server": "Werkzeug/3.1.9 Python/3.12.15",
+     "date": "Sun, 11 Oct 2026 15:41:12 GMT",
+     "content-type": "application/json",
+     "content-length": "27",
+     "connection": "close"
+    },
+    "http_body": "{\"id\":1,\"name\":\"testitem\"}\n"
+   },
+   {
+    "probe_index": 1,
+    "http_status": 404,
+    "http_headers": {
+     "server": "Werkzeug/3.1.9 Python/3.12.15",
+     "date": "Sun, 11 Oct 2026 15:41:12 GMT",
+     "content-type": "application/json",
+     "content-length": "22",
+     "connection": "close"
+    },
+    "http_body": "{\"error\":\"not found\"}\n"
+   }
+  ]
+ }
+}
