@@ -744,6 +744,17 @@ def test_inconclusive_sandboxed_counts(tmp_path, monkeypatch):
         "proofdeploy.orchestrator.assert_measurement_gate",
         lambda: fake_probe,
     )
+    # The harness gate has its own tests (Addendum 24/25); stub it so
+    # this test does not depend on the working tree being clean.
+    monkeypatch.setattr(
+        "proofdeploy.orchestrator.assert_harness_commit_gate",
+        lambda: {
+            "commit": "0" * 40,
+            "source": "git",
+            "dirty": False,
+            "workflow_ref": None,
+        },
+    )
 
     def failing_runner(prompt: str):
         raise ModelCallError("overflow", cause="model_overflow")
@@ -1154,6 +1165,18 @@ def test_sandboxed_crash_records_measured(tmp_path, monkeypatch):
     import proofdeploy.orchestrator as orch_mod
 
     monkeypatch.setattr(orch_mod, "assert_measurement_gate", lambda: {})
+    # The harness gate has its own tests (Addendum 24/25); stub it so
+    # this test does not depend on the working tree being clean.
+    monkeypatch.setattr(
+        orch_mod,
+        "assert_harness_commit_gate",
+        lambda: {
+            "commit": "0" * 40,
+            "source": "git",
+            "dirty": False,
+            "workflow_ref": None,
+        },
+    )
     info = make_mini_repo(tmp_path)
     out = tmp_path / "records"
     work = tmp_path / "work"
@@ -1212,6 +1235,18 @@ def test_sandboxed_clean_run_records_measured(tmp_path, monkeypatch):
     import proofdeploy.orchestrator as orch_mod
 
     monkeypatch.setattr(orch_mod, "assert_measurement_gate", lambda: {})
+    # The harness gate has its own tests (Addendum 24/25); stub it so
+    # this test does not depend on the working tree being clean.
+    monkeypatch.setattr(
+        orch_mod,
+        "assert_harness_commit_gate",
+        lambda: {
+            "commit": "0" * 40,
+            "source": "git",
+            "dirty": False,
+            "workflow_ref": None,
+        },
+    )
 
     from proofdeploy.runner import ProvisionResult, ProvisionStatus
 
