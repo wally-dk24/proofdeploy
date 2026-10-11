@@ -905,6 +905,21 @@ class Orchestrator:
             )
 
         runtime_name = _detect_runtime(snapshot.dir)
+        # S1 (Addendum 15): fail closed for ecosystems the sandbox does
+        # not support yet. Never half-provision (e.g. running a Node
+        # app's start command with no install at all).
+        if runtime_name != "python":
+            logs.append(f"sandbox: runtime {runtime_name!r} not yet supported")
+            provision = ProvisionResult(
+                status=ProvisionStatus.BUILD_FAILED,
+                reason="not yet supported in the sandbox",
+                logs=logs,
+                runtime=runtime_name,
+            )
+            return _Side(
+                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+                contract=contract, provision=provision,
+            )
         image = SANDBOX_IMAGES.get(runtime_name, SANDBOX_IMAGES["python"])
         logs.append(f"sandbox image: {image} (runtime {runtime_name})")
         # Item 5: fail closed when the image's runtime doesn't satisfy the
@@ -956,69 +971,131 @@ class Orchestrator:
             if k in cfg.public_contract_env_keys
         }
 
+        # S1 (Addendum 15): one install path. The sandbox uses the
+        # provisioner's lockfile selection and frozen-install rules, run
+        # inside the container. The old code ran `pip install` in a --rm
+        # install container, installing into that container's own
+        # site-packages, which were discarded when it exited; the app
+        # container then started without the dependencies and never
+        # became ready. The venv lives INSIDE the checkout
+        # (/checkout/.venv), which is a bind mount shared by every
+        # container, so it persists from install to app start.
+        from proofdeploy.runner import check_requirements_frozen, find_lockfile
+
+        found = find_lockfile(snapshot.dir, "python")
+        if found is None:
+            logs.append("no frozen lockfile found for python")
+            return self._sandbox_failed_side(
+                sb, rev, sha, snapshot, contract, logs,
+                ProvisionStatus.BUILD_FAILED,
+                "no frozen lockfile found in snapshot for runtime 'python'",
+                runtime_name, image_version, image_digest, None,
+            )
+        lockfile_name, lockfile_sha = found
+        logs.append(f"lockfile: {lockfile_name} sha256: {lockfile_sha[:16]}...")
+        # Fail closed for lockfiles the sandbox pip flow cannot install.
+        if lockfile_name != "requirements.txt":
+            logs.append(f"sandbox: lockfile {lockfile_name} not yet supported")
+            return self._sandbox_failed_side(
+                sb, rev, sha, snapshot, contract, logs,
+                ProvisionStatus.BUILD_FAILED, "not yet supported in the sandbox",
+                runtime_name, image_version, image_digest, lockfile_sha,
+            )
+        not_frozen = check_requirements_frozen(
+            snapshot.dir / "requirements.txt"
+        )
+        if not_frozen is not None:
+            logs.append(not_frozen)
+            return self._sandbox_failed_side(
+                sb, rev, sha, snapshot, contract, logs,
+                ProvisionStatus.BUILD_FAILED, not_frozen,
+                runtime_name, image_version, image_digest, lockfile_sha,
+            )
+
+        req_text = (snapshot.dir / lockfile_name).read_text(encoding="utf-8")
+        pip_flags = "--require-hashes --no-deps" if "--hash" in req_text else "--no-deps"
+        install_cmds = [
+            "python3 -m venv /checkout/.venv",
+            f"/checkout/.venv/bin/pip install {pip_flags} -r /checkout/{lockfile_name}",
+        ]
+        # Contract steps in order (build, migrate, seed), each with the
+        # venv first on PATH so the installed dependencies are used.
+        for step_name in ("build", "migrate", "seed"):
+            step_cmd = getattr(contract, step_name, None)
+            if step_cmd:
+                install_cmds.append(
+                    f"export PATH=/checkout/.venv/bin:$PATH && {step_cmd}"
+                )
+        # PIP_NO_CACHE_DIR=1: pip warns the cache dir isn't writable as
+        # the sandbox user; the venv removes the running-as-root warning.
+        install_env = dict(secret_free_env)
+        install_env["PIP_NO_CACHE_DIR"] = "1"
         proxy_env = {k: v for k, v in os.environ.items() if "proxy" in k.lower()}
-        install_cmds = []
-        if contract.build:
-            install_cmds.append(contract.build)
-        # Python: install the lockfile into the checkout.
-        lockfile = snapshot.dir / "requirements.txt"
-        if lockfile.is_file():
-            install_cmds.insert(0, "pip install --quiet -r requirements.txt")
-        if contract.migrate:
-            install_cmds.append(contract.migrate)
         if not sb.install(
-            snapshot.dir, install_cmds, secret_free_env, proxy_env, timeout=600
+            snapshot.dir, install_cmds, install_env, proxy_env, timeout=600
         ):
             logs.extend(sb.log)
-            provision = ProvisionResult(
-                status=ProvisionStatus.BUILD_FAILED,
-                reason="sandbox install failed",
-                logs=logs,
-            )
-            return _Side(
-                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
-                contract=contract, provision=provision,
+            logs.append("sandbox install failed")
+            return self._sandbox_failed_side(
+                sb, rev, sha, snapshot, contract, logs,
+                ProvisionStatus.BUILD_FAILED, "sandbox install failed",
+                runtime_name, image_version, image_digest, lockfile_sha,
             )
         logs.extend(sb.log)
+        sb.log.clear()
 
+        app_name = f"pd-{tag}-{sha[:8]}"
+        # The app runs with the venv first on PATH.
+        start_cmd = f"export PATH=/checkout/.venv/bin:$PATH && {contract.start}"
         try:
             app = sb.start(
                 snapshot.dir,
-                contract.start,
+                start_cmd,
                 secret_free_env,
                 port,
-                name=f"pd-{tag}-{sha[:8]}",
+                name=app_name,
             )
+            logs.extend(sb.log)
+            sb.log.clear()
         except Exception as e:
+            logs.extend(sb.log)
             logs.append(f"sandbox start failed: {e}")
-            provision = ProvisionResult(
-                status=ProvisionStatus.START_FAILED,
-                reason=str(e)[:200],
-                logs=logs,
-            )
-            return _Side(
-                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
-                contract=contract, provision=provision,
+            # S2: capture the app container's output for diagnosis.
+            app_log = sb.app_logs(app_name)
+            if app_log:
+                logs.append(f"app container log tail:\n{app_log}")
+            return self._sandbox_failed_side(
+                sb, rev, sha, snapshot, contract, logs,
+                ProvisionStatus.START_FAILED, str(e)[:200],
+                runtime_name, image_version, image_digest, lockfile_sha,
             )
         if not app.wait_ready(contract.readiness or "/health", timeout=120):
+            # S2: the record must say more than "not ready". Capture the
+            # app container's stdout/stderr tail before stopping it
+            # (stop removes the container).
+            app_log = sb.app_logs(app.name)
+            if app_log:
+                logs.append(f"app container log tail:\n{app_log}")
             logs.append("sandbox app not ready")
             app.stop()
-            provision = ProvisionResult(
-                status=ProvisionStatus.START_FAILED,
-                reason="readiness timeout",
-                logs=logs,
+            return self._sandbox_failed_side(
+                sb, rev, sha, snapshot, contract, logs,
+                ProvisionStatus.START_FAILED, "readiness timeout",
+                runtime_name, image_version, image_digest, lockfile_sha,
             )
-            return _Side(
-                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
-                contract=contract, provision=provision,
-            )
+        # S2: log tail on success too, for the record.
+        app_log = sb.app_logs(app.name)
+        if app_log:
+            logs.append(f"app container log tail:\n{app_log}")
         logs.append(f"sandbox app READY at {app.target_url}")
         provision = ProvisionResult(
             status=ProvisionStatus.READY,
             target_url=app.target_url,
             logs=logs,
+            lockfile_sha256=lockfile_sha,
             runtime=runtime_name,
             runtime_version=image_version,
+            package_manager="pip",
             run_id=f"sandbox-{tag}-{sha[:8]}",
         )
         provision.image_digest = image_digest
@@ -1029,6 +1106,42 @@ class Orchestrator:
             rev=rev, sha=sha, snapshot_dir=snapshot.dir,
             contract=contract, provision=provision,
             sandbox_evidence=dict(app.sandbox_evidence),
+        )
+
+    def _sandbox_failed_side(
+        self,
+        sb: Sandbox,
+        rev: str,
+        sha: str,
+        snapshot: Any,
+        contract: RepoContract,
+        logs: list[str],
+        status: ProvisionStatus,
+        reason: str,
+        runtime_name: str,
+        image_version: str | None,
+        image_digest: str | None,
+        lockfile_sha256: str | None,
+    ) -> _Side:
+        """Build a failed sandbox _Side with runtime facts populated (S3).
+
+        Runtime, version, digest, lockfile hash and isolation evidence are
+        recorded on every outcome, not just on success.
+        """
+        provision = ProvisionResult(
+            status=status,
+            reason=reason,
+            logs=logs,
+            runtime=runtime_name,
+            runtime_version=image_version,
+            lockfile_sha256=lockfile_sha256,
+            package_manager="pip",
+        )
+        provision.image_digest = image_digest
+        return _Side(
+            rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+            contract=contract, provision=provision,
+            sandbox_evidence=sb.isolation_evidence_best_effort(),
         )
 
     def _credential_config(self, side: _Side) -> dict[str, Any] | None:

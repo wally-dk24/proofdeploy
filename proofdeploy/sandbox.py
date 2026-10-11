@@ -570,11 +570,17 @@ class Sandbox:
                 "--security-opt=no-new-privileges"]
 
     def _common_args(
-        self, checkout: Path, name: str, with_network: bool, detach: bool = False
+        self, checkout: Path, name: str, with_network: bool, detach: bool = False,
+        rm: bool = True,
     ) -> list[str]:
         cmd = ["run", "-d"] if detach else ["run"]
-        args = _podman_base() + cmd + [
-            "--rm",
+        args = _podman_base() + cmd
+        # S2: app containers keep --rm off so `podman logs` can diagnose
+        # a crash after the fact; app.stop() (rm -f) cleans up.
+        # One-shot install containers keep --rm.
+        if rm:
+            args += ["--rm"]
+        args += [
             "--name",
             name,
         ]
@@ -706,6 +712,38 @@ class Sandbox:
         app.sandbox_evidence = self._isolation_evidence(mode)
         return app
 
+    def isolation_evidence_best_effort(self) -> dict[str, object]:
+        """Isolation evidence even when the app never started (S3).
+
+        Never raises; returns {} when the network mode cannot be
+        resolved (e.g. the sandbox was never usable on this host).
+        """
+        try:
+            mode = self._resolve_network_mode()
+        except Exception:
+            return {}
+        return dict(self._isolation_evidence(mode))
+
+    def app_logs(self, name: str, tail_lines: int = 100) -> str:
+        """Tail of a container's stdout+stderr, for failure diagnosis (S2).
+
+        Never raises; returns "" when the logs cannot be read (e.g. the
+        container never existed).
+        """
+        try:
+            proc = subprocess.run(
+                _podman_base() + ["logs", "--tail", str(tail_lines), name],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        if proc.returncode != 0:
+            return ""
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return out[-8000:]
+
     def _isolation_evidence(self, app_mode: str) -> dict[str, object]:
         """Isolation actually in effect, for the evidence record."""
         uid = 0 if self.userns_mode == "userns-remap" else 65534
@@ -725,7 +763,9 @@ class Sandbox:
         run_env: dict[str, str],
         name: str,
     ) -> SandboxApp:
-        args = self._common_args(checkout, name, False, detach=True)
+        # S2: no --rm (see _common_args): the container must persist so
+        # a crash can be diagnosed from its logs; stop() removes it.
+        args = self._common_args(checkout, name, False, detach=True, rm=False)
         for k, v in _strip_secret_env(run_env).items():
             args += ["-e", f"{k}={v}"]
         args += [self.config.image, "bash", "-c", command]
@@ -778,8 +818,10 @@ class Sandbox:
             f"/checkout/{_BRIDGE_SOCK_NAME} {port} &); "
             f"{command}"
         )
+        # S2: no --rm: the container must persist so a crash can be
+        # diagnosed from its logs; app.stop() (rm -f) cleans up.
         args = _podman_base() + [
-            "run", "-d", "--rm", "--name", name, "--net=none",
+            "run", "-d", "--name", name, "--net=none",
         ]
         args += self._user_args()
         args += ["-v", f"{checkout}:/checkout", "-w", "/checkout"]

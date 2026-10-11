@@ -1354,9 +1354,24 @@ def _sandbox_caps():
         return {}
 
 
+def _sandbox_usable() -> bool:
+    """True when this host can actually run the sandbox.
+
+    Podman alone is not enough: the install phase needs a build
+    network, and the default fail-closed mode needs userns remapping.
+    """
+    caps = _sandbox_caps()
+    return bool(
+        caps.get("podman") and caps.get("userns_remap") and caps.get("build_network")
+    )
+
+
 requires_sandbox = pytest.mark.skipif(
-    not _sandbox_caps().get("podman", False),
-    reason="no container runtime: sandboxed orchestrator test needs podman",
+    not _sandbox_usable(),
+    reason=(
+        "sandbox not usable on this host: needs podman, userns remapping, "
+        "and a build network (runs in the sandbox-tests CI job)"
+    ),
 )
 
 
