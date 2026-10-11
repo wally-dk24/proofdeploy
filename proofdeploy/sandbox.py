@@ -38,9 +38,11 @@ future work.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -74,9 +76,10 @@ def _strip_secret_env(env: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k not in _SECRET_ENV_BLOCKLIST}
 
 
-# Unix socket (in the shared checkout) bridging the executor to an
-# app in a --net=none container.
-_BRIDGE_SOCK_NAME = ".pd-app.sock"
+# Unix socket bridging the executor to an app in a --net=none
+# container. Lives in a short per-run dir under /tmp (bind-mounted
+# at /pd-sock), NOT in the checkout: AF_UNIX paths are limited to
+# 107 bytes on Linux, and checkout paths in CI exceed that.
 _BRIDGE_SCRIPT_NAME = ".pd-bridge.py"
 
 # Python TCP->Unix-socket bridge run inside the --net=none container.
@@ -796,12 +799,22 @@ class Sandbox:
         port: int,
         name: str,
     ) -> SandboxApp:
-        # Bridge script + socket path inside the shared checkout.
-        sock_path = checkout / _BRIDGE_SOCK_NAME
+        # B2 (Addendum 16): the bridge Unix socket must live on a
+        # SHORT host path. AF_UNIX paths are limited to 107 bytes on
+        # Linux; the checkout path in CI is 121 chars, so a socket
+        # inside the checkout can never be connected to. Use a short
+        # per-run dir under /tmp instead, bind-mounted at /pd-sock.
+        sock_dir = Path(tempfile.mkdtemp(prefix="pd-", dir="/tmp"))
+        os.chmod(sock_dir, 0o777)
+        sock_path = sock_dir / "app.sock"
+        if len(str(sock_path).encode()) > 100:
+            raise SandboxError(
+                f"bridge socket path too long: {sock_path}"
+            )
+        # Bridge script lives in the checkout (path length doesn't
+        # matter for a regular file).
         script_path = checkout / _BRIDGE_SCRIPT_NAME
         script_path.write_text(_BRIDGE_SCRIPT, encoding="utf-8")
-        if sock_path.exists():
-            sock_path.unlink()
         # The script was written after _prepare_checkout's chmod; make it
         # readable by the sandbox user.
         try:
@@ -812,10 +825,11 @@ class Sandbox:
         except (OSError, subprocess.TimeoutExpired):
             pass
         # The app binds to the container's own loopback (isolated).
-        # The bridge forwards the Unix socket to it.
+        # The bridge forwards the Unix socket at /pd-sock/app.sock
+        # to it.
         wrapped = (
             f"(python3 /checkout/{_BRIDGE_SCRIPT_NAME} "
-            f"/checkout/{_BRIDGE_SOCK_NAME} {port} &); "
+            f"/pd-sock/app.sock {port} &); "
             f"{command}"
         )
         # S2: no --rm: the container must persist so a crash can be
@@ -825,6 +839,8 @@ class Sandbox:
         ]
         args += self._user_args()
         args += ["-v", f"{checkout}:/checkout", "-w", "/checkout"]
+        # The short socket dir, visible to both host and container.
+        args += ["-v", f"{sock_dir}:/pd-sock"]
         for host_path, container_path in self.config.extra_mounts:
             args += ["-v", f"{host_path}:{container_path}:ro"]
         for k, v in _strip_secret_env(run_env).items():
@@ -832,7 +848,22 @@ class Sandbox:
         args += [self.config.image, "bash", "-c", wrapped]
         ok, reason = _run(args, 60, self.log)
         if not ok:
+            self._cleanup_sock_dir(sock_dir)
             raise SandboxError(f"sandbox start failed: {reason}")
+        # B2: verify the bridge socket becomes ready. Fail fast with
+        # the container's logs (and the last connect error) instead
+        # of a silent 120s readiness timeout.
+        last_err = self._wait_for_socket(sock_path, name, timeout=15)
+        if last_err is not None:
+            app_log = self.app_logs(name)
+            self.stop(name)
+            self._cleanup_sock_dir(sock_dir)
+            raise SandboxError(
+                "sandbox start: bridge socket "
+                f"{sock_path.name} never became ready: {last_err}. "
+                f"Container log tail:\n{app_log[-2000:] if app_log else '(empty)'}"
+            )
+        self.log.append(f"bridge socket ready: {sock_path}")
         # Host-side TCP proxy: executor -> Unix socket.
         proxy = _TcpToUnixProxy(sock_path)
         proxy.start()
@@ -845,7 +876,62 @@ class Sandbox:
             sandbox=self,
             target_url=f"http://127.0.0.1:{proxy.port}",
             _proxy=proxy,
+            _bridge_sock=sock_path,
+            _bridge_sock_dir=sock_dir,
         )
+
+    def _cleanup_sock_dir(self, sock_dir: Path) -> None:
+        """Remove a per-run bridge socket dir (best effort)."""
+        try:
+            shutil.rmtree(sock_dir, ignore_errors=True)
+        except OSError:
+            pass
+
+    def _wait_for_socket(
+        self, sock_path: Path, container_name: str, timeout: int = 15
+    ) -> str | None:
+        """Wait for the bridge socket to appear and accept connections.
+
+        Returns None on success, or the last connect error message on
+        timeout. The caller reports the error (never a generic
+        message) so the real cause is visible.
+        """
+        import socket as _socket
+        import stat
+
+        last_err = "socket file never appeared"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if sock_path.exists():
+                try:
+                    if stat.S_ISSOCK(sock_path.stat().st_mode):
+                        # Verify someone is actually listening.
+                        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                        s.settimeout(2)
+                        try:
+                            s.connect(str(sock_path))
+                            s.close()
+                            return None
+                        except OSError as e:
+                            last_err = (
+                                f"socket present but connect failed: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                        finally:
+                            try:
+                                s.close()
+                            except OSError:
+                                pass
+                    else:
+                        last_err = "path exists but is not a socket"
+                except OSError as e:
+                    last_err = f"stat failed: {type(e).__name__}: {e}"
+            time.sleep(0.5)
+        self.log.append(
+            f"bridge socket {sock_path.name} did not become ready within "
+            f"{timeout}s: {last_err}"
+        )
+        return last_err
 
     def stop(self, name: str) -> None:
         _run(_podman_base() + ["rm", "-f", name], 30, self.log)
@@ -869,16 +955,44 @@ class SandboxApp:
     # Isolation actually in effect for this app (network mode, userns
     # mode, uid). Set by Sandbox.start(); goes in the evidence record.
     sandbox_evidence: dict[str, object] = field(default_factory=dict)
+    # Host path to the bridge Unix socket (none+socket mode only).
+    # Lets the orchestrator distinguish "bridge down" from "app down"
+    # in the readiness record (B2).
+    _bridge_sock: Path | None = None
+    # Host dir holding the bridge socket (per-run, under /tmp).
+    # Removed on stop() so no /tmp/pd-* is left behind.
+    _bridge_sock_dir: Path | None = None
 
     @property
     def port(self) -> int:
         """The executor-facing port (host proxy or container port)."""
         return int(self.target_url.rsplit(":", 1)[1])
 
+    def bridge_socket_present(self) -> bool:
+        """True when the bridge socket exists (none+socket mode).
+
+        For isolated mode (no socket), always True. Lets the
+        orchestrator report "bridge down" vs "app down" separately.
+        """
+        if self._bridge_sock is None:
+            return True
+        try:
+            import stat
+            return stat.S_ISSOCK(self._bridge_sock.stat().st_mode)
+        except OSError:
+            return False
+
     def stop(self) -> None:
         if self._proxy is not None:
             self._proxy.stop()
         self.sandbox.stop(self.name)
+        # Clean up the per-run socket dir on every exit path.
+        if self._bridge_sock_dir is not None:
+            try:
+                shutil.rmtree(self._bridge_sock_dir, ignore_errors=True)
+            except OSError:
+                pass
+            self._bridge_sock_dir = None
 
     def wait_ready(self, path: str = "/health", timeout: int = 60) -> bool:
         """Poll the app's readiness endpoint via the executor path."""

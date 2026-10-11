@@ -5,6 +5,11 @@ alive at the end. This catches the O2 resource leak (target servers left
 running after tests). Scoped to the suite's own processes: only PIDs whose
 working directory is under pytest's tmp root, compared against a baseline
 taken at session start.
+
+B3 (Addendum 16): when PD_REQUIRE_SANDBOX=1 (set in the sandbox-tests
+CI job), sandbox tests must not skip. A skipped sandbox test fails the
+job instead. This catches the T1 miss: the sandboxed end-to-end test
+was silently skipping in CI due to a broken import, hiding real bugs.
 """
 import os
 import subprocess
@@ -47,6 +52,37 @@ def _target_procs(tmp_root: str, baseline: set[str]) -> list[str]:
                 if cwd and cwd.startswith(tmp_root):
                     pids.append(pid)
     return pids
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """B3: with PD_REQUIRE_SANDBOX=1, sandbox skips become failures.
+
+    Runs before pytest's own skip handling (tryfirst). If a test has a
+    skipif marker with a true condition and a sandbox-related reason,
+    fail instead of skipping. This ensures the sandbox-tests CI job
+    actually exercises the sandbox, rather than silently skipping.
+    """
+    if os.environ.get("PD_REQUIRE_SANDBOX") != "1":
+        return
+    for marker in item.iter_markers(name="skipif"):
+        condition = marker.args[0] if marker.args else False
+        # The condition was evaluated at import; a truthy value means
+        # the test would skip.
+        would_skip = bool(condition) if isinstance(condition, bool) else False
+        if not would_skip:
+            continue
+        reason = marker.kwargs.get("reason", "")
+        if any(
+            kw in reason.lower()
+            for kw in ("podman", "sandbox", "bridge", "userns", "container")
+        ):
+            pytest.fail(
+                f"B3: test {item.nodeid} would skip with "
+                f"PD_REQUIRE_SANDBOX=1 (reason: {reason}). "
+                f"Sandbox tests must run in the sandbox-tests job; "
+                f"a skip here hides real bugs."
+            )
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -1346,11 +1346,25 @@ def test_no_auth_app_model_failure(tmp_path):
 
 
 def _sandbox_caps():
-    """Capability probe for sandbox tests (cached)."""
+    """Capability probe for sandbox tests (cached).
+
+    B3: import errors fail loudly. If PD_REQUIRE_SANDBOX=1, an
+    unexpected exception (e.g. a broken import) raises instead of
+    silently returning {} (which would cause a silent skip, hiding
+    real bugs — the T1 miss).
+    """
+    import os
+
     try:
         from proofdeploy.sandbox import sandbox_evidence
         return sandbox_evidence()
+    except ImportError:
+        # Import errors are always loud: a broken import must never
+        # cause a silent skip.
+        raise
     except Exception:
+        if os.environ.get("PD_REQUIRE_SANDBOX") == "1":
+            raise
         return {}
 
 

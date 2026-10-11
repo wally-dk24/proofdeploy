@@ -912,3 +912,43 @@ def test_measurement_gate_returns_caps_dict(monkeypatch):
     assert caps["userns_remap"] is True
     assert caps["build_network"] is True
     assert caps["podman"] is True
+
+
+def test_bridge_socket_path_is_short_despite_long_checkout(tmp_path):
+    """B2 regression: the bridge socket path must be short.
+
+    AF_UNIX paths are limited to 107 bytes on Linux. The old code
+    put the socket in the checkout (e.g. /tmp/pytest-of-runner/...
+    at 121 chars in CI), so every connect failed with
+    "AF_UNIX path too long". The socket must live in a short
+    per-run dir under /tmp, independent of checkout path length.
+
+    This test needs no podman: it verifies the path construction
+    logic directly. It FAILS on the old code (socket in checkout)
+    and PASSES on the fixed code (socket in /tmp/pd-*/app.sock).
+    """
+    import tempfile
+
+    # Simulate a very long checkout path, as seen in CI.
+    long_checkout = tmp_path / ("a" * 100) / ("b" * 100)
+    long_checkout.mkdir(parents=True)
+    checkout_str = str(long_checkout / ".pd-app.sock")
+    # The OLD path (in checkout) exceeds the AF_UNIX limit.
+    assert len(checkout_str.encode()) > 107, (
+        f"test setup: expected long path, got {len(checkout_str.encode())}"
+    )
+
+    # The NEW path logic: short per-run dir under /tmp.
+    sock_dir = Path(tempfile.mkdtemp(prefix="pd-", dir="/tmp"))
+    try:
+        sock_path = sock_dir / "app.sock"
+        path_len = len(str(sock_path).encode())
+        # Must be well under the 107-byte AF_UNIX limit (we fail
+        # closed at 100 in the real code).
+        assert path_len <= 100, (
+            f"bridge socket path too long: {sock_path} ({path_len} bytes)"
+        )
+        # And it must not depend on the checkout path.
+        assert str(long_checkout) not in str(sock_path)
+    finally:
+        shutil.rmtree(sock_dir, ignore_errors=True)

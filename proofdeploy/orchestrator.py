@@ -1017,15 +1017,27 @@ class Orchestrator:
         install_cmds = [
             "python3 -m venv /checkout/.venv",
             f"/checkout/.venv/bin/pip install {pip_flags} -r /checkout/{lockfile_name}",
+            # B2: verify the venv actually works. py_compile doesn't
+            # execute imports, so a broken venv (bad symlinks, missing
+            # site-packages) would only fail at app runtime. Fail fast
+            # here instead.
+            "/checkout/.venv/bin/python -c \"import sys; print(sys.prefix)\"",
         ]
         # Contract steps in order (build, migrate, seed), each with the
-        # venv first on PATH so the installed dependencies are used.
+        # venv's python. Use the explicit venv binary path when the
+        # command starts with `python`; otherwise prepend venv bin to
+        # PATH for that command only.
+        venv_bin = "/checkout/.venv/bin"
         for step_name in ("build", "migrate", "seed"):
             step_cmd = getattr(contract, step_name, None)
             if step_cmd:
-                install_cmds.append(
-                    f"export PATH=/checkout/.venv/bin:$PATH && {step_cmd}"
-                )
+                parts = step_cmd.split(maxsplit=1)
+                if parts[0] in ("python", "python3") and len(parts) == 2:
+                    install_cmds.append(f"{venv_bin}/python {parts[1]}")
+                else:
+                    install_cmds.append(
+                        f"env PATH={venv_bin}:$PATH {step_cmd}"
+                    )
         # PIP_NO_CACHE_DIR=1: pip warns the cache dir isn't writable as
         # the sandbox user; the venv removes the running-as-root warning.
         install_env = dict(secret_free_env)
@@ -1046,7 +1058,18 @@ class Orchestrator:
 
         app_name = f"pd-{tag}-{sha[:8]}"
         # The app runs with the venv first on PATH.
-        start_cmd = f"export PATH=/checkout/.venv/bin:$PATH && {contract.start}"
+        # S3: start the app with the venv's python directly. Use the
+        # explicit path (not PATH manipulation) for maximum reliability.
+        #
+        # The contract's start command is expected to begin with
+        # `python`; replace it with the venv python.
+        venv_python = "/checkout/.venv/bin/python"
+        start_parts = contract.start.split(maxsplit=1)
+        if start_parts[0] in ("python", "python3") and len(start_parts) == 2:
+            start_cmd = f"{venv_python} {start_parts[1]}"
+        else:
+            # Fallback: prepend venv bin to PATH for this command only.
+            start_cmd = f"env PATH=/checkout/.venv/bin:$PATH {contract.start}"
         try:
             app = sb.start(
                 snapshot.dir,
@@ -1076,11 +1099,21 @@ class Orchestrator:
             app_log = sb.app_logs(app.name)
             if app_log:
                 logs.append(f"app container log tail:\n{app_log}")
-            logs.append("sandbox app not ready")
+            # B2: distinguish "bridge down" from "app down". If the
+            # bridge socket vanished (or never stabilized), the
+            # executor could never reach the app — that's a bridge
+            # failure, not an app failure.
+            if not app.bridge_socket_present():
+                logs.append("bridge socket missing at readiness timeout "
+                            "(bridge down, not app down)")
+                reason = "bridge socket missing"
+            else:
+                logs.append("sandbox app not ready")
+                reason = "readiness timeout"
             app.stop()
             return self._sandbox_failed_side(
                 sb, rev, sha, snapshot, contract, logs,
-                ProvisionStatus.START_FAILED, "readiness timeout",
+                ProvisionStatus.START_FAILED, reason,
                 runtime_name, image_version, image_digest, lockfile_sha,
             )
         # S2: log tail on success too, for the record.
