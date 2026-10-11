@@ -845,18 +845,36 @@ class Orchestrator:
         files = [bundle.diff, bundle.description]
         if bundle.skill is not None:
             files.append(bundle.skill)
-        for rel in sorted(
-            p.relative_to(bundle.snapshot).as_posix()
-            for p in bundle.snapshot.rglob("*")
-            if p.is_file() and not p.is_symlink()
-        ):
-            files.append(bundle.snapshot / rel)
-        for f in files:
+        snapshot_files = [
+            bundle.snapshot / rel
+            for rel in sorted(
+                p.relative_to(bundle.snapshot).as_posix()
+                for p in bundle.snapshot.rglob("*")
+                if p.is_file() and not p.is_symlink()
+            )
+        ]
+        # The contract file declares its own env values: their
+        # presence in proofdeploy.yml itself is the declaration, not
+        # a leak (WO-7's golden contracts declare a canary env value
+        # exactly this way). The exemption is scoped to that one file
+        # and those declared values: the values stay forbidden in the
+        # prompt (checked above), in the diff, and in every other
+        # bundle file, and they are still redacted from records and
+        # kept out of container environments downstream.
+        declared_env_values = {
+            v for v in contract.env.values() if isinstance(v, str)
+        }
+        for f in files + snapshot_files:
             try:
                 text = f.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            assert_no_secrets(text, forbidden, where=f"bundle file {f.name}")
+            values = forbidden
+            if f.parent == bundle.snapshot and f.name == "proofdeploy.yml":
+                values = [
+                    v for v in forbidden if v not in declared_env_values
+                ]
+            assert_no_secrets(text, values, where=f"bundle file {f.name}")
         self._say("leak check passed: prompt and bundle carry no secret values")
 
     def _author_probes(self, prompt: str) -> tuple[ProbeSet, ModelResponse]:

@@ -28,6 +28,8 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from proofdeploy.provisioning import plan_provisioning, select_image
 
 # ---------------------------------------------------------------------------
@@ -575,3 +577,129 @@ def test_git_available_for_golden_kit():
         ["git", "--version"], capture_output=True, text=True, timeout=10
     )
     assert proc.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Fixes proven by the first sandbox-CI run of this PR.
+# ---------------------------------------------------------------------------
+
+
+def test_range_with_spaced_operator_selects_image():
+    """uptime-kuma declares engines.node '>= 26.2.0' — npm semver
+    allows whitespace between the operator and the version. The
+    parser must not lose the comparator to a bare '>=' token (the
+    first CI run of this PR refused the plan: 'declared range
+    >= 26.2.0 not satisfiable by pinned images').
+    """
+    from proofdeploy.provisioning import select_image
+    from proofdeploy.runner import satisfies_range
+
+    assert satisfies_range("26.11.1", ">= 26.2.0", ecosystem="node")
+    assert not satisfies_range("24.21.0", ">= 26.2.0", ecosystem="node")
+    row = select_image("node", ">= 26.2.0")
+    assert row is not None and row.version == "26.11.1"
+    # The golden apps' declaration form, spaced throughout.
+    row = select_image("node", ">= 20 < 25")
+    assert row is not None and row.version == "24.21.0"
+
+
+def test_node_plan_with_kuma_engines_string(tmp_path):
+    """Plan-level: a snapshot whose engines use the spaced form
+    selects the 26.11.1 pinned image instead of refusing."""
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "kuma", "engines": {"node": ">= 26.2.0"}},
+    )
+    plan = plan_provisioning(snap, _contract())
+    assert plan.image_refusal is None
+    assert plan.selected_version == "26.11.1"
+
+
+def _leak_check(tmp_path: Path, *, yml_text: str, other_files: dict):
+    """Drive Orchestrator._leak_check_bundle podman-free with a fake
+    bundle whose snapshot holds the given contract + files."""
+    from proofdeploy.orchestrator import MeasureConfig, Orchestrator
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snapshot"
+    snap.mkdir()
+    (snap / "proofdeploy.yml").write_text(yml_text, encoding="utf-8")
+    for name, text in other_files.items():
+        (snap / name).write_text(text, encoding="utf-8")
+    diff = tmp_path / "diff.patch"
+    diff.write_text("diff --git a/x b/x\n", encoding="utf-8")
+    desc = tmp_path / "description.txt"
+    desc.write_text("fixture description\n", encoding="utf-8")
+    bundle = SimpleNamespace(
+        diff=diff, description=desc, skill=None, snapshot=snap
+    )
+    contract = RepoContract(
+        build="x", start="x", readiness="/health",
+        env={"CANARY_SECRET": "pdcanary-env-test123"},
+        fixture={},
+    )
+    cfg = MeasureConfig(
+        repo_dir=tmp_path, output_dir=tmp_path / "out",
+        workdir=tmp_path / "work", no_skill=True,
+    )
+    orch = Orchestrator(cfg)
+    return orch, bundle, contract
+
+
+def test_leak_check_allows_contracts_own_env_declaration(tmp_path):
+    """WO-7's golden contracts declare a canary env value in
+    proofdeploy.yml. The bundle scan must not refuse the run over
+    the declaration itself (the first CI run of this PR errored all
+    30 conformance cases on exactly this)."""
+    from proofdeploy.leakcheck import SecretLeakError  # noqa: F401
+
+    orch, bundle, contract = _leak_check(
+        tmp_path,
+        yml_text='env:\n  CANARY_SECRET: "pdcanary-env-test123"\n',
+        other_files={"server.js": "console.log('clean');\n"},
+    )
+    orch._leak_check_bundle(bundle, "a clean prompt", contract)
+
+
+def test_leak_check_still_refuses_declared_value_in_other_files(tmp_path):
+    """The exemption is scoped to the contract file: the same value
+    in any other bundle file is still a leak, refused fail-closed."""
+    from proofdeploy.leakcheck import SecretLeakError
+
+    orch, bundle, contract = _leak_check(
+        tmp_path,
+        yml_text='env:\n  CANARY_SECRET: "pdcanary-env-test123"\n',
+        other_files={"server.js": "const s = 'pdcanary-env-test123';\n"},
+    )
+    with pytest.raises(SecretLeakError):
+        orch._leak_check_bundle(bundle, "a clean prompt", contract)
+
+
+def test_leak_check_still_refuses_other_secrets_in_contract_file(tmp_path):
+    """Only the contract's declared ENV values are exempted in the
+    contract file: a different secret smuggled into proofdeploy.yml
+    (here a non-public fixture value) still refuses the run."""
+    from proofdeploy.leakcheck import SecretLeakError
+    from proofdeploy.orchestrator import MeasureConfig, Orchestrator
+    from proofdeploy.yml import RepoContract
+
+    orch, bundle, _ = _leak_check(
+        tmp_path,
+        yml_text=(
+            'fixture:\n  internal_note: "fixture-secret-abcdef"\n'
+            'env:\n  CANARY_SECRET: "pdcanary-env-test123"\n'
+        ),
+        other_files={"server.js": "console.log('clean');\n"},
+    )
+    contract = RepoContract(
+        build="x", start="x", readiness="/health",
+        env={"CANARY_SECRET": "pdcanary-env-test123"},
+        fixture={"internal_note": "fixture-secret-abcdef"},
+    )
+    cfg = MeasureConfig(
+        repo_dir=tmp_path, output_dir=tmp_path / "out",
+        workdir=tmp_path / "work", no_skill=True,
+    )
+    orch = Orchestrator(cfg)
+    with pytest.raises(SecretLeakError):
+        orch._leak_check_bundle(bundle, "a clean prompt", contract)

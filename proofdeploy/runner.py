@@ -328,6 +328,13 @@ def _parse_range(
             )
             continue
         comparators: list[tuple[str, tuple[int, ...]]] = []
+        # npm and PEP 440 both allow whitespace between an operator
+        # and its version (uptime-kuma declares ">= 26.2.0"): remove
+        # it before tokenizing, or the bare operator becomes a token
+        # of its own and the comparator is lost.
+        group_str = re.sub(
+            r"(>=|<=|!=|==|~=|>|<|=|\^|~)\s+", r"\1", group_str
+        )
         for tok in re.split(r"[,\s]+", group_str):
             if tok:
                 comparators.extend(_parse_token(tok, ecosystem))
