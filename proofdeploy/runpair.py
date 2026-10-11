@@ -114,11 +114,15 @@ def _side_unreachable(results: list[ProbeResult]) -> bool:
 
     Registered text: "the target is unreachable for every probe". Only
     reason ``environment`` counts as unreachable. Schema-invalid probes
-    (reason ``probe``) are a miss, not infrastructure.
+    (reason ``probe``) are a miss, not infrastructure. Results that were
+    never sent (invalid author blocks, ``sent=False``) are excluded:
+    they must not turn an infrastructure failure into an author miss,
+    nor an author miss into infrastructure.
     """
-    return all(
+    sent = [r for r in results if r.sent]
+    return bool(sent) and all(
         r.verdict == Verdict.INCONCLUSIVE and r.reason == InconclusiveReason.ENVIRONMENT
-        for r in results
+        for r in sent
     )
 
 

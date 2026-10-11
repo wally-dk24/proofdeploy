@@ -144,6 +144,9 @@ def _invalid_block_results(
                 f"author output block {b['block_index']} rejected, never sent: "
                 f"{b['rejection_reason']}"
             ],
+            # Never sent: excluded from the scorer's unreachable test so an
+            # infrastructure failure is not relabeled an author miss.
+            sent=False,
         )
         for j, b in enumerate(probeset.invalid_blocks)
     ]
@@ -662,6 +665,7 @@ class Orchestrator:
                     verdict=Verdict.INCONCLUSIVE,
                     reason=InconclusiveReason.PROBE,
                     details=["no valid probe in author output"],
+                    sent=False,
                 )
             ]
         # Resolve the SHAs for the record (no provisioning happens).

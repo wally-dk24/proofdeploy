@@ -138,6 +138,12 @@ class ProbeResult:
     # the results instead of trusting the caller to pass them in.
     captured_bindings: dict[str, str] = field(default_factory=dict, repr=False)
     minted_tokens: list[str] = field(default_factory=list, repr=False)
+    # Whether the probe was actually sent to the target. Invalid author
+    # blocks are never sent; their results are reported individually as
+    # INCONCLUSIVE `probe` but must not affect reachability scoring
+    # (Addendum 10 follow-up: an infrastructure failure must not be
+    # relabeled an author miss).
+    sent: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -152,6 +158,7 @@ class ProbeResult:
             "http_body": self.http_body[:2000],
             "writes": self.writes,
             "details": self.details,
+            "sent": self.sent,
         }
 
     @classmethod
@@ -171,6 +178,8 @@ class ProbeResult:
             writes=list(d.get("writes") or []),
             request=d.get("request"),
             setup_requests=d.get("setup_requests"),
+            # Old records predate the field; default True (sent).
+            sent=bool(d.get("sent", True)),
         )
 
 

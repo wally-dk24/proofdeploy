@@ -994,14 +994,47 @@ def test_provider_failure_is_inconclusive_auth(tmp_path):
 # O2: Target processes are terminated on every exit path.
 # ------------------------------------------------------------------
 
-def _count_app_processes():
-    """Count running 'python app.py' processes (our test targets)."""
+def _count_app_processes(root=None):
+    """Count running 'python app.py' processes (our test targets).
+
+    When `root` is given, only counts processes whose working directory
+    is under `root` — so unrelated servers elsewhere on the machine are
+    not mistaken for leaked targets.
+    """
+    import os
+    import re
     import subprocess
     p = subprocess.run(
-        ["ps", "-eo", "args"],
+        ["ps", "-eo", "pid,args"],
         capture_output=True, text=True,
     )
-    return sum(1 for line in p.stdout.splitlines() if "python app.py" in line)
+    # Matches "python app.py" and "python3 app.py" (ps shows the resolved
+    # binary name).
+    pat = re.compile(r"\bpython3?\b.*\bapp\.py\b")
+    count = 0
+    for line in p.stdout.splitlines():
+        if not pat.search(line):
+            continue
+        parts = line.strip().split(None, 1)
+        if not parts:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if root is not None:
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                continue  # process gone or unreadable; not ours to count
+            # Resolve both sides; the target runs with cwd=snap which is
+            # under the test's tmp_path workdir.
+            if os.path.commonpath(
+                [os.path.realpath(cwd), os.path.realpath(str(root))]
+            ) != os.path.realpath(str(root)):
+                continue
+        count += 1
+    return count
 
 
 def test_target_process_stopped_after_run(tmp_path):
@@ -1009,7 +1042,7 @@ def test_target_process_stopped_after_run(tmp_path):
     info = make_mini_repo(tmp_path)
     out = tmp_path / "records"
     work = tmp_path / "work"
-    before = _count_app_processes()
+    before = _count_app_processes(tmp_path)
     cfg = MeasureConfig(
         repo_dir=Path(info["repo"]),
         output_dir=out,
@@ -1026,7 +1059,7 @@ def test_target_process_stopped_after_run(tmp_path):
     Orchestrator(cfg).measure_bug()
     import time
     time.sleep(2)  # let the OS reap
-    after = _count_app_processes()
+    after = _count_app_processes(tmp_path)
     assert after <= before, f"target processes leaked: {before} -> {after}"
 
 
@@ -1035,7 +1068,7 @@ def test_target_process_stopped_after_crash(tmp_path):
     info = make_mini_repo(tmp_path)
     out = tmp_path / "records"
     work = tmp_path / "work"
-    before = _count_app_processes()
+    before = _count_app_processes(tmp_path)
 
     cfg = MeasureConfig(
         repo_dir=Path(info["repo"]),
@@ -1067,7 +1100,7 @@ def test_target_process_stopped_after_crash(tmp_path):
     assert summary["cause"] == "tool_failure"
     import time
     time.sleep(2)
-    after = _count_app_processes()
+    after = _count_app_processes(tmp_path)
     assert after <= before, f"target processes leaked after crash: {before} -> {after}"
 
 

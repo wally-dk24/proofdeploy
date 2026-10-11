@@ -140,6 +140,47 @@ def test_mixed_reasons_not_unreachable():
     assert score_run_pair(parent, fix) == RunPairVerdict.NO_CATCH
 
 
+def _unsent_probe_result(index: int) -> ProbeResult:
+    # An invalid author block: never sent, INCONCLUSIVE `probe`.
+    return ProbeResult(
+        probe_index=index,
+        verdict=Verdict.INCONCLUSIVE,
+        reason=InconclusiveReason.PROBE,
+        details=["author output block rejected, never sent"],
+        sent=False,
+    )
+
+
+def test_unsent_invalid_block_does_not_mask_unreachable_side():
+    # Reviewer repro: [env] vs [env] is INCONCLUSIVE, but appending a
+    # never-sent invalid block must not turn it into NO_CATCH. An
+    # infrastructure failure is not an author miss.
+    parent = [
+        _result(Verdict.INCONCLUSIVE, 0, InconclusiveReason.ENVIRONMENT),
+        _unsent_probe_result(1),
+    ]
+    fix = [
+        _result(Verdict.INCONCLUSIVE, 0, InconclusiveReason.ENVIRONMENT),
+        _unsent_probe_result(1),
+    ]
+    assert score_run_pair(parent, fix) == RunPairVerdict.INCONCLUSIVE
+
+
+def test_unsent_invalid_block_does_not_change_reachable_score():
+    # A reachable pair scores exactly as before when an invalid block is
+    # present: the never-sent result is excluded from reachability but the
+    # sent probes still decide CATCH vs NO_CATCH.
+    parent = [_result(Verdict.FAIL, 0), _unsent_probe_result(1)]
+    fix = [_result(Verdict.PASS, 0), _unsent_probe_result(1)]
+    detailed = score_run_pair_detailed(parent, fix)
+    assert detailed.verdict == RunPairVerdict.CATCH
+    assert detailed.candidate_catch == [0]
+    # And a non-discriminating reachable pair is still NO_CATCH.
+    parent = [_result(Verdict.PASS, 0), _unsent_probe_result(1)]
+    fix = [_result(Verdict.PASS, 0), _unsent_probe_result(1)]
+    assert score_run_pair(parent, fix) == RunPairVerdict.NO_CATCH
+
+
 def test_probes_matched_by_index():
     parent = [_result(Verdict.PASS, 0), _result(Verdict.FAIL, 1)]
     fix = [_result(Verdict.PASS, 0), _result(Verdict.PASS, 1)]
