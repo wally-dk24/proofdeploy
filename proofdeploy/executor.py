@@ -132,10 +132,12 @@ class ProbeResult:
     # setup HTTP steps.
     setup_requests: list[dict[str, Any]] | None = None
     # Secrets from THIS probe run, for the record's fail-closed redaction.
-    # captured_bindings holds setup-step captures (name -> value);
-    # minted_tokens holds provider-issued tokens. These are NEVER
-    # serialized by to_dict(): build_evidence_record collects them from
-    # the results instead of trusting the caller to pass them in.
+    # captured_bindings holds setup-step captures (name -> value; a name
+    # captured more than once in the run maps to the list of its distinct
+    # values, Addendum 23 R1); minted_tokens holds provider-issued tokens.
+    # These are NEVER serialized by to_dict(): build_evidence_record
+    # collects them from the results instead of trusting the caller to
+    # pass them in.
     captured_bindings: dict[str, Any] = field(default_factory=dict, repr=False)
     minted_tokens: list[str] = field(default_factory=list, repr=False)
     # Whether the probe was actually sent to the target. Invalid author
@@ -1138,9 +1140,16 @@ class Executor:
             The secrets are never serialized by to_dict(); runpair's
             build_evidence_record collects them from the results for the
             record's fail-closed redaction, so a caller that forgets to
-            pass captured_values cannot leak a session token.
+            pass captured_values cannot leak a session token. A name
+            captured more than once in this run (e.g. a re-login) is
+            attached as the list of its distinct values: every one of
+            them is a secret (Addendum 23 R1).
             """
-            pr.captured_bindings = dict(ctx.run_captures)
+            captured: dict[str, Any] = dict(ctx.run_captures)
+            for _k, _vs in ctx.run_captures_all.items():
+                if len(_vs) > 1:
+                    captured[_k] = list(_vs)
+            pr.captured_bindings = captured
             pr.minted_tokens = list(ctx.run_minted)
             return pr
 
