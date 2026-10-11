@@ -80,6 +80,7 @@ from proofdeploy.runner import (
 )
 from proofdeploy.runpair import (
     RunPairVerdict,
+    assert_harness_commit_gate,
     build_evidence_record,
     commit_records,
     score_clean_diff,
@@ -1264,6 +1265,11 @@ class Orchestrator:
         use_sandbox = cfg.sandbox and not cfg.allow_unsandboxed
         capability_probe: dict[str, object] = {}
         if use_sandbox:
+            # Fail-closed harness gate (Addendum 24): refuse the
+            # measured run unless the running code's commit is known,
+            # the tree is clean, and it matches GITHUB_SHA when set.
+            assert_harness_commit_gate()
+            self._say("harness commit gate passed")
             # Fail-closed isolation gate: refuse the measured run unless
             # the host meets the sandbox requirements (userns remapping,
             # bridge network for the install phase).
@@ -1542,6 +1548,11 @@ class Orchestrator:
         use_sandbox = cfg.sandbox and not cfg.allow_unsandboxed
         capability_probe: dict[str, object] = {}
         if use_sandbox:
+            # Fail-closed harness gate (Addendum 24): refuse the
+            # measured run unless the running code's commit is known,
+            # the tree is clean, and it matches GITHUB_SHA when set.
+            assert_harness_commit_gate()
+            self._say("harness commit gate passed")
             # Fail-closed isolation gate: refuse the measured run unless
             # the host meets the sandbox requirements.
             capability_probe = assert_measurement_gate()

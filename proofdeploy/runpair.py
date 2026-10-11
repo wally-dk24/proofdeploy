@@ -35,8 +35,10 @@ Unknown versions raise.
 
 Records:
 - Every record (evidence, score, judgment) and every per-probe result
-  carries ``schema_version`` (currently ``"1.0.0"``). Bump it when the
-  record format changes; readers must refuse unknown versions.
+  carries ``schema_version`` (currently ``"1.1.0"``). Bump it when the
+  record format changes; readers must refuse unknown versions. Records
+  written at 1.0.0 (scalar ``captured_values``, no harness provenance)
+  still load and re-score.
 - Every run writes an evidence record BEFORE any scoring. The evidence
   record holds the prompt, the raw model response, the parsed probes
   (verbatim) and their hash, the bundle manifest (skill hash or no-skill
@@ -48,9 +50,12 @@ Records:
   that built the prompt, and ``model_request``: the exact model request
   as sent (model, temperature, per-message hashes, and the seed/tools
   fields as sent).
-- The evidence record also holds ``proofdeploy_commit``: the commit
-  SHA of the ProofDeploy code that produced the record (Addendum 23
-  R2), resolved from the environment or the code's own checkout.
+- The evidence record's ``provenance`` also holds ``harness``: the
+  ProofDeploy commit that produced the record, its source, a dirty
+  flag, and the workflow ref (Addendum 24). The commit comes from git
+  only when the package's parent directory is the repo's toplevel —
+  never from an environment variable — so the audit trail names the
+  code version directly instead of inferring it from behavior.
 - Writing the evidence record makes a git commit; the commit SHA is
   recorded. Scoring reads the evidence record back AT that commit,
   rebuilds the per-probe results, and scores them: any caller-passed
@@ -444,34 +449,111 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def proofdeploy_commit() -> str | None:
-    """The commit SHA of the running ProofDeploy code, best-effort.
+class CommitGateError(RuntimeError):
+    """A measured run was refused: the harness commit is not proven."""
 
-    Resolution order: the ``PROOFDEPLOY_COMMIT`` env var, then
-    ``GITHUB_SHA`` (set by GitHub Actions to the commit the workflow is
-    running), then ``git rev-parse HEAD`` in the repository containing
-    this package. ``None`` when no source is available — the record
-    carries null rather than a guessed value (Addendum 23 R2).
-    """
-    for var in ("PROOFDEPLOY_COMMIT", "GITHUB_SHA"):
-        val = os.environ.get(var)
-        if val:
-            return val
+
+def _git_stdout(args: list[str], cwd: Path) -> str | None:
+    """Run git and return stripped stdout, or None on any failure."""
     try:
         r = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).resolve().parent.parent,
+            ["git", *args],
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if r.returncode == 0:
-        sha = r.stdout.strip()
-        if sha:
-            return sha
-    return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
+def harness_provenance() -> dict[str, Any]:
+    """Provenance of the running ProofDeploy code (Addendum 24).
+
+    Returns ``{commit, source, dirty, workflow_ref}``:
+
+    - ``commit``: ``git rev-parse HEAD`` of the checkout containing
+      this package, taken ONLY when the package's parent directory is
+      that repo's toplevel (``git rev-parse --show-toplevel``). Any
+      other layout — a package installed inside another project's git
+      checkout, e.g. in a venv — yields None: that repo's commit is
+      not ProofDeploy's. ``source`` is ``"git"`` when the commit came
+      from git, else None.
+    - No environment variable supplies or overrides the commit. The
+      round-1 ``PROOFDEPLOY_COMMIT`` override is dropped entirely (an
+      env var can claim any commit), and ``GITHUB_SHA`` is only a
+      cross-check for the measurement gate, never a source.
+    - ``dirty``: True when any tracked file differs from HEAD
+      (``git diff --quiet HEAD``); untracked files do not count.
+      False when there is no proven commit.
+    - ``workflow_ref``: ``GITHUB_WORKFLOW_REF``, or ``GITHUB_REF``
+      when the former is absent; None outside GitHub Actions.
+    """
+    workflow_ref = (
+        os.environ.get("GITHUB_WORKFLOW_REF") or os.environ.get("GITHUB_REF") or None
+    )
+    commit: str | None = None
+    source: str | None = None
+    dirty = False
+    pkg_root = Path(__file__).resolve().parent.parent
+    toplevel = _git_stdout(["rev-parse", "--show-toplevel"], pkg_root)
+    if toplevel is not None and Path(toplevel).resolve() == pkg_root:
+        head = _git_stdout(["rev-parse", "HEAD"], pkg_root)
+        if head:
+            commit = head
+            source = "git"
+            try:
+                r = subprocess.run(
+                    ["git", "diff", "--quiet", "HEAD"],
+                    cwd=pkg_root,
+                    capture_output=True,
+                    timeout=10,
+                )
+                dirty = r.returncode != 0
+            except (OSError, subprocess.SubprocessError):
+                dirty = True
+    return {
+        "commit": commit,
+        "source": source,
+        "dirty": dirty,
+        "workflow_ref": workflow_ref,
+    }
+
+
+def assert_harness_commit_gate() -> dict[str, Any]:
+    """Fail-closed gate for measured runs (Addendum 24).
+
+    A measured run refuses to start unless the running code's commit
+    is known (``harness_provenance``), the working tree is clean, and
+    — when GitHub Actions provides ``GITHUB_SHA`` — the git commit
+    matches it exactly. Unmeasured dev runs never call this gate: they
+    record whatever provenance is true and continue.
+
+    Returns the harness provenance dict on success.
+    """
+    harness = harness_provenance()
+    if harness["commit"] is None:
+        raise CommitGateError(
+            "measured run refused: the ProofDeploy commit is unknown "
+            "(the package is not at the root of its own git checkout); "
+            "a measured run must name the exact code that produced it"
+        )
+    if harness["dirty"]:
+        raise CommitGateError(
+            "measured run refused: the ProofDeploy working tree has "
+            "uncommitted changes to tracked files; a measured run must "
+            "run exactly the recorded commit"
+        )
+    github_sha = os.environ.get("GITHUB_SHA") or None
+    if github_sha is not None and github_sha != harness["commit"]:
+        raise CommitGateError(
+            "measured run refused: the ProofDeploy commit "
+            f"{harness['commit']} does not match GITHUB_SHA {github_sha}"
+        )
+    return harness
 
 
 def _sha256_canonical(obj: Any) -> str:
@@ -665,11 +747,13 @@ def build_evidence_record(
         "sandbox_evidence": sandbox_evidence or {},
         "sandboxed": sandboxed,
         "measured_result": measured_result,
-        "provenance": provenance or {},
-        # The ProofDeploy commit that produced this record (Addendum
-        # 23 R2): the audit trail names the code version directly
-        # instead of inferring it from behavior.
-        "proofdeploy_commit": proofdeploy_commit(),
+        # Caller provenance (Actions run URL/ID, runner image,
+        # capability probe) plus the harness object (Addendum 24):
+        # the ProofDeploy commit that produced this record, its
+        # source, the dirty flag, and the workflow ref. The harness
+        # is computed here, never caller-supplied, so every record
+        # path (bug, clean, crash, inconclusive) carries it.
+        "provenance": {**(provenance or {}), "harness": harness_provenance()},
         "harness_version": harness_version,
         "scoring_version": scoring_version,
         "fix_parent_provision": fix_parent_provision or {},

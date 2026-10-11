@@ -11,9 +11,12 @@ committed record in plaintext. The same defect existed one level down:
 ``SetupContext.run_captures`` kept only the latest value when a single
 probe run captured the same name twice.
 
-R2: the evidence record names the ProofDeploy commit that produced it
-(``proofdeploy_commit``), so the audit trail does not have to infer the
-code version from behavior.
+R2: the evidence record names the ProofDeploy commit that produced it,
+so the audit trail does not have to infer the code version from
+behavior. Round 1 recorded it as a top-level ``proofdeploy_commit``;
+Addendum 24 replaced that with the ``provenance.harness`` object
+(commit, source, dirty, workflow_ref) — see
+tests/test_runpair_addendum24.py.
 """
 
 import json
@@ -183,6 +186,7 @@ def test_recapture_within_one_probe_run_keeps_every_value(tmp_path):
 
 
 def test_evidence_record_names_proofdeploy_commit(tmp_path):
+    # Addendum 24: the commit now lives in provenance.harness.
     expected = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=REPO_ROOT,
@@ -196,10 +200,12 @@ def test_evidence_record_names_proofdeploy_commit(tmp_path):
         fix_sha="a" * 40,
         fix_parent_sha="b" * 40,
     )
-    assert record["proofdeploy_commit"] == expected
+    harness = record["provenance"]["harness"]
+    assert harness["commit"] == expected
+    assert harness["source"] == "git"
 
     repo = _git_repo(tmp_path)
     out = tmp_path / "runs"
     write_evidence_record(record, out, repo)
     written = read_records(out)[0]
-    assert written["proofdeploy_commit"] == expected
+    assert written["provenance"]["harness"]["commit"] == expected
