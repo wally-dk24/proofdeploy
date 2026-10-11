@@ -439,28 +439,44 @@ def test_sandbox_install_uses_require_hashes(monkeypatch, tmp_path):
 
 
 def _build_test_wheel(tmp_path: Path) -> Path:
-    """Build a tiny local wheel (offline) for the pip hash tests."""
-    pkg = tmp_path / "pkg"
-    (pkg / "mypkg").mkdir(parents=True)
-    (pkg / "mypkg" / "__init__.py").write_text("x = 1\n")
-    (pkg / "pyproject.toml").write_text(
-        "[build-system]\n"
-        'requires = ["setuptools"]\n'
-        'build-backend = "setuptools.build_meta"\n'
-        "[project]\n"
-        'name = "mypkg"\n'
-        'version = "0.1"\n'
-    )
+    """Build a tiny wheel by hand (zipfile; no build backend needed).
+
+    setuptools may not be installed on CI runners, so `pip wheel`
+    cannot be used. A wheel is just a zip: pip installs it fine from
+    --find-links, and --require-hashes verifies the archive's own
+    sha256, which is what this test exercises.
+    """
+    import hashlib
+    import zipfile
+
     dist = tmp_path / "dist"
     dist.mkdir()
-    r = subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", str(pkg), "--no-deps",
-         "--no-build-isolation", "-w", str(dist), "-q"],
-        capture_output=True, text=True, timeout=180,
+    wheel_path = dist / "mypkg-0.1-py3-none-any.whl"
+    dist_info = "mypkg-0.1.dist-info"
+    init_py = b"x = 1\n"
+    metadata = b"Metadata-Version: 2.1\nName: mypkg\nVersion: 0.1\n"
+    wheel_meta = (
+        b"Wheel-Version: 1.0\nGenerator: proofdeploy-test\n"
+        b"Root-Is-Purelib: true\nTag: py3-none-any\n"
     )
-    assert r.returncode == 0, f"wheel build failed: {r.stderr}"
-    wheels = list(dist.glob("*.whl"))
-    assert len(wheels) == 1
+
+    def _record_entry(name: str, data: bytes) -> bytes:
+        digest = hashlib.sha256(data).digest()
+        import base64
+
+        b64 = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        return f"{name},sha256={b64},{len(data)}\n".encode()
+
+    record = b""
+    with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("mypkg/__init__.py", init_py)
+        zf.writestr(f"{dist_info}/METADATA", metadata)
+        zf.writestr(f"{dist_info}/WHEEL", wheel_meta)
+        record += _record_entry("mypkg/__init__.py", init_py)
+        record += _record_entry(f"{dist_info}/METADATA", metadata)
+        record += _record_entry(f"{dist_info}/WHEEL", wheel_meta)
+        record += f"{dist_info}/RECORD,,\n".encode()
+        zf.writestr(f"{dist_info}/RECORD", record)
     return dist
 
 
