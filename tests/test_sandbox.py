@@ -786,6 +786,7 @@ def test_wait_ready_true():
         assert app.wait_ready("/health", timeout=10) is True
     finally:
         srv.shutdown()
+    srv.server_close()
 
 
 def test_wait_ready_false_on_dead_port():

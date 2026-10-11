@@ -343,3 +343,122 @@ def test_allowlist_refuses_extra_file_at_bundle_root(tmp_path):
         check_bundle_answer_key(
             ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
         )
+
+
+def test_tampered_skill_copy_refused(tmp_path):
+    """T2(a): disabling the answer-key skill-hash check must be caught.
+
+    A skill file present in the no-skill arm must be refused by the
+    answer-key leak check.
+    """
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    # The test bundle uses no_skill=True; smuggle a skill file in.
+    skill_file = ctx["bundle"] / "skill-author.md"
+    skill_file.write_text("smuggled skill content")
+    # The check must refuse: skill present in no-skill arm.
+    with pytest.raises(AnswerKeyLeakError, match="skill"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
+
+
+def test_tampered_skill_arm_copy_refused(tmp_path):
+    """L4: in the skill arm, a tampered skill-author.md must be refused by
+    the hash check (not by the no-skill branch).
+
+    Builds a real skill-arm bundle (no_skill=False), replaces
+    skill-author.md with altered bytes, and asserts the hash check refuses.
+    Only the hash comparison can catch this.
+    """
+    import hashlib
+
+    from proofdeploy.fixture import assemble_author_bundle, template_hash
+    from proofdeploy.model_client import build_author_prompt
+
+    info = _eq_repo(tmp_path)
+    repo = Path(info["repo"])
+    work = tmp_path / "skill-arm-work"
+    work.mkdir()
+    diff_text = _git(repo, "diff", f"{info['base']}..{info['bug']}", "--")
+    diff_path = work / "diff.patch"
+    diff_path.write_text(diff_text)
+    snap_src = work / "snap-src"
+    snap_src.mkdir()
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "archive", info["bug"]],
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["tar", "-x", "-C", str(snap_src)],
+        input=proc.stdout,
+        capture_output=True,
+        check=True,
+    )
+    # Use the real registered skill file (must match EXPECTED_SKILL_HASH).
+    real_skill = Path(__file__).parent.parent / "docs" / "evaluation" / "skill" / "skill-author.md"
+    skill_hash = hashlib.sha256(real_skill.read_bytes()).hexdigest()
+    bundle_dir = work / "bundle"
+    assemble_author_bundle(
+        diff_path=diff_path,
+        snapshot_dir=snap_src,
+        yml_fixture={
+            "repo_name": "ak",
+            "seed_note": "seed",
+            "auth_mechanism": "none",
+            "auth_scope": "none",
+            "flags_note": "none",
+        },
+        output_dir=bundle_dir,
+        expected_template_hash=template_hash(),
+        source_sha=info["bug"],
+        diff_range=f"{info['base']}..{info['bug']}",
+        skill_path=real_skill,
+        no_skill=False,
+    )
+    prompt, _ = build_author_prompt(
+        skill_text=real_skill.read_text(),
+        fixture_description=(bundle_dir / "fixture-description.txt").read_text(),
+        diff_text=diff_text,
+        snapshot_dir=bundle_dir / "snapshot",
+    )
+    manifest = Path(str(bundle_dir) + ".manifest.json")
+    # Sanity: the untampered skill-arm bundle passes.
+    fix_subject = _git(repo, "log", "-1", "--format=%s", info["fix"])
+    kwargs = {
+        "repo_dir": repo,
+        "bug_sha": info["bug"],
+        "bug_parent_sha": info["base"],
+        "fix_sha": info["fix"],
+        "fix_subject": fix_subject,
+        "expected_skill_hash": skill_hash,
+        "no_skill": False,
+    }
+    check_bundle_answer_key(bundle_dir, manifest, prompt, **kwargs)
+    # Tamper the skill copy in the bundle: altered bytes, same filename.
+    (bundle_dir / "skill-author.md").write_text(
+        real_skill.read_text() + "\nALTERED"
+    )
+    # Only the hash check can refuse this.
+    with pytest.raises(AnswerKeyLeakError, match="skill hash"):
+        check_bundle_answer_key(bundle_dir, manifest, prompt, **kwargs)
+
+
+def test_tampered_fixture_description_refused(tmp_path):
+    """T2(b): disabling the fixture-description check must be caught.
+    
+    A tampered fixture-description.txt must be refused by the answer-key
+    leak check.
+    """
+    info = _eq_repo(tmp_path)
+    ctx = _eq_bundle(tmp_path, info)
+    # Tamper the fixture description in the bundle.
+    desc_file = ctx["bundle"] / "fixture-description.txt"
+    if desc_file.is_file():
+        desc_file.write_text("tampered fixture description")
+    # The check must refuse: fixture description mismatch.
+    with pytest.raises(AnswerKeyLeakError, match="fixture-description"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )

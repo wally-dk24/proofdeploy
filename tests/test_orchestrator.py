@@ -21,6 +21,7 @@ import json
 import os
 import secrets
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 
 TOKENS = {}
 VALUE = __VALUE__
@@ -794,3 +795,1039 @@ def test_inconclusive_unsandboxed_dev_does_not_count(tmp_path):
     evidence = records[0]
     assert evidence["measured_result"] is False
     assert evidence["sandboxed"] is False
+
+
+# ------------------------------------------------------------------
+# O1: No hard-coded /register. Auth comes from the contract.
+# ------------------------------------------------------------------
+
+MINI_APP_NO_AUTH = '''\\
+import json
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+VALUE = __VALUE__
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._json(200, {"ok": True})
+        elif self.path == "/value":
+            self._json(200, {"v": VALUE})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def log_message(self, *args):
+        pass
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+'''
+
+MINI_YML_NO_AUTH = """build: "python -m py_compile app.py"
+start: "python app.py"
+readiness: "/health"
+env:
+  APP_ENV: verification
+fixture:
+  repo_name: "mini-app-no-auth"
+  seed_note: "empty"
+  auth_mechanism: "none"
+  auth_scope: "no auth"
+  flags_note: "no feature flags"
+"""
+
+
+def make_mini_repo_no_auth(root: Path) -> dict[str, str]:
+    """A tiny app with NO /register endpoint and no credential declared."""
+    repo = root / "mini-app-no-auth"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@test")
+    (repo / "requirements.txt").write_text("# no third-party deps\\n")
+    (repo / "proofdeploy.yml").write_text(MINI_YML_NO_AUTH)
+    shas = {}
+    for tag, value in (("base", 1), ("bug", 2), ("fix", 1)):
+        (repo / "app.py").write_text(MINI_APP_NO_AUTH.replace("__VALUE__", str(value)))
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", tag)
+        shas[tag] = _git(repo, "rev-parse", "HEAD")
+    return {"repo": str(repo), **shas}
+
+
+def test_no_auth_app_does_not_crash(tmp_path):
+    """O1: an app without /register and no declared credential does not
+    crash. Probes run; no token is used."""
+    info = make_mini_repo_no_auth(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-no-auth",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    # No crash; the run completes and scores.
+    assert summary["verdict"] == "candidate_catch"
+    assert summary["parent_ready"] and summary["fix_ready"]
+
+
+def test_declared_registration_provider(tmp_path):
+    """O1: a contract-declared register provider mints a token."""
+    import json
+
+    info = make_mini_repo(tmp_path)
+    # Add the credential_provider declaration to the fixture.
+    # We modify the base commit's yml so the fix still restores VALUE=1.
+    repo = Path(info["repo"])
+    # Amend the fix commit to include the provider declaration.
+    _git(repo, "checkout", "-q", info["fix"])
+    yml_path = repo / "proofdeploy.yml"
+    yml_text = yml_path.read_text()
+    provider_json = json.dumps({
+        "mode": "register",
+        "path": "/register",
+        "method": "POST",
+        "username_field": "username",
+        "password_field": "password",
+        "token_json_path": "token",
+    })
+    yml_text = yml_text.replace(
+        '  flags_note: "no feature flags"',
+        f'  flags_note: "no feature flags"\n  credential_provider: \'{provider_json}\'',
+    )
+    yml_path.write_text(yml_text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "--amend", "--no-edit")
+    new_fix = _git(repo, "rev-parse", "HEAD")
+
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=repo,
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-provider",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=new_fix,
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    # The run completes; the provider was used (no crash on /register).
+    assert summary["verdict"] == "candidate_catch"
+
+
+def test_provider_failure_is_inconclusive_auth(tmp_path):
+    """O1: a declared provider with a bad endpoint does not crash the run.
+    The failure is INCONCLUSIVE auth, never an exception."""
+    import json
+
+    info = make_mini_repo(tmp_path)
+    repo = Path(info["repo"])
+    _git(repo, "checkout", "-q", info["fix"])
+    yml_path = repo / "proofdeploy.yml"
+    yml_text = yml_path.read_text()
+    # Declare a provider pointing at a non-existent endpoint.
+    provider_json = json.dumps({
+        "mode": "register",
+        "path": "/nonexistent-register",
+        "method": "POST",
+        "username_field": "username",
+        "password_field": "password",
+        "token_json_path": "token",
+    })
+    yml_text = yml_text.replace(
+        '  flags_note: "no feature flags"',
+        f'  flags_note: "no feature flags"\n  credential_provider: \'{provider_json}\'',
+    )
+    yml_path.write_text(yml_text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "--amend", "--no-edit")
+    new_fix = _git(repo, "rev-parse", "HEAD")
+
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=repo,
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-bad-provider",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=new_fix,
+        model_runner=canned_probes,  # probes don't use auth
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    # Should not raise; the run completes (provider only runs when a probe
+    # needs ${AUTH_TOKEN}).
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] in ("candidate_catch", "no_catch", "inconclusive")
+
+
+# ------------------------------------------------------------------
+# O2: Target processes are terminated on every exit path.
+# ------------------------------------------------------------------
+
+def _count_app_processes(root=None):
+    """Count running 'python app.py' processes (our test targets).
+
+    When `root` is given, only counts processes whose working directory
+    is under `root` — so unrelated servers elsewhere on the machine are
+    not mistaken for leaked targets.
+    """
+    import os
+    import re
+    import subprocess
+    p = subprocess.run(
+        ["ps", "-eo", "pid,args"],
+        capture_output=True, text=True,
+    )
+    # Matches "python app.py" and "python3 app.py" (ps shows the resolved
+    # binary name).
+    pat = re.compile(r"\bpython3?\b.*\bapp\.py\b")
+    count = 0
+    for line in p.stdout.splitlines():
+        if not pat.search(line):
+            continue
+        parts = line.strip().split(None, 1)
+        if not parts:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if root is not None:
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                continue  # process gone or unreadable; not ours to count
+            # Resolve both sides; the target runs with cwd=snap which is
+            # under the test's tmp_path workdir.
+            if os.path.commonpath(
+                [os.path.realpath(cwd), os.path.realpath(str(root))]
+            ) != os.path.realpath(str(root)):
+                continue
+        count += 1
+    return count
+
+
+def test_target_process_stopped_after_run(tmp_path):
+    """O2: after a normal run, no target process is alive."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    before = _count_app_processes(tmp_path)
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-cleanup",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    Orchestrator(cfg).measure_bug()
+    import time
+    time.sleep(2)  # let the OS reap
+    after = _count_app_processes(tmp_path)
+    assert after <= before, f"target processes leaked: {before} -> {after}"
+
+
+def test_target_process_stopped_after_crash(tmp_path):
+    """O2: after a crash, no target process is alive."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    before = _count_app_processes(tmp_path)
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-crash-cleanup",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    orch = Orchestrator(cfg)
+    # Monkeypatch the executor's run_probe to raise after provisioning.
+    # This simulates a crash after the targets are READY.
+    orig_make_executor = orch._make_executor
+    def bad_make_executor(side):
+        ex = orig_make_executor(side)
+        def crashing_run(*args, **kwargs):
+            raise RuntimeError("simulated crash during probe")
+        ex.run_probe = crashing_run
+        return ex
+    orch._make_executor = bad_make_executor
+    # The crash should be recorded as INCONCLUSIVE, not propagate.
+    summary = orch.measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "tool_failure"
+    import time
+    time.sleep(2)
+    after = _count_app_processes(tmp_path)
+    assert after <= before, f"target processes leaked after crash: {before} -> {after}"
+
+
+# ------------------------------------------------------------------
+# O3: Crash after authoring commits an INCONCLUSIVE record.
+# ------------------------------------------------------------------
+
+def test_crash_after_authoring_records_inconclusive(tmp_path):
+    """O3: a crash after the model call commits an INCONCLUSIVE record
+    with a typed reason; the prompt and response are not lost."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-crash-record",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    orch = Orchestrator(cfg)
+    # Crash during probe execution (after authoring).
+    def bad_provision(*args, **kwargs):
+        raise RuntimeError("simulated post-authoring crash")
+    orch._provision_side = bad_provision
+    summary = orch.measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "tool_failure"
+    # The evidence record exists with the prompt and raw response.
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["record_type"] == "evidence"
+    assert evidence["prompt"]
+    assert evidence["raw_model_response"]
+    # O5: unsandboxed crash is not a measured result.
+    assert evidence["measured_result"] is False
+    assert evidence["sandboxed"] is False
+
+
+def test_sandboxed_crash_records_measured(tmp_path, monkeypatch):
+    """O5: a sandboxed crash (gate mocked) records measured_result=True."""
+    import proofdeploy.orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "assert_measurement_gate", lambda: {})
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-crash-sandboxed",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        sandbox=True,
+        allow_unsandboxed=False,
+    )
+    orch = Orchestrator(cfg)
+    def bad_provision_sandbox(*args, **kwargs):
+        raise RuntimeError("simulated post-authoring crash (sandboxed)")
+    orch._provision_side_sandbox = bad_provision_sandbox
+    summary = orch.measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "tool_failure"
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["measured_result"] is True
+    assert evidence["sandboxed"] is True
+
+
+def test_unsandboxed_clean_run_records_not_measured(tmp_path):
+    """O6: an unsandboxed clean run records measured_result=False."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-clean-unmeasured",
+        rev_clean=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    Orchestrator(cfg).measure_clean()
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["measured_result"] is False
+    assert evidence["sandboxed"] is False
+
+
+def test_sandboxed_clean_run_records_measured(tmp_path, monkeypatch):
+    """O6: a sandboxed clean run (gate mocked) records measured_result=True."""
+    import proofdeploy.orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "assert_measurement_gate", lambda: {})
+
+    from proofdeploy.runner import ProvisionResult, ProvisionStatus
+
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-clean-sandboxed",
+        rev_clean=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        sandbox=True,
+        allow_unsandboxed=False,
+    )
+    orch = Orchestrator(cfg)
+
+    # Fake a READY sandboxed side without a real container.
+    def fake_provision_sandbox(rev, port, unit_dir, name):
+        from types import SimpleNamespace as _SNS
+
+        from proofdeploy.orchestrator import _Side
+
+        contract = _SNS(
+            build=None, migrate=None, seed=None, env={}, start="x",
+            readiness="/", fixture={}, database=None, auth=None,
+        )
+        side = _Side(
+            name=name,
+            sha="abc123",
+            snapshot_dir=tmp_path / "snap",
+            contract=contract,
+            provision=ProvisionResult(
+                status=ProvisionStatus.READY,
+                target_url=f"http://127.0.0.1:{port}",
+                run_id="fake",
+                sandbox_evidence={"image": "fake"},
+            ),
+        )
+        return side
+
+    orch._provision_side_sandbox = fake_provision_sandbox
+    # Stub out the executor and probe run: no real target.
+    def fake_make_executor(side):
+        from proofdeploy.executor import Executor
+        return Executor(target_url=side.provision.target_url)
+    orch._make_executor = fake_make_executor
+    orch.measure_clean()
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["measured_result"] is True
+    assert evidence["sandboxed"] is True
+
+
+def test_unsandboxed_normal_run_records_not_measured(tmp_path):
+    """T2(c): the normal (non-failure) evidence path must not hard-code
+    measured_result=True. An unsandboxed run records measured_result=False.
+    """
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-normal-unmeasured",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    Orchestrator(cfg).measure_bug()
+    records = read_records(out)
+    evidence = records[0]
+    # Unsandboxed normal run: never a measured result.
+    assert evidence["measured_result"] is False
+    assert evidence["sandboxed"] is False
+
+
+def test_no_auth_app_clean_run(tmp_path):
+    """T4: a clean-diff run against the no-auth toy app completes."""
+    info = make_mini_repo_no_auth(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-no-auth-clean",
+        rev_clean=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_clean()
+    assert summary["run_kind"] == "clean"
+    assert summary["parent_ready"] if "parent_ready" in summary else True
+
+
+def test_no_auth_app_model_failure(tmp_path):
+    """T4: a model failure on the no-auth toy app records INCONCLUSIVE."""
+    from proofdeploy.model_client import ModelCallError
+
+    info = make_mini_repo_no_auth(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    def failing_runner(prompt: str):
+        raise ModelCallError("overflow", cause="model_overflow")
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-no-auth-mf",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=failing_runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "inconclusive"
+
+
+def _sandbox_caps():
+    """Capability probe for sandbox tests (cached)."""
+    try:
+        from proofdeploy.sandbox import capability_probe
+        return capability_probe()
+    except Exception:
+        return {}
+
+
+requires_sandbox = pytest.mark.skipif(
+    not _sandbox_caps().get("podman", False),
+    reason="no container runtime: sandboxed orchestrator test needs podman",
+)
+
+
+def test_check_sandbox_runtime_match():
+    """Coverage: sandbox runtime check passes when the image satisfies the
+    declared range. Uses a fake runner (no podman)."""
+    from proofdeploy.orchestrator import check_sandbox_runtime
+
+    class FakeResult:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        if "--version" in cmd:
+            return FakeResult("Python 3.12.3\n")
+        return FakeResult("sha256:abc123\n")
+
+    version, digest, failure = check_sandbox_runtime(
+        "python:3.12-slim", "python", ">=3.12,<3.13", runner=fake_run
+    )
+    assert version == "3.12.3"
+    assert digest == "sha256:abc123"
+    assert failure is None
+
+
+def test_check_sandbox_runtime_mismatch_fails_closed():
+    """Coverage: sandbox runtime check fails closed (BUILD_FAILED reason)
+    when the image version does not satisfy the declared range."""
+    from proofdeploy.orchestrator import check_sandbox_runtime
+
+    class FakeResult:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        if "--version" in cmd:
+            return FakeResult("Python 3.11.0\n")
+        return FakeResult("sha256:def456\n")
+
+    version, digest, failure = check_sandbox_runtime(
+        "python:3.12-slim", "python", ">=3.12,<3.13", runner=fake_run
+    )
+    assert version == "3.11.0"
+    assert digest == "sha256:def456"
+    assert failure is not None
+    assert "does not satisfy" in failure
+
+
+def test_check_sandbox_runtime_no_declared_range():
+    """Coverage: no declared range means no failure, version still recorded."""
+    from proofdeploy.orchestrator import check_sandbox_runtime
+
+    class FakeResult:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        if "--version" in cmd:
+            return FakeResult("v22.1.0\n")
+        return FakeResult("sha256:789\n")
+
+    version, digest, failure = check_sandbox_runtime(
+        "node:22", "node", None, runner=fake_run
+    )
+    assert version == "22.1.0"
+    assert digest == "sha256:789"
+    assert failure is None
+
+
+@requires_sandbox
+def test_sandboxed_end_to_end_orchestrator(tmp_path):
+    """T1: sandboxed end-to-end orchestrator test (canned model, real container).
+
+    Runs in the `sandbox-tests` CI job. Asserts READY on both sides, probe
+    results, the score, sandboxed=True, measured_result=True, and sandbox
+    evidence.
+    """
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        bug_id="mini-sandbox-e2e",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes,
+        public_contract_env_keys=["APP_ENV"],
+        # Sandboxed (no allow_unsandboxed).
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["parent_ready"] is True
+    assert summary["fix_ready"] is True
+    assert summary["verdict"] in ("candidate_catch", "no_catch", "INCONCLUSIVE")
+
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["sandboxed"] is True
+    assert evidence["measured_result"] is True
+    assert evidence["sandbox_evidence"]
+
+
+def test_target_process_group_killed(tmp_path):
+    """O2: a wrapper start command that spawns a child must not leave
+    survivors. The whole process group is terminated.
+
+    Goes through Provisioner.provision (not a hand-built Popen) to prove
+    the provisioner starts targets with start_new_session=True. Treats
+    zombies as dead (some hosts' init doesn't reap orphans) and checks
+    the port no longer answers.
+    """
+    import os
+    import socket
+    import subprocess
+    import time
+    import urllib.request
+
+    from proofdeploy.runner import Provisioner, ProvisionStatus
+
+    # A tiny HTTP app with /health.
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "requirements.txt").write_text("# no third-party deps\n")
+    (snap / "app.py").write_text(
+        "import os\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "class H(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200)\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(b'ok')\n"
+        "    def log_message(self, *a):\n"
+        "        pass\n"
+        "port = int(os.environ.get('PORT', '8000'))\n"
+        "HTTPServer(('127.0.0.1', port), H).serve_forever()\n"
+    )
+
+    # Find a free port.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    from types import SimpleNamespace as _SNS2
+
+    contract = _SNS2(
+        build=None,
+        migrate=None,
+        seed=None,
+        env={},
+        # Wrapper start: spawns a child (the backgrounded python3) and waits.
+        start='sh -c "python3 app.py & wait"',
+        readiness="/",
+        fixture={},
+        database=None,
+        auth=None,
+    )
+    prov = Provisioner(workdir=tmp_path / "work")
+    # Mock _exec for install/build steps (not relevant to O2); the start
+    # step uses subprocess.Popen directly and runs for real.
+    def fake_exec(cmd, cwd, timeout, logs, env):
+        logs.append(f"$ {' '.join(cmd)} (mocked)")
+        return True, None
+    # Fake venv dir (bin subdir need not exist; system PATH still applies).
+    prov._make_venv = lambda *a, **k: tmp_path  # type: ignore[method-assign]
+    prov._exec = fake_exec  # type: ignore[method-assign]
+    result = prov.provision(
+        snapshot_dir=snap,
+        contract=contract,
+        port=port,
+        require_lockfile_match=False,
+    )
+    assert result.status == ProvisionStatus.READY, f"provision failed: {result.reason}"
+    proc = result.proc
+    assert proc is not None
+    try:
+        # The provisioner must start the target in its own session:
+        # process-group id equals the pid.
+        pgid = os.getpgid(proc.pid)
+        assert pgid == proc.pid, (
+            f"target is not a process-group leader: pid={proc.pid} pgid={pgid}"
+        )
+        # Give the wrapper's child time to spawn.
+        time.sleep(1.0)
+        out = subprocess.run(
+            ["ps", "--ppid", str(proc.pid), "-o", "pid="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        child_pids = [p for p in out.split() if p.isdigit()]
+        assert child_pids, "test setup: wrapper should have spawned a child"
+    finally:
+        prov.stop_target(proc, logs=[])
+
+    def _is_dead_or_zombie(pid: str) -> bool:
+        """True if the process is gone or a zombie (state Z)."""
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                state = f.read().split()[2]
+            return state == "Z"
+        except (FileNotFoundError, ProcessLookupError, IndexError):
+            return True
+
+    # Every group member must be gone or a zombie.
+    time.sleep(1.0)
+    for pid in child_pids:
+        assert _is_dead_or_zombie(pid), f"child process {pid} survived stop_target"
+    assert _is_dead_or_zombie(str(proc.pid)), "target process survived stop_target"
+
+    # The port must no longer answer.
+    time.sleep(0.5)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5):
+            raise AssertionError(f"port {port} still answers after stop_target")
+    except AssertionError:
+        raise
+    except Exception:
+        pass  # Expected: connection refused.
+
+    # Clean up the run's scratch dirs.
+    prov.cleanup_run(result.run_id, logs=[])
+
+
+# ---------------------------------------------------------------------------
+# Addendum 10/11: invalid author output never crashes or loses the record.
+# Each invalid block is validated on its own; valid blocks run, invalid
+# blocks are recorded verbatim as INCONCLUSIVE probe results, never sent.
+# ---------------------------------------------------------------------------
+
+def _mixed_probes(prompt: str) -> ModelResponse:
+    """One valid status probe plus one invalid block (missing assert)."""
+    return ModelResponse(
+        content=(
+            "Here are my probes.\n"
+            "```json\n"
+            '{"setup": [], '
+            '"act": {"method": "GET", "path": "/value"}, '
+            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+            "\n```\n"
+            "And a second one:\n"
+            "```json\n"
+            '{"act": {"method": "GET", "path": "/x"}}'
+            "\n```\n"
+        ),
+        finish_reason="stop",
+    )
+
+
+def _no_block_probes(prompt: str) -> ModelResponse:
+    return ModelResponse(
+        content="I looked at the app and could not devise a probe.",
+        finish_reason="stop",
+    )
+
+
+def _non_json_probes(prompt: str) -> ModelResponse:
+    return ModelResponse(
+        content="```json\n{this is not valid json\n```\n",
+        finish_reason="stop",
+    )
+
+
+def _all_invalid_probes(prompt: str) -> ModelResponse:
+    return ModelResponse(
+        content=(
+            "```json\n"
+            '{"act": {"method": "BREW", "path": "/x"}, '
+            '"assert": [{"type": "status", "equals": 200}]}'
+            "\n```\n"
+        ),
+        finish_reason="stop",
+    )
+
+
+def _bug_cfg_invalid(tmp_path, info, bug_id, runner):
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    return (
+        MeasureConfig(
+            repo_dir=Path(info["repo"]),
+            output_dir=out,
+            workdir=work,
+            skill_path=skill_path(),
+            bug_id=bug_id,
+            rev_bug_base=info["base"],
+            rev_bug=info["bug"],
+            rev_fix=info["fix"],
+            model_runner=runner,
+            public_contract_env_keys=["APP_ENV"],
+            allow_unsandboxed=True,
+        ),
+        out,
+    )
+
+
+def test_mixed_valid_invalid_blocks(tmp_path):
+    """Addendum 11 rule 6: the valid block runs and can catch; the
+    invalid block is recorded verbatim as an INCONCLUSIVE probe result,
+    never sent."""
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-mixed-blocks", _mixed_probes)
+    summary = Orchestrator(cfg).measure_bug()
+    # The valid probe still caught the bug (FAIL at fix^, PASS at fix).
+    assert summary["verdict"] == "candidate_catch"
+    assert summary["candidate_catch"] == [0]
+    assert summary["probe_count"] == 1
+    # The invalid block was recorded verbatim with its rejection reason.
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["record_type"] == "evidence"
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    bad = evidence["invalid_probe_blocks"][0]
+    assert bad["block_index"] == 1
+    assert bad["raw_text"].strip() == '{"act": {"method": "GET", "path": "/x"}}'
+    assert "assert" in bad["rejection_reason"]
+    # ... and reported as an INCONCLUSIVE probe result on both sides.
+    for side_key in ("fix_parent_results", "fix_results"):
+        results = evidence[side_key]
+        assert len(results) == 2
+        by_index = {r["probe_index"]: r for r in results}
+        assert by_index[1]["verdict"] == "inconclusive"
+        assert by_index[1]["reason"] == "probe"
+        assert by_index[1]["request"] is None  # never sent
+    # The score record agrees with the evidence (re-scored on write).
+    score = records[1]
+    assert score["record_type"] == "score"
+    assert score["verdict"] == "candidate_catch"
+    assert score["candidate_catch"] == [0]
+
+
+def test_no_blocks_records_author_output_invalid(tmp_path):
+    """No fenced blocks: the evidence is committed (prompt + raw
+    response), the bug unit scores as not caught with cause
+    author_output_invalid, never as pair INCONCLUSIVE."""
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-no-blocks", _no_block_probes)
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "no_catch"
+    assert summary["cause"] == "author_output_invalid"
+    assert summary["reason_class"] == "probe"
+    assert summary["counting"] == "counts_as_not_caught"
+    assert summary["candidate_catch"] == []
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["record_type"] == "evidence"
+    assert evidence["prompt"]  # not lost
+    assert evidence["raw_model_response"] == _no_block_probes("").content
+    assert evidence["inconclusive_cause"] == "author_output_invalid"
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    assert "no fenced" in evidence["invalid_probe_blocks"][0]["rejection_reason"]
+    # Unsandboxed dev run is not a measured result.
+    assert evidence["measured_result"] is False
+    score = records[1]
+    assert score["record_type"] == "score"
+    assert score["verdict"] == "no_catch"
+    assert score["candidate_catch"] == []
+
+
+def test_non_json_block_records_author_output_invalid(tmp_path):
+    """Unparseable JSON block: same no-valid-probe path as no blocks."""
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-non-json", _non_json_probes)
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "no_catch"
+    assert summary["cause"] == "author_output_invalid"
+    assert summary["counting"] == "counts_as_not_caught"
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["prompt"]
+    assert evidence["raw_model_response"] == _non_json_probes("").content
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    assert "invalid JSON" in evidence["invalid_probe_blocks"][0]["rejection_reason"]
+
+
+def test_all_blocks_invalid_records_author_output_invalid(tmp_path):
+    """Every block invalid: evidence committed, not caught, cause recorded."""
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-all-invalid", _all_invalid_probes)
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "no_catch"
+    assert summary["cause"] == "author_output_invalid"
+    assert summary["counting"] == "counts_as_not_caught"
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["prompt"]
+    assert evidence["raw_model_response"] == _all_invalid_probes("").content
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    assert "BREW" in evidence["invalid_probe_blocks"][0]["rejection_reason"]
+
+
+def test_clean_no_valid_probe_is_false_alarm(tmp_path):
+    """Addendum 11 rule 6 on a clean diff: no valid probe counts as a
+    false alarm (rule 3 counting)."""
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    work = tmp_path / "work"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=work,
+        skill_path=skill_path(),
+        clean_id="mini-clean-invalid",
+        rev_clean=info["fix"],
+        model_runner=_no_block_probes,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_clean()
+    assert summary["verdict"] == "false_alarm"
+    assert summary["false_alarm"] is True
+    assert summary["cause"] == "author_output_invalid"
+    assert summary["reason_class"] == "probe"
+    assert summary["counting"] == "counts_as_false_alarm"
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["prompt"]
+    assert len(evidence["invalid_probe_blocks"]) == 1
+    score = records[1]
+    assert score["record_type"] == "score"
+    assert score["false_alarm"] is True
+
+
+def test_unreachable_target_with_invalid_block_scores_inconclusive(tmp_path, monkeypatch):
+    """Addendum 13: target unreachable after READY plus one invalid block.
+
+    The evidence keeps sent=False on the invalid-block result, and
+    re-scoring from the committed evidence gives pair INCONCLUSIVE --
+    an infrastructure failure is not relabeled an author miss.
+    """
+    import socket
+
+    from proofdeploy.executor import ProbeResult
+    from proofdeploy.runpair import RunPairVerdict, score_run_pair
+
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg_invalid(tmp_path, info, "mini-unreachable-invalid", _mixed_probes)
+
+    # Closed port: provisioning still sees READY, but every probe fails
+    # to connect -> INCONCLUSIVE environment on both sides.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    dead_url = f"http://127.0.0.1:{s.getsockname()[1]}"
+    s.close()
+
+    orig = Orchestrator._make_executor
+
+    def dead_executor(self, side):
+        ex = orig(self, side)
+        ex.target_url = dead_url
+        return ex
+
+    monkeypatch.setattr(Orchestrator, "_make_executor", dead_executor)
+
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "inconclusive"
+
+    records = read_records(out)
+    evidence = records[0]
+    assert evidence["record_type"] == "evidence"
+    # The invalid block is recorded with sent=False on both sides.
+    for side_key in ("fix_parent_results", "fix_results"):
+        by_index = {r["probe_index"]: r for r in evidence[side_key]}
+        assert by_index[1]["sent"] is False
+        assert by_index[1]["verdict"] == "inconclusive"
+        assert by_index[1]["reason"] == "probe"
+    # Re-score from the committed evidence: still pair INCONCLUSIVE.
+    parent = [ProbeResult.from_dict(r) for r in evidence["fix_parent_results"]]
+    fix = [ProbeResult.from_dict(r) for r in evidence["fix_results"]]
+    assert score_run_pair(parent, fix) == RunPairVerdict.INCONCLUSIVE

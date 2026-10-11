@@ -27,23 +27,29 @@ occurrence aborts the run.
 
 If provisioning fails on a side, the run is still recorded and scored:
 the registered rule maps a non-READY side to infrastructure
-INCONCLUSIVE. If the model produces no valid probes, the run aborts
-with OrchestratorError and nothing is scored or committed: there is no
-evidence to score.
+INCONCLUSIVE. If the model produces no valid probes, the run is still
+recorded and scored: every invalid block is kept verbatim with its
+rejection reason and reported as an INCONCLUSIVE probe result
+(Addendum 11 rule 6). A bug unit with no valid probe counts as not
+caught; a clean-diff unit counts as a false alarm.
 """
 
 from __future__ import annotations
 
 import json
-import secrets
 import socket
 import subprocess
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from proofdeploy.executor import Executor, HarnessAppConfig
+from proofdeploy.executor import (
+    Executor,
+    HarnessAppConfig,
+    InconclusiveReason,
+    ProbeResult,
+    Verdict,
+)
 from proofdeploy.fixture import (
     assemble_author_bundle,
     create_snapshot,
@@ -65,7 +71,7 @@ from proofdeploy.model_client import (
     build_author_prompt,
     call_model,
 )
-from proofdeploy.probe import ProbeRejected, ProbeSet
+from proofdeploy.probe import ProbeSet
 from proofdeploy.runner import (
     Provisioner,
     ProvisionResult,
@@ -118,6 +124,81 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
+
+
+def _invalid_block_results(
+    probeset: ProbeSet, start_index: int = 0
+) -> list[ProbeResult]:
+    """INCONCLUSIVE `probe` results for invalid author blocks.
+
+    Invalid blocks are never sent; each is reported individually with
+    its rejection reason (Addendum 11 rule 6). The verbatim block text
+    lives in the evidence record's ``invalid_probe_blocks`` field.
+    """
+    return [
+        ProbeResult(
+            probe_index=start_index + j,
+            verdict=Verdict.INCONCLUSIVE,
+            reason=InconclusiveReason.PROBE,
+            details=[
+                f"author output block {b['block_index']} rejected, never sent: "
+                f"{b['rejection_reason']}"
+            ],
+            # Never sent: excluded from the scorer's unreachable test so an
+            # infrastructure failure is not relabeled an author miss.
+            sent=False,
+        )
+        for j, b in enumerate(probeset.invalid_blocks)
+    ]
+
+
+def check_sandbox_runtime(
+    image: str,
+    runtime_name: str,
+    declared_range: str | None,
+    runner: Any = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Check the sandbox image's runtime version against the declared range.
+
+    Returns (image_version, image_digest, failure_reason). failure_reason is
+    None on success (or when no declared range to check); otherwise a
+    BUILD_FAILED reason. Uses `runner` (defaults to subprocess.run) so tests
+    can inject a fake without podman.
+    """
+    import subprocess as _sp
+
+    from proofdeploy.runner import satisfies_range
+
+    run = runner or _sp.run
+    image_version = None
+    image_digest = None
+    try:
+        ver_cmd = (
+            ["python3", "--version"] if runtime_name == "python"
+            else ["node", "--version"]
+        )
+        r = run(
+            ["podman", "run", "--rm", image] + ver_cmd,
+            capture_output=True, text=True, timeout=60,
+        )
+        out = (r.stdout or r.stderr or "").strip()
+        # "Python 3.12.3" -> "3.12.3"; "v22.1.0" -> "22.1.0"
+        image_version = out.split()[-1].lstrip("v") if out else None
+        r2 = run(
+            ["podman", "images", "--digests", "--format", "{{.Digest}}", image],
+            capture_output=True, text=True, timeout=30,
+        )
+        image_digest = (r2.stdout or "").strip().split("\n")[0] or None
+    except Exception as e:
+        return None, None, f"sandbox runtime version check failed: {e}"
+    if declared_range and image_version:
+        ecosystem = "python" if runtime_name == "python" else "node"
+        if not satisfies_range(image_version, declared_range, ecosystem=ecosystem):
+            return image_version, image_digest, (
+                f"sandbox image runtime {image_version} does not satisfy "
+                f"declared version {declared_range}"
+            )
+    return image_version, image_digest, None
 
 
 @dataclass
@@ -173,7 +254,6 @@ class _Side:
     contract: RepoContract
     provision: ProvisionResult
     executor: Executor | None = None
-    auth_password: str | None = None  # runner's disposable password (secret)
     # Isolation actually in effect for this side's sandbox app (network
     # mode, userns mode, uid). None when the sandbox was not used.
     sandbox_evidence: dict[str, object] | None = None
@@ -413,6 +493,291 @@ class Orchestrator:
             "model_attempts": attempts,
         }
 
+    def _record_orchestrator_crash(
+        self,
+        cfg: MeasureConfig,
+        unit_dir: Path,
+        repo: Path,
+        bundle: Any,
+        manifest: dict[str, Any],
+        prompt: str,
+        base_sha: str,
+        tip_sha: str,
+        manifest_sha: str,
+        raw: ModelResponse,
+        probeset: ProbeSet,
+        run_kind: str,
+        use_sandbox: bool,
+        capability_probe: dict[str, Any],
+        error: BaseException,
+        runner_log: list[str] | None = None,
+        provisioning: dict[str, Any] | None = None,
+        probe_results: Any | None = None,
+    ) -> dict[str, Any]:
+        """Record an INCONCLUSIVE run after a ProofDeploy failure (O3).
+
+        If the orchestrator fails after the model call (e.g., provisioning
+        crash, probe execution crash), the prompt, raw response, parsed
+        probes, runner log, and any provisioning/probe results gathered so
+        far must not be lost. This commits an evidence record with verdict
+        INCONCLUSIVE and a typed reason (cause, exception type and message),
+        then the score as usual.
+
+        The cause is ``tool_failure`` (Addendum 11 rule 5, registered):
+        a failure in ProofDeploy itself, reason class ``environment``.
+
+        Master's principle: state what failed, never lose it.
+        """
+        from proofdeploy.model_client import (
+            author_prompt_builder_sha256,
+            author_prompt_sha256,
+        )
+        from proofdeploy.runpair import (
+            RunPairVerdict,
+            build_evidence_record,
+            commit_records,
+            write_evidence_record,
+            write_score_record,
+        )
+
+        cause = "tool_failure"
+        error_text = f"{type(error).__name__}: {error}"
+        self._say(
+            "ProofDeploy failed after authoring; recording INCONCLUSIVE "
+            f"({cause}): {error_text[:200]}"
+        )
+        record = build_evidence_record(
+            run_kind=run_kind,
+            bug_id=cfg.bug_id if run_kind == "bug" else None,
+            clean_id=cfg.clean_id if run_kind == "clean" else None,
+            prompt=prompt,
+            raw_model_response=raw.content,
+            parsed_probes=probeset.probes,
+            invalid_probe_blocks=probeset.invalid_blocks,
+            bundle_manifest=manifest,
+            bundle_manifest_sha256=manifest_sha,
+            author_prompt_sha256=author_prompt_sha256(),
+            author_prompt_builder_sha256=author_prompt_builder_sha256(),
+            skill_sha256=manifest.get("skill_sha256"),
+            sandboxed=use_sandbox,
+            measured_result=use_sandbox,
+            provenance=self._provenance(capability_probe),
+            model_request=raw.request_record,
+            # O3: keep the reason, the runner log, and everything gathered
+            # before the crash.
+            inconclusive_cause=cause,
+            inconclusive_error=error_text,
+            runner_log=list(runner_log) if runner_log else list(self.log),
+            crash_provisioning=provisioning or {},
+            crash_probe_results=probe_results,
+        )
+        record_id, _, evidence_sha = write_evidence_record(
+            record, repo, repo, secret_values=self.cfg.extra_secrets,
+        )
+        self._say(f"evidence committed: {evidence_sha[:12]}")
+        counting = (
+            "counts_as_not_caught" if run_kind == "bug"
+            else "counts_as_false_alarm"
+        )
+        score_path, _ = write_score_record(
+            output_dir=repo,
+            repo=repo,
+            evidence_record_id=record_id,
+            run_kind=run_kind,
+            bug_id=cfg.bug_id if run_kind == "bug" else None,
+            clean_id=cfg.clean_id if run_kind == "clean" else None,
+            verdict=RunPairVerdict.INCONCLUSIVE,
+            note="environment: tool_failure",
+            secret_values=self.cfg.extra_secrets,
+        )
+        score_sha = commit_records(
+            repo, repo, f"score: {run_kind} {(cfg.bug_id or cfg.clean_id)} ({record_id[:8]})"
+        )
+        self._say(f"score committed: {score_sha[:12]}")
+        return {
+            "run_kind": run_kind,
+            "bug_id": cfg.bug_id if run_kind == "bug" else None,
+            "clean_id": cfg.clean_id if run_kind == "clean" else None,
+            "evidence_record_id": record_id,
+            "evidence_commit": evidence_sha,
+            "score_commit": score_sha,
+            "verdict": "inconclusive",
+            "reason_class": "environment",
+            "cause": "tool_failure",
+            "counting": counting,
+        }
+
+    def _record_author_output_invalid(
+        self,
+        cfg: MeasureConfig,
+        unit_dir: Path,
+        repo: Path,
+        bundle: Any,
+        manifest: dict[str, Any],
+        prompt: str,
+        base_sha: str,
+        tip_sha: str,
+        manifest_sha: str,
+        raw: ModelResponse,
+        probeset: ProbeSet,
+        run_kind: str,
+        use_sandbox: bool,
+        capability_probe: dict[str, Any],
+        attempts: list[str],
+        truncation_flags: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record a run whose author output held no valid probe.
+
+        Addendum 11 rule 6: the evidence record is always written and
+        committed once the model has answered — prompt, raw response,
+        and every invalid block verbatim with its rejection reason.
+        Nothing is provisioned (there is no valid probe to run); each
+        invalid block is reported as an INCONCLUSIVE ``probe`` result.
+        A bug unit counts as not caught; a clean-diff unit counts as a
+        false alarm (rule 3 counting). Never pair INCONCLUSIVE.
+        """
+        from proofdeploy.model_client import (
+            author_prompt_builder_sha256,
+            author_prompt_sha256,
+        )
+        from proofdeploy.runpair import (
+            build_evidence_record,
+            commit_records,
+            write_evidence_record,
+            write_score_record,
+        )
+
+        cause = "author_output_invalid"
+        n_invalid = len(probeset.invalid_blocks)
+        self._say(
+            f"author output held no valid probe ({n_invalid} invalid "
+            f"block(s)); recording {cause}"
+        )
+        invalid_results = _invalid_block_results(probeset)
+        if not invalid_results:
+            # Defensive: from_author_output always yields at least one
+            # invalid block when no probe validated, but the score
+            # re-checks against the evidence and would refuse a claim
+            # it cannot reproduce.
+            invalid_results = [
+                ProbeResult(
+                    probe_index=0,
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason=InconclusiveReason.PROBE,
+                    details=["no valid probe in author output"],
+                    sent=False,
+                )
+            ]
+        # Resolve the SHAs for the record (no provisioning happens).
+        repo_dir = self.cfg.repo_dir
+        sha_kwargs: dict[str, Any] = {}
+        if run_kind == "bug":
+            sha_kwargs = {
+                "fix_sha": _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_fix}^{{commit}}"),
+                "fix_parent_sha": _git(
+                    repo_dir, "rev-parse", "--verify", f"{cfg.rev_fix}^{{commit}}"
+                ),
+                "b_sha": _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_bug}^{{commit}}"),
+                "b_parent_sha": _git(
+                    repo_dir, "rev-parse", "--verify", f"{cfg.rev_bug_base}^{{commit}}"
+                ),
+            }
+        else:
+            sha_kwargs = {
+                "c_sha": _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_clean}^{{commit}}"),
+            }
+        record = build_evidence_record(
+            run_kind=run_kind,
+            bug_id=cfg.bug_id if run_kind == "bug" else None,
+            clean_id=cfg.clean_id if run_kind == "clean" else None,
+            prompt=prompt,
+            raw_model_response=raw.content,
+            parsed_probes=[],
+            invalid_probe_blocks=probeset.invalid_blocks,
+            bundle_manifest=manifest,
+            bundle_manifest_sha256=manifest_sha,
+            model_id=MODEL_ID,
+            model_temperature=TEMPERATURE,
+            model_attempts=1,
+            model_request=raw.request_record,
+            model_call_attempts=attempts,
+            author_prompt_sha256=author_prompt_sha256(),
+            author_prompt_builder_sha256=author_prompt_builder_sha256(),
+            skill_sha256=manifest.get("skill_sha256"),
+            truncation_flags=truncation_flags,
+            sandboxed=use_sandbox,
+            measured_result=use_sandbox,
+            provenance=self._provenance(capability_probe),
+            runner_log=list(self.log),
+            inconclusive_cause=cause,
+            inconclusive_error=(
+                f"author output contained no valid probe "
+                f"({n_invalid} invalid block(s))"
+            ),
+            fix_parent_results=invalid_results if run_kind == "bug" else None,
+            fix_results=invalid_results if run_kind == "bug" else None,
+            c_results=invalid_results if run_kind == "clean" else None,
+            **sha_kwargs,
+        )
+        record_id, _, evidence_sha = write_evidence_record(
+            record, repo, repo, secret_values=self.cfg.extra_secrets,
+        )
+        self._say(f"evidence committed: {evidence_sha[:12]}")
+        counting = (
+            "counts_as_not_caught" if run_kind == "bug"
+            else "counts_as_false_alarm"
+        )
+        if run_kind == "bug":
+            # The evidence holds INCONCLUSIVE/probe results on both
+            # sides, so the re-score yields NO_CATCH (a miss), never
+            # pair INCONCLUSIVE.
+            score_path, _ = write_score_record(
+                output_dir=repo,
+                repo=repo,
+                evidence_record_id=record_id,
+                run_kind="bug",
+                bug_id=cfg.bug_id,
+                verdict=RunPairVerdict.NO_CATCH,
+                candidate_catch=[],
+                note=f"probe: {cause}",
+                secret_values=self.cfg.extra_secrets,
+            )
+        else:
+            # Any INCONCLUSIVE result is a false alarm under the strict
+            # clean-diff rule.
+            score_path, _ = write_score_record(
+                output_dir=repo,
+                repo=repo,
+                evidence_record_id=record_id,
+                run_kind="clean",
+                clean_id=cfg.clean_id,
+                false_alarm=True,
+                note=f"probe: {cause}",
+                secret_values=self.cfg.extra_secrets,
+            )
+        score_sha = commit_records(
+            repo, repo, f"score: {run_kind} {(cfg.bug_id or cfg.clean_id)} ({record_id[:8]})"
+        )
+        self._say(f"score committed: {score_sha[:12]}")
+        result: dict[str, Any] = {
+            "run_kind": run_kind,
+            "bug_id": cfg.bug_id if run_kind == "bug" else None,
+            "clean_id": cfg.clean_id if run_kind == "clean" else None,
+            "evidence_record_id": record_id,
+            "evidence_commit": evidence_sha,
+            "score_commit": score_sha,
+            "verdict": "no_catch" if run_kind == "bug" else "false_alarm",
+            "reason_class": "probe",
+            "cause": cause,
+            "counting": counting,
+            "model_attempts": attempts,
+        }
+        if run_kind == "clean":
+            result["false_alarm"] = True
+        else:
+            result["candidate_catch"] = []
+        return result
+
     def _leak_check_bundle(
         self, bundle: Any, prompt: str, contract: RepoContract
     ) -> None:
@@ -444,21 +809,34 @@ class Orchestrator:
         self._say("leak check passed: prompt and bundle carry no secret values")
 
     def _author_probes(self, prompt: str) -> tuple[ProbeSet, ModelResponse]:
-        """Call the model once and parse its probes (steps b-c)."""
+        """Call the model once and parse its probes (steps b-c).
+
+        Never raises for author-output problems (Addendum 11 rule 6):
+        each block is validated on its own; valid blocks run as usual
+        and each invalid block is kept on the ProbeSet to be recorded
+        as an INCONCLUSIVE probe result, never sent. Only a model-call
+        failure raises (handled by the caller with retry).
+        """
         raw = call_model(prompt, runner=self.cfg.model_runner)
-        if not raw.content.strip():
-            raise OrchestratorError("model returned empty content")
-        try:
-            probeset = ProbeSet.from_author_output(
-                raw.content, allow_harness_app=self.cfg.allow_harness_app
+        probeset = ProbeSet.from_author_output(
+            raw.content, allow_harness_app=self.cfg.allow_harness_app
+        )
+        n_valid = len(probeset.probes)
+        n_invalid = len(probeset.invalid_blocks)
+        if n_valid:
+            self._say(
+                f"author produced {n_valid} valid probe(s)"
+                + (
+                    f"; {n_invalid} invalid block(s) recorded verbatim, never sent"
+                    if n_invalid
+                    else ""
+                )
             )
-        except ProbeRejected as e:
-            raise OrchestratorError(
-                f"author output failed probe validation: {e}"
-            ) from e
-        if not probeset.probes:
-            raise OrchestratorError("author produced zero probes")
-        self._say(f"author produced {len(probeset.probes)} validated probes")
+        else:
+            self._say(
+                "author produced no valid probes "
+                f"({n_invalid} invalid block(s)); recording author_output_invalid"
+            )
         return probeset, raw
 
     # ------------------------------------------------------------------
@@ -529,6 +907,48 @@ class Orchestrator:
         runtime_name = _detect_runtime(snapshot.dir)
         image = SANDBOX_IMAGES.get(runtime_name, SANDBOX_IMAGES["python"])
         logs.append(f"sandbox image: {image} (runtime {runtime_name})")
+        # Item 5: fail closed when the image's runtime doesn't satisfy the
+        # repo's declared version (requires-python / engines). Record the
+        # image digest and the runtime version in the evidence.
+        from proofdeploy.runner import _requires_python_from_toml
+
+        _sandbox_requires_python = _requires_python_from_toml
+        declared_range = None
+        if runtime_name == "python":
+            pyproject = snapshot.dir / "pyproject.toml"
+            if pyproject.is_file():
+                declared_range = _sandbox_requires_python(pyproject)
+        elif runtime_name == "node":
+            pkg = snapshot.dir / "package.json"
+            if pkg.is_file():
+                try:
+                    import json
+                    data = json.loads(pkg.read_text(encoding="utf-8"))
+                    engines = data.get("engines") or {}
+                    if isinstance(engines, dict):
+                        declared_range = engines.get("node")
+                except Exception:
+                    pass
+        # Get the image's runtime version and digest (unit-testable).
+        image_version, image_digest, runtime_failure = check_sandbox_runtime(
+            image, runtime_name, declared_range
+        )
+        logs.append(f"sandbox runtime version: {image_version} (digest {image_digest})")
+        if runtime_failure:
+            logs.append(f"{runtime_failure}: BUILD_FAILED")
+            provision = ProvisionResult(
+                status=ProvisionStatus.BUILD_FAILED,
+                reason=runtime_failure,
+                logs=logs,
+                runtime=runtime_name,
+                runtime_version=image_version,
+            )
+            # Record the digest/version even on failure.
+            provision.image_digest = image_digest
+            return _Side(
+                rev=rev, sha=sha, snapshot_dir=snapshot.dir,
+                contract=contract, provision=provision,
+            )
         sb = Sandbox(SandboxConfig(image=image))
         # Secret-free contract env only; never the full env.
         secret_free_env = {
@@ -598,8 +1018,10 @@ class Orchestrator:
             target_url=app.target_url,
             logs=logs,
             runtime=runtime_name,
+            runtime_version=image_version,
             run_id=f"sandbox-{tag}-{sha[:8]}",
         )
+        provision.image_digest = image_digest
         # Stash the SandboxApp for cleanup; the finally block stops it.
         provision.proc = app
         self._say(f"provision {tag} ({sha[:12]}): READY -> {app.target_url} (sandbox)")
@@ -609,49 +1031,50 @@ class Orchestrator:
             sandbox_evidence=dict(app.sandbox_evidence),
         )
 
-    def _register_runner_user(self, side: _Side) -> str:
-        """Create the runner's disposable credential on a READY target.
+    def _credential_config(self, side: _Side) -> dict[str, Any] | None:
+        """Parse the contract's declared credential provider, if any.
 
-        The app exposes open registration; the runner registers a random
-        user and returns its bearer token, which becomes ${AUTH_TOKEN}
-        for the probe runs. Password and token are secrets: they are
-        collected for the record's fail-closed redaction and never enter
-        the author bundle or prompt (authoring already happened).
+        The contract declares auth via the top-level `auth:` mapping,
+        validated at load by `load_contract`. Absent means no credential:
+        no token is used, `${AUTH_TOKEN}` is unknown, and a probe using
+        it is INCONCLUSIVE `probe` (fail-closed, never a crash).
+
+        Registration is one declared provider mode (`register`), never a
+        default. Its requests are recorded and logged as writes by the
+        executor; a provider failure is INCONCLUSIVE `auth`, never an
+        exception.
         """
-        assert side.provision and side.provision.target_url
-        password = secrets.token_hex(16)
-        username = f"runner-{secrets.token_hex(4)}"
-        body = json.dumps({"username": username, "password": password}).encode()
-        req = urllib.request.Request(
-            side.provision.target_url.rstrip("/") + "/register",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = json.loads(r.read().decode("utf-8"))
-        except Exception as e:
-            raise OrchestratorError(
-                f"runner registration failed on {side.provision.target_url}: {e}"
-            ) from e
-        token = data.get("token")
-        if not isinstance(token, str) or not token:
-            raise OrchestratorError("registration did not return a token")
-        side.auth_password = password
-        self.cfg.extra_secrets.extend([password, token])
-        return token
+        auth = side.contract.auth
+        if not auth:
+            return None
+        return dict(auth)
 
-    def _make_executor(self, side: _Side, token: str | None) -> Executor:
+    def _make_executor(self, side: _Side) -> Executor:
         assert side.provision and side.provision.target_url
-        db_path = side.snapshot_dir / "notes.db"
+        # DB path comes from the contract's `database:` declaration, not a
+        # hard-coded filename. None declared means the executor gets no DB
+        # path and DB assertions are INCONCLUSIVE. Declared but missing
+        # means INCONCLUSIVE `environment` (flagged explicitly, not silent).
+        db_path = None
+        db_declared_missing = False
+        declared = side.contract.database
+        if declared and declared.get("kind") == "sqlite":
+            candidate = side.snapshot_dir / declared["path"]
+            # Resolve relative to the snapshot dir (contract paths are
+            # relative to the repo root, which the snapshot mirrors).
+            if candidate.is_file():
+                db_path = str(candidate)
+            else:
+                db_declared_missing = True
         return Executor(
             target_url=side.provision.target_url,
-            db_path=str(db_path) if db_path.is_file() else None,
+            db_path=db_path,
+            db_declared_missing=db_declared_missing,
             provisioned=True,
             contract_env=dict(side.contract.env),
             fixture=dict(side.contract.fixture),
-            auth_token=token,
+            auth_token=None,
+            credential_config=self._credential_config(side),
             allow_harness_app=self.cfg.allow_harness_app,
             harness=(
                 HarnessAppConfig(workdir=self.cfg.workdir / "harness")
@@ -761,6 +1184,21 @@ class Orchestrator:
                     capability_probe=capability_probe,
                 )
 
+        if not probeset.probes:
+            # Addendum 11 rule 6: the author output held no valid probe.
+            # Record the evidence (prompt, raw response, every invalid
+            # block verbatim) and score without provisioning: a bug unit
+            # counts as not caught, never as pair INCONCLUSIVE.
+            return self._record_author_output_invalid(
+                cfg, unit_dir, repo, bundle, manifest, prompt,
+                base_sha, tip_sha, manifest_sha, raw, probeset,
+                run_kind="bug",
+                use_sandbox=use_sandbox,
+                capability_probe=capability_probe,
+                attempts=attempts,
+                truncation_flags=truncation_flags,
+            )
+
         prov_workdir = cfg.workdir / "provisioner"
         prov_workdir.mkdir(parents=True, exist_ok=True)
         runner = Provisioner(workdir=prov_workdir)
@@ -775,6 +1213,8 @@ class Orchestrator:
         fix_sha = _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_fix}^{{commit}}")
         fix_parent_sha = _git(repo_dir, "rev-parse", "--verify", f"{fix_parent_rev}^{{commit}}")
         sides: list[_Side] = []
+        parent_results = None
+        fix_results = None
         try:
             if use_sandbox:
                 sides.append(
@@ -795,12 +1235,12 @@ class Orchestrator:
                     self._provision_side(runner, cfg.rev_fix, _free_port(), unit_dir, "fix")
                 )
             parent, fix = sides
-            parent_results = fix_results = None
             if parent.provision.ready and fix.provision.ready:
-                parent_token = self._register_runner_user(parent)
-                fix_token = self._register_runner_user(fix)
-                parent.executor = self._make_executor(parent, parent_token)
-                fix.executor = self._make_executor(fix, fix_token)
+                # Auth comes from the contract's declared credential
+                # provider (O1). Absent means no token; the executor
+                # handles ${AUTH_TOKEN} as unknown (INCONCLUSIVE probe).
+                parent.executor = self._make_executor(parent)
+                fix.executor = self._make_executor(fix)
                 try:
                     parent_results = [
                         parent.executor.run_probe(p, i)
@@ -813,6 +1253,15 @@ class Orchestrator:
                 finally:
                     parent.executor.close()
                     fix.executor.close()
+                # Addendum 11 rule 6: each invalid block is reported
+                # individually as an INCONCLUSIVE probe result on every
+                # side that ran, never sent.
+                invalid_results = _invalid_block_results(
+                    probeset, start_index=len(probeset.probes)
+                )
+                if invalid_results:
+                    parent_results = parent_results + invalid_results
+                    fix_results = fix_results + invalid_results
             else:
                 self._say("a side is not READY; scoring infrastructure-INCONCLUSIVE")
 
@@ -826,6 +1275,7 @@ class Orchestrator:
                 prompt=prompt,
                 raw_model_response=raw.content,
                 parsed_probes=probeset.probes,
+            invalid_probe_blocks=probeset.invalid_blocks,
                 bundle_manifest=manifest,
                 bundle_manifest_sha256=manifest_sha,
                 model_id=MODEL_ID,
@@ -892,6 +1342,32 @@ class Orchestrator:
                 "parent_ready": parent.provision.ready,
                 "fix_ready": fix.provision.ready,
             }
+        except Exception as e:
+            # O3: any failure after authoring commits an INCONCLUSIVE
+            # record with a typed reason, then the score as usual.
+            # Master's principle: state what failed, never lose it.
+            # Gather everything available at crash time.
+            crash_provisioning = {}
+            try:
+                for i, s in enumerate(sides):
+                    if s.provision:
+                        crash_provisioning[f"side_{i}"] = s.provision.to_dict()
+            except Exception:
+                pass
+            return self._record_orchestrator_crash(
+                cfg, unit_dir, repo, bundle, manifest, prompt,
+                base_sha, tip_sha, manifest_sha, raw, probeset,
+                run_kind="bug",
+                use_sandbox=use_sandbox,
+                capability_probe=capability_probe,
+                error=e,
+                runner_log=list(self.log),
+                provisioning=crash_provisioning,
+                probe_results={
+                    "parent_results": [r.to_dict() for r in (parent_results or [])],
+                    "fix_results": [r.to_dict() for r in (fix_results or [])],
+                },
+            )
         finally:
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
@@ -900,6 +1376,9 @@ class Orchestrator:
                         proc.stop()
                         self._say(f"sandbox stop: {side.provision.run_id}")
                     else:
+                        # O2: terminate and reap the target process on every
+                        # exit path, then remove the scratch dirs.
+                        runner.stop_target(proc, self.log)
                         runner.cleanup_run(side.provision.run_id, self.log)
                         self._say(f"cleanup_run: {side.provision.run_id}")
 
@@ -983,10 +1462,26 @@ class Orchestrator:
                     capability_probe=capability_probe,
                 )
 
+        if not probeset.probes:
+            # Addendum 11 rule 6: the author output held no valid probe.
+            # Record the evidence (prompt, raw response, every invalid
+            # block verbatim) and score without provisioning: a
+            # clean-diff unit counts as a false alarm.
+            return self._record_author_output_invalid(
+                cfg, unit_dir, repo, bundle, manifest, prompt,
+                base_sha, tip_sha, manifest_sha, raw, probeset,
+                run_kind="clean",
+                use_sandbox=use_sandbox,
+                capability_probe=capability_probe,
+                attempts=attempts,
+                truncation_flags=truncation_flags,
+            )
+
         prov_workdir = cfg.workdir / "provisioner"
         prov_workdir.mkdir(parents=True, exist_ok=True)
         runner = Provisioner(workdir=prov_workdir)
         sides: list[_Side] = []
+        c_results = None
         try:
             if use_sandbox:
                 sides.append(
@@ -997,10 +1492,10 @@ class Orchestrator:
                     self._provision_side(runner, cfg.rev_clean, _free_port(), unit_dir, "clean")
                 )
             (side,) = sides
-            c_results = None
             if side.provision.ready:
-                token = self._register_runner_user(side)
-                side.executor = self._make_executor(side, token)
+                # Auth comes from the contract's declared credential
+                # provider (O1). Absent means no token.
+                side.executor = self._make_executor(side)
                 try:
                     c_results = [
                         side.executor.run_probe(p, i)
@@ -1008,6 +1503,13 @@ class Orchestrator:
                     ]
                 finally:
                     side.executor.close()
+                # Addendum 11 rule 6: each invalid block is reported
+                # individually as an INCONCLUSIVE probe result, never sent.
+                invalid_results = _invalid_block_results(
+                    probeset, start_index=len(probeset.probes)
+                )
+                if invalid_results:
+                    c_results = c_results + invalid_results
             else:
                 self._say("C is not READY; recording without results")
 
@@ -1020,6 +1522,7 @@ class Orchestrator:
                 prompt=prompt,
                 raw_model_response=raw.content,
                 parsed_probes=probeset.probes,
+            invalid_probe_blocks=probeset.invalid_blocks,
                 bundle_manifest=manifest,
                 bundle_manifest_sha256=manifest_sha,
                 model_id=MODEL_ID,
@@ -1066,6 +1569,29 @@ class Orchestrator:
                 "probe_count": len(probeset.probes),
                 "c_ready": side.provision.ready,
             }
+        except Exception as e:
+            # O3: any failure after authoring commits an INCONCLUSIVE
+            # record with a typed reason, then the score as usual.
+            crash_provisioning = {}
+            try:
+                for i, s in enumerate(sides):
+                    if s.provision:
+                        crash_provisioning[f"side_{i}"] = s.provision.to_dict()
+            except Exception:
+                pass
+            return self._record_orchestrator_crash(
+                cfg, unit_dir, repo, bundle, manifest, prompt,
+                base_sha, tip_sha, manifest_sha, raw, probeset,
+                run_kind="clean",
+                use_sandbox=use_sandbox,
+                capability_probe=capability_probe,
+                error=e,
+                runner_log=list(self.log),
+                provisioning=crash_provisioning,
+                probe_results={
+                    "c_results": [r.to_dict() for r in (c_results or [])],
+                },
+            )
         finally:
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
@@ -1074,6 +1600,9 @@ class Orchestrator:
                         proc.stop()
                         self._say(f"sandbox stop: {side.provision.run_id}")
                     else:
+                        # O2: terminate and reap the target process on every
+                        # exit path, then remove the scratch dirs.
+                        runner.stop_target(proc, self.log)
                         runner.cleanup_run(side.provision.run_id, self.log)
                         self._say(f"cleanup_run: {side.provision.run_id}")
 

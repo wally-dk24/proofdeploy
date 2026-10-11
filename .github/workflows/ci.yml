@@ -23,7 +23,7 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - name: tests
-        run: python -m pytest -q
+        run: python -m pytest -q -W error::ResourceWarning
       - name: lint
         run: ruff check proofdeploy tests
       - name: typecheck

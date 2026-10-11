@@ -138,6 +138,12 @@ class ProbeResult:
     # the results instead of trusting the caller to pass them in.
     captured_bindings: dict[str, str] = field(default_factory=dict, repr=False)
     minted_tokens: list[str] = field(default_factory=list, repr=False)
+    # Whether the probe was actually sent to the target. Invalid author
+    # blocks are never sent; their results are reported individually as
+    # INCONCLUSIVE `probe` but must not affect reachability scoring
+    # (Addendum 10 follow-up: an infrastructure failure must not be
+    # relabeled an author miss).
+    sent: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -152,6 +158,7 @@ class ProbeResult:
             "http_body": self.http_body[:2000],
             "writes": self.writes,
             "details": self.details,
+            "sent": self.sent,
         }
 
     @classmethod
@@ -171,6 +178,8 @@ class ProbeResult:
             writes=list(d.get("writes") or []),
             request=d.get("request"),
             setup_requests=d.get("setup_requests"),
+            # Old records predate the field; default True (sent).
+            sent=bool(d.get("sent", True)),
         )
 
 
@@ -393,6 +402,11 @@ class Executor:
 
     target_url: str
     db_path: str | None = None
+    # True when the contract declared a database but the file was missing
+    # at executor construction. DB assertions are INCONCLUSIVE `environment`
+    # (the DB was declared, so this is an environment problem, not a
+    # "no DB configured" case).
+    db_declared_missing: bool = False
     http_timeout: int = 30
     # Fail-closed: harness_app setup steps are rejected unless the caller
     # explicitly opts in (dev-set library repos only).
@@ -517,6 +531,8 @@ class Executor:
             return self._provide_ghost_jwt(provider, ctx, details)
         if provider.mode == "refresh":
             return self._provide_refresh(provider, ctx, details, writes)
+        if provider.mode == "register":
+            return self._provide_register(provider, ctx, details, writes)
         details.append(f"credential provider failed: unknown mode '{provider.mode}'")
         return InconclusiveReason.AUTH
 
@@ -623,6 +639,96 @@ class Executor:
                 expires_in = float(node)
         ctx.provide_token(cur, expires_in_seconds=expires_in)
         details.append("credential provider: token acquired")
+        return None
+
+    def _provide_register(
+        self,
+        provider: CredentialProvider,
+        ctx: SetupContext,
+        details: list[str],
+        writes: list[str],
+    ) -> InconclusiveReason | None:
+        """Register a disposable user on the target (declared provider).
+
+        The endpoint, body fields, and token field come from the contract's
+        credential_provider declaration — never a default. A random
+        username and password are generated per run; both are secrets for
+        the record's redaction (via ctx.run_minted).
+
+        The request is recorded and logged as a write. A failure is
+        INCONCLUSIVE `auth`, never an exception.
+        """
+        import secrets as _secrets
+
+        cfg = provider.config
+        path = cfg.get("path")
+        token_path = cfg.get("token_json_path")
+        if not isinstance(path, str) or not path.startswith("/"):
+            details.append(
+                "credential provider failed: register mode needs 'path' starting with '/'"
+            )
+            return InconclusiveReason.AUTH
+        if not isinstance(token_path, str) or not token_path:
+            details.append(
+                "credential provider failed: register mode needs 'token_json_path'"
+            )
+            return InconclusiveReason.AUTH
+        username_field = str(cfg.get("username_field", "username"))
+        password_field = str(cfg.get("password_field", "password"))
+        method = str(cfg.get("method", "POST")).upper()
+        if method not in ("POST", "PUT"):
+            details.append(
+                f"credential provider failed: register mode needs POST or PUT, got '{method}'"
+            )
+            return InconclusiveReason.AUTH
+        username = f"runner-{_secrets.token_hex(4)}"
+        password = _secrets.token_hex(16)
+        try:
+            body = ctx.apply_strict(
+                {username_field: username, password_field: password}
+            )
+        except PlaceholderError as e:
+            details.append(f"credential provider failed: {e}")
+            return InconclusiveReason.AUTH
+        url = self.target_url.rstrip("/") + path
+        allowed, detail = self._check_write_allowed(method, "credential provider")
+        if not allowed:
+            details.append(f"credential provider refused: {detail}")
+            return InconclusiveReason.AUTH
+        details.append(f"credential provider: {method} {path} (register)")
+        status, _, resp_body, req_logs = _do_http(
+            method, url, {"Content-Type": "application/json"}, body, self.http_timeout
+        )
+        details.extend(req_logs)
+        self._log_write(method, url, status, writes, details)
+        if status is None or not (200 <= status < 300):
+            details.append(
+                f"credential provider failed: register endpoint returned {status}"
+            )
+            return InconclusiveReason.AUTH
+        try:
+            data = json.loads(resp_body)
+        except json.JSONDecodeError:
+            details.append("credential provider failed: register response is not JSON")
+            return InconclusiveReason.AUTH
+        cur: Any = data
+        for part in str(token_path).split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                cur = None
+                break
+        if not isinstance(cur, str) or not cur:
+            details.append(
+                f"credential provider failed: no token at '{token_path}' in register response"
+            )
+            return InconclusiveReason.AUTH
+        # Both the password and the token are secrets: record them for
+        # the evidence record's fail-closed redaction. provide_token
+        # records the token; the password is recorded explicitly.
+        ctx.provide_token(cur)
+        ctx.run_minted.append(password)
+        details.append("credential provider: registered user, token acquired")
         return None
 
     def _run_harness_app(
@@ -1140,7 +1246,10 @@ class Executor:
         db_results: dict[int, Any] = {}
         if any(a.get("type") == "db" for a in assertions):
             if self.db_path is None:
-                details.append("db assertion but no db_path")
+                if self.db_declared_missing:
+                    details.append("db assertion but declared database file is missing")
+                else:
+                    details.append("db assertion but no db_path")
                 return _attach_secrets(
                     ProbeResult(
                         probe_index=index,

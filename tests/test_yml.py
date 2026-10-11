@@ -67,3 +67,43 @@ def test_find_contract(tmp_path):
     assert find_contract(tmp_path) is None
     p = write(tmp_path, VALID)
     assert find_contract(tmp_path) == p
+
+
+def test_database_unknown_keys_rejected(tmp_path):
+    """Should-fix: unknown keys in `database:` are rejected (typos fail)."""
+    bad = VALID + 'database:\n  kind: sqlite\n  path: ./app.db\n  bogus_key: x\n'
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_contract(write(tmp_path, bad))
+
+
+def test_database_absolute_path_rejected(tmp_path):
+    """Should-fix: database.path must stay inside the checkout."""
+    bad = VALID + 'database:\n  kind: sqlite\n  path: /etc/passwd\n'
+    with pytest.raises(ValueError, match="inside the checkout"):
+        load_contract(write(tmp_path, bad))
+
+
+def test_database_dotdot_rejected(tmp_path):
+    """Should-fix: database.path with `..` is rejected."""
+    bad = VALID + 'database:\n  kind: sqlite\n  path: ../evil.db\n'
+    with pytest.raises(ValueError, match="inside the checkout"):
+        load_contract(write(tmp_path, bad))
+
+
+def test_auth_unknown_keys_rejected(tmp_path):
+    """Should-fix: unknown keys in `auth:` are rejected (typos fail)."""
+    bad = (
+        VALID
+        + 'auth:\n  mode: register\n  path: /register\n  method: POST\n'
+        + '  username_field: u\n  password_field: p\n  token_json_path: t\n'
+        + '  token_path: typo\n'
+    )
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_contract(write(tmp_path, bad))
+
+
+def test_database_valid_loads(tmp_path):
+    """A valid database declaration loads."""
+    good = VALID + 'database:\n  kind: sqlite\n  path: ./app.db\n'
+    c = load_contract(write(tmp_path, good))
+    assert c.database == {"kind": "sqlite", "path": "./app.db"}

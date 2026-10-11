@@ -57,6 +57,7 @@ def server():
     t.start()
     yield f"http://127.0.0.1:{port}"
     srv.shutdown()
+    srv.server_close()
 
 
 def _probe(**kw):
@@ -184,6 +185,34 @@ def test_result_to_dict(server):
     assert d["writes"] == []
 
 
+def test_probe_result_sent_round_trip():
+    """Addendum 13 (U4): sent=False survives to_dict/from_dict.
+
+    The committed evidence record must keep the flag; otherwise
+    re-scoring from the record brings back the unreachable-masking bug.
+    """
+    from proofdeploy.executor import ProbeResult
+
+    r = ProbeResult(
+        probe_index=1,
+        verdict=Verdict.INCONCLUSIVE,
+        reason=InconclusiveReason.PROBE,
+        details=["author output block rejected, never sent"],
+        sent=False,
+    )
+    assert ProbeResult.from_dict(r.to_dict()).sent is False
+
+
+def test_probe_result_from_dict_defaults_sent_true():
+    """Addendum 13 (U5): old records without sent load as sent=True."""
+    from proofdeploy.executor import ProbeResult
+
+    r = ProbeResult(probe_index=0, verdict=Verdict.PASS, sent=False)
+    d = r.to_dict()
+    del d["sent"]
+    assert ProbeResult.from_dict(d).sent is True
+
+
 # --- WO-2: fail-closed executor tests ---
 
 
@@ -209,6 +238,7 @@ def server2():
     t.start()
     yield f"http://127.0.0.1:{port}"
     srv.shutdown()
+    srv.server_close()
 
 
 def test_invalid_probe_rejected_before_http():
@@ -630,6 +660,7 @@ def auth_server():
     t.start()
     yield f"http://127.0.0.1:{port}"
     srv.shutdown()
+    srv.server_close()
 
 
 def test_unknown_placeholder_is_inconclusive_probe(auth_server):

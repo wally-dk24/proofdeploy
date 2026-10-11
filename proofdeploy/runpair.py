@@ -114,11 +114,15 @@ def _side_unreachable(results: list[ProbeResult]) -> bool:
 
     Registered text: "the target is unreachable for every probe". Only
     reason ``environment`` counts as unreachable. Schema-invalid probes
-    (reason ``probe``) are a miss, not infrastructure.
+    (reason ``probe``) are a miss, not infrastructure. Results that were
+    never sent (invalid author blocks, ``sent=False``) are excluded:
+    they must not turn an infrastructure failure into an author miss,
+    nor an author miss into infrastructure.
     """
-    return all(
+    sent = [r for r in results if r.sent]
+    return bool(sent) and all(
         r.verdict == Verdict.INCONCLUSIVE and r.reason == InconclusiveReason.ENVIRONMENT
-        for r in results
+        for r in sent
     )
 
 
@@ -406,6 +410,10 @@ def build_evidence_record(
     prompt: str | None = None,
     raw_model_response: str | None = None,
     parsed_probes: list[dict[str, Any]] | None = None,
+    # Addendum 11 rule 6: author blocks that failed validation, recorded
+    # verbatim with their rejection reason. Entries: {"block_index",
+    # "raw_text", "rejection_reason"}. Never sent as probes.
+    invalid_probe_blocks: list[dict[str, Any]] | None = None,
     bundle_manifest: dict[str, Any] | None = None,
     bundle_manifest_sha256: str | None = None,
     skill_sha256: str | None = None,
@@ -465,6 +473,13 @@ def build_evidence_record(
     # Every token minted by the credential provider during the run:
     # all are secret-collected.
     minted_tokens: list[str] | None = None,
+    # O3: crash record fields. When the orchestrator crashes after
+    # authoring, these preserve the reason and everything gathered
+    # before the crash.
+    inconclusive_cause: str | None = None,
+    inconclusive_error: str | None = None,
+    crash_provisioning: dict[str, Any] | None = None,
+    crash_probe_results: Any | None = None,
 ) -> dict[str, Any]:
     """Build the evidence record for a run pair (before scoring).
 
@@ -520,6 +535,7 @@ def build_evidence_record(
         "raw_model_response": raw_model_response,
         "parsed_probes": parsed,
         "parsed_probes_sha256": _sha256_canonical(parsed),
+        "invalid_probe_blocks": invalid_probe_blocks or [],
         "bundle_manifest": bundle_manifest or {},
         "bundle_manifest_sha256": bundle_manifest_sha256,
         "skill_sha256": skill_sha256,
@@ -548,6 +564,11 @@ def build_evidence_record(
         "public_contract_env_keys": public_contract_env_keys or [],
         "captured_values": merged_captured,
         "minted_tokens": merged_minted,
+        # O3: crash record fields (only set on orchestrator crashes).
+        "inconclusive_cause": inconclusive_cause,
+        "inconclusive_error": inconclusive_error,
+        "crash_provisioning": crash_provisioning or {},
+        "crash_probe_results": crash_probe_results,
         "verdict": None,
     }
     return record
