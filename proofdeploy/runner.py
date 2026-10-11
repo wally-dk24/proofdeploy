@@ -64,6 +64,10 @@ class ProvisionResult:
     run_id: str | None = None  # per-run scratch dirs: workdir/venvs/<run_id>, workdir/runs/<run_id>
     # Sandbox image digest (recorded when provisioned in the sandbox).
     image_digest: str | None = None
+    # The install plan this provision executed (WO-7), and its sha256.
+    # Recorded in the evidence on every path that planned.
+    install_plan: dict | None = None
+    install_plan_sha256: str | None = None
     # Live process handle on READY. Caller-owned: the caller must terminate
     # it when done and call cleanup_run(run_id). Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
@@ -84,6 +88,8 @@ class ProvisionResult:
             "reason": self.reason,
             "target_log_path": self.target_log_path,
             "run_id": self.run_id,
+            "install_plan": self.install_plan,
+            "install_plan_sha256": self.install_plan_sha256,
             "logs": self.logs,
         }
 
@@ -873,29 +879,53 @@ class Provisioner:
         snap = Path(snapshot_dir)
         contract_env: dict[str, str] = dict(getattr(contract, "env", None) or {})
 
+        # WO-7: this Provisioner is the HOST executor. The plan comes
+        # from the runtime's provisioning adapter (proofdeploy.
+        # provisioning) — the same plan the sandbox executor runs. The
+        # adapter is imported lazily: provisioning imports this
+        # module's helpers, so a top-level import would be circular.
+        from proofdeploy.provisioning import (
+            InstallPlan,
+            plan_provisioning,
+        )
+
         def _bail(
             status: ProvisionStatus,
             reason: str,
+            _plan: InstallPlan | None = None,
             **kw: Any,
         ) -> ProvisionResult:
             # Failure path: nothing is running; remove the run's scratch dirs.
             self.cleanup_run(run_id, logs)
-            return self._fail(status, reason, logs, run_id=run_id, **kw)
+            result = self._fail(status, reason, logs, run_id=run_id, **kw)
+            if _plan is not None:
+                result.install_plan = _plan.to_dict()
+                result.install_plan_sha256 = _plan.sha256()
+            return result
 
-        # 1. Detect runtime and declared version range.
+        # 1. Plan through the adapter: runtime detection, declared
+        # range, lockfile selection, and the frozen check all happen
+        # there now (one source of truth, shared with the sandbox).
         try:
-            runtime, declared_range = detect_runtime(snap)
+            plan = plan_provisioning(snap, contract)
         except ValueError as e:
             return _bail(ProvisionStatus.BUILD_FAILED, str(e))
+        runtime = plan.runtime
+        declared_range = plan.declared_range
         logs.append(f"runtime: {runtime} (declared range: {declared_range})")
-
+        logs.append(
+            f"install plan: sha256 {plan.sha256()[:16]}... "
+            f"(adapter: {plan.adapter})"
+        )
         # Base environment for probing (allowlist + contract env).
         probe_env = build_env(contract_env)
 
         # 2. Select an installed binary satisfying the declared range
         # (finding 2). actual_version is the probed version here; it is
         # re-probed through the final step PATH below, so the recorded
-        # version is the one the target really runs.
+        # version is the one the target really runs. (Host executor:
+        # the runtime comes from the host's own binaries; the plan's
+        # pinned image selection is the sandbox executor's input.)
         runtime_bin, actual_version, bin_reason = select_runtime_binary(
             runtime, declared_range, probe_env, logs
         )
@@ -904,6 +934,7 @@ class Provisioner:
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 bin_reason,
+                plan,
                 runtime=runtime,
                 runtime_version=None,
             )
@@ -921,51 +952,45 @@ class Provisioner:
                 return _bail(
                     ProvisionStatus.BUILD_FAILED,
                     f"could not pin selected node runtime {runtime_bin!r}",
+                    plan,
                     runtime=runtime,
                     runtime_version=None,
                 )
             run_bin = str(run_bin_dir)
 
-        # 3. Find the frozen lockfile, preferring the packageManager's
-        # lockfile when several exist (finding 3).
-        preferred: list[str] | None = None
-        if runtime == "node":
-            pm_name, _ = read_package_manager(snap)
-            if pm_name and pm_name in _PM_LOCKFILES:
-                preferred = list(_PM_LOCKFILES[pm_name])
-                logs.append(
-                    f"packageManager declares {pm_name}; "
-                    f"preferring lockfile(s) {preferred}"
-                )
-        found = find_lockfile(snap, runtime, preferred)
-        if found is None:
+        # 3. The plan's lockfile facts (the adapter already applied
+        # the packageManager preference, finding 3, and the frozen
+        # check, finding 4). A refusal in the plan is a BUILD_FAILED
+        # here, with the plan's lockfile hash recorded.
+        if plan.lockfile_name is None:
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 f"no frozen lockfile found in {snap} for runtime {runtime!r}",
+                plan,
                 runtime=runtime,
                 runtime_version=actual_version,
             )
-        lockfile_name, lockfile_sha = found
+        lockfile_name = plan.lockfile_name
+        lockfile_sha = plan.lockfile_sha256
+        assert lockfile_sha is not None
         logs.append(f"lockfile: {lockfile_name} sha256: {lockfile_sha[:16]}...")
+        if plan.refusal is not None:
+            return _bail(
+                ProvisionStatus.BUILD_FAILED,
+                plan.refusal,
+                plan,
+                runtime=runtime,
+                runtime_version=actual_version,
+                lockfile_sha256=lockfile_sha,
+            )
 
-        # 4. requirements.txt must be frozen (finding 4).
-        if lockfile_name == "requirements.txt":
-            not_frozen = check_requirements_frozen(snap / "requirements.txt")
-            if not_frozen is not None:
-                return _bail(
-                    ProvisionStatus.BUILD_FAILED,
-                    not_frozen,
-                    runtime=runtime,
-                    runtime_version=actual_version,
-                    lockfile_sha256=lockfile_sha,
-                )
-
-        # 5. Lockfile match check (required for measured runs).
+        # 4. Lockfile match check (required for measured runs).
         if require_lockfile_match and expected_lockfile_sha256 is None:
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 "lockfile hash required for measured runs "
                 "(expected_lockfile_sha256 is None)",
+                plan,
                 runtime=runtime,
                 runtime_version=actual_version,
                 lockfile_sha256=lockfile_sha,
@@ -974,37 +999,44 @@ class Provisioner:
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 "lockfile mismatch: frozen lockfile changed",
+                plan,
                 runtime=runtime,
                 runtime_version=actual_version,
                 lockfile_sha256=lockfile_sha,
             )
 
-        # 6. Select the package manager matching the lockfile.
-        try:
-            package_manager, install_cmd = select_package_manager(
-                snap, runtime, lockfile_name
-            )
-        except ValueError as e:
-            return _bail(
-                ProvisionStatus.BUILD_FAILED,
-                str(e),
-                runtime=runtime,
-                runtime_version=actual_version,
-                lockfile_sha256=lockfile_sha,
-            )
+        # 5. The package manager and the install step come from the
+        # plan (the adapter selected both from the lockfile).
+        package_manager = plan.package_manager
+        assert package_manager is not None
+        install_step = next(
+            (s for s in plan.steps if s.phase == "install"), None
+        )
+        assert install_step is not None and install_step.argv is not None
         logs.append(f"package manager: {package_manager}")
-        logs.append(f"install command: {' '.join(install_cmd)}")
+        logs.append(f"install command: {' '.join(install_step.argv)}")
 
         # Step environment: allowlist + contract env. The selected runtime
         # goes first on PATH for EVERY step: the per-run bin/ dir for Node
         # (blocker fix), the fresh per-run venv's bin for pip Python.
+        #
+        # The plan's venv step (python3 -m venv <venv>) is materialized
+        # by _make_venv at the host executor's per-run location
+        # (workdir/venvs/<run_id>): one venv per provision call, never
+        # reused across runs, so fix^ and fix cannot share installed
+        # packages (finding 5). The sandbox executor renders the same
+        # step at /checkout/.venv.
+        from proofdeploy.provisioning import pip_flags, render_argv
+
         venv_bin: str | None = None
+        venv_dir: Path | None = None
         if package_manager == "pip":
             venv_dir = self._make_venv(runtime_bin, run_id, logs, probe_env)
             if venv_dir is None:
                 return _bail(
                     ProvisionStatus.BUILD_FAILED,
                     "could not create isolated venv",
+                    plan,
                     runtime=runtime,
                     runtime_version=actual_version,
                     package_manager=package_manager,
@@ -1024,6 +1056,7 @@ class Provisioner:
                 ProvisionStatus.BUILD_FAILED,
                 f"selected {runtime} runtime {runtime_bin!r} not usable "
                 f"via step PATH",
+                plan,
                 runtime=runtime,
                 runtime_version=actual_version,
                 package_manager=package_manager,
@@ -1031,6 +1064,23 @@ class Provisioner:
             )
         actual_version = effective
         logs.append(f"runtime version in use: {actual_version}")
+
+        # Render the plan's install step for this executor. pip's argv
+        # is a template (venv/checkout/flags placeholders); every other
+        # manager's argv is already concrete.
+        if package_manager == "pip":
+            assert venv_dir is not None
+            install_cmd = render_argv(
+                install_step.argv,
+                {
+                    "{runtime_bin}": runtime_bin,
+                    "{venv}": str(venv_dir),
+                    "{checkout}": str(snap),
+                },
+                pip_flags(plan, sandbox=False),
+            )
+        else:
+            install_cmd = list(install_step.argv)
 
         # 6c. Tools that choose their own Python must use the selected one.
         if package_manager == "uv":
@@ -1048,6 +1098,7 @@ class Provisioner:
                 return _bail(
                     ProvisionStatus.BUILD_FAILED,
                     f"poetry env use failed: {reason}",
+                    plan,
                     runtime=runtime,
                     runtime_version=actual_version,
                     package_manager=package_manager,
@@ -1056,51 +1107,55 @@ class Provisioner:
 
         # 7. Install (frozen). Python pip installs into the per-run venv,
         # never the host environment.
-        if package_manager == "pip":
-            assert venv_bin is not None
-            req_file = snap / "requirements.txt"
-            cmd = [os.path.join(venv_bin, "pip"), "install", "-r", str(req_file)]
-            if "--hash" in req_file.read_text(encoding="utf-8"):
-                cmd.append("--require-hashes")
-        else:
-            cmd = install_cmd
-        ok, reason = self._exec(cmd, snap, self.build_timeout, logs, step_env)
+        ok, reason = self._exec(
+            install_cmd, snap, self.build_timeout, logs, step_env
+        )
         if not ok:
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 f"install failed: {reason}",
+                plan,
                 runtime=runtime,
                 runtime_version=actual_version,
                 package_manager=package_manager,
                 lockfile_sha256=lockfile_sha,
             )
 
-        # 8. Contract steps in order: build, migrate, seed.
-        for step_name in ("build", "migrate", "seed"):
-            step_cmd = getattr(contract, step_name, None)
-            if not step_cmd:
+        # 8. Contract steps in order: build, migrate, seed (from the
+        # plan's steps; the sandbox executor runs the same steps).
+        for step in plan.steps:
+            if step.phase not in ("build", "migrate", "seed"):
                 continue
+            if step.executor not in (None, "host"):
+                continue
+            assert step.shell is not None
+            step_name = step.phase
             logs.append(f"contract step: {step_name}")
             ok, reason = self._exec(
-                shlex.split(step_cmd), snap, self.build_timeout, logs, step_env
+                shlex.split(step.shell), snap, self.build_timeout, logs, step_env
             )
             if not ok:
                 return _bail(
                     ProvisionStatus.BUILD_FAILED,
                     f"contract step '{step_name}' failed: {reason}",
+                    plan,
                     runtime=runtime,
                     runtime_version=actual_version,
                     package_manager=package_manager,
                     lockfile_sha256=lockfile_sha,
                 )
 
-        # 9. Start the target. Output is captured to a per-run log file
-        # (finding 7), not thrown away.
-        start_cmd = getattr(contract, "start", "")
+        # 9. Start the target (the plan's start step). Output is
+        # captured to a per-run log file (finding 7), not thrown away.
+        start_step = next(
+            (s for s in plan.steps if s.phase == "start"), None
+        )
+        start_cmd = start_step.shell if start_step is not None else None
         if not start_cmd:
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 "contract missing 'start' command",
+                plan,
                 runtime=runtime,
                 runtime_version=actual_version,
                 package_manager=package_manager,
@@ -1120,7 +1175,7 @@ class Provisioner:
             tail = _target_log_tail(target_log_path)
             if tail:
                 logs.append(f"target output (tail):\n{tail}")
-            return self._fail(
+            result = self._fail(
                 ProvisionStatus.START_FAILED,
                 reason,
                 logs,
@@ -1130,6 +1185,9 @@ class Provisioner:
                 lockfile_sha256=lockfile_sha,
                 target_log_path=str(target_log_path),
             )
+            result.install_plan = plan.to_dict()
+            result.install_plan_sha256 = plan.sha256()
+            return result
 
         proc: subprocess.Popen[str] | None = None
         keep_proc = False  # set True on READY to transfer ownership to caller
@@ -1197,6 +1255,8 @@ class Provisioner:
                 package_manager=package_manager,
                 target_log_path=str(target_log_path),
                 run_id=run_id,
+                install_plan=plan.to_dict(),
+                install_plan_sha256=plan.sha256(),
                 proc=proc,
             )
         finally:
