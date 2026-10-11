@@ -48,15 +48,26 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from proofdeploy.provisioning import select_image
+
 PODMAN = ["podman", "--storage-driver", "vfs", "--cgroup-manager=cgroupfs"]
 
 # The workload user when userns remapping is unavailable: nobody.
 SANDBOX_UID = "65534"
 
-# Base images per runtime.
+# Default image per runtime: the pinned images.lock.json row for the
+# runtime's default line (WO-7), digest-pinned like every plan image.
+# Kept as the capability probe's image and SandboxConfig's default;
+# provisioning itself always uses the plan's selected image.
+def _default_image(runtime: str) -> str:
+    row = select_image(runtime, None)
+    assert row is not None, f"no pinned image rows for runtime {runtime!r}"
+    return row.pinned_ref
+
+
 IMAGES = {
-    "python": "docker.io/library/python:3.12-slim",
-    "node": "docker.io/library/node:22",
+    "python": _default_image("python"),
+    "node": _default_image("node"),
 }
 
 # In-container path for an optional platform CA (see

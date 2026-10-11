@@ -1,0 +1,71 @@
+{
+  "comment": "Pinned sandbox images for ProofDeploy provisioning (WO-7). Full official -bookworm images. Each digest was resolved from the Docker Hub registry for the exact-version tag and verified equal to the floating line tag digest. Executors pull ref@digest. This table changes only by a committed change.",
+  "images": [
+    {
+      "runtime": "python",
+      "version": "3.10.22",
+      "ref": "docker.io/library/python:3.10.22-bookworm",
+      "digest": "sha256:f72a86806f92fe13a49f49aeca1db0b19ea5cf4a0470b842a01b0e14314945b8"
+    },
+    {
+      "runtime": "python",
+      "version": "3.11.17",
+      "ref": "docker.io/library/python:3.11.17-bookworm",
+      "digest": "sha256:5887f265d8d44d8b4734d3658b21d668edf5aaf92e4945bc0c984afbfab105d3"
+    },
+    {
+      "runtime": "python",
+      "version": "3.12.15",
+      "ref": "docker.io/library/python:3.12.15-bookworm",
+      "digest": "sha256:5560e9ab8709f459489e5b8aa696eda8a07ef821e14bb122be62d91234bfa98b"
+    },
+    {
+      "runtime": "python",
+      "version": "3.13.16",
+      "ref": "docker.io/library/python:3.13.16-bookworm",
+      "digest": "sha256:073ffebb96ae4d0ed73ccad59f08c47bd84af8a79f5258130f8458ac50ad9ff4"
+    },
+    {
+      "runtime": "python",
+      "version": "3.14.8",
+      "ref": "docker.io/library/python:3.14.8-bookworm",
+      "digest": "sha256:7ee7e4d4fb42c3ad45b8fdc473b64ec69c3cf6e80ae5d52f6fa55f77fac29027"
+    },
+    {
+      "runtime": "node",
+      "version": "18.20.8",
+      "ref": "docker.io/library/node:18.20.8-bookworm",
+      "digest": "sha256:c6ae79e38498325db67193d391e6ec1d224d96c693a8a4d943498556716d3783"
+    },
+    {
+      "runtime": "node",
+      "version": "20.20.2",
+      "ref": "docker.io/library/node:20.20.2-bookworm",
+      "digest": "sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2ba5d2cde28bac7d1c01c9ba5"
+    },
+    {
+      "runtime": "node",
+      "version": "22.23.3",
+      "ref": "docker.io/library/node:22.23.3-bookworm",
+      "digest": "sha256:0e5f906573693feaa1e21057ebdcfdb5bd5021f050b2dc7c9deceb629c7da2a8"
+    },
+    {
+      "runtime": "node",
+      "version": "24.21.0",
+      "ref": "docker.io/library/node:24.21.0-bookworm",
+      "digest": "sha256:3d27e5c11e5786e309ec3e03f93ae536eb36e6e5eb3714d5eb3300a36157add0"
+    },
+    {
+      "runtime": "node",
+      "version": "25.9.0",
+      "ref": "docker.io/library/node:25.9.0-bookworm",
+      "digest": "sha256:78839ac448c23517f8eab2e8f7943d9b4f73979eb7f8bed2c73dbf72ff869e7b"
+    },
+    {
+      "runtime": "node",
+      "version": "26.11.1",
+      "ref": "docker.io/library/node:26.11.1-bookworm",
+      "digest": "sha256:f1233c415b41ffcf237c717b3dea92e9d4ea006e0e4c71edcb790605d74f5404"
+    }
+  ]
+}
