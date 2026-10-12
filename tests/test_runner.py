@@ -165,7 +165,7 @@ def test_verify_lockfile_missing(tmp_path):
         ("bun.lock", "bun", ["bun", "install", "--frozen-lockfile"]),
         ("bun.lockb", "bun", ["bun", "install", "--frozen-lockfile"]),
         ("uv.lock", "uv", ["uv", "sync", "--frozen"]),
-        ("poetry.lock", "poetry", ["poetry", "install"]),
+        ("poetry.lock", "poetry", ["poetry", "install", "--sync"]),
         ("requirements.txt", "pip", ["pip", "install"]),
     ],
 )
@@ -553,9 +553,17 @@ def test_provision_prefers_package_manager_lockfile(tmp_path, monkeypatch):
 
 
 def test_check_requirements_frozen_pinned_ok(tmp_path):
+    # REG-A (WO-8.1): "frozen" means a COMPLETE lock — every spec
+    # entry carries --hash (the pip-compile form, hashes on
+    # continuation lines). An ==-only file is not complete; see
+    # tests/test_wo81.py for the ==-only case.
     req = tmp_path / "requirements.txt"
     req.write_text(
-        "# comment\nrequests==2.32.3\nurllib3==2.2.0 ; python_version > '3.8'\n",
+        "# comment\n"
+        "requests==2.32.3 \\\n"
+        "    --hash=sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
+        "urllib3==2.2.0 ; python_version > '3.8' \\\n"
+        "    --hash=sha256:2222222222222222222222222222222222222222222222222222222222222222\n",
         encoding="utf-8",
     )
     assert check_requirements_frozen(req) is None
@@ -565,10 +573,13 @@ def test_check_requirements_frozen_unpinned_fails(tmp_path):
     req = tmp_path / "requirements.txt"
     req.write_text("requests\n", encoding="utf-8")
     reason = check_requirements_frozen(req)
-    assert reason is not None and "not pinned" in reason
+    assert reason is not None and "no --hash" in reason
 
 
 def test_provision_unpinned_requirements_is_build_failed(tmp_path):
+    # REG-A (WO-8.1): an unpinned requirements file goes through
+    # lock generation, which is refused without the unit's cutoff —
+    # a BUILD_FAILED, never a loose install.
     snap = _python_snapshot(tmp_path)  # body is "requests\n" (unpinned)
     prov = Provisioner(workdir=tmp_path)
     result = prov.provision(
@@ -578,7 +589,7 @@ def test_provision_unpinned_requirements_is_build_failed(tmp_path):
         expected_lockfile_sha256=verify_lockfile(snap, "python"),
     )
     assert result.status == ProvisionStatus.BUILD_FAILED
-    assert result.reason is not None and "not pinned" in result.reason
+    assert result.reason is not None and "cutoff" in result.reason
 
 
 # --- fresh venv per run (finding 5) ---
@@ -590,6 +601,14 @@ def test_venvs_are_per_run(tmp_path):
     def fake_exec(cmd, cwd, timeout, logs, env):
         seen_envs.append(dict(env))
         logs.append(f"$ {' '.join(cmd)} (mocked)")
+        # REG-A: the mocked resolver produces the generated lock
+        # its --output-file names, like the real uv compile step.
+        if "--output-file" in cmd:
+            out = Path(cmd[cmd.index("--output-file") + 1])
+            out.write_text(
+                "requests==2.32.3 \\\n    --hash=sha256:abc\n",
+                encoding="utf-8",
+            )
         return True, None
 
     prov = Provisioner(workdir=tmp_path)
@@ -604,10 +623,12 @@ def test_venvs_are_per_run(tmp_path):
     r1 = prov.provision(
         snapshot_dir=snap, contract=_contract(start=""),
         port=18094, expected_lockfile_sha256=sha,
+        lock_cutoff="2026-01-02T03:04:05Z",
     )
     r2 = prov.provision(
         snapshot_dir=snap, contract=_contract(start=""),
         port=18095, expected_lockfile_sha256=sha,
+        lock_cutoff="2026-01-02T03:04:05Z",
     )
     assert r1.status == ProvisionStatus.BUILD_FAILED  # missing start
     assert r2.status == ProvisionStatus.BUILD_FAILED

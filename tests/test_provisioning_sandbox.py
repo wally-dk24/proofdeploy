@@ -182,9 +182,9 @@ def test_sandbox_path_plans_through_the_adapter(monkeypatch, tmp_path):
     calls = []
     real_plan = provisioning.plan_provisioning
 
-    def spy(snapshot_dir, contract):
+    def spy(snapshot_dir, contract, lock_cutoff=None):
         calls.append(Path(snapshot_dir))
-        return real_plan(snapshot_dir, contract)
+        return real_plan(snapshot_dir, contract, lock_cutoff=lock_cutoff)
 
     monkeypatch.setattr(orch_mod, "plan_provisioning", spy)
 

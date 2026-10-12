@@ -500,7 +500,7 @@ def test_write_grant_and_mode_in_evidence_on_both_sides(
     assert evidence["write_grants"]["fix"] == expected
     assert evidence["sandbox_evidence"]["fix_parent"]["app_network_mode"] == "isolated"
     assert evidence["sandbox_evidence"]["fix"]["app_network_mode"] == "isolated"
-    assert evidence["schema_version"] == "1.3.0"
+    assert evidence["schema_version"] == "1.4.0"
 
 
 def test_write_grant_not_invented_for_unready_side(
@@ -570,9 +570,11 @@ def test_schema_130_and_old_records_still_load(tmp_path):
     from proofdeploy.probe import SCHEMA_VERSION
     from proofdeploy.runpair import build_evidence_record, read_records
 
-    assert SCHEMA_VERSION == "1.3.0"
+    # WO-8.1 bumped the schema to 1.4.0 (REG-A lock fields); the
+    # 1.3.0 write_grants behavior pinned here is unchanged.
+    assert SCHEMA_VERSION == "1.4.0"
     record = build_evidence_record(run_kind="bug", bug_id="WO73-SCHEMA")
-    assert record["schema_version"] == "1.3.0"
+    assert record["schema_version"] == "1.4.0"
     # Callers that do not pass grants get an empty mapping, never a
     # missing key crash for readers.
     assert record["write_grants"] == {}

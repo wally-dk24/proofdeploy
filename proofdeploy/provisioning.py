@@ -28,15 +28,32 @@ pinned): the highest table version satisfying the declared range
 typed refusal: "declared range R not satisfiable by pinned images".
 The table changes only by a committed change.
 
-The Python adapter carries today's hashed-requirements behavior
-unchanged: venv in the checkout at ``/checkout/.venv`` (the sandbox
-executor renders it there; the host executor renders the same step at
-its per-run venv dir), ``pip install --require-hashes --no-deps``
-(sandbox rendering), ``PIP_NO_CACHE_DIR=1``, the venv first on PATH
-for build/migrate/seed/start, the lockfile sha256 recorded and
-verified, seed runs, and unsupported lockfiles refused by the sandbox
-executor with BUILD_FAILED "not yet supported in the sandbox".
-Unlocked repos stay refused until WO-8 (REG-A). The Node adapter
+The Python adapter implements the registered Python lock rule
+(REG-A, docs/registration/python-lock-rule.md; WO-8.1): a COMPLETE
+committed lock — ``uv.lock``, ``poetry.lock``, ``pdm.lock``, or a
+requirements file where every spec entry carries ``--hash`` —
+installs frozen; anything else (an ``==``-only or unpinned
+requirements file, or a bare ``pyproject.toml``) goes through lock
+GENERATION: the pinned resolver (uv 0.13.0, bootstrapped into the
+checkout's ``.pd-tools``) compiles the declared dependencies with
+``--generate-hashes`` against the registered index, with
+``--exclude-newer`` set to the unit's one cutoff (the fix commit's
+committer time for a bug pair, C's for a clean diff — supplied by
+the caller as ``lock_cutoff``), and the generated lock installs
+with ``pip install --require-hashes --no-deps``. Generation without
+a cutoff is a typed refusal: a lock resolved without the unit's
+cutoff is not the registered artifact. The plan records the lock
+source (committed / generated) and, for a generated lock, the
+resolver and its version, the cutoff, and the index URL; the
+executors read the generated lock back into the evidence. The
+hashed-requirements flow is otherwise unchanged: venv in the
+checkout at ``/checkout/.venv`` (the sandbox executor renders it
+there; the host executor renders the same step at its per-run venv
+dir), ``PIP_NO_CACHE_DIR=1``, the venv first on PATH for
+build/migrate/seed/start, the lockfile sha256 recorded and
+verified, seed runs, and unsupported lockfiles refused by the
+sandbox executor with BUILD_FAILED "not yet supported in the
+sandbox". The Node adapter
 plans frozen installs from the lockfile for both executors: npm ci /
 pnpm install --frozen-lockfile / yarn classic --frozen-lockfile or
 berry --immutable, a packageManager pin rendered through corepack,
@@ -48,6 +65,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -63,6 +81,13 @@ from proofdeploy.runner import (
     satisfies_range,
     select_package_manager,
 )
+
+# A REG-A resolution cutoff as handed to an adapter: the timestamp
+# itself, a zero-arg callable producing it (evaluated LAZILY — only
+# when a generated lock is actually planned, so planning a
+# committed lock or a Node plan never pays for, or trips over, the
+# caller's cutoff source), or None (no cutoff available).
+LockCutoff = str | Callable[[], str | None] | None
 
 # Lines used when a repo declares no version range: the runtimes the
 # pre-WO-7 sandbox images pinned (python:3.12-slim, node:22).
@@ -189,6 +214,27 @@ class InstallPlan:
     image_refusal: str | None = None
     lockfile_name: str | None = None
     lockfile_sha256: str | None = None
+    # REG-A lock facts (Python; None for Node plans). lock_source is
+    # "committed" (a complete lock in the repo, installed frozen) or
+    # "generated" (the runner resolved the declared dependencies —
+    # see lock_resolver / lock_resolver_version / lock_cutoff /
+    # lock_index_url, and generated_lockfile_name for the file the
+    # resolve step writes into the checkout). For a generated plan,
+    # lockfile_name / lockfile_sha256 name the DECLARED source file
+    # (requirements.txt or pyproject.toml) the lock was generated
+    # from; the generated lock's own text + sha256 are captured by
+    # the executors into the provision's generated_lock.
+    lock_source: str | None = None
+    lock_resolver: str | None = None
+    lock_resolver_version: str | None = None
+    lock_cutoff: str | None = None
+    lock_index_url: str | None = None
+    # Addendum 46: the sha256 of the COMMITTED bootstrap
+    # requirements file the resolver is installed from (the file
+    # pins the resolver's wheel by hash; see
+    # _uv_bootstrap_requirements).
+    lock_resolver_bootstrap_sha256: str | None = None
+    generated_lockfile_name: str | None = None
     package_manager: str | None = None
     package_manager_version: str | None = None
     corepack_version: str | None = None
@@ -223,8 +269,20 @@ class ProvisioningAdapter(Protocol):
         """Detect this adapter's runtime in the snapshot, or None."""
         ...
 
-    def plan(self, snapshot_dir: Path, contract: Any) -> InstallPlan:
-        """Build the install plan (or refusal) for this snapshot."""
+    def plan(
+        self,
+        snapshot_dir: Path,
+        contract: Any,
+        lock_cutoff: LockCutoff = None,
+    ) -> InstallPlan:
+        """Build the install plan (or refusal) for this snapshot.
+
+        ``lock_cutoff`` is the unit's REG-A resolution cutoff (an
+        RFC 3339 timestamp) for a generated Python lock — or a
+        zero-arg callable producing it, evaluated lazily and only
+        when a generated lock is planned. Adapters that never
+        generate a lock ignore it.
+        """
         ...
 
 
@@ -267,9 +325,50 @@ def _contract_steps(contract: Any) -> list[PlanStep]:
     return steps
 
 
+# REG-A (docs/registration/python-lock-rule.md): the registered
+# resolver for generated Python locks, its exact pinned version,
+# the registered index, the target platform, and the file the
+# resolve step writes into the checkout. The generated lock is
+# recorded in the evidence (text + sha256) by the executors.
+UV_VERSION = "0.13.0"
+LOCK_INDEX_URL = "https://pypi.org/simple"
+LOCK_TARGET_PLATFORM = "x86_64-unknown-linux-gnu"
+GENERATED_LOCKFILE_NAME = ".pd-generated-requirements.txt"
+
+# Addendum 46: the resolver is pinned BY HASH, not by version
+# alone. The committed bootstrap requirements file (kept next to
+# this module) pins uv==0.13.0 with the sha256 of its manylinux
+# x86_64 wheel; a generated plan materializes that file verbatim
+# into the checkout's .pd-tools, installs from it with
+# --require-hashes, and records the file's sha256 on the plan
+# (lock_resolver_bootstrap_sha256).
+UV_BOOTSTRAP_REQUIREMENTS_FILE = "uv_bootstrap_requirements.txt"
+UV_BOOTSTRAP_CHECKOUT_PATH = ".pd-tools/uv-requirements.txt"
+
+# Writes argv[1]'s file with argv[2]'s exact bytes: a plan step
+# ([python, -c, THIS, <path>, <content>]) that materializes a
+# committed file into the checkout — the install container mounts
+# only the checkout, so a package file cannot be referenced in
+# place on every executor.
+_WRITE_FILE_CODE = (
+    "import pathlib,sys; "
+    "pathlib.Path(sys.argv[1]).write_bytes(sys.argv[2].encode())"
+)
+
+
+def _uv_bootstrap_requirements() -> tuple[str, str]:
+    """The committed resolver-bootstrap requirements: (text, sha256)."""
+    data = Path(__file__).with_name(
+        UV_BOOTSTRAP_REQUIREMENTS_FILE
+    ).read_bytes()
+    return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
+
+
 class PythonAdapter:
-    """Python: uv.lock / poetry.lock plans, and the hashed
-    requirements.txt flow (venv + pip --require-hashes) unchanged."""
+    """Python: REG-A — complete committed locks (uv.lock /
+    poetry.lock / pdm.lock / fully hashed requirements.txt) install
+    frozen; anything else is resolved into a generated hashed lock
+    by the pinned uv at the unit's cutoff, then installed frozen."""
 
     name = "python"
 
@@ -293,12 +392,98 @@ class PythonAdapter:
             reason=f"python detected from {source}",
         )
 
-    def plan(self, snapshot_dir: Path, contract: Any) -> InstallPlan:
+    def plan(
+        self,
+        snapshot_dir: Path,
+        contract: Any,
+        lock_cutoff: LockCutoff = None,
+    ) -> InstallPlan:
         det = self.detect(snapshot_dir)
         assert det is not None, "plan() called without a python detection"
         image = _image_fields("python", det.declared_range)
         found = find_lockfile(snapshot_dir, "python")
-        if found is None:
+        # REG-A item 1: a COMPLETE committed lock installs frozen —
+        # uv.lock / poetry.lock / pdm.lock by construction, or a
+        # requirements file where every spec entry carries --hash
+        # (check_requirements_frozen is now exactly that check).
+        if found is not None and found[0] != "requirements.txt":
+            lockfile_name, lockfile_sha = found
+            manager, argv = select_package_manager(
+                snapshot_dir, "python", lockfile_name
+            )
+            return InstallPlan(
+                adapter=self.name,
+                runtime="python",
+                declared_range=det.declared_range,
+                lockfile_name=lockfile_name,
+                lockfile_sha256=lockfile_sha,
+                lock_source="committed",
+                **image,
+                package_manager=manager,
+                steps=[
+                    PlanStep(phase="install", argv=argv),
+                    *_contract_steps(contract),
+                ],
+                persisted_dirs=[".venv"] if manager == "uv" else [],
+            )
+        if found is not None and check_requirements_frozen(
+            snapshot_dir / "requirements.txt"
+        ) is None:
+            lockfile_name, lockfile_sha = found
+            req_text = (snapshot_dir / "requirements.txt").read_text(
+                encoding="utf-8"
+            )
+            steps = [
+                PlanStep(
+                    phase="venv",
+                    argv=["{runtime_bin}", "-m", "venv", "{venv}"],
+                ),
+                PlanStep(
+                    phase="install",
+                    argv=[
+                        "{venv}/bin/pip",
+                        "install",
+                        PIP_FLAGS_TOKEN,
+                        "-r",
+                        "{checkout}/requirements.txt",
+                    ],
+                ),
+                # Sandbox-only sanity check (Addendum 15, B2): the
+                # venv must actually work before any contract step
+                # relies on it; py_compile would not notice a
+                # broken venv.
+                PlanStep(
+                    phase="verify",
+                    argv=[
+                        "/checkout/.venv/bin/python",
+                        "-c",
+                        "import sys; print(sys.prefix)",
+                    ],
+                    executor="sandbox",
+                ),
+                *_contract_steps(contract),
+            ]
+            return InstallPlan(
+                adapter=self.name,
+                runtime="python",
+                declared_range=det.declared_range,
+                lockfile_name=lockfile_name,
+                lockfile_sha256=lockfile_sha,
+                lock_source="committed",
+                **image,
+                package_manager="pip",
+                pip_require_hashes="--hash" in req_text,
+                steps=steps,
+                persisted_dirs=[".venv"],
+            )
+        # REG-A item 2: no complete lock — GENERATE one. The declared
+        # source is the requirements file when one is present (its
+        # pins are the constraints) or pyproject.toml otherwise.
+        if (snapshot_dir / "requirements.txt").is_file():
+            source_name = "requirements.txt"
+        elif (snapshot_dir / "pyproject.toml").is_file():
+            source_name = "pyproject.toml"
+        else:  # pragma: no cover - detect() guarantees one exists
             return InstallPlan(
                 adapter=self.name,
                 runtime="python",
@@ -309,41 +494,124 @@ class PythonAdapter:
                     "for runtime 'python'"
                 ),
             )
-        lockfile_name, lockfile_sha = found
-        base: dict[str, Any] = {
+        source_sha = hashlib.sha256(
+            (snapshot_dir / source_name).read_bytes()
+        ).hexdigest()
+        # The cutoff is evaluated only NOW, when a generated lock
+        # is actually being planned (see LockCutoff): planning a
+        # committed lock above never touched the caller's source.
+        cutoff = lock_cutoff() if callable(lock_cutoff) else lock_cutoff
+        bootstrap_text, bootstrap_sha256 = _uv_bootstrap_requirements()
+        generated_base: dict[str, Any] = {
             "adapter": self.name,
             "runtime": "python",
             "declared_range": det.declared_range,
-            "lockfile_name": lockfile_name,
-            "lockfile_sha256": lockfile_sha,
+            "lockfile_name": source_name,
+            "lockfile_sha256": source_sha,
+            "lock_source": "generated",
+            "lock_resolver": "uv",
+            "lock_resolver_version": UV_VERSION,
+            "lock_index_url": LOCK_INDEX_URL,
+            "lock_resolver_bootstrap_sha256": bootstrap_sha256,
+            "generated_lockfile_name": GENERATED_LOCKFILE_NAME,
             **image,
         }
-        if lockfile_name != "requirements.txt":
-            manager, argv = select_package_manager(
-                snapshot_dir, "python", lockfile_name
-            )
+        if cutoff is None:
+            # Fail closed: a lock generated without the unit's one
+            # cutoff is not the registered artifact, and there is no
+            # honest default to invent here.
             return InstallPlan(
-                **base,
-                package_manager=manager,
-                steps=[
-                    PlanStep(phase="install", argv=argv),
-                    *_contract_steps(contract),
-                ],
-                persisted_dirs=[".venv"] if manager == "uv" else [],
+                **generated_base,
+                refusal=(
+                    "python lock generation requires the unit's "
+                    "resolution cutoff (the fix commit's committer "
+                    "time for a bug pair, C's for a clean diff); "
+                    "none was provided"
+                ),
             )
-        not_frozen = check_requirements_frozen(
-            snapshot_dir / "requirements.txt"
+        python_version = (
+            image["selected_version"] or DEFAULT_IMAGE_LINES["python"]
         )
-        if not_frozen is not None:
-            return InstallPlan(**base, refusal=not_frozen)
-        req_text = (snapshot_dir / "requirements.txt").read_text(
-            encoding="utf-8"
-        )
+        uv_bin = "{checkout}/.pd-tools/bin/uv"
         steps = [
             PlanStep(
                 phase="venv",
                 argv=["{runtime_bin}", "-m", "venv", "{venv}"],
             ),
+            # The pinned resolver, bootstrapped into the checkout's
+            # .pd-tools (persisted across the sandbox's per-step
+            # containers — the corepack pattern, Addendum 35; never
+            # a global install). A dedicated venv keeps the layout
+            # identical on every pip: <prefix>/bin/uv.
+            PlanStep(
+                phase="install",
+                argv=[
+                    "{runtime_bin}", "-m", "venv",
+                    "{checkout}/.pd-tools",
+                ],
+            ),
+            # Addendum 46: the resolver is installed BY HASH from
+            # the committed bootstrap requirements file. The file
+            # is materialized verbatim into .pd-tools first (the
+            # install container mounts only the checkout), then
+            # installed in hash-checking mode, binaries only: a
+            # wrong or substituted wheel fails this step.
+            PlanStep(
+                phase="install",
+                argv=[
+                    "{runtime_bin}",
+                    "-c",
+                    _WRITE_FILE_CODE,
+                    f"{{checkout}}/{UV_BOOTSTRAP_CHECKOUT_PATH}",
+                    bootstrap_text,
+                ],
+            ),
+            PlanStep(
+                phase="install",
+                argv=[
+                    "{checkout}/.pd-tools/bin/pip",
+                    "install",
+                    "--require-hashes",
+                    "--no-deps",
+                    "--only-binary",
+                    ":all:",
+                    "-r",
+                    f"{{checkout}}/{UV_BOOTSTRAP_CHECKOUT_PATH}",
+                ],
+            ),
+            # REG-A item 2: resolve the declared dependencies with
+            # the pinned uv, hashes generated, for the selected
+            # Python version and linux/x86_64, against the
+            # registered index, with the unit's one cutoff.
+            # --no-header (Addendum 46): uv's header embeds the full
+            # command, including --output-file <path>, so without it
+            # the recorded sha256 of the generated lock depended on
+            # the checkout path — identical resolutions at fix^ and
+            # fix recorded different hashes. The command itself is
+            # already recorded in executed_steps.
+            PlanStep(
+                phase="install",
+                argv=[
+                    uv_bin,
+                    "pip",
+                    "compile",
+                    f"{{checkout}}/{source_name}",
+                    "--generate-hashes",
+                    "--no-header",
+                    "--exclude-newer",
+                    cutoff,
+                    "--python-version",
+                    python_version,
+                    "--python-platform",
+                    LOCK_TARGET_PLATFORM,
+                    "--index-url",
+                    LOCK_INDEX_URL,
+                    "--output-file",
+                    f"{{checkout}}/{GENERATED_LOCKFILE_NAME}",
+                ],
+                env={"UV_NATIVE_TLS": "true"},
+            ),
+            # REG-A item 2: install the generated lock frozen.
             PlanStep(
                 phase="install",
                 argv=[
@@ -351,12 +619,11 @@ class PythonAdapter:
                     "install",
                     PIP_FLAGS_TOKEN,
                     "-r",
-                    "{checkout}/requirements.txt",
+                    f"{{checkout}}/{GENERATED_LOCKFILE_NAME}",
                 ],
             ),
-            # Sandbox-only sanity check (Addendum 15, B2): the venv
-            # must actually work before any contract step relies on
-            # it; py_compile would not notice a broken venv.
+            # Sandbox-only sanity check (Addendum 15, B2), as on the
+            # committed path.
             PlanStep(
                 phase="verify",
                 argv=[
@@ -369,11 +636,12 @@ class PythonAdapter:
             *_contract_steps(contract),
         ]
         return InstallPlan(
-            **base,
+            **generated_base,
+            lock_cutoff=cutoff,
             package_manager="pip",
-            pip_require_hashes="--hash" in req_text,
+            pip_require_hashes=True,
             steps=steps,
-            persisted_dirs=[".venv"],
+            persisted_dirs=[".venv", ".pd-tools"],
         )
 
 
@@ -440,7 +708,16 @@ class NodeAdapter:
             reason="node detected from package.json",
         )
 
-    def plan(self, snapshot_dir: Path, contract: Any) -> InstallPlan:
+    def plan(
+        self,
+        snapshot_dir: Path,
+        contract: Any,
+        lock_cutoff: LockCutoff = None,
+    ) -> InstallPlan:
+        # Node never generates a lock (REG-A is Python-only); the
+        # cutoff is accepted for the Protocol and ignored (and, being
+        # possibly a lazy callable, never evaluated here).
+        del lock_cutoff
         det = self.detect(snapshot_dir)
         assert det is not None, "plan() called without a node detection"
         image = _image_fields("node", det.declared_range)
@@ -581,17 +858,23 @@ def get_adapter(name: str) -> ProvisioningAdapter:
     return _ADAPTERS[name]
 
 
-def plan_provisioning(snapshot_dir: Path, contract: Any) -> InstallPlan:
+def plan_provisioning(
+    snapshot_dir: Path,
+    contract: Any,
+    lock_cutoff: LockCutoff = None,
+) -> InstallPlan:
     """Plan provisioning for a snapshot through its adapter.
 
-    Raises ValueError (detect_runtime's message) when no adapter
-    detects a runtime in the snapshot.
+    ``lock_cutoff`` is the unit's REG-A resolution cutoff for a
+    generated Python lock (see the Protocol). Raises ValueError
+    (detect_runtime's message) when no adapter detects a runtime in
+    the snapshot.
     """
     snap = Path(snapshot_dir)
     for name in _ADAPTER_ORDER:
         adapter = _ADAPTERS[name]
         if adapter.detect(snap) is not None:
-            return adapter.plan(snap, contract)
+            return adapter.plan(snap, contract, lock_cutoff=lock_cutoff)
     detect_runtime(snap)  # raises ValueError with the canonical message
     raise AssertionError("unreachable: detect_runtime did not raise")
 

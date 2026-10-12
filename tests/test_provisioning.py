@@ -167,30 +167,58 @@ def test_python_plan_for_hashed_requirements(tmp_path):
 
 
 def test_python_plan_without_range_or_hashes(tmp_path):
+    # REG-A (WO-8.1): an ==-only requirements file is NOT a complete
+    # lock — it goes through generation, which needs the unit's
+    # cutoff. Without one the plan refuses (fail closed); with one
+    # it is a generated plan installing the generated lock with
+    # hashes required.
     snap = _python_snapshot(tmp_path, requirements="flask==3.1.0\n")
     plan = plan_provisioning(snap, _contract())
+    assert plan.refusal is not None
+    assert "cutoff" in plan.refusal
+    plan = plan_provisioning(
+        snap, _contract(), lock_cutoff="2026-01-02T03:04:05Z"
+    )
     assert plan.refusal is None
     assert plan.declared_range is None
-    assert plan.pip_require_hashes is False
+    assert plan.lock_source == "generated"
+    # The install consumes the GENERATED lock (which carries hashes),
+    # not the ==-only source file.
+    assert plan.pip_require_hashes is True
     row = select_image("python", None)
     assert row is not None
     assert plan.selected_version == row.version
 
 
 def test_python_plan_refuses_unfrozen_requirements(tmp_path):
-    # Planted-bug guard (unfrozen install): a requirements line that is
-    # not pinned with '==' must refuse the plan, never install loose.
+    # REG-A (WO-8.1): an unpinned requirements line is a declared
+    # dependency, resolved through generation — never installed
+    # loose. Without the unit's cutoff the plan refuses.
     snap = _python_snapshot(tmp_path, requirements="flask>=3\n")
     plan = plan_provisioning(snap, _contract())
     assert plan.refusal is not None
-    assert "not pinned" in plan.refusal
+    assert "cutoff" in plan.refusal
+    plan = plan_provisioning(
+        snap, _contract(), lock_cutoff="2026-01-02T03:04:05Z"
+    )
+    assert plan.refusal is None
+    assert plan.lock_source == "generated"
 
 
 def test_python_plan_refuses_missing_lockfile(tmp_path):
+    # REG-A (WO-8.1): a bare pyproject.toml is not a lock either —
+    # its declared dependencies go through generation (cutoff
+    # required, as for a requirements file).
     snap = _python_snapshot(tmp_path, pyproject=PYPROJECT_312)
     plan = plan_provisioning(snap, _contract())
     assert plan.refusal is not None
-    assert "no frozen lockfile" in plan.refusal
+    assert "cutoff" in plan.refusal
+    plan = plan_provisioning(
+        snap, _contract(), lock_cutoff="2026-01-02T03:04:05Z"
+    )
+    assert plan.refusal is None
+    assert plan.lock_source == "generated"
+    assert plan.lockfile_name == "pyproject.toml"
 
 
 def test_python_plan_unsatisfiable_range_is_an_image_refusal(tmp_path):
@@ -201,7 +229,11 @@ def test_python_plan_unsatisfiable_range_is_an_image_refusal(tmp_path):
     snap = _python_snapshot(
         tmp_path, pyproject=pyproject, requirements="flask==3.1.0\n"
     )
-    plan = plan_provisioning(snap, _contract())
+    # REG-A: the ==-only requirements goes through generation, so
+    # the plan needs the unit's cutoff to build at all.
+    plan = plan_provisioning(
+        snap, _contract(), lock_cutoff="2026-01-02T03:04:05Z"
+    )
     assert plan.refusal is None
     assert plan.image_ref is None
     assert plan.image_digest is None
