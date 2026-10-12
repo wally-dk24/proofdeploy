@@ -52,6 +52,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -165,8 +166,85 @@ class SandboxCapabilities:
     reason: str = ""
 
 
+# Capability-probe reachability polling (WO-7.4). A detached probe
+# container's app needs a moment to listen after `podman run -d`
+# returns; one connect attempt races that startup and reads a
+# healthy host as incapable (the reviewer's host: isolated reported
+# 1 time in 4 with a single connect, 3 of 3 with a polled one). Poll
+# until the deadline instead, and keep the attempt count and the
+# last error for the recorded reason, so a refusal shows the polling
+# happened rather than one raced refusal.
+_PROBE_CONNECT_DEADLINE_S = 10.0
+_PROBE_CONNECT_INTERVAL_S = 0.3
+# One attempt is time-boxed well under the deadline: a connect into
+# an unroutable network is not refused, it hangs — with the whole
+# deadline as its timeout it would consume the poll window in a
+# single attempt (seen on the GitHub runners: "1 connect attempts
+# over 10 s, last error: timed out").
+_PROBE_CONNECT_ATTEMPT_TIMEOUT_S = 1.0
+
+
+def _poll_probe_app(
+    container: str, network_name: str, port: int
+) -> tuple[str, int, str]:
+    """Poll a probe container until the host can connect to it.
+
+    Returns ``(ip, attempts, last_error)``: the container's IP (""
+    when it never became readable), how many connect attempts were
+    made, and the last attempt's error ("" on success). The IP read
+    is polled too — inspect can lag the detached start just like
+    the app's listen can.
+    """
+    ip = ""
+    attempts = 0
+    last_error = ""
+    deadline = time.monotonic() + _PROBE_CONNECT_DEADLINE_S
+    while True:
+        if not ip:
+            ip = _container_ip(container, network_name)
+        if ip:
+            attempts += 1
+            remaining = deadline - time.monotonic()
+            attempt_timeout = max(
+                0.1, min(remaining, _PROBE_CONNECT_ATTEMPT_TIMEOUT_S)
+            )
+            try:
+                with socket.create_connection(
+                    (ip, port), timeout=attempt_timeout
+                ):
+                    return ip, attempts, ""
+            except OSError as e:
+                last_error = str(e) or repr(e)
+        if time.monotonic() >= deadline:
+            return ip, attempts, last_error
+        time.sleep(_PROBE_CONNECT_INTERVAL_S)
+
+
+def _cleanup_probe(network_name: str, container: str = "") -> None:
+    """Best-effort removal of a capability probe's network/container.
+
+    Called from a finally: a probe must never leave its network
+    behind (a leftover fixed-name network once poisoned every later
+    probe), and a cleanup failure must never mask the probe's own
+    verdict.
+    """
+    steps: list[list[str]] = []
+    if container:
+        steps.append(["stop", "-t", "0", container])
+    steps.append(["network", "rm", network_name])
+    for args in steps:
+        try:
+            subprocess.run(PODMAN + args, capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def check_sandbox_capabilities() -> SandboxCapabilities:
-    """Probe the host for sandbox capabilities (no side effects)."""
+    """Probe the host for sandbox capabilities.
+
+    Starts transient probe containers/networks; every one is
+    removed again before returning (cleanup in a finally, WO-7.4).
+    """
     caps = SandboxCapabilities()
     if shutil.which("podman") is None:
         caps.reason = "podman not found"
@@ -190,15 +268,25 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
     # netavark can't set up the namespace; a --rm run exits before its
     # IP can be read; and an IP the host cannot route to is useless.
     # The detached start + IP lookup + TCP connect is the real test.
-    net_name = "pd-capability-probe"
-    probe_container = "pd-capability-probe-app"
+    # WO-7.4: the IP read and the connect are POLLED to a deadline
+    # (a single connect races the probe app's startup), the network
+    # and container names are unique per probe (a leftover from a
+    # crashed probe once made every later probe report "already
+    # exists"), and cleanup runs in a finally.
+    suffix = uuid.uuid4().hex[:12]
+    net_name = f"pd-capability-probe-{suffix}"
+    probe_container = f"pd-capability-probe-app-{suffix}"
     probe_port = 18099
     try:
         proc = subprocess.run(
             PODMAN + ["network", "create", "--internal", net_name],
             capture_output=True, text=True, timeout=60,
         )
-        if proc.returncode == 0:
+        if proc.returncode != 0:
+            caps.reason = (
+                f"isolated network unavailable: {proc.stderr.strip()[:150]}"
+            )
+        else:
             run = subprocess.run(
                 PODMAN
                 + [
@@ -211,36 +299,35 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
                 ],
                 capture_output=True, text=True, timeout=90,
             )
-            if run.returncode == 0:
-                ip = _container_ip(probe_container, net_name)
-                if ip and _tcp_reachable(ip, probe_port, timeout=10):
+            if run.returncode != 0:
+                caps.reason = (
+                    "isolated network unavailable: "
+                    f"{run.stderr.strip()[:150]}"
+                )
+            else:
+                ip, attempts, last_error = _poll_probe_app(
+                    probe_container, net_name, probe_port
+                )
+                if ip and not last_error:
                     caps.isolated_network = True
                 elif ip:
                     caps.reason = (
                         "isolated network unavailable: container has IP "
-                        f"{ip} but the host cannot reach it"
+                        f"{ip} but the host cannot reach it: {attempts} "
+                        "connect attempts over "
+                        f"{_PROBE_CONNECT_DEADLINE_S:.0f} s, last error: "
+                        f"{last_error}"
                     )
                 else:
                     caps.reason = (
                         "isolated network unavailable: container started "
-                        "but its IP could not be read"
+                        "but its IP could not be read after "
+                        f"{_PROBE_CONNECT_DEADLINE_S:.0f} s of polling"
                     )
-            else:
-                caps.reason = (
-                    f"isolated network unavailable: {run.stderr.strip()[:150]}"
-                )
-            subprocess.run(
-                PODMAN + ["stop", "-t", "0", probe_container],
-                capture_output=True, timeout=60,
-            )
-            subprocess.run(
-                PODMAN + ["network", "rm", net_name],
-                capture_output=True, timeout=60,
-            )
-        else:
-            caps.reason = f"isolated network unavailable: {proc.stderr.strip()[:150]}"
     except (OSError, subprocess.TimeoutExpired) as e:
         caps.reason = f"isolated network probe failed: {e}"
+    finally:
+        _cleanup_probe(net_name, probe_container)
     # Userns remapping: try --uidmap on a trivial container.
     try:
         proc = subprocess.run(
@@ -262,7 +349,7 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
     # phase (the install needs the egress proxy). Same netavark
     # machinery as the isolated probe; probed separately because the
     # install must never fall back to --net=host.
-    build_net = "pd-capability-probe-build"
+    build_net = f"pd-capability-probe-build-{uuid.uuid4().hex[:12]}"
     try:
         proc = subprocess.run(
             PODMAN + ["network", "create", build_net],
@@ -283,15 +370,13 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
                 caps.reason = (
                     f"build network unavailable: {run.stderr.strip()[:150]}"
                 )
-            subprocess.run(
-                PODMAN + ["network", "rm", build_net],
-                capture_output=True, timeout=60,
-            )
         elif not caps.reason:
             caps.reason = f"build network unavailable: {proc.stderr.strip()[:150]}"
     except (OSError, subprocess.TimeoutExpired) as e:
         if not caps.reason:
             caps.reason = f"build network probe failed: {e}"
+    finally:
+        _cleanup_probe(build_net)
     return caps
 
 
