@@ -170,6 +170,12 @@ class SandboxCapabilities:
 # happened rather than one raced refusal.
 _PROBE_CONNECT_DEADLINE_S = 10.0
 _PROBE_CONNECT_INTERVAL_S = 0.3
+# One attempt is time-boxed well under the deadline: a connect into
+# an unroutable network is not refused, it hangs — with the whole
+# deadline as its timeout it would consume the poll window in a
+# single attempt (seen on the GitHub runners: "1 connect attempts
+# over 10 s, last error: timed out").
+_PROBE_CONNECT_ATTEMPT_TIMEOUT_S = 1.0
 
 
 def _poll_probe_app(
@@ -193,9 +199,12 @@ def _poll_probe_app(
         if ip:
             attempts += 1
             remaining = deadline - time.monotonic()
+            attempt_timeout = max(
+                0.1, min(remaining, _PROBE_CONNECT_ATTEMPT_TIMEOUT_S)
+            )
             try:
                 with socket.create_connection(
-                    (ip, port), timeout=max(remaining, 0.1)
+                    (ip, port), timeout=attempt_timeout
                 ):
                     return ip, attempts, ""
             except OSError as e:

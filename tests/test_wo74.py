@@ -193,6 +193,36 @@ def test_probe_reason_records_attempts_and_last_error(monkeypatch):
     assert "Connection refused" in caps.reason
 
 
+def test_probe_connect_attempt_is_time_boxed(monkeypatch):
+    """A connect into a black hole (no RST — the attempt hangs until
+    its timeout) must not eat the whole deadline in one attempt:
+    each attempt is time-boxed, so the poll actually polls. (The
+    first WO-7.4 cut set the attempt timeout to the remaining
+    deadline and the GitHub focus run reported "1 connect attempts
+    over 10 s, last error: timed out".)"""
+    monkeypatch.setattr(
+        sb_mod, "_PROBE_CONNECT_DEADLINE_S", 1.2, raising=False
+    )
+    monkeypatch.setattr(
+        sb_mod, "_PROBE_CONNECT_INTERVAL_S", 0.05, raising=False
+    )
+    timeouts = []
+
+    def hanging(address, timeout=None, *args, **kwargs):
+        timeouts.append(timeout)
+        raise TimeoutError("timed out")
+
+    podman = _FakePodman()
+    _patch_probe(monkeypatch, podman, hanging)
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.isolated_network is False
+    assert len(timeouts) > 1, "the hanging connect was not re-polled"
+    assert all(t <= 1.0 for t in timeouts), (
+        f"an attempt was given the whole deadline: {timeouts}"
+    )
+    assert "timed out" in caps.reason
+
+
 def test_probe_uses_unique_network_name_per_probe(monkeypatch):
     """Two consecutive probes must not share a network name — a
     shared fixed name is exactly what let one crashed probe poison
