@@ -1073,10 +1073,16 @@ class Provisioner:
         # plan (the adapter selected both from the lockfile).
         package_manager = plan.package_manager
         assert package_manager is not None
-        install_step = next(
-            (s for s in plan.steps if s.phase == "install"), None
-        )
-        assert install_step is not None and install_step.argv is not None
+        install_steps = [
+            s for s in plan.steps
+            if s.phase == "install" and s.argv is not None
+        ]
+        assert install_steps
+        # The dependency install is the LAST install-phase step;
+        # any earlier ones are bootstraps (Addendum 35's persisted
+        # corepack install) that run first, verbatim.
+        install_step = install_steps[-1]
+        assert install_step.argv is not None
         logs.append(f"package manager: {package_manager}")
         logs.append(f"install command: {' '.join(install_step.argv)}")
 
@@ -1142,8 +1148,9 @@ class Provisioner:
         logs.append(f"runtime version in use: {actual_version}")
 
         # Render the plan's install step for this executor. pip's argv
-        # is a template (venv/checkout/flags placeholders); every other
-        # manager's argv is already concrete.
+        # is a template (venv/checkout/flags placeholders); other
+        # managers' argv may carry {checkout} (the persisted corepack
+        # paths) and {runtime_bin}, rendered the same way.
         if package_manager == "pip":
             assert venv_dir is not None
             install_cmd = render_argv(
@@ -1156,7 +1163,14 @@ class Provisioner:
                 pip_flags(plan, sandbox=False),
             )
         else:
-            install_cmd = list(install_step.argv)
+            install_cmd = render_argv(
+                install_step.argv,
+                {
+                    "{runtime_bin}": runtime_bin,
+                    "{checkout}": str(snap),
+                },
+                [],
+            )
 
         # 6c. Tools that choose their own Python must use the selected one.
         if package_manager == "uv":
@@ -1184,7 +1198,33 @@ class Provisioner:
         # 7. Install (frozen). Python pip installs into the per-run venv,
         # never the host environment. The plan step's own env rides
         # along (e.g. COREPACK_ENABLE_DOWNLOAD_PROMPT=0 for a
-        # packageManager-pinned Node install).
+        # packageManager-pinned Node install). Bootstrap steps (the
+        # persisted corepack install) run first, in plan order.
+        for boot in install_steps[:-1]:
+            assert boot.argv is not None
+            boot_cmd = render_argv(
+                boot.argv,
+                {
+                    "{runtime_bin}": runtime_bin,
+                    "{checkout}": str(snap),
+                },
+                [],
+            )
+            ok, reason = _run_step(
+                boot_cmd, snap, self.build_timeout,
+                {**step_env, **boot.env},
+                phase="install",
+            )
+            if not ok:
+                return _bail(
+                    ProvisionStatus.BUILD_FAILED,
+                    f"install bootstrap failed: {reason}",
+                    plan,
+                    runtime=runtime,
+                    runtime_version=actual_version,
+                    package_manager=package_manager,
+                    lockfile_sha256=lockfile_sha,
+                )
         install_env = {**step_env, **install_step.env}
         ok, reason = _run_step(
             install_cmd, snap, self.build_timeout, install_env,

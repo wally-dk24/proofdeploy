@@ -61,8 +61,8 @@ APPS = list(kit.APPS)
 # tokens that must appear in the recorded install argv.
 FROZEN_INSTALL = {
     "node-express-sqlite": ["npm", "ci"],
-    "node-pnpm-sqlite": ["corepack", "pnpm@9.15.0", "install",
-                         "--frozen-lockfile"],
+    "node-pnpm-sqlite": ["/checkout/.pd-tools/node_modules/.bin/corepack",
+                         "pnpm@9.15.0", "install", "--frozen-lockfile"],
     "python-flask-sqlite": ["install", "--require-hashes", "--no-deps"],
 }
 
@@ -120,6 +120,20 @@ def golden(request, tmp_path_factory):
         for r in all_records
         if r.get("record_type") == "evidence"
     }
+    # Addendum 35: every measured provision's full logs to pd-logs/
+    # for the CI artifact (test evidence; records unchanged).
+    for kind, ev in evidence.items():
+        for key, side_name in (
+            ("fix_parent_provision", "fix-parent"),
+            ("fix_provision", "fix"),
+            ("c_provision", "clean"),
+        ):
+            prov = ev.get(key)
+            if prov:
+                kit.dump_logs(
+                    f"conformance-{app}-{kind}-{side_name}",
+                    prov.get("logs") or [],
+                )
     scores = {
         r["run_kind"]: r
         for r in all_records
@@ -157,12 +171,25 @@ def test_case1_frozen_lockfile_honored(golden):
     want = FROZEN_INSTALL[golden.app]
     for provision in _bug_provisions(golden):
         steps = provision["executed_steps"]
-        install = next(s for s in steps if s["phase"] == "install")
+        installs = [s for s in steps if s["phase"] == "install"]
+        assert installs, (golden.app, steps)
+        # Every install-phase step (a corepack bootstrap included)
+        # ran in the sandbox and exited 0; the frozen install is the
+        # step carrying the frozen form.
+        for s in installs:
+            assert s["exit_code"] == 0, (
+                golden.app, s, "\n".join(provision["logs"]),
+            )
+            assert s["executor"] == "sandbox"
+        install = next(
+            s for s in installs
+            if "--frozen-lockfile" in s["argv_rendered"]
+            or "--require-hashes" in s["argv_rendered"]
+            or s["argv_rendered"][:2] == ["npm", "ci"]
+        )
         argv = install["argv_rendered"]
         for token in want:
             assert token in argv, (golden.app, argv)
-        assert install["exit_code"] == 0
-        assert install["executor"] == "sandbox"
         # The plan on the record is the adapter's, with the lockfile
         # hash the install consumed.
         assert provision["install_plan"]["persisted_dirs"]
@@ -193,7 +220,9 @@ def test_case4_build_migrate_seed_run(golden):
         }
         for phase in ("build", "migrate", "seed"):
             assert phase in by_phase, (golden.app, sorted(by_phase))
-            assert by_phase[phase]["exit_code"] == 0, by_phase[phase]
+            assert by_phase[phase]["exit_code"] == 0, (
+                by_phase[phase], "\n".join(provision["logs"]),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +233,13 @@ def test_case4_build_migrate_seed_run(golden):
 def test_case7_bug_pair_fails_at_parent_passes_at_fix(golden):
     """Case 7: FAIL at fix^, PASS at fix — a candidate catch — with
     both sides READY."""
-    assert golden.bug["parent_ready"], golden.bug
-    assert golden.bug["fix_ready"], golden.bug
+    parent_prov, fix_prov = _bug_provisions(golden)
+    assert golden.bug["parent_ready"], (
+        golden.bug, "\n".join(parent_prov["logs"]),
+    )
+    assert golden.bug["fix_ready"], (
+        golden.bug, "\n".join(fix_prov["logs"]),
+    )
     assert golden.bug["verdict"] == "candidate_catch", golden.bug
     ev = golden.evidence["bug"]
     parent_verdicts = [r["verdict"] for r in ev["fix_parent_results"]]
@@ -217,7 +251,10 @@ def test_case7_bug_pair_fails_at_parent_passes_at_fix(golden):
 def test_case8_clean_commit_no_fail(golden):
     """Case 8: the clean behavior-changing commit produces no FAIL —
     no false alarm, the side READY."""
-    assert golden.clean["c_ready"], golden.clean
+    c_prov = golden.evidence["clean"]["c_provision"]
+    assert golden.clean["c_ready"], (
+        golden.clean, "\n".join(c_prov["logs"]),
+    )
     assert golden.clean["false_alarm"] is False, golden.clean
     ev = golden.evidence["clean"]
     verdicts = [r["verdict"] for r in ev["c_results"]]
@@ -267,6 +304,15 @@ def test_case10_record_replays_to_same_verdict(golden):
     import copy
 
     evidence = golden.evidence["bug"]
+    # Precondition (Addendum 35): a replay is only meaningful when
+    # both sides actually provisioned — otherwise the failure is
+    # the provisioning cascade, not a replay result, and must read
+    # as such.
+    for key in ("fix_parent_provision", "fix_provision"):
+        prov = evidence[key]
+        assert prov["status"] == "ready", (
+            f"replay precondition: side not READY: {prov.get('reason')}"
+        )
     stored = golden.scores["bug"]["verdict"]
     assert kit.replay_verdict(evidence) == stored
     tampered = copy.deepcopy(evidence)
@@ -314,13 +360,19 @@ def test_case2_lockfile_mismatch_commit_refused(golden, tmp_path):
         golden.shas["lockmismatch"], _free_port(), unit, "mm"
     )
     provision = side.provision
-    assert provision.status.value == "build_failed", provision.reason
+    kit.dump_logs(
+        f"conformance-{golden.app}-case2-lockmismatch", provision.logs
+    )
+    assert provision.status.value == "build_failed", (
+        provision.reason, "\n".join(provision.logs),
+    )
     marker = MISMATCH_MARKERS[golden.app]
     assert marker in "\n".join(provision.logs), marker
-    install = next(
-        s for s in provision.executed_steps if s["phase"] == "install"
-    )
-    assert install["exit_code"] not in (0, None)
+    failed_installs = [
+        s for s in provision.executed_steps
+        if s["phase"] == "install" and s["exit_code"] not in (0, None)
+    ]
+    assert failed_installs, provision.executed_steps
 
 
 def test_case5_forced_start_failure_typed_with_error(golden, tmp_path):
@@ -361,7 +413,12 @@ def test_case5_forced_start_failure_typed_with_error(golden, tmp_path):
             broken_sha, _free_port(), unit, "broken"
         )
         provision = side.provision
-        assert provision.status.value == "start_failed", provision.reason
+        kit.dump_logs(
+            f"conformance-{golden.app}-case5-broken-start", provision.logs
+        )
+        assert provision.status.value == "start_failed", (
+            provision.reason, "\n".join(provision.logs),
+        )
         assert "PD_START_MARKER_BOOM" in "\n".join(provision.logs)
         start = next(
             s for s in provision.executed_steps if s["phase"] == "start"
@@ -388,7 +445,10 @@ def test_case6_network_cut_and_no_secret_in_container(golden, tmp_path):
         golden.shas["fix"], _free_port(), unit, "net"
     )
     provision = side.provision
-    assert provision.ready, provision.reason
+    kit.dump_logs(f"conformance-{golden.app}-case6-fix", provision.logs)
+    assert provision.ready, (
+        provision.reason, "\n".join(provision.logs),
+    )
     app = provision.proc
     try:
         env_out = subprocess.run(

@@ -90,8 +90,9 @@ def test_pnpm_golden_variant_provisions_on_node26(tmp_path):
     unit.mkdir()
     side = orch._provision_side_sandbox(rev, _free_port(), unit, "node26")
     provision = side.provision
+    kit.dump_logs("node26-corepack-node-pnpm-sqlite-variant", provision.logs)
     try:
-        assert provision.ready, "\n".join(provision.logs[-30:])
+        assert provision.ready, "\n".join(provision.logs)
         plan = provision.install_plan
         assert plan is not None
         assert plan["selected_version"] == "26.11.1", plan
@@ -102,14 +103,18 @@ def test_pnpm_golden_variant_provisions_on_node26(tmp_path):
             s for s in provision.executed_steps if s["phase"] == "install"
         ]
         assert len(installs) >= 2, provision.executed_steps
-        # The explicit corepack bootstrap ran first, on the Node 26
-        # image that does not bundle corepack.
+        # The persisted corepack bootstrap ran first (Addendum 35:
+        # into the checkout's .pd-tools, never -g — each step is its
+        # own --rm container), and the pinned install ran through
+        # the persisted corepack binary.
         assert installs[0]["argv_rendered"] == [
-            "npm", "install", "-g", "corepack@0.36.0",
+            "npm", "install", "--prefix", "/checkout/.pd-tools",
+            "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
         ]
         assert installs[0]["exit_code"] == 0
         assert installs[1]["argv_rendered"] == [
-            "corepack", "pnpm@9.15.0", "install", "--frozen-lockfile",
+            "/checkout/.pd-tools/node_modules/.bin/corepack",
+            "pnpm@9.15.0", "install", "--frozen-lockfile",
         ]
         assert installs[1]["exit_code"] == 0
     finally:

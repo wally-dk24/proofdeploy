@@ -217,20 +217,36 @@ def check_sandbox_runtime(
     return image_version, image_digest, None
 
 
+_ERROR_MARKERS_STRONG = ("npm error", "ERR_PNPM_", "ELIFECYCLE", "gyp ERR!")
+_ERROR_MARKERS_GENERIC = ("ERROR:", "Error:")
+
+
 def _first_error_line(lines: list) -> str | None:
     """The first concrete error line in a list of log entries
-    (Addendum 33): an ``npm error`` / ``ERR_PNPM_`` / ``ERROR:`` line
-    names WHY an install failed, where the bare step failure does
-    not. Entries may be multi-line blobs; scan line by line."""
+    (Addendum 33/35): a strong marker line (``npm error``,
+    ``ERR_PNPM_``, ``ELIFECYCLE``, ``gyp ERR!``) names WHY an
+    install failed, where the bare step failure does not; a generic
+    ``Error:`` line is next; if nothing matches, fall back to the
+    LAST non-empty line of the output — an unmatched failure still
+    gets its most concrete line into the provision reason instead
+    of a bare "install failed". Entries may be multi-line blobs;
+    scan line by line."""
+    last_nonempty: str | None = None
+    generic: str | None = None
     for entry in lines:
         for line in str(entry).splitlines():
-            if (
-                "npm error" in line
-                or "ERR_PNPM_" in line
-                or "ERROR:" in line
+            stripped = line.strip()
+            if stripped:
+                last_nonempty = stripped
+            if any(marker in line for marker in _ERROR_MARKERS_STRONG):
+                return stripped[:300]
+            if generic is None and any(
+                marker in line for marker in _ERROR_MARKERS_GENERIC
             ):
-                return line.strip()[:300]
-    return None
+                generic = stripped
+    if generic is not None:
+        return generic[:300]
+    return last_nonempty[:300] if last_nonempty else None
 
 
 def _sandbox_step_command(cmd: str, runtime: str = "python") -> str:

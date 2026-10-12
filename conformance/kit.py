@@ -157,6 +157,20 @@ def canary_env_value(app: str) -> str:
     return str(data["env"]["CANARY_SECRET"])
 
 
+def dump_logs(name: str, logs: list) -> Path:
+    """Write a provision's logs to ``pd-logs/<name>.log`` (Addendum
+    35): test evidence, uploaded as a CI artifact — the full joined
+    logs, so a failing install's real error line survives even
+    where an assertion message or a record would trim it. Records
+    themselves are unchanged; this is test evidence only."""
+    out = Path("pd-logs") / f"{name}.log"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        "\n".join(str(entry) for entry in logs), encoding="utf-8"
+    )
+    return out
+
+
 _CANARY_TOKEN_RE = re.compile(r"pdcanary-[0-9a-f]{16}")
 
 

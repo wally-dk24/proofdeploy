@@ -191,6 +191,7 @@ class InstallPlan:
     lockfile_sha256: str | None = None
     package_manager: str | None = None
     package_manager_version: str | None = None
+    corepack_version: str | None = None
     pip_require_hashes: bool = False
     steps: list[PlanStep] = field(default_factory=list)
     persisted_dirs: list[str] = field(default_factory=list)
@@ -376,21 +377,15 @@ class PythonAdapter:
         )
 
 
-# Corepack is not bundled with Node from version 25 onward (verified
-# against the pinned node:26.11.1 image), so a packageManager-pinned
-# plan on those rows bootstraps it explicitly at this pinned version,
-# installed via npm (present on every Node row) as an install step.
+# The pinned corepack a packageManager-pinned Node plan bootstraps
+# into the checkout's .pd-tools (Addendum 35). Persisted form on
+# every row: each sandbox step is its own --rm container and only
+# the checkout survives between steps, so a global (-g) install
+# would die with the install container — and corepack is not even
+# bundled from Node 25 onward (verified against the pinned
+# node:26.11.1 image: `corepack: command not found`).
 COREPACK_BOOTSTRAP_VERSION = "0.36.0"
-
-
-def _node_major_needs_corepack_bootstrap(version: Any) -> bool:
-    """True when the selected Node row does not bundle corepack."""
-    if not version:
-        return False
-    try:
-        return int(str(version).split(".")[0]) >= 25
-    except ValueError:
-        return False
+COREPACK_BIN = "{checkout}/.pd-tools/node_modules/.bin/corepack"
 
 
 class NodeAdapter:
@@ -486,30 +481,35 @@ class NodeAdapter:
             # The pin renders through corepack, as plan data: strip
             # whatever prefix select_package_manager chose (plain
             # binary, or corepack when the planning host has it) and
-            # prepend the deterministic corepack form.
+            # prepend the deterministic persisted-corepack form.
             frozen_args = list(argv)
-            corepack_prefix = ["corepack", f"{manager}@{pm_version}"]
-            if frozen_args[:2] == corepack_prefix:
+            corepack_prefix = [COREPACK_BIN, f"{manager}@{pm_version}"]
+            if frozen_args[:2] == [
+                "corepack", f"{manager}@{pm_version}",
+            ] or frozen_args[:2] == corepack_prefix:
                 frozen_args = frozen_args[2:]
             elif frozen_args[:1] == [manager]:
                 frozen_args = frozen_args[1:]
             argv = [*corepack_prefix, *frozen_args]
             step_env = {"COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
         steps: list[PlanStep] = []
-        if step_env and _node_major_needs_corepack_bootstrap(
-            image.get("selected_version")
-        ):
-            # Corepack is not bundled from Node 25 onward (verified on
-            # the pinned node:26.11.1 image: `corepack: command not
-            # found`, npm present). A packageManager-pinned install on
-            # those rows first installs a pinned corepack via npm —
-            # npm ships on every Node row — as its own install step,
-            # recorded like every other executed step (Addendum 31).
+        corepack_version: str | None = None
+        if step_env:
+            # Addendum 35: the bootstrap is part of the pinned
+            # rendering on EVERY row, in persisted form — corepack
+            # is installed into the checkout's .pd-tools (which
+            # persists across the per-step --rm containers), never
+            # -g. COREPACK_HOME rides on HOME (inside the checkout
+            # in the sandbox), so the downloaded manager survives
+            # to later steps with the network cut.
+            corepack_version = COREPACK_BOOTSTRAP_VERSION
             steps.append(
                 PlanStep(
                     phase="install",
                     argv=[
-                        "npm", "install", "-g",
+                        "npm", "install", "--prefix",
+                        "{checkout}/.pd-tools",
+                        "--no-save", "--no-audit", "--no-fund",
                         f"corepack@{COREPACK_BOOTSTRAP_VERSION}",
                     ],
                 )
@@ -524,8 +524,13 @@ class NodeAdapter:
             package_manager_version=(
                 pm_version if pm_name == manager else None
             ),
+            corepack_version=corepack_version,
             steps=steps,
-            persisted_dirs=["node_modules"],
+            persisted_dirs=(
+                ["node_modules", ".pd-tools"]
+                if corepack_version
+                else ["node_modules"]
+            ),
         )
 
     @staticmethod

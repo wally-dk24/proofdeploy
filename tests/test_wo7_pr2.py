@@ -80,11 +80,23 @@ def test_node_plan_pnpm_pin_renders_corepack_with_exact_version(tmp_path):
     assert plan.refusal is None
     assert plan.package_manager == "pnpm"
     assert plan.package_manager_version == "9.15.0"
-    step = _install_step(plan)
-    assert step.argv == [
-        "corepack", "pnpm@9.15.0", "install", "--frozen-lockfile",
+    steps = _install_steps(plan)
+    assert len(steps) == 2
+    # Addendum 35: corepack is bootstrapped into the checkout
+    # (.pd-tools, persisted) — never -g, which dies with the
+    # install container — and the pinned install runs through the
+    # persisted binary.
+    assert steps[0].argv == [
+        "npm", "install", "--prefix", "{checkout}/.pd-tools",
+        "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
     ]
-    assert step.env.get("COREPACK_ENABLE_DOWNLOAD_PROMPT") == "0"
+    assert steps[1].argv == [
+        "{checkout}/.pd-tools/node_modules/.bin/corepack",
+        "pnpm@9.15.0", "install", "--frozen-lockfile",
+    ]
+    assert steps[1].env.get("COREPACK_ENABLE_DOWNLOAD_PROMPT") == "0"
+    assert plan.corepack_version == "0.36.0"
+    assert plan.persisted_dirs == ["node_modules", ".pd-tools"]
 
 
 def test_node_plan_pnpm_without_pin_uses_plain_frozen_install(tmp_path):
@@ -109,10 +121,15 @@ def test_node_plan_npm_pin_renders_corepack(tmp_path):
     assert plan.refusal is None
     assert plan.package_manager == "npm"
     assert plan.package_manager_version == "10.9.0"
-    step = _install_step(plan)
-    assert step.argv[:2] == ["corepack", "npm@10.9.0"]
+    steps = _install_steps(plan)
+    assert len(steps) == 2
+    step = steps[1]
+    assert step.argv[:2] == [
+        "{checkout}/.pd-tools/node_modules/.bin/corepack", "npm@10.9.0",
+    ]
     assert "ci" in step.argv
     assert step.env.get("COREPACK_ENABLE_DOWNLOAD_PROMPT") == "0"
+    assert plan.corepack_version == "0.36.0"
 
 
 def test_node_plan_yarn_classic_vs_berry(tmp_path):
@@ -134,7 +151,11 @@ def test_node_plan_yarn_classic_vs_berry(tmp_path):
     )
     plan = plan_provisioning(snap, _contract())
     assert plan.package_manager == "yarn"
-    step = _install_step(plan)
+    # A berry pin renders through the persisted corepack too: the
+    # frozen install is the LAST install-phase step (the bootstrap
+    # precedes it).
+    step = _install_steps(plan)[-1]
+    assert step.argv[0] == "{checkout}/.pd-tools/node_modules/.bin/corepack"
     assert "--immutable" in step.argv
     assert "--frozen-lockfile" not in step.argv
 
@@ -777,10 +798,12 @@ def _install_steps(plan):
     return [s for s in plan.steps if s.phase == "install"]
 
 
-def test_node26_pin_plan_bootstraps_corepack(tmp_path):
-    """Corepack is not bundled from Node 25 onward: a packageManager-
-    pinned app selecting the 26 row gets an explicit, pinned corepack
-    bootstrap step BEFORE the corepack install step."""
+def test_node26_pin_plan_uses_persisted_corepack(tmp_path):
+    """The pinned corepack rendering is identical on every row
+    (Addendum 35): a bootstrap step installs corepack@0.36.0 into
+    the checkout's .pd-tools, and the install runs through the
+    persisted binary — on the 26 row, whose image does not bundle
+    corepack at all, exactly as on the 24 row."""
     snap = _node_snapshot(
         tmp_path,
         package_json={
@@ -796,14 +819,22 @@ def test_node26_pin_plan_bootstraps_corepack(tmp_path):
     assert plan.package_manager_version == "9.15.0"
     steps = _install_steps(plan)
     assert len(steps) == 2
-    assert steps[0].argv == ["npm", "install", "-g", "corepack@0.36.0"]
-    assert steps[1].argv == [
-        "corepack", "pnpm@9.15.0", "install", "--frozen-lockfile",
+    assert steps[0].argv == [
+        "npm", "install", "--prefix", "{checkout}/.pd-tools",
+        "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
     ]
+    assert steps[1].argv == [
+        "{checkout}/.pd-tools/node_modules/.bin/corepack",
+        "pnpm@9.15.0", "install", "--frozen-lockfile",
+    ]
+    assert plan.corepack_version == "0.36.0"
+    assert ".pd-tools" in plan.persisted_dirs
 
 
-def test_node24_pin_plan_has_no_corepack_bootstrap(tmp_path):
-    """Node 24 still bundles corepack: no bootstrap step there."""
+def test_node24_pin_plan_same_persisted_corepack_no_global(tmp_path):
+    """Same persisted rendering on the 24 row — and the -g mutant
+    guard: no step may install globally, because a global install
+    dies with the per-step --rm install container."""
     snap = _node_snapshot(
         tmp_path,
         package_json={
@@ -817,10 +848,18 @@ def test_node24_pin_plan_has_no_corepack_bootstrap(tmp_path):
     assert plan.refusal is None
     assert plan.selected_version == "24.21.0"
     steps = _install_steps(plan)
-    assert len(steps) == 1
+    assert len(steps) == 2
     assert steps[0].argv == [
-        "corepack", "pnpm@9.15.0", "install", "--frozen-lockfile",
+        "npm", "install", "--prefix", "{checkout}/.pd-tools",
+        "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
     ]
+    assert steps[1].argv == [
+        "{checkout}/.pd-tools/node_modules/.bin/corepack",
+        "pnpm@9.15.0", "install", "--frozen-lockfile",
+    ]
+    for step in plan.steps:
+        assert "-g" not in (step.argv or [])
+        assert "--global" not in (step.argv or [])
 
 
 def test_sandbox_install_failure_reason_names_first_error_line(
@@ -860,6 +899,70 @@ def test_sandbox_install_failure_reason_names_first_error_line(
     assert side.provision.status == ProvisionStatus.BUILD_FAILED
     assert side.provision.reason == (
         "sandbox install failed: npm error code EUSAGE"
+    )
+
+
+def test_first_error_line_markers_and_fallback():
+    """Addendum 35: strong markers win, a generic Error: line is
+    next, and an unmatched failure falls back to the last non-empty
+    line of the output."""
+    from proofdeploy.orchestrator import _first_error_line
+
+    assert _first_error_line(
+        ["noise\n  ERR_PNPM_OUTDATED_LOCKFILE x"]
+    ) == "ERR_PNPM_OUTDATED_LOCKFILE x"
+    assert _first_error_line(
+        [".../better-sqlite3 install: gyp ERR! build error"]
+    ) == ".../better-sqlite3 install: gyp ERR! build error"
+    assert _first_error_line(
+        ["npm error code EUSAGE", "Error: later generic"]
+    ) == "npm error code EUSAGE"
+    assert _first_error_line(
+        ["Error: generic first", "nothing else"]
+    ) == "Error: generic first"
+    assert _first_error_line(
+        ["plain output", "  ", "last nonempty line"]
+    ) == "last nonempty line"
+    assert _first_error_line(["", "  "]) is None
+
+
+def test_sandbox_install_failure_reason_falls_back_to_last_line(
+    monkeypatch, tmp_path
+):
+    """Addendum 35: when no known error marker appears in a failed
+    install's output, the provision reason carries the output's
+    last non-empty line instead of a bare 'sandbox install
+    failed'."""
+    from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps({"name": "t"}) + "\n", encoding="utf-8"
+    )
+    (snap / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (snap / "server.js").write_text("// app\n", encoding="utf-8")
+    contract = RepoContract(
+        build="node --check server.js",
+        start="node server.js",
+        readiness="/health",
+        env={},
+    )
+
+    def failing_install(self, checkout, steps, env, proxy_env, timeout=600):
+        self.log.append(
+            "fetching packages\n"
+            "some neutral output\n"
+            "the final concrete line of the step"
+        )
+        return [{"phase": steps[0]["phase"], "exit_code": 1}]
+
+    orch = _stub_sandbox(monkeypatch, snap, contract, failing_install)
+    side = orch._provision_side_sandbox("fakerev", 18097, snap / "unit", "t")
+    assert side.provision.status == ProvisionStatus.BUILD_FAILED
+    assert side.provision.reason == (
+        "sandbox install failed: the final concrete line of the step"
     )
 
 

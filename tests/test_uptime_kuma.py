@@ -17,9 +17,13 @@ Runs in the sandbox-tests CI job; locally it skips without a capable
 sandbox (in CI a skip fails the job, per PD_REQUIRE_SANDBOX).
 """
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "conformance"))
+import kit
 
 from proofdeploy.orchestrator import (
     MeasureConfig,
@@ -98,8 +102,9 @@ def test_uptime_kuma_head_ready_in_sandbox(tmp_path):
     unit.mkdir()
     side = orch._provision_side_sandbox(rev, _free_port(), unit, "kuma")
     provision = side.provision
+    kit.dump_logs("uptime-kuma-uptime-kuma-head", provision.logs)
     try:
-        assert provision.ready, "\n".join(provision.logs[-30:])
+        assert provision.ready, "\n".join(provision.logs)
         plan = provision.install_plan
         assert plan is not None
         # engines.node >= 26.2.0 selects the 26.11.1 pinned row, and
