@@ -1,0 +1,700 @@
+"""WO-8.3: auth providers — auth from the contract, per-run credentials.
+
+Covers Addendum 44 items 1-5 at the unit/host level (the sandbox
+end-to-end proofs live in tests/test_wo83_sandbox.py):
+
+- yml.py validates the four modes and their keys; unknown keys or
+  modes are refused; bootstrap_env declares names only.
+- generate_bootstrap_env: fresh random values per call (per side and
+  per run), email-shaped for EMAIL names.
+- login / refresh (login, then refresh near expiry) / ghost_jwt
+  (seed-written key file) / register end to end against the golden
+  auth app (tests/fixtures/wo83_auth_app) running on the host.
+- credentials differ per side: one side's bootstrap values do not
+  authenticate against another side's instance.
+- a missing key file -> INCONCLUSIVE auth, never a crash.
+- planted leaks: a generated value planted in a record is redacted
+  on write; planted in a prompt or bundle text it is refused by the
+  leak check (the generated values are in the forbidden-values set).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+import pytest
+
+from proofdeploy.executor import (
+    Executor,
+    InconclusiveReason,
+    ProbeResult,
+    Verdict,
+)
+from proofdeploy.leakcheck import (
+    SecretLeakError,
+    assert_no_secrets,
+    collect_forbidden_values,
+)
+from proofdeploy.probe import SCHEMA_VERSION
+from proofdeploy.runpair import (
+    build_evidence_record,
+    read_records,
+    write_evidence_record,
+)
+from proofdeploy.yml import RepoContract, load_contract
+
+
+def generate_bootstrap_env(names: list[str]) -> dict[str, str]:
+    """The WO-8.3 generator, imported lazily so this module collects
+    (and its tests fail individually) on a tree without it."""
+    from proofdeploy.setup_auth import generate_bootstrap_env as _gen
+
+    return _gen(names)
+
+FIXTURE_APP = Path(__file__).parent / "fixtures" / "wo83_auth_app"
+
+BASE_YML = "build: 'true'\nstart: 'python app.py'\nreadiness: /health\n"
+
+
+def _contract(tmp_path: Path, auth_yaml: str) -> RepoContract:
+    (tmp_path / "proofdeploy.yml").write_text(
+        BASE_YML + "auth:\n" + auth_yaml, encoding="utf-8"
+    )
+    return load_contract(tmp_path / "proofdeploy.yml")
+
+
+# ----------------------------------------------------------------------
+# yml validation (Addendum 44 item 4)
+# ----------------------------------------------------------------------
+
+
+def test_login_mode_validates(tmp_path):
+    contract = _contract(
+        tmp_path,
+        "  mode: login\n"
+        "  path: /auth/login\n"
+        "  method: POST\n"
+        "  body:\n"
+        "    email: '${ADMIN_EMAIL}'\n"
+        "    password: '${ADMIN_PASSWORD}'\n"
+        "  token_json_path: access_token\n"
+        "  bootstrap_env: [ADMIN_EMAIL, ADMIN_PASSWORD]\n",
+    )
+    assert contract.auth is not None
+    assert contract.auth["mode"] == "login"
+    assert contract.auth["body"] == {
+        "email": "${ADMIN_EMAIL}",
+        "password": "${ADMIN_PASSWORD}",
+    }
+    assert contract.auth["bootstrap_env"] == ["ADMIN_EMAIL", "ADMIN_PASSWORD"]
+
+
+def test_refresh_mode_with_login_validates(tmp_path):
+    contract = _contract(
+        tmp_path,
+        "  mode: refresh\n"
+        "  path: /auth/refresh\n"
+        "  body:\n"
+        "    refresh_token: '${REFRESH_TOKEN}'\n"
+        "  token_json_path: access_token\n"
+        "  refresh_token_json_path: refresh_token\n"
+        "  login_path: /login\n"
+        "  login_body:\n"
+        "    email: '${ADMIN_EMAIL}'\n"
+        "    password: '${ADMIN_PASSWORD}'\n",
+    )
+    assert contract.auth is not None
+    assert contract.auth["mode"] == "refresh"
+    assert contract.auth["login_path"] == "/login"
+
+
+def test_ghost_jwt_key_file_validates(tmp_path):
+    contract = _contract(
+        tmp_path,
+        "  mode: ghost_jwt\n  key_file: .pd-auth/admin_key\n  ttl_seconds: 300\n",
+    )
+    assert contract.auth is not None
+    assert contract.auth["key_file"] == ".pd-auth/admin_key"
+    assert contract.auth["ttl_seconds"] == 300
+
+
+def test_ghost_jwt_key_placeholder_validates(tmp_path):
+    contract = _contract(tmp_path, "  mode: ghost_jwt\n  key: '${ADMIN_KEY}'\n")
+    assert contract.auth is not None
+    assert contract.auth["key"] == "${ADMIN_KEY}"
+
+
+def test_unknown_auth_mode_refused(tmp_path):
+    with pytest.raises(ValueError, match="auth.mode"):
+        _contract(tmp_path, "  mode: oauth2\n  path: /login\n")
+
+
+def test_unknown_auth_key_refused(tmp_path):
+    with pytest.raises(ValueError, match="unknown keys"):
+        _contract(
+            tmp_path,
+            "  mode: login\n  path: /login\n  token_json_path: token\n"
+            "  grant_type: password\n",
+        )
+
+
+def test_login_unknown_key_from_other_mode_refused(tmp_path):
+    # username_field belongs to register; in login mode it is unknown.
+    with pytest.raises(ValueError, match="unknown keys"):
+        _contract(
+            tmp_path,
+            "  mode: login\n  path: /login\n  token_json_path: token\n"
+            "  username_field: username\n",
+        )
+
+
+def test_bootstrap_env_must_be_a_list_of_names(tmp_path):
+    with pytest.raises(ValueError, match="bootstrap_env"):
+        _contract(
+            tmp_path,
+            "  mode: login\n  path: /login\n  token_json_path: token\n"
+            "  bootstrap_env: ADMIN_EMAIL\n",
+        )
+
+
+def test_bootstrap_env_bad_name_refused(tmp_path):
+    with pytest.raises(ValueError, match="bootstrap_env"):
+        _contract(
+            tmp_path,
+            "  mode: login\n  path: /login\n  token_json_path: token\n"
+            "  bootstrap_env: ['NOT-A-NAME']\n",
+        )
+
+
+def test_bootstrap_env_duplicate_refused(tmp_path):
+    with pytest.raises(ValueError, match="bootstrap_env"):
+        _contract(
+            tmp_path,
+            "  mode: login\n  path: /login\n  token_json_path: token\n"
+            "  bootstrap_env: [ADMIN_EMAIL, ADMIN_EMAIL]\n",
+        )
+
+
+def test_ghost_jwt_needs_exactly_one_key_source(tmp_path):
+    with pytest.raises(ValueError, match="exactly one"):
+        _contract(tmp_path, "  mode: ghost_jwt\n")
+    with pytest.raises(ValueError, match="exactly one"):
+        _contract(
+            tmp_path,
+            "  mode: ghost_jwt\n  key: '${ADMIN_KEY}'\n"
+            "  key_file: .pd-auth/admin_key\n",
+        )
+
+
+def test_ghost_jwt_key_file_must_stay_in_checkout(tmp_path):
+    with pytest.raises(ValueError, match="inside"):
+        _contract(tmp_path, "  mode: ghost_jwt\n  key_file: /etc/passwd\n")
+    with pytest.raises(ValueError, match="inside"):
+        _contract(tmp_path, "  mode: ghost_jwt\n  key_file: ../admin_key\n")
+
+
+def test_ghost_jwt_ttl_must_be_positive_int(tmp_path):
+    with pytest.raises(ValueError, match="ttl_seconds"):
+        _contract(
+            tmp_path,
+            "  mode: ghost_jwt\n  key_file: .pd-auth/admin_key\n"
+            "  ttl_seconds: '300'\n",
+        )
+
+
+# ----------------------------------------------------------------------
+# Bootstrap generation (Addendum 43 conditions 1-2)
+# ----------------------------------------------------------------------
+
+
+def test_generate_bootstrap_env_fresh_per_call():
+    names = ["ADMIN_EMAIL", "ADMIN_PASSWORD"]
+    first = generate_bootstrap_env(names)
+    second = generate_bootstrap_env(names)
+    assert set(first) == set(names)
+    # Fresh per run: no value is reused across calls.
+    assert first != second
+    for value in first.values():
+        assert value not in second.values()
+    # Email-shaped for EMAIL names; long random hex otherwise.
+    assert first["ADMIN_EMAIL"].endswith("@example.com")
+    assert len(first["ADMIN_PASSWORD"]) >= 16
+
+
+def test_generate_bootstrap_env_distinct_within_call():
+    values = generate_bootstrap_env(["A_SECRET", "B_SECRET", "C_SECRET"])
+    assert len(set(values.values())) == 3
+
+
+# ----------------------------------------------------------------------
+# The golden auth app on the host
+# ----------------------------------------------------------------------
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _wait_ready(url: str, timeout: float = 30.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url + "/health", timeout=2) as resp:
+                if resp.status == 200:
+                    return
+        except Exception:
+            time.sleep(0.2)
+    raise RuntimeError(f"golden auth app did not become ready at {url}")
+
+
+@pytest.fixture()
+def auth_app(tmp_path):
+    """The golden auth app, migrated + seeded like provisioning does.
+
+    Yields (base_url, workdir, bootstrap_values). The seed runs with
+    the generated bootstrap values in its env — the same values the
+    install container would see.
+    """
+
+    def _start(ttl_seconds: str | None = None, seed: bool = True):
+        work = Path(tmp_path) / f"app-{_free_port()}"
+        work.mkdir(parents=True)
+        for name in ("app.py", "migrate.py", "seed.py"):
+            (work / name).write_text(
+                (FIXTURE_APP / name).read_text(encoding="utf-8"), encoding="utf-8"
+            )
+        bootstrap = generate_bootstrap_env(["ADMIN_EMAIL", "ADMIN_PASSWORD"])
+        env = {
+            **os.environ,
+            "APP_DB": str(work / "app.db"),
+            "ADMIN_EMAIL": bootstrap["ADMIN_EMAIL"],
+            "ADMIN_PASSWORD": bootstrap["ADMIN_PASSWORD"],
+        }
+        if ttl_seconds is not None:
+            env["TOKEN_TTL_SECONDS"] = ttl_seconds
+        subprocess.run(
+            [sys.executable, "migrate.py"], cwd=work, env=env, check=True,
+            capture_output=True,
+        )
+        if seed:
+            subprocess.run(
+                [sys.executable, "seed.py"], cwd=work, env=env, check=True,
+                capture_output=True,
+            )
+        port = _free_port()
+        proc = subprocess.Popen(
+            [sys.executable, "app.py"],
+            cwd=work,
+            env={**env, "PORT": str(port)},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        url = f"http://127.0.0.1:{port}"
+        try:
+            _wait_ready(url)
+        except Exception:
+            proc.terminate()
+            raise
+        return url, work, bootstrap, proc
+
+    procs: list[subprocess.Popen] = []
+
+    def start(**kwargs):
+        url, work, bootstrap, proc = _start(**kwargs)
+        procs.append(proc)
+        return url, work, bootstrap
+
+    yield start
+    for proc in procs:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _me_probe() -> dict:
+    return {
+        "act": {
+            "method": "GET",
+            "path": "/me",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        "assert": [{"type": "status", "equals": 200}],
+    }
+
+
+LOGIN_CONFIG = {
+    "mode": "login",
+    "path": "/login",
+    "method": "POST",
+    "body": {"email": "${ADMIN_EMAIL}", "password": "${ADMIN_PASSWORD}"},
+    "token_json_path": "access_token",
+    "expires_in_json_path": "expires_in",
+}
+
+
+def test_login_mode_end_to_end(auth_app):
+    url, _work, bootstrap = auth_app()
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config=dict(LOGIN_CONFIG),
+        bootstrap_env=bootstrap,
+    )
+    r = ex.run_probe(_me_probe())
+    assert r.verdict == Verdict.PASS, r.details
+    assert any("(login)" in d for d in r.details)
+    # The bootstrap values rode the result's redaction channel.
+    assert set(bootstrap.values()) <= set(r.bootstrap_values)
+
+
+def test_login_with_other_sides_credentials_fails(auth_app):
+    """Credentials differ per side: side A's generated values do not
+    authenticate against side B's instance (Addendum 44 item 5)."""
+    url_a, _wa, bootstrap_a = auth_app()
+    url_b, _wb, bootstrap_b = auth_app()
+    assert bootstrap_a != bootstrap_b
+    ex = Executor(
+        target_url=url_b,
+        provisioned=True,
+        credential_config=dict(LOGIN_CONFIG),
+        bootstrap_env=bootstrap_a,
+    )
+    r = ex.run_probe(_me_probe())
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.AUTH
+
+
+def test_refresh_mode_logs_in_then_refreshes_near_expiry(auth_app):
+    # TTL 59 s is inside the provider's 60 s proactive-refresh margin,
+    # so the second ensure in the same probe run must refresh.
+    url, _work, bootstrap = auth_app(ttl_seconds="59")
+    config = {
+        "mode": "refresh",
+        "path": "/auth/refresh",
+        "method": "POST",
+        "body": {"refresh_token": "${REFRESH_TOKEN}"},
+        "token_json_path": "access_token",
+        "refresh_token_json_path": "refresh_token",
+        "expires_in_json_path": "expires_in",
+        "login_path": "/login",
+        "login_body": {"email": "${ADMIN_EMAIL}", "password": "${ADMIN_PASSWORD}"},
+    }
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config=config,
+        bootstrap_env=bootstrap,
+    )
+    # A setup GET plus the act GET: the provider runs before each
+    # request — login before the first, refresh before the second.
+    probe = {
+        "setup": [
+            {
+                "type": "http",
+                "act": {
+                    "method": "GET",
+                    "path": "/me",
+                    "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+                },
+            }
+        ],
+        "act": {
+            "method": "GET",
+            "path": "/me",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        "assert": [{"type": "status", "equals": 200}],
+    }
+    r = ex.run_probe(probe)
+    assert r.verdict == Verdict.PASS, r.details
+    assert any("(login)" in d for d in r.details), r.details
+    assert any(
+        d == "credential provider: POST /auth/refresh" for d in r.details
+    ), r.details
+    # The refresh token from login was captured for redaction and use.
+    assert "REFRESH_TOKEN" in r.captured_bindings
+
+
+def test_ghost_jwt_from_seed_written_key_file(auth_app):
+    url, work, _bootstrap = auth_app()
+    key_file = work / ".pd-auth" / "admin_key"
+    assert key_file.is_file()
+    key_value = key_file.read_text(encoding="utf-8").strip()
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config={
+            "mode": "ghost_jwt",
+            "key_value": key_value,
+            "ttl_seconds": 300,
+        },
+    )
+    probe = {
+        "act": {
+            "method": "GET",
+            "path": "/admin/site",
+            "headers": {"Authorization": "Ghost ${AUTH_TOKEN}"},
+        },
+        "assert": [{"type": "status", "equals": 200}],
+    }
+    r = ex.run_probe(probe)
+    assert r.verdict == Verdict.PASS, r.details
+    # The read key joined the run's minted/redaction channel.
+    assert key_value in r.minted_tokens
+
+
+def test_ghost_jwt_missing_key_file_is_inconclusive_auth(auth_app):
+    url, _work, _bootstrap = auth_app()
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config={
+            "mode": "ghost_jwt",
+            "key_error": (
+                "auth key file not found or empty: .pd-auth/admin_key "
+                "(declared by the contract; the instance's seed must "
+                "write it during provisioning)"
+            ),
+        },
+    )
+    probe = {
+        "act": {
+            "method": "GET",
+            "path": "/admin/site",
+            "headers": {"Authorization": "Ghost ${AUTH_TOKEN}"},
+        },
+        "assert": [{"type": "status", "equals": 200}],
+    }
+    r = ex.run_probe(probe)  # never a crash
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.AUTH
+    assert any("key file not found" in d for d in r.details)
+
+
+def test_register_mode_still_works_on_golden(auth_app):
+    url, _work, _bootstrap = auth_app()
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config={
+            "mode": "register",
+            "path": "/register",
+            "method": "POST",
+            "username_field": "username",
+            "password_field": "password",
+            "token_json_path": "token",
+        },
+    )
+    r = ex.run_probe(_me_probe())
+    assert r.verdict == Verdict.PASS, r.details
+
+
+# ----------------------------------------------------------------------
+# Orchestrator wiring (no sandbox): key file read, config shaping
+# ----------------------------------------------------------------------
+
+
+def _orchestrator(tmp_path: Path):
+    from proofdeploy.orchestrator import MeasureConfig, Orchestrator
+
+    cfg = MeasureConfig(
+        repo_dir=tmp_path,
+        output_dir=tmp_path / "out",
+        workdir=tmp_path / "work",
+        bug_id="b",
+        rev_bug_base="x",
+        rev_bug="x",
+        rev_fix="x",
+    )
+    return Orchestrator(cfg)
+
+
+def _side(tmp_path: Path, contract: RepoContract):
+    from proofdeploy.orchestrator import _Side
+    from proofdeploy.runner import ProvisionResult, ProvisionStatus
+
+    return _Side(
+        rev="x",
+        sha="0" * 40,
+        snapshot_dir=tmp_path,
+        contract=contract,
+        provision=ProvisionResult(status=ProvisionStatus.READY),
+    )
+
+
+def test_credential_config_reads_ghost_key_file(tmp_path):
+    contract = _contract(
+        tmp_path,
+        "  mode: ghost_jwt\n  key_file: .pd-auth/admin_key\n"
+        "  bootstrap_env: [ADMIN_EMAIL]\n",
+    )
+    key_dir = tmp_path / ".pd-auth"
+    key_dir.mkdir()
+    (key_dir / "admin_key").write_text("abc123:deadbeef\n", encoding="utf-8")
+    orch = _orchestrator(tmp_path)
+    side = _side(tmp_path, contract)
+    cfg = orch._credential_config(side)
+    assert cfg is not None
+    assert cfg["key_value"] == "abc123:deadbeef"
+    assert "key_file" not in cfg
+    assert "bootstrap_env" not in cfg
+    # The read key is a generated secret of the side (redaction).
+    assert "abc123:deadbeef" in side.generated_secrets
+
+
+def test_credential_config_missing_key_file_no_crash(tmp_path):
+    contract = _contract(
+        tmp_path, "  mode: ghost_jwt\n  key_file: .pd-auth/admin_key\n"
+    )
+    orch = _orchestrator(tmp_path)
+    side = _side(tmp_path, contract)
+    cfg = orch._credential_config(side)  # never raises
+    assert cfg is not None
+    assert "key_value" not in cfg
+    assert "key file not found" in cfg["key_error"]
+
+
+def test_side_bootstrap_and_record_shapes(tmp_path):
+    contract = _contract(
+        tmp_path,
+        "  mode: login\n  path: /login\n  token_json_path: token\n"
+        "  bootstrap_env: [ADMIN_EMAIL, ADMIN_PASSWORD]\n",
+    )
+    orch = _orchestrator(tmp_path)
+    values = orch._side_bootstrap(contract)
+    assert set(values) == {"ADMIN_EMAIL", "ADMIN_PASSWORD"}
+    side = _side(tmp_path, contract)
+    side.bootstrap_env = values
+    side.generated_secrets = list(values.values())
+    # The record names the env names as "generated" — never values.
+    entry = orch._auth_bootstrap(side)
+    assert entry == {"generated": ["ADMIN_EMAIL", "ADMIN_PASSWORD"]}
+    assert json.dumps(entry).find(values["ADMIN_PASSWORD"]) == -1
+    # Redaction values: configured extras plus the side's secrets.
+    assert set(values.values()) <= set(orch._record_secret_values([side]))
+
+
+def test_side_bootstrap_absent_means_no_values(tmp_path):
+    contract = _contract(
+        tmp_path,
+        "  mode: register\n  path: /register\n  method: POST\n"
+        "  username_field: username\n  password_field: password\n"
+        "  token_json_path: token\n",
+    )
+    orch = _orchestrator(tmp_path)
+    assert orch._side_bootstrap(contract) == {}
+
+
+# ----------------------------------------------------------------------
+# Planted leaks are refused / redacted (Addendum 44 item 5)
+# ----------------------------------------------------------------------
+
+
+def _evidence_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "records"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    return repo
+
+
+def test_planted_bootstrap_value_in_record_is_redacted(tmp_path):
+    """A generated value planted in the record text never reaches the
+    committed record: the write path's secret set includes it."""
+    value = generate_bootstrap_env(["ADMIN_PASSWORD"])["ADMIN_PASSWORD"]
+    record = build_evidence_record(
+        run_kind="clean",
+        clean_id="c1",
+        runner_log=[f"planted leak: {value}"],
+    )
+    repo = _evidence_repo(tmp_path)
+    write_evidence_record(record, repo, repo, secret_values=[value])
+    committed = (repo / "runs.jsonl").read_text(encoding="utf-8")
+    assert value not in committed
+    assert "***REDACTED***" in committed
+
+
+def test_bootstrap_values_auto_collected_from_probe_results(tmp_path):
+    """Even a caller that passes no secret_values cannot leak a
+    bootstrap value: build_evidence_record collects the values from
+    the probe results themselves (the minted-tokens channel)."""
+    bootstrap = generate_bootstrap_env(["ADMIN_EMAIL", "ADMIN_PASSWORD"])
+    result = ProbeResult(
+        probe_index=0,
+        verdict=Verdict.PASS,
+        details=[f"planted leak: {bootstrap['ADMIN_PASSWORD']}"],
+        bootstrap_values=list(bootstrap.values()),
+    )
+    record = build_evidence_record(
+        run_kind="clean", clean_id="c1", c_results=[result]
+    )
+    assert bootstrap["ADMIN_PASSWORD"] in record["minted_tokens"]
+    repo = _evidence_repo(tmp_path)
+    write_evidence_record(record, repo, repo)  # no secret_values passed
+    committed = (repo / "runs.jsonl").read_text(encoding="utf-8")
+    assert bootstrap["ADMIN_PASSWORD"] not in committed
+    assert bootstrap["ADMIN_EMAIL"] not in committed
+
+
+def test_planted_bootstrap_value_in_prompt_is_refused():
+    value = generate_bootstrap_env(["ADMIN_PASSWORD"])["ADMIN_PASSWORD"]
+    forbidden = collect_forbidden_values(None, None, extra_secrets=[value])
+    assert value in forbidden
+    with pytest.raises(SecretLeakError):
+        assert_no_secrets(
+            f"the prompt mentions {value}", forbidden, where="author prompt"
+        )
+
+
+def test_planted_bootstrap_value_in_bundle_is_refused(tmp_path):
+    value = generate_bootstrap_env(["ADMIN_PASSWORD"])["ADMIN_PASSWORD"]
+    forbidden = collect_forbidden_values(None, None, extra_secrets=[value])
+    bundle_file = tmp_path / "bundle.txt"
+    bundle_file.write_text(f"bundle content {value}", encoding="utf-8")
+    with pytest.raises(SecretLeakError):
+        assert_no_secrets(
+            bundle_file.read_text(encoding="utf-8"), forbidden, where="bundle file"
+        )
+
+
+def test_record_names_bootstrap_generated_never_values(tmp_path):
+    bootstrap = generate_bootstrap_env(["ADMIN_EMAIL", "ADMIN_PASSWORD"])
+    record = build_evidence_record(
+        run_kind="clean",
+        clean_id="c1",
+        auth_bootstrap={"c": {"generated": sorted(bootstrap)}},
+    )
+    assert record["schema_version"] == "1.4.0"
+    assert record["auth_bootstrap"] == {
+        "c": {"generated": ["ADMIN_EMAIL", "ADMIN_PASSWORD"]}
+    }
+    blob = json.dumps(record)
+    for value in bootstrap.values():
+        assert value not in blob
+
+
+def test_older_records_still_load(tmp_path):
+    """Schema discipline: a 1.3.0 record (no auth_bootstrap) loads."""
+    old = {
+        "record_id": "old1",
+        "record_type": "evidence",
+        "schema_version": "1.3.0",
+        "run_kind": "clean",
+    }
+    (tmp_path / "runs.jsonl").write_text(json.dumps(old) + "\n", encoding="utf-8")
+    records = read_records(tmp_path)
+    assert records[0]["record_id"] == "old1"
+    assert records[0].get("auth_bootstrap") is None
+    assert SCHEMA_VERSION == "1.4.0"

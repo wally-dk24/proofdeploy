@@ -631,6 +631,11 @@ def build_evidence_record(
     scoring_version: str = DEFAULT_SCORING_VERSION,
     fix_parent_provision: dict[str, Any] | None = None,
     fix_provision: dict[str, Any] | None = None,
+    # WO-8.3 (schema 1.4.0): per-side auth bootstrap summary, e.g.
+    # {"fix": {"generated": ["ADMIN_EMAIL", "ADMIN_PASSWORD"]}} — env
+    # NAMES only, recorded as "generated"; the values never appear in
+    # any record (they ride the redaction channels instead).
+    auth_bootstrap: dict[str, Any] | None = None,
     fix_parent_results: list[ProbeResult] | None = None,
     fix_results: list[ProbeResult] | None = None,
     runner_log: list[str] | None = None,
@@ -701,6 +706,11 @@ def build_evidence_record(
         for _k, _v in _r.captured_bindings.items():
             _accumulate(_k, _v)
         auto_minted.extend(_r.minted_tokens)
+        # WO-8.3: per-run bootstrap credential values in effect for
+        # the probe run join the same redaction pool (run secrets
+        # exactly like minted tokens; the record names them only as
+        # "generated" — see the auth_bootstrap field).
+        auto_minted.extend(_r.bootstrap_values)
     # Caller-supplied values are added too, never replacing the
     # auto-collected ones: dropping a value that occurred during the
     # run would leave it unredacted in the written record.
@@ -773,6 +783,7 @@ def build_evidence_record(
         "public_contract_env_keys": public_contract_env_keys or [],
         "captured_values": merged_captured,
         "minted_tokens": merged_minted,
+        "auth_bootstrap": auth_bootstrap or {},
         # O3: crash record fields (only set on orchestrator crashes).
         "inconclusive_cause": inconclusive_cause,
         "inconclusive_error": inconclusive_error,

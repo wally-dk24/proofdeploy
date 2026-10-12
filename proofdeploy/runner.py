@@ -900,6 +900,7 @@ class Provisioner:
         port: int,
         expected_lockfile_sha256: str | None = None,
         require_lockfile_match: bool = True,
+        bootstrap_env: dict[str, str] | None = None,
     ) -> ProvisionResult:
         """Provision a target: install, build, migrate, seed, start, readiness.
 
@@ -941,6 +942,13 @@ class Provisioner:
 
         snap = Path(snapshot_dir)
         contract_env: dict[str, str] = dict(getattr(contract, "env", None) or {})
+        # WO-8.3: per-run bootstrap credential values merge over the
+        # contract env (they win a name collision — the credential the
+        # instance is bootstrapped with is the generated one). They
+        # reach every step and the started app, exactly as the sandbox
+        # path injects them into the install and app containers.
+        if bootstrap_env:
+            contract_env.update(bootstrap_env)
 
         # WO-7: this Provisioner is the HOST executor. The plan comes
         # from the runtime's provisioning adapter (proofdeploy.

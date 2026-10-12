@@ -147,6 +147,36 @@ de-privileged container:
 - no secrets enter the container environment: only declared-public
   contract config is passed; auth tokens travel over HTTP.
 
+#### Which secrets: the rule-9 clarification (Master, Addendum 43, WO-8.3)
+
+The "no secrets" rule above is clarified by Master's ruling of
+2026-10-12 (Addendum 43), recorded here verbatim:
+
+> "No secrets in the container" means CUSTOMER secrets (CI secrets,
+> the customer's environment, any credential for a real system).
+> Per-run credentials ProofDeploy generates for a disposable instance
+> may enter its install and app containers, on these mandatory
+> conditions:
+>
+> 1. Generated fresh per side and per run, random, never reused,
+>    never derived from a customer value.
+> 2. Used only against the disposable instance ProofDeploy
+>    provisioned (the WO-7.3 provenance grant).
+> 3. Redacted from every record, and in the forbidden-values set for
+>    the prompt and bundle.
+> 4. Never written to proofdeploy.yml or any committed file.
+>    Recorded only as "generated" with their env names, never their
+>    values.
+> 5. Customer secrets stay out of every container, unchanged.
+
+Implemented in WO-8.3 as the contract's `auth.bootstrap_env` (names
+only in `proofdeploy.yml`; values generated per side and per run by
+`proofdeploy.setup_auth.generate_bootstrap_env`, injected into that
+side's install and app containers, fed to the same side's
+login/refresh provider, collected into the record's redaction set,
+and named in the evidence record's `auth_bootstrap` field as
+"generated" with their env names — never their values).
+
 ### Schema version
 
 Every record (evidence, score, judgment) and every per-probe result

@@ -58,3 +58,31 @@ credential providers. No default registration.
   five template fields are), and it is leak-checked.
 - Tests: no-auth app (no crash), declared registration provider (works),
   provider failure (INCONCLUSIVE auth).
+
+## Addendum (WO-8.3, 2026-10-12): login, refresh-with-login, ghost key file, bootstrap env
+
+The provider family is completed per Addenda 43/44:
+
+- **`login` mode**: the contract declares the login path and a body
+  template; the template's `${NAME}` placeholders resolve from the
+  run's bindings, and the token is read at `token_json_path`.
+- **`refresh` mode** gains a declared login leg (`login_path` /
+  `login_body`): the first acquisition logs in, the response's
+  refresh token is read at `refresh_token_json_path` and bound as
+  `${REFRESH_TOKEN}`, and later acquisitions refresh near expiry —
+  "login, then refresh near expiry".
+- **`ghost_jwt` mode** gains the `key_file` form: the admin key is
+  created by the instance during the contract's own seed and written
+  to a declared checkout file (e.g. `.pd-auth/admin_key`); the
+  orchestrator reads it host-side after READY and passes it to the
+  provider as a value. A missing file is INCONCLUSIVE `auth`, never
+  a crash.
+- **`auth.bootstrap_env`** declares env NAMES for which ProofDeploy
+  generates a fresh random value per side and per run (Master's
+  rule-9 clarification, Addendum 43 — see ADR-0009). The values are
+  injected into that side's install and app containers and are the
+  same values the login/refresh body templates resolve to. They are
+  never written to `proofdeploy.yml` or any committed file; the
+  evidence record names them only as "generated".
+- `yml.py` validates all four modes and their key sets; unknown keys
+  or modes are refused at load.

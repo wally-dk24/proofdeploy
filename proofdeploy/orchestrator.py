@@ -103,6 +103,7 @@ from proofdeploy.sandbox import (
     check_podman,
     resolve_network_mode,
 )
+from proofdeploy.setup_auth import generate_bootstrap_env
 from proofdeploy.yml import RepoContract, load_contract
 
 # Fixture keys rendered into the author-facing description by design.
@@ -361,6 +362,18 @@ class _Side:
     # Isolation actually in effect for this side's sandbox app (network
     # mode, userns mode, uid). None when the sandbox was not used.
     sandbox_evidence: dict[str, object] | None = None
+    # Per-run bootstrap credentials for this side (WO-8.3): generated
+    # fresh for this side when its contract declares
+    # `auth.bootstrap_env`, injected into its install and app
+    # containers and passed to its executor as provider bindings.
+    # VALUES live only here, in container env, and in the record's
+    # redaction channels — never in any record field (the record names
+    # them only as "generated", with their env names).
+    bootstrap_env: dict[str, str] = field(default_factory=dict)
+    # Secret VALUES tied to this side that must reach the record's
+    # redaction set even when no probe ran: the bootstrap values plus
+    # a ghost_jwt admin key read from the contract's key file.
+    generated_secrets: list[str] = field(default_factory=list)
 
 
 class Orchestrator:
@@ -446,6 +459,45 @@ class Orchestrator:
             "target_url": side.provision.target_url if side.provision else None,
             "network_mode": mode,
         }
+
+    # ------------------------------------------------------------------
+    # Auth bootstrap credentials (WO-8.3, Addenda 43/44).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _side_bootstrap(contract: RepoContract) -> dict[str, str]:
+        """Generate this side's bootstrap credentials, if declared.
+
+        The contract's `auth.bootstrap_env` declares env NAMES only;
+        the values are generated fresh here — per side and per run,
+        because every provisioning call generates anew. An undeclared
+        bootstrap means no values and no behavior change.
+        """
+        auth = contract.auth or {}
+        names = auth.get("bootstrap_env")
+        if not isinstance(names, list) or not names:
+            return {}
+        return generate_bootstrap_env([str(n) for n in names])
+
+    @staticmethod
+    def _auth_bootstrap(side: _Side) -> dict[str, object]:
+        """The record's auth_bootstrap entry for one side: the env
+        NAMES, recorded as "generated" — never the values (Addendum
+        43 condition 4)."""
+        if not side.bootstrap_env:
+            return {}
+        return {"generated": sorted(side.bootstrap_env)}
+
+    def _record_secret_values(self, sides: list[_Side]) -> list[str]:
+        """Secret values for record redaction: the configured extras
+        plus every side's generated/read credentials (WO-8.3), so a
+        bootstrap value or a read admin key is redacted from every
+        record field — provision logs included — even on paths where
+        no probe ran to carry it."""
+        values = list(self.cfg.extra_secrets)
+        for side in sides:
+            values.extend(side.generated_secrets)
+        return values
 
     # ------------------------------------------------------------------
     # Bundle and authoring (steps a-c).
@@ -679,6 +731,7 @@ class Orchestrator:
         runner_log: list[str] | None = None,
         provisioning: dict[str, Any] | None = None,
         probe_results: Any | None = None,
+        extra_secret_values: list[str] | None = None,
     ) -> dict[str, Any]:
         """Record an INCONCLUSIVE run after a ProofDeploy failure (O3).
 
@@ -737,8 +790,13 @@ class Orchestrator:
             crash_provisioning=provisioning or {},
             crash_probe_results=probe_results,
         )
+        # WO-8.3: a crash after provisioning can carry generated
+        # bootstrap values in its logs/results; the callers pass the
+        # sides' generated secrets so the crash record redacts them
+        # like every other record.
+        crash_secrets = list(self.cfg.extra_secrets) + list(extra_secret_values or [])
         record_id, _, evidence_sha = write_evidence_record(
-            record, repo, repo, secret_values=self.cfg.extra_secrets,
+            record, repo, repo, secret_values=crash_secrets,
         )
         self._say(f"evidence committed: {evidence_sha[:12]}")
         counting = (
@@ -754,7 +812,7 @@ class Orchestrator:
             clean_id=cfg.clean_id if run_kind == "clean" else None,
             verdict=RunPairVerdict.INCONCLUSIVE,
             note="environment: tool_failure",
-            secret_values=self.cfg.extra_secrets,
+            secret_values=crash_secrets,
         )
         score_sha = commit_records(
             repo, repo, f"score: {run_kind} {(cfg.bug_id or cfg.clean_id)} ({record_id[:8]})"
@@ -1036,6 +1094,9 @@ class Orchestrator:
         snap_dir = unit_dir / f"snapshot-{tag}"
         snapshot = create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=snap_dir)
         contract = load_contract(snapshot.dir / "proofdeploy.yml")
+        # WO-8.3: fresh bootstrap credentials for THIS side and run,
+        # generated before any step runs (the seed consumes them).
+        bootstrap = self._side_bootstrap(contract)
         found = find_lockfile(snapshot.dir, _detect_runtime(snapshot.dir))
         expected = found[1] if found else None
         provision = runner.provision(
@@ -1043,6 +1104,7 @@ class Orchestrator:
             contract=contract,
             port=port,
             expected_lockfile_sha256=expected,
+            bootstrap_env=bootstrap,
         )
         self._say(
             f"provision {tag} ({sha[:12]}): {provision.status.value} "
@@ -1054,6 +1116,8 @@ class Orchestrator:
             snapshot_dir=snapshot.dir,
             contract=contract,
             provision=provision,
+            bootstrap_env=bootstrap,
+            generated_secrets=list(bootstrap.values()),
         )
 
     def _provision_side_sandbox(
@@ -1176,6 +1240,20 @@ class Orchestrator:
             k: v for k, v in contract.env.items()
             if k in cfg.public_contract_env_keys
         }
+        # WO-8.3 (Addenda 43/44): per-run bootstrap credentials for
+        # THIS side. The contract declares env names only; the values
+        # are generated fresh here, per side and per run, and are the
+        # one exception to "no secrets in the container": they are
+        # credentials ProofDeploy itself generated for this disposable
+        # instance, injected into its install and app containers below
+        # and recorded only as "generated" with their env names.
+        # Customer secrets still never enter any container: the base
+        # env above stays the declared-public contract env only.
+        bootstrap = self._side_bootstrap(contract)
+        if bootstrap:
+            logs.append(
+                "auth bootstrap: generated " + ", ".join(sorted(bootstrap))
+            )
 
         # S1 (Addendum 15): one install path, now the adapter's plan.
         # The old sandbox code ran `pip install` in a --rm install
@@ -1196,6 +1274,7 @@ class Orchestrator:
                 f"{runtime_name!r}",
                 runtime_name, image_version, image_digest, None, plan,
                 package_manager=plan.package_manager,
+                bootstrap=bootstrap,
             )
         lockfile_name, lockfile_sha = plan.lockfile_name, plan.lockfile_sha256
         assert lockfile_sha is not None
@@ -1213,6 +1292,7 @@ class Orchestrator:
                 ProvisionStatus.BUILD_FAILED, "not yet supported in the sandbox",
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
                 package_manager=plan.package_manager,
+                bootstrap=bootstrap,
             )
         if plan.refusal is not None:
             logs.append(plan.refusal)
@@ -1221,6 +1301,7 @@ class Orchestrator:
                 ProvisionStatus.BUILD_FAILED, plan.refusal,
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
                 package_manager=plan.package_manager,
+                bootstrap=bootstrap,
             )
 
         # Render the plan's steps for the sandbox executor: argv steps
@@ -1276,7 +1357,11 @@ class Orchestrator:
                 })
         # PIP_NO_CACHE_DIR=1: pip warns the cache dir isn't writable as
         # the sandbox user; the venv removes the running-as-root warning.
+        # WO-8.3: the install phase (build/migrate/seed) runs with this
+        # side's generated bootstrap values in its env — the seed is
+        # what bootstraps the instance's first credential from them.
         install_env = dict(secret_free_env)
+        install_env.update(bootstrap)
         if runtime_name == "python":
             install_env["PIP_NO_CACHE_DIR"] = "1"
         proxy_env = {k: v for k, v in os.environ.items() if "proxy" in k.lower()}
@@ -1336,6 +1421,7 @@ class Orchestrator:
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
                 package_manager=plan.package_manager,
                 executed_steps=executed,
+                bootstrap=bootstrap,
             )
         logs.extend(sb.log)
         sb.log.clear()
@@ -1365,10 +1451,14 @@ class Orchestrator:
             "exit_code": None,
         })
         try:
+            # WO-8.3: the app container also gets this side's generated
+            # bootstrap values (e.g. an instance that reads its admin
+            # credentials from env on every boot), over the secret-free
+            # public contract env.
             app = sb.start(
                 snapshot.dir,
                 start_cmd,
-                secret_free_env,
+                {**secret_free_env, **bootstrap},
                 port,
                 name=app_name,
             )
@@ -1387,6 +1477,7 @@ class Orchestrator:
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
                 package_manager=plan.package_manager,
                 executed_steps=executed,
+                bootstrap=bootstrap,
             )
         if not app.wait_ready(contract.readiness or "/health", timeout=120):
             # S2: the record must say more than "not ready". Capture the
@@ -1413,6 +1504,7 @@ class Orchestrator:
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
                 package_manager=plan.package_manager,
                 executed_steps=executed,
+                bootstrap=bootstrap,
             )
         # S2: log tail on success too, for the record.
         app_log = sb.app_logs(app.name)
@@ -1440,6 +1532,8 @@ class Orchestrator:
             rev=rev, sha=sha, snapshot_dir=snapshot.dir,
             contract=contract, provision=provision,
             sandbox_evidence=dict(app.sandbox_evidence),
+            bootstrap_env=bootstrap,
+            generated_secrets=list(bootstrap.values()),
         )
 
     def _sandbox_failed_side(
@@ -1459,6 +1553,7 @@ class Orchestrator:
         plan: InstallPlan | None = None,
         package_manager: str | None = None,
         executed_steps: list[dict] | None = None,
+        bootstrap: dict[str, str] | None = None,
     ) -> _Side:
         """Build a failed sandbox _Side with runtime facts populated (S3).
 
@@ -1483,6 +1578,8 @@ class Orchestrator:
             rev=rev, sha=sha, snapshot_dir=snapshot.dir,
             contract=contract, provision=provision,
             sandbox_evidence=sb.isolation_evidence_best_effort(),
+            bootstrap_env=dict(bootstrap or {}),
+            generated_secrets=list((bootstrap or {}).values()),
         )
 
     def _credential_config(self, side: _Side) -> dict[str, Any] | None:
@@ -1497,11 +1594,42 @@ class Orchestrator:
         default. Its requests are recorded and logged as writes by the
         executor; a provider failure is INCONCLUSIVE `auth`, never an
         exception.
+
+        WO-8.3: `bootstrap_env` is not provider config (the values ride
+        the executor's `bootstrap_env` field) and is dropped here. For
+        `ghost_jwt` with a declared `key_file`, the key is read HERE —
+        host-side, after the side is READY, from the instance's own
+        checkout (the file its seed wrote) — and passed to the
+        provider as `key_value`. A missing or empty file is NOT an
+        error here: the config carries `key_error` and the provider
+        fails INCONCLUSIVE `auth` at first use, never a crash. The
+        read key joins the side's generated secrets so it is redacted
+        from every record.
         """
         auth = side.contract.auth
         if not auth:
             return None
-        return dict(auth)
+        cfg = dict(auth)
+        cfg.pop("bootstrap_env", None)
+        if cfg.get("mode") == "ghost_jwt":
+            key_file = cfg.pop("key_file", None)
+            if isinstance(key_file, str) and key_file:
+                key_path = side.snapshot_dir / key_file
+                try:
+                    key_value = key_path.read_text(encoding="utf-8").strip()
+                except OSError:
+                    key_value = ""
+                if key_value:
+                    cfg["key_value"] = key_value
+                    if key_value not in side.generated_secrets:
+                        side.generated_secrets.append(key_value)
+                else:
+                    cfg["key_error"] = (
+                        f"auth key file not found or empty: {key_file} "
+                        "(declared by the contract; the instance's seed "
+                        "must write it during provisioning)"
+                    )
+        return cfg
 
     def _make_executor(self, side: _Side) -> Executor:
         assert side.provision and side.provision.target_url
@@ -1529,6 +1657,10 @@ class Orchestrator:
             fixture=dict(side.contract.fixture),
             auth_token=None,
             credential_config=self._credential_config(side),
+            # WO-8.3: this side's generated bootstrap values, so the
+            # provider's body templates resolve the same credentials
+            # the instance was bootstrapped with.
+            bootstrap_env=dict(side.bootstrap_env),
             allow_harness_app=self.cfg.allow_harness_app,
             harness=(
                 HarnessAppConfig(workdir=self.cfg.workdir / "harness")
@@ -1763,6 +1895,10 @@ class Orchestrator:
                     "fix_parent": self._write_grant(parent),
                     "fix": self._write_grant(fix),
                 },
+                auth_bootstrap={
+                    "fix_parent": self._auth_bootstrap(parent),
+                    "fix": self._auth_bootstrap(fix),
+                },
                 sandboxed=use_sandbox,
                 measured_result=use_sandbox,
                 provenance=self._provenance(capability_probe),
@@ -1780,7 +1916,7 @@ class Orchestrator:
                 record,
                 repo,
                 repo,
-                secret_values=self.cfg.extra_secrets,
+                secret_values=self._record_secret_values([parent, fix]),
             )
             self._say(f"evidence committed: {evidence_sha[:12]}")
             score_path = write_score_record(
@@ -1789,7 +1925,7 @@ class Orchestrator:
                 evidence_record_id=record_id,
                 run_kind="bug",
                 bug_id=cfg.bug_id,
-                secret_values=self.cfg.extra_secrets,
+                secret_values=self._record_secret_values([parent, fix]),
             )
             score_sha = commit_records(repo, repo, f"score: bug {cfg.bug_id} ({record_id[:8]})")
             self._say(f"score committed: {score_sha[:12]}")
@@ -1845,6 +1981,9 @@ class Orchestrator:
                     "parent_results": [r.to_dict() for r in (parent_results or [])],
                     "fix_results": [r.to_dict() for r in (fix_results or [])],
                 },
+                extra_secret_values=[
+                    v for s in sides for v in s.generated_secrets
+                ],
             )
         finally:
             for side in sides:
@@ -2022,6 +2161,7 @@ class Orchestrator:
                 truncation_flags=truncation_flags,
                 sandbox_evidence={"c": side.sandbox_evidence or {}},
                 write_grants={"c": self._write_grant(side)},
+                auth_bootstrap={"c": self._auth_bootstrap(side)},
                 sandboxed=use_sandbox,
                 measured_result=use_sandbox,
                 provenance=self._provenance(capability_probe),
@@ -2032,7 +2172,7 @@ class Orchestrator:
                 public_contract_env_keys=list(self.cfg.public_contract_env_keys),
             )
             record_id, _, evidence_sha = write_evidence_record(
-                record, repo, repo, secret_values=self.cfg.extra_secrets
+                record, repo, repo, secret_values=self._record_secret_values([side])
             )
             self._say(f"evidence committed: {evidence_sha[:12]}")
             score_path = write_score_record(
@@ -2041,7 +2181,7 @@ class Orchestrator:
                 evidence_record_id=record_id,
                 run_kind="clean",
                 clean_id=cfg.clean_id,
-                secret_values=self.cfg.extra_secrets,
+                secret_values=self._record_secret_values([side]),
             )
             score_sha = commit_records(repo, repo, f"score: clean {cfg.clean_id} ({record_id[:8]})")
             self._say(f"score committed: {score_sha[:12]}")
@@ -2079,6 +2219,9 @@ class Orchestrator:
                 probe_results={
                     "c_results": [r.to_dict() for r in (c_results or [])],
                 },
+                extra_secret_values=[
+                    v for s in sides for v in s.generated_secrets
+                ],
             )
         finally:
             for side in sides:

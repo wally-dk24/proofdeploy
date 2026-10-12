@@ -143,6 +143,13 @@ class ProbeResult:
     # pass them in.
     captured_bindings: dict[str, Any] = field(default_factory=dict, repr=False)
     minted_tokens: list[str] = field(default_factory=list, repr=False)
+    # Per-run bootstrap credential VALUES in effect for this probe run
+    # (WO-8.3): generated fresh per side and per run by the orchestrator
+    # and injected into the side's containers and provider bindings.
+    # Like captured/minted, never serialized: build_evidence_record
+    # collects them for the record's fail-closed redaction, and the
+    # record itself names them only as "generated" (env names only).
+    bootstrap_values: list[str] = field(default_factory=list, repr=False)
     # Whether the probe was actually sent to the target. Invalid author
     # blocks are never sent; their results are reported individually as
     # INCONCLUSIVE `probe` but must not affect reachability scoring
@@ -436,6 +443,17 @@ def evaluate_assertions(
     return Verdict.PASS, None, details
 
 
+def _dig_json_path(data: Any, path: str) -> Any:
+    """Walk a dotted JSON path ("data.access_token"); None when absent."""
+    cur: Any = data
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+
 def _check_remote_method(
     method: str, url: str, provisioned: bool = False
 ) -> tuple[bool, str]:
@@ -532,6 +550,14 @@ class Executor:
     #   expiry. The provider runs BEFORE requests are sent; it never reacts
     #   to a response and never re-sends a request.
     credential_config: dict[str, Any] | None = None
+    # Per-run bootstrap credential VALUES for this side (WO-8.3): the
+    # orchestrator generates them fresh per side and per run for the
+    # env names the contract's `auth.bootstrap_env` declares, injects
+    # them into the side's install and app containers, and passes them
+    # here so provider body templates (${ADMIN_EMAIL}, ...) resolve to
+    # the SAME values the instance was bootstrapped with. They join
+    # the run's redaction channels (see SetupContext.run_bootstrap).
+    bootstrap_env: dict[str, str] = field(default_factory=dict)
     # Harness-app provisioning (WO-5, dev-set library repos only). When
     # None, a harness_app setup step is INCONCLUSIVE (environment):
     # there is nothing to run the author's app with.
@@ -595,6 +621,14 @@ class Executor:
         ctx = SetupContext(auth_token=token)
         ctx.bindings.update(self.contract_env)
         ctx.known_names.update(self.contract_env.keys())
+        # Per-run bootstrap credentials (WO-8.3) are bindings of this
+        # side: provider body templates resolve them, and the values
+        # are recorded for the record's redaction. They win over a
+        # same-named contract env value — the credential the instance
+        # was bootstrapped with is the generated one.
+        ctx.bindings.update(self.bootstrap_env)
+        ctx.known_names.update(self.bootstrap_env.keys())
+        ctx.run_bootstrap = list(self.bootstrap_env.values())
         for k, v in self.fixture.items():
             if k != "auth_token":
                 ctx.bindings.setdefault(k, v)
@@ -631,6 +665,8 @@ class Executor:
             return self._provide_refresh(provider, ctx, details, writes)
         if provider.mode == "register":
             return self._provide_register(provider, ctx, details, writes)
+        if provider.mode == "login":
+            return self._provide_login(provider, ctx, details, writes)
         details.append(f"credential provider failed: unknown mode '{provider.mode}'")
         return InconclusiveReason.AUTH
 
@@ -639,11 +675,27 @@ class Executor:
     ) -> InconclusiveReason | None:
         """Mint a short-lived Ghost Admin API JWT for this request."""
         cfg = provider.config
-        try:
-            raw_key = ctx.apply_strict(cfg.get("key", "${ADMIN_KEY}"))
-        except PlaceholderError as e:
-            details.append(f"credential provider failed: {e}")
+        # WO-8.3 key_file form: the orchestrator read the key from the
+        # declared checkout file after READY and passes it as
+        # `key_value`; a missing/unreadable file arrives as `key_error`
+        # and fails INCONCLUSIVE auth here, never as a crash. The read
+        # key is a credential of this run: it joins the record's
+        # redaction set (once per run) below.
+        key_error = cfg.get("key_error")
+        if isinstance(key_error, str) and key_error:
+            details.append(f"credential provider failed: {key_error}")
             return InconclusiveReason.AUTH
+        key_value = cfg.get("key_value")
+        if isinstance(key_value, str) and key_value:
+            if key_value not in ctx.run_minted:
+                ctx.run_minted.append(key_value)
+            raw_key: Any = key_value
+        else:
+            try:
+                raw_key = ctx.apply_strict(cfg.get("key", "${ADMIN_KEY}"))
+            except PlaceholderError as e:
+                details.append(f"credential provider failed: {e}")
+                return InconclusiveReason.AUTH
         if not isinstance(raw_key, str) or not raw_key:
             details.append("credential provider failed: admin key did not resolve to a string")
             return InconclusiveReason.AUTH
@@ -668,7 +720,12 @@ class Executor:
         details: list[str],
         writes: list[str],
     ) -> InconclusiveReason | None:
-        """Call the refresh endpoint proactively (no token or near expiry)."""
+        """Call the refresh endpoint proactively (no token or near expiry).
+
+        With a login declared (WO-8.3: `login_path`/`login_body`), the
+        first acquisition — no provider token yet — is a login; the
+        refresh endpoint is only for near-expiry renewals.
+        """
         cfg = provider.config
         path = cfg.get("path")
         token_path = cfg.get("token_json_path")
@@ -680,6 +737,18 @@ class Executor:
         if not isinstance(token_path, str) or not token_path:
             details.append("credential provider failed: credential_config needs 'token_json_path'")
             return InconclusiveReason.AUTH
+        login_path = cfg.get("login_path")
+        if ctx._provided_token is None and isinstance(login_path, str) and login_path:
+            return self._login_exchange(
+                ctx,
+                details,
+                writes,
+                path=login_path,
+                method=str(cfg.get("login_method", "POST")),
+                body_template=cfg.get("login_body"),
+                token_path=token_path,
+                cfg=cfg,
+            )
         method = str(cfg.get("method", "POST")).upper()
         try:
             headers = ctx.apply_strict(cfg.get("headers") or {})
@@ -711,13 +780,7 @@ class Executor:
         except json.JSONDecodeError:
             details.append("credential provider failed: refresh response is not JSON")
             return InconclusiveReason.AUTH
-        cur: Any = data
-        for part in str(token_path).split("."):
-            if isinstance(cur, dict) and part in cur:
-                cur = cur[part]
-            else:
-                cur = None
-                break
+        cur = _dig_json_path(data, str(token_path))
         if not isinstance(cur, str) or not cur:
             details.append(
                 f"credential provider failed: no token at '{token_path}' in refresh response"
@@ -726,18 +789,133 @@ class Executor:
         expires_in: float | None = None
         expires_path = cfg.get("expires_in_json_path")
         if isinstance(expires_path, str) and expires_path:
-            node: Any = data
-            for part in expires_path.split("."):
-                if isinstance(node, dict) and part in node:
-                    node = node[part]
-                else:
-                    node = None
-                    break
+            node = _dig_json_path(data, expires_path)
             if isinstance(node, (int, float)) and node > 0:
                 expires_in = float(node)
         ctx.provide_token(cur, expires_in_seconds=expires_in)
+        # Refresh endpoints commonly rotate the refresh token; rebind
+        # the fresh one for the next renewal (WO-8.3).
+        self._capture_refresh_token(ctx, data, cfg)
         details.append("credential provider: token acquired")
         return None
+
+    def _capture_refresh_token(
+        self, ctx: SetupContext, data: Any, cfg: dict[str, Any]
+    ) -> None:
+        """Bind a response's refresh token as ${REFRESH_TOKEN} (WO-8.3).
+
+        `ctx.add` records the value in the run's captured secrets, so
+        the refresh token joins the record's redaction set like every
+        other credential of the run.
+        """
+        refresh_path = cfg.get("refresh_token_json_path")
+        if not isinstance(refresh_path, str) or not refresh_path:
+            return
+        value = _dig_json_path(data, refresh_path)
+        if isinstance(value, str) and value:
+            ctx.add({"REFRESH_TOKEN": value})
+
+    def _login_exchange(
+        self,
+        ctx: SetupContext,
+        details: list[str],
+        writes: list[str],
+        *,
+        path: str,
+        method: str,
+        body_template: Any,
+        token_path: str,
+        cfg: dict[str, Any],
+    ) -> InconclusiveReason | None:
+        """POST a login and provide the token from the response (WO-8.3).
+
+        The body is a template: its ${NAME} placeholders resolve from
+        the run's bindings, which is how the per-run bootstrap values
+        (and only they) reach the login. A declared refresh token in
+        the response is bound as ${REFRESH_TOKEN} for later renewals.
+        """
+        if not path.startswith("/"):
+            details.append(
+                "credential provider failed: credential_config needs a login "
+                "'path' starting with '/'"
+            )
+            return InconclusiveReason.AUTH
+        method = method.upper()
+        try:
+            body = ctx.apply_strict(body_template)
+        except PlaceholderError as e:
+            details.append(f"credential provider failed: {e}")
+            return InconclusiveReason.AUTH
+        url = self.target_url.rstrip("/") + path
+        allowed, detail = _check_remote_method(method, url, self.provisioned)
+        if not allowed:
+            details.append(f"credential provider refused: {detail}")
+            return InconclusiveReason.AUTH
+        allowed, detail = self._check_write_allowed(method, "credential provider")
+        if not allowed:
+            details.append(f"credential provider refused: {detail}")
+            return InconclusiveReason.AUTH
+        details.append(f"credential provider: {method} {path} (login)")
+        status, _, resp_body, req_logs = _do_http(
+            method, url, None, body, self.http_timeout
+        )
+        details.extend(req_logs)
+        if method.upper() in WRITE_METHODS:
+            self._log_write(method, url, status, writes, details)
+        if status is None or not (200 <= status < 300):
+            details.append(f"credential provider failed: login endpoint returned {status}")
+            return InconclusiveReason.AUTH
+        try:
+            data = json.loads(resp_body)
+        except json.JSONDecodeError:
+            details.append("credential provider failed: login response is not JSON")
+            return InconclusiveReason.AUTH
+        token = _dig_json_path(data, token_path)
+        if not isinstance(token, str) or not token:
+            details.append(
+                f"credential provider failed: no token at '{token_path}' in login response"
+            )
+            return InconclusiveReason.AUTH
+        expires_in: float | None = None
+        expires_path = cfg.get("expires_in_json_path")
+        if isinstance(expires_path, str) and expires_path:
+            node = _dig_json_path(data, expires_path)
+            if isinstance(node, (int, float)) and node > 0:
+                expires_in = float(node)
+        ctx.provide_token(token, expires_in_seconds=expires_in)
+        self._capture_refresh_token(ctx, data, cfg)
+        details.append("credential provider: token acquired")
+        return None
+
+    def _provide_login(
+        self,
+        provider: CredentialProvider,
+        ctx: SetupContext,
+        details: list[str],
+        writes: list[str],
+    ) -> InconclusiveReason | None:
+        """Log in with the contract's declared body template (WO-8.3)."""
+        cfg = provider.config
+        path = cfg.get("path")
+        token_path = cfg.get("token_json_path")
+        if not isinstance(path, str) or not path.startswith("/"):
+            details.append(
+                "credential provider failed: credential_config needs 'path' starting with '/'"
+            )
+            return InconclusiveReason.AUTH
+        if not isinstance(token_path, str) or not token_path:
+            details.append("credential provider failed: credential_config needs 'token_json_path'")
+            return InconclusiveReason.AUTH
+        return self._login_exchange(
+            ctx,
+            details,
+            writes,
+            path=path,
+            method=str(cfg.get("method", "POST")),
+            body_template=cfg.get("body"),
+            token_path=token_path,
+            cfg=cfg,
+        )
 
     def _provide_register(
         self,
@@ -1229,6 +1407,7 @@ class Executor:
                     captured[_k] = list(_vs)
             pr.captured_bindings = captured
             pr.minted_tokens = list(ctx.run_minted)
+            pr.bootstrap_values = list(ctx.run_bootstrap)
             return pr
 
         # 2. Setup steps. A failed step is INCONCLUSIVE, not silently continued.

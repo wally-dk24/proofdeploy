@@ -27,9 +27,15 @@ do userns remapping (this sandbox: newuidmap EPERM), it falls back to
 ``no-new-privileges``, and records the limitation. Set
 ``require_userns=True`` to fail closed instead.
 
-Secrets never enter the container environment. The contract env passed
-to the sandbox must already be secret-free (the orchestrator passes
-only declared-public config); auth tokens travel over HTTP, not env.
+Customer secrets never enter the container environment. The contract
+env passed to the sandbox must already be secret-free (the
+orchestrator passes only declared-public config); auth tokens travel
+over HTTP, not env. The one exception is per-run credentials
+ProofDeploy itself generates for the disposable instance (WO-8.3,
+under Master's rule-9 clarification in ADR-0009 / Addendum 43): the
+orchestrator merges that side's generated bootstrap values into the
+install and app env — fresh per side and per run, redacted from every
+record, never committed.
 
 Python is supported (venv inside the checkout), and Node too
 (node_modules inside the checkout, frozen installs from the lockfile,
