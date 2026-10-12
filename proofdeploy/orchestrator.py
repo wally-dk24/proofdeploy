@@ -52,10 +52,10 @@ from proofdeploy.executor import (
     Verdict,
 )
 from proofdeploy.fixture import (
+    REGISTERED_TEMPLATE_SHA256,
     assemble_author_bundle,
     create_snapshot,
     template_filename,
-    template_hash,
     template_path,
 )
 from proofdeploy.leakcheck import (
@@ -496,13 +496,14 @@ class Orchestrator:
         # parsed contract — before any model call. A declared credential
         # (top-level auth:) selects the credential template; anything
         # else selects the no-credential template.
-        selected_template = template_path(template_filename(contract.auth is not None))
+        selected_name = template_filename(contract.auth is not None)
+        selected_template = template_path(selected_name)
         bundle = assemble_author_bundle(
             diff_path=diff_path,
             snapshot_dir=snapshot.dir,
             yml_fixture=contract.fixture,
             output_dir=bundle_dir,
-            expected_template_hash=template_hash(selected_template),
+            expected_template_hash=REGISTERED_TEMPLATE_SHA256[selected_name],
             template_file=selected_template,
             source_sha=snapshot.sha,
             diff_range=f"{base_sha}..{tip_sha}",
