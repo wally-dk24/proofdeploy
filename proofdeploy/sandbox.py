@@ -289,6 +289,52 @@ def check_sandbox_capabilities() -> SandboxCapabilities:
     return caps
 
 
+def resolve_network_mode(
+    requested: str, caps: SandboxCapabilities | None = None
+) -> tuple[str, str]:
+    """Resolve the app network mode for a run, ONCE (WO-7.3).
+
+    Returns ``(mode, reason)``: the concrete mode every side of the
+    run must use, and why. With ``auto`` the host's capability probe
+    decides and the reason records the choice AND the capability
+    evidence behind it (the fallback reason when isolated networks
+    are unavailable). Explicit modes resolve to themselves, with the
+    same refusals a Sandbox enforces when it picks a mode per side:
+    ``host`` is refused outright, and ``isolated`` on a host that
+    cannot create isolated networks is refused with the probe's
+    reason. The orchestrator calls this once per measured run and
+    hands the resolved mode to every side; ``Sandbox`` delegates
+    here too, so there is exactly one implementation of the choice.
+    """
+    if caps is None:
+        caps = check_sandbox_capabilities()
+    if requested == "host":
+        raise SandboxError(
+            "network_mode=host is refused: the app must not share "
+            "the host network"
+        )
+    if requested == "auto":
+        if caps.isolated_network:
+            return (
+                "isolated",
+                "auto: isolated network available "
+                "(sandbox capability probe passed)",
+            )
+        return (
+            "none+socket",
+            f"auto: {caps.reason or 'isolated network unavailable'}; "
+            "falling back to none+socket",
+        )
+    if requested == "isolated" and not caps.isolated_network:
+        raise SandboxError(
+            "network_mode=isolated requested but the host cannot "
+            f"create isolated networks: {caps.reason}"
+        )
+    if requested not in ("isolated", "none+socket"):
+        raise SandboxError(f"unknown network_mode {requested!r}")
+    return requested, f"explicit network_mode={requested}"
+
+
 @dataclass
 class SandboxConfig:
     """Configuration for sandboxed runs."""
@@ -545,22 +591,15 @@ class Sandbox:
         return self._caps
 
     def _resolve_network_mode(self) -> str:
-        """Pick the network mode for the app container."""
-        mode = self.config.network_mode
-        if mode == "host":
-            raise SandboxError(
-                "network_mode=host is refused: the app must not share "
-                "the host network"
-            )
-        if mode == "auto":
-            if self._capabilities().isolated_network:
-                return "isolated"
-            return "none+socket"
-        if mode == "isolated" and not self._capabilities().isolated_network:
-            raise SandboxError(
-                "network_mode=isolated requested but the host cannot "
-                f"create isolated networks: {self._capabilities().reason}"
-            )
+        """Pick the network mode for the app container.
+
+        Delegates to the module-level resolve_network_mode (WO-7.3):
+        one implementation of the choice, whether the orchestrator
+        resolved the run's mode up front or a lone Sandbox is used.
+        """
+        mode, _reason = resolve_network_mode(
+            self.config.network_mode, self._capabilities()
+        )
         return mode
 
     def _ensure_isolated_network(self) -> str:

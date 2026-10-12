@@ -19,8 +19,11 @@ Fail-closed rules:
   provisioner says the target was provisioned (``provisioned=True``);
   localhost alone is not sufficient. A write on a non-provisioned target
   is INCONCLUSIVE (reason ``probe``).
-- Only GET and HEAD are allowed against remote (non-localhost) targets;
-  anything else is INCONCLUSIVE (reason ``probe``).
+- Against a NON-provisioned executor, only GET and HEAD are allowed on
+  remote (non-localhost) targets; anything else is INCONCLUSIVE
+  (reason ``probe``). The grant is provenance, not hostname (WO-7.3):
+  a provisioned executor may use any method on any host, including a
+  sandbox app's container IP.
 - Redirects are never followed; a 3xx response is evaluated as-is.
 - ``${NAME}`` placeholders must name a known binding (contract ``env``
   key, fixture key, ``AUTH_TOKEN``, or a capture declared by a setup
@@ -433,11 +436,26 @@ def evaluate_assertions(
     return Verdict.PASS, None, details
 
 
-def _check_remote_method(method: str, url: str) -> tuple[bool, str]:
-    """Fail-closed policy: only GET/HEAD on remote targets.
+def _check_remote_method(
+    method: str, url: str, provisioned: bool = False
+) -> tuple[bool, str]:
+    """Fail-closed policy: only GET/HEAD on remote targets — unless
+    the executor is provisioned (WO-7.3).
+
+    The write grant is PROVENANCE, not hostname: an executor the
+    orchestrator built for a target it provisioned itself may use
+    any method on any host (a sandbox app at its container IP is
+    the case that matters — deciding by hostname made every write
+    probe against an isolated-mode sandbox refuse). A
+    non-provisioned executor keeps the old rule exactly: local URL
+    any method, remote URL GET/HEAD only. Nothing here is settable
+    by CLI flag, contract field or env var — the only input is the
+    executor's ``provisioned`` flag.
 
     Returns (allowed, detail).
     """
+    if provisioned:
+        return True, ""
     if _is_local_url(url):
         return True, ""
     if method.upper() in SAFE_REMOTE_METHODS:
@@ -489,8 +507,11 @@ class Executor:
     # explicitly opts in (dev-set library repos only).
     allow_harness_app: bool = False
     # Fail-closed: write methods (POST/PUT/DELETE/PATCH) are allowed only
-    # when the target was provisioned by the provisioner. Localhost alone
-    # is NOT sufficient.
+    # when the target was provisioned by the provisioner — whatever the
+    # host (loopback, container IP, or any other address; WO-7.3).
+    # Localhost alone is NOT sufficient. Set ONLY by the orchestrator,
+    # only for a target it provisioned itself; there is no CLI flag,
+    # contract field or env var for it.
     provisioned: bool = False
     # Contract `env` keys: known `${NAME}` bindings for every probe run.
     contract_env: dict[str, str] = field(default_factory=dict)
@@ -667,7 +688,7 @@ class Executor:
             details.append(f"credential provider failed: {e}")
             return InconclusiveReason.AUTH
         url = self.target_url.rstrip("/") + path
-        allowed, detail = _check_remote_method(method, url)
+        allowed, detail = _check_remote_method(method, url, self.provisioned)
         if not allowed:
             details.append(f"credential provider refused: {detail}")
             return InconclusiveReason.AUTH
@@ -1040,7 +1061,9 @@ class Executor:
                 method = act.get("method", "GET")
                 path = act.get("path", "/")
                 url = self._base_url(ctx).rstrip("/") + path
-                allowed, detail = _check_remote_method(method, url)
+                allowed, detail = _check_remote_method(
+                    method, url, self.provisioned
+                )
                 if not allowed:
                     return (
                         logs,
@@ -1159,7 +1182,7 @@ class Executor:
         method = act.get("method", "GET")
         path = act.get("path", "/")
         url = self.target_url.rstrip("/") + path
-        allowed, detail = _check_remote_method(method, url)
+        allowed, detail = _check_remote_method(method, url, self.provisioned)
         if not allowed:
             details.append(detail)
             return ProbeResult(

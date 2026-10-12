@@ -16,6 +16,7 @@ provisions carry no executed_steps, and the kit itself does not
 exist.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -88,6 +89,13 @@ def golden(request, tmp_path_factory):
     work.mkdir()
     probes = kit.load_probes(app)
 
+    # WO-7.3 both-modes proof: the sandbox-focus workflow can force
+    # one network mode for the whole run via PD_FORCE_NETWORK_MODE
+    # (test plumbing only — it feeds the run config's network_mode;
+    # product code has no env switch, and the write grant is never
+    # env-controlled). Unset/empty means the normal "auto".
+    forced_mode = os.environ.get("PD_FORCE_NETWORK_MODE") or "auto"
+
     bug_cfg = MeasureConfig(
         repo_dir=repo,
         output_dir=records,
@@ -98,6 +106,7 @@ def golden(request, tmp_path_factory):
         rev_bug=shas["bug"],
         rev_fix=shas["fix"],
         sandbox=True,
+        network_mode=forced_mode,
         model_runner=kit.canned_runner(probes["bug_probes"]),
     )
     bug_summary = Orchestrator(bug_cfg).measure_bug()
@@ -110,6 +119,7 @@ def golden(request, tmp_path_factory):
         clean_id=f"conformance-{app}",
         rev_clean=shas["clean"],
         sandbox=True,
+        network_mode=forced_mode,
         model_runner=kit.canned_runner(probes["clean_probes"]),
     )
     clean_summary = Orchestrator(clean_cfg).measure_clean()

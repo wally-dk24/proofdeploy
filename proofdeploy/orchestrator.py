@@ -101,6 +101,7 @@ from proofdeploy.sandbox import (
     SandboxConfig,
     assert_measurement_gate,
     check_podman,
+    resolve_network_mode,
 )
 from proofdeploy.yml import RepoContract, load_contract
 
@@ -111,6 +112,13 @@ PUBLIC_FIXTURE_KEYS = ("repo_name", "seed_note", "auth_mechanism", "auth_scope",
 
 class OrchestratorError(RuntimeError):
     """The measured unit could not run to a score."""
+
+
+class MixedNetworkModeError(OrchestratorError):
+    """Typed environment error (WO-7.3): the sides of one measured
+    run reported different app network modes. The run is REFUSED —
+    no evidence and no score record — because a pair measured under
+    two different network setups is not one measurement."""
 
 
 def _git(repo_dir: Path, *args: str) -> str:
@@ -322,6 +330,12 @@ class MeasureConfig:
     # never counts as a measured result.
     sandbox: bool = True
     allow_unsandboxed: bool = False
+    # Sandbox app network mode for the run ("auto", "isolated" or
+    # "none+socket"; WO-7.3). Run configuration only: resolved ONCE
+    # per measured run by the orchestrator and passed to every side.
+    # It is NOT a write-grant switch — the executor's grant is
+    # provenance (Executor.provisioned), never this field.
+    network_mode: str = "auto"
     # Provenance for CI-driven measured runs (GitHub Actions run URL/ID,
     # runner image). Recorded verbatim in the evidence record.
     provenance_run_url: str | None = None
@@ -355,6 +369,12 @@ class Orchestrator:
     def __init__(self, cfg: MeasureConfig) -> None:
         self.cfg = cfg
         self.log: list[str] = []
+        # The run's resolved app network mode and the reason behind
+        # the choice (WO-7.3). Set once by _resolve_run_network_mode
+        # before the first side is provisioned; None for unsandboxed
+        # runs and for direct _provision_side_sandbox calls.
+        self._run_network_mode: str | None = None
+        self._run_network_reason: str | None = None
 
     def _say(self, msg: str) -> None:
         self.log.append(msg)
@@ -363,12 +383,68 @@ class Orchestrator:
         """Provenance for the evidence record: CI run identity (when
         provided via the CLI) plus the capability probe output from the
         measurement gate. Empty capability_probe means the gate did not
-        run (unsandboxed dev run)."""
-        return {
+        run (unsandboxed dev run). Sandboxed runs also record the
+        run's network mode (WO-7.3): what was requested, what was
+        resolved, and the capability reason behind the choice."""
+        provenance: dict[str, object] = {
             "actions_run_url": self.cfg.provenance_run_url,
             "actions_run_id": self.cfg.provenance_run_id,
             "runner_image": self.cfg.provenance_runner_image,
             "capability_probe": capability_probe,
+        }
+        if self._run_network_mode is not None:
+            provenance["network_mode"] = {
+                "requested": self.cfg.network_mode,
+                "resolved": self._run_network_mode,
+                "reason": self._run_network_reason,
+            }
+        return provenance
+
+    def _resolve_run_network_mode(self) -> None:
+        """Resolve this run's app network mode ONCE (WO-7.3), before
+        the first side is provisioned; every side then gets the same
+        resolved value. A refusal (network_mode=host, or isolated on
+        a host that cannot create isolated networks) propagates and
+        fails the run before any side exists — loudly, never as a
+        scored result."""
+        resolved, reason = resolve_network_mode(self.cfg.network_mode)
+        self._run_network_mode = resolved
+        self._run_network_reason = reason
+        self._say(f"network mode for this run: {resolved} ({reason})")
+
+    def _check_single_network_mode(self, sides: list[_Side]) -> None:
+        """Refuse a mixed-mode run (WO-7.3): every side that reported
+        an app network mode must report the SAME one. Sides without
+        sandbox evidence (host runs) carry no mode and cannot mix."""
+        modes = {
+            str(s.sandbox_evidence["app_network_mode"])
+            for s in sides
+            if s.sandbox_evidence and s.sandbox_evidence.get("app_network_mode")
+        }
+        if len(modes) > 1:
+            raise MixedNetworkModeError(
+                "mixed network modes in one measured run: "
+                f"{sorted(modes)}; the run is refused (no score record)"
+            )
+
+    def _write_grant(self, side: _Side) -> dict[str, object]:
+        """The write grant in effect for one side (WO-7.3), recorded
+        in the evidence: writes were allowed on the side iff its
+        executor was provisioned — the orchestrator sets that flag
+        only in _make_executor, only for a target it provisioned
+        itself. ``provisioned`` is therefore True only when an
+        executor carrying the grant actually ran against the target;
+        a side that never got an executor records False."""
+        mode: str | None = None
+        if side.sandbox_evidence:
+            reported = side.sandbox_evidence.get("app_network_mode")
+            mode = str(reported) if reported else None
+        return {
+            "provisioned": bool(
+                side.executor is not None and side.executor.provisioned
+            ),
+            "target_url": side.provision.target_url if side.provision else None,
+            "network_mode": mode,
         }
 
     # ------------------------------------------------------------------
@@ -1086,7 +1162,15 @@ class Orchestrator:
                 rev=rev, sha=sha, snapshot_dir=snapshot.dir,
                 contract=contract, provision=_attach_plan(provision, plan),
             )
-        sb = Sandbox(SandboxConfig(image=image))
+        # WO-7.3: the run's mode, resolved once by measure_* before
+        # the first side; direct callers (tests, dev) fall back to
+        # the run config's requested mode.
+        sb = Sandbox(
+            SandboxConfig(
+                image=image,
+                network_mode=self._run_network_mode or self.cfg.network_mode,
+            )
+        )
         # Secret-free contract env only; never the full env.
         secret_free_env = {
             k: v for k, v in contract.env.items()
@@ -1590,6 +1674,12 @@ class Orchestrator:
         sides: list[_Side] = []
         parent_results = None
         fix_results = None
+        if use_sandbox:
+            # WO-7.3: resolve the run's network mode ONCE, before the
+            # first side. A refusal propagates (typed environment
+            # error, no record): a forced mode the host cannot do is
+            # a failed run, never a skip and never a scored result.
+            self._resolve_run_network_mode()
         try:
             if use_sandbox:
                 sides.append(
@@ -1610,6 +1700,10 @@ class Orchestrator:
                     self._provision_side(runner, cfg.rev_fix, _free_port(), unit_dir, "fix")
                 )
             parent, fix = sides
+            # WO-7.3: one network mode per measured run. If the sides
+            # disagree about the mode actually in effect, the run is
+            # refused (typed error, no score) — re-raised below.
+            self._check_single_network_mode(sides)
             if parent.provision.ready and fix.provision.ready:
                 # Auth comes from the contract's declared credential
                 # provider (O1). Absent means no token; the executor
@@ -1665,6 +1759,10 @@ class Orchestrator:
                     "fix_parent": parent.sandbox_evidence or {},
                     "fix": fix.sandbox_evidence or {},
                 },
+                write_grants={
+                    "fix_parent": self._write_grant(parent),
+                    "fix": self._write_grant(fix),
+                },
                 sandboxed=use_sandbox,
                 measured_result=use_sandbox,
                 provenance=self._provenance(capability_probe),
@@ -1717,6 +1815,11 @@ class Orchestrator:
                 "parent_ready": parent.provision.ready,
                 "fix_ready": fix.provision.ready,
             }
+        except MixedNetworkModeError:
+            # WO-7.3: a mixed-mode run is REFUSED, not scored: no
+            # evidence record, no score record. The finally below
+            # still stops the apps.
+            raise
         except Exception as e:
             # O3: any failure after authoring commits an INCONCLUSIVE
             # record with a typed reason, then the score as usual.
@@ -1862,6 +1965,10 @@ class Orchestrator:
         runner = Provisioner(workdir=prov_workdir)
         sides: list[_Side] = []
         c_results = None
+        if use_sandbox:
+            # WO-7.3: resolve the run's network mode ONCE, before the
+            # side is provisioned (same rule as measure_bug).
+            self._resolve_run_network_mode()
         try:
             if use_sandbox:
                 sides.append(
@@ -1914,6 +2021,7 @@ class Orchestrator:
                 skill_sha256=manifest.get("skill_sha256"),
                 truncation_flags=truncation_flags,
                 sandbox_evidence={"c": side.sandbox_evidence or {}},
+                write_grants={"c": self._write_grant(side)},
                 sandboxed=use_sandbox,
                 measured_result=use_sandbox,
                 provenance=self._provenance(capability_probe),
