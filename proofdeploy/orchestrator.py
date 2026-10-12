@@ -36,6 +36,7 @@ caught; a clean-diff unit counts as a false alarm.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 import socket
@@ -377,6 +378,15 @@ class Orchestrator:
         # runs and for direct _provision_side_sandbox calls.
         self._run_network_mode: str | None = None
         self._run_network_reason: str | None = None
+        # The run's REG-A lock-resolution cutoff (WO-8.1): ONE
+        # cutoff per measured unit — the fix commit's committer
+        # time for a bug pair (the SAME value for fix^ and fix),
+        # C's committer time for a clean diff. Set once by
+        # measure_bug / measure_clean before the first side is
+        # provisioned; None until then (direct single-side
+        # provisions fall back to the side's own commit — a lone
+        # side is its own unit).
+        self._run_lock_cutoff: str | None = None
 
     def _say(self, msg: str) -> None:
         self.log.append(msg)
@@ -401,6 +411,32 @@ class Orchestrator:
                 "reason": self._run_network_reason,
             }
         return provenance
+
+    def _commit_cutoff(self, sha: str) -> str:
+        """A commit's committer time as an RFC 3339 UTC timestamp
+        (the REG-A --exclude-newer form, WO-8.1)."""
+        from datetime import datetime, timezone
+
+        epoch = int(
+            _git(self.cfg.repo_dir, "show", "-s", "--format=%ct", sha)
+        )
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    def _lock_cutoff_arg(self, sha: str) -> Any:
+        """The cutoff argument a side provisions with: the run's
+        one cutoff when measure_* set it (a plain string — the one
+        cutoff for both sides of the unit); otherwise a LAZY
+        fallback to the side's own commit time for a direct
+        single-side provision (tests, dev), where a lone side is
+        its own unit so its own committer time IS the unit's. Lazy
+        because the adapter evaluates it only when a generated lock
+        is planned: a committed lock, a Node plan, or an image
+        refusal never reads a commit time at all."""
+        if self._run_lock_cutoff is not None:
+            return self._run_lock_cutoff
+        return lambda: self._commit_cutoff(sha)
 
     def _resolve_run_network_mode(self) -> None:
         """Resolve this run's app network mode ONCE (WO-7.3), before
@@ -1052,6 +1088,7 @@ class Orchestrator:
             contract=contract,
             port=port,
             expected_lockfile_sha256=expected,
+            lock_cutoff=self._lock_cutoff_arg(sha),
         )
         self._say(
             f"provision {tag} ({sha[:12]}): {provision.status.value} "
@@ -1099,11 +1136,15 @@ class Orchestrator:
 
         # WO-7: plan through the runtime's provisioning adapter (pure;
         # the same InstallPlan the host executor runs). Detection,
-        # lockfile selection, the frozen check, and the pinned-image
-        # selection all happen in the adapter — one source of truth.
-        # The plan is attached to every provision below and lands in
-        # the evidence record.
-        plan = plan_provisioning(snapshot.dir, contract)
+        # lockfile selection, the REG-A completeness check, and the
+        # pinned-image selection all happen in the adapter — one
+        # source of truth. The plan is attached to every provision
+        # below and lands in the evidence record. The REG-A cutoff
+        # is the run's one value (WO-8.1).
+        plan = plan_provisioning(
+            snapshot.dir, contract,
+            lock_cutoff=self._lock_cutoff_arg(sha),
+        )
         runtime_name = plan.runtime
         logs.append(
             f"install plan: sha256 {plan.sha256()[:16]}... "
@@ -1301,6 +1342,29 @@ class Orchestrator:
                 entry["shell"] = spec["shell"]
             entry["exit_code"] = result["exit_code"]
             executed.append(entry)
+        # REG-A (WO-8.1): read the generated lock back for the
+        # evidence — the resolve step wrote it into the checkout
+        # (item 4: the generated lock text and its sha256 are
+        # recorded). Captured on success AND on a later step's
+        # failure: whenever the file exists, it is evidence.
+        gen_lock: dict | None = None
+        if plan.lock_source == "generated":
+            assert plan.generated_lockfile_name is not None
+            gen_path = snapshot.dir / plan.generated_lockfile_name
+            try:
+                gen_text = gen_path.read_text(encoding="utf-8")
+                gen_lock = {
+                    "text": gen_text,
+                    "sha256": hashlib.sha256(
+                        gen_text.encode()
+                    ).hexdigest(),
+                }
+                logs.append(
+                    f"generated lock: {plan.generated_lockfile_name} "
+                    f"sha256 {gen_lock['sha256'][:16]}..."
+                )
+            except OSError:
+                gen_lock = None
         install_ok = len(step_results) == len(step_specs) and all(
             r["exit_code"] == 0 for r in step_results
         )
@@ -1345,6 +1409,7 @@ class Orchestrator:
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
                 package_manager=plan.package_manager,
                 executed_steps=executed,
+                generated_lock=gen_lock,
             )
         logs.extend(sb.log)
         sb.log.clear()
@@ -1396,6 +1461,7 @@ class Orchestrator:
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
                 package_manager=plan.package_manager,
                 executed_steps=executed,
+                generated_lock=gen_lock,
             )
         if not app.wait_ready(contract.readiness or "/health", timeout=120):
             # S2: the record must say more than "not ready". Capture the
@@ -1422,6 +1488,7 @@ class Orchestrator:
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
                 package_manager=plan.package_manager,
                 executed_steps=executed,
+                generated_lock=gen_lock,
             )
         # S2: log tail on success too, for the record.
         app_log = sb.app_logs(app.name)
@@ -1440,6 +1507,7 @@ class Orchestrator:
             install_plan=plan.to_dict(),
             install_plan_sha256=plan.sha256(),
             executed_steps=executed,
+            generated_lock=gen_lock,
         )
         provision.image_digest = image_digest
         # Stash the SandboxApp for cleanup; the finally block stops it.
@@ -1468,6 +1536,7 @@ class Orchestrator:
         plan: InstallPlan | None = None,
         package_manager: str | None = None,
         executed_steps: list[dict] | None = None,
+        generated_lock: dict | None = None,
     ) -> _Side:
         """Build a failed sandbox _Side with runtime facts populated (S3).
 
@@ -1484,6 +1553,7 @@ class Orchestrator:
             lockfile_sha256=lockfile_sha256,
             package_manager=package_manager or "pip",
             executed_steps=executed_steps or [],
+            generated_lock=generated_lock,
         )
         provision.image_digest = image_digest
         if plan is not None:
@@ -1690,6 +1760,14 @@ class Orchestrator:
             # a failed run, never a skip and never a scored result.
             self._resolve_run_network_mode()
         try:
+            # WO-8.1 (REG-A item 2): the unit's ONE lock-resolution
+            # cutoff is the FIX commit's committer time — the same
+            # value for fix^ and fix, resolved once here, before
+            # either side is provisioned (never per side). Set
+            # inside the try so the finally clears it on EVERY exit
+            # (Addendum 46): a leaked cutoff would silently become
+            # the next unit's — or a direct provision's — cutoff.
+            self._run_lock_cutoff = self._commit_cutoff(fix_sha)
             if use_sandbox:
                 sides.append(
                     self._provision_side_sandbox(
@@ -1856,6 +1934,8 @@ class Orchestrator:
                 },
             )
         finally:
+            # Addendum 46: the run cutoff dies with the run.
+            self._run_lock_cutoff = None
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
                     proc = side.provision.proc
@@ -1979,6 +2059,12 @@ class Orchestrator:
             # side is provisioned (same rule as measure_bug).
             self._resolve_run_network_mode()
         try:
+            # WO-8.1 (REG-A item 2): the clean unit's lock-resolution
+            # cutoff is C's own committer time (tip_sha is C, resolved
+            # by _build_bundle above). Set inside the try so the
+            # finally clears it on every exit (Addendum 46, as in
+            # measure_bug).
+            self._run_lock_cutoff = self._commit_cutoff(tip_sha)
             if use_sandbox:
                 sides.append(
                     self._provision_side_sandbox(cfg.rev_clean, _free_port(), unit_dir, "clean")
@@ -2090,6 +2176,8 @@ class Orchestrator:
                 },
             )
         finally:
+            # Addendum 46: the run cutoff dies with the run.
+            self._run_lock_cutoff = None
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
                     proc = side.provision.proc

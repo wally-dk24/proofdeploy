@@ -275,7 +275,9 @@ def _result(verdict: Verdict, token: str) -> ProbeResult:
 
 
 def test_schema_bump_and_old_record_loads_and_rescores(tmp_path):
-    assert SCHEMA_VERSION == "1.3.0"
+    # WO-8.1 bumped the schema to 1.4.0 (REG-A lock fields); the
+    # old-record loading behavior pinned here is unchanged.
+    assert SCHEMA_VERSION == "1.4.0"
 
     token = "sess-schema-check-0123456789"
     record = build_evidence_record(
@@ -286,7 +288,7 @@ def test_schema_bump_and_old_record_loads_and_rescores(tmp_path):
         fix_parent_results=[_result(Verdict.FAIL, token)],
         fix_results=[_result(Verdict.PASS, token)],
     )
-    assert record["schema_version"] == "1.3.0"
+    assert record["schema_version"] == "1.4.0"
     assert record["provenance"]["harness"]["commit"]
 
     # Downgrade the record to the 1.0.0 shape: scalar captured_values,
