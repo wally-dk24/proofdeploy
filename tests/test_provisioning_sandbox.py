@@ -129,7 +129,7 @@ def _stub_sandbox_side(monkeypatch, snap: Path, install):
     )
     monkeypatch.setattr(Sandbox, "_capabilities", lambda self: _fake_caps())
     if install is not None:
-        monkeypatch.setattr(Sandbox, "install", install)
+        monkeypatch.setattr(Sandbox, "install_steps", install)
 
     cfg = MeasureConfig(
         repo_dir=snap,
@@ -144,12 +144,21 @@ def _stub_sandbox_side(monkeypatch, snap: Path, install):
 
 
 class _CaptureInstall:
-    def __init__(self):
-        self.commands: list[str] = []
+    """Fake Sandbox.install_steps (WO-7 PR 2 signature): captures the
+    step descriptors, reports every step as exit code 0."""
 
-    def __call__(self, checkout, commands, env, proxy_env, timeout=600):
-        self.commands.extend(commands)
-        return True
+    def __init__(self):
+        self.descriptors: list[dict] = []
+
+    @property
+    def commands(self) -> list[str]:
+        return [d["command"] for d in self.descriptors]
+
+    def __call__(self, checkout, steps, env, proxy_env, timeout=600):
+        self.descriptors.extend(steps)
+        return [
+            {"phase": s["phase"], "exit_code": 0} for s in steps
+        ]
 
 
 def test_sandbox_path_plans_through_the_adapter(monkeypatch, tmp_path):
@@ -231,23 +240,19 @@ def test_sandbox_executor_uses_pinned_image_from_plan(monkeypatch, tmp_path):
     assert row.pinned_ref in seen_images
 
 
-def test_sandbox_executor_refuses_node_plan(monkeypatch, tmp_path):
-    """A Node plan in the sandbox executor fails closed (Node sandbox
-    support is PR 2), with the plan recorded on the provision.
+def test_sandbox_executor_refuses_bun_plan(monkeypatch, tmp_path):
+    """WO-7 PR 2: Node plans now run in the sandbox (npm/pnpm/yarn);
+    a plan whose manager the sandbox cannot run (bun) still fails
+    closed, with the plan recorded and no install attempted.
     """
     from proofdeploy.runner import ProvisionStatus
 
     snap = tmp_path / "snap"
     snap.mkdir()
     (snap / "package.json").write_text('{"name": "t"}\n')
-    (snap / "package-lock.json").write_text("{}\n")
+    (snap / "bun.lock").write_bytes(b"\x00bun")
     cap = _CaptureInstall()
     orch, _ = _stub_sandbox_side(monkeypatch, snap, cap)
-    # The runtime probe is irrelevant: the refusal precedes it.
-    monkeypatch.setattr(
-        "proofdeploy.orchestrator.check_sandbox_runtime",
-        lambda *a: (None, None, "probe must not run for a node plan"),
-    )
     side = orch._provision_side_sandbox("fakerev", 18092, snap / "unit", "t")
     assert side.provision.status == ProvisionStatus.BUILD_FAILED
     assert side.provision.reason == "not yet supported in the sandbox"

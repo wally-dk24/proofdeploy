@@ -146,6 +146,12 @@ class ProbeResult:
     # (Addendum 10 follow-up: an infrastructure failure must not be
     # relabeled an author miss).
     sent: bool = True
+    # Whether step 5 (evaluate_assertions) actually ran for this
+    # probe (Addendum 38). Every early return leaves this False:
+    # the probe's assertions were never evaluated, so an offline
+    # replay must NOT re-decide it — replay carries the recorded
+    # INCONCLUSIVE verdict and reason instead of inventing one.
+    assertions_evaluated: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -158,9 +164,15 @@ class ProbeResult:
             "http_status": self.http_status,
             "http_headers": self.http_headers,
             "http_body": self.http_body[:2000],
+            # Schema 1.2.0: replay must know when the recorded body
+            # was truncated — a truncated body is not replayable.
+            "http_body_truncated": len(self.http_body) > 2000,
             "writes": self.writes,
             "details": self.details,
             "sent": self.sent,
+            # Addendum 38: replay honesty — False means the run
+            # returned before the assertions were evaluated.
+            "assertions_evaluated": self.assertions_evaluated,
         }
 
     @classmethod
@@ -182,6 +194,10 @@ class ProbeResult:
             setup_requests=d.get("setup_requests"),
             # Old records predate the field; default True (sent).
             sent=bool(d.get("sent", True)),
+            # Records predating Addendum 38 cannot prove their
+            # assertions were evaluated; default False (honest:
+            # replay will not re-decide them).
+            assertions_evaluated=bool(d.get("assertions_evaluated", False)),
         )
 
 
@@ -376,6 +392,45 @@ def _check_assertion(
         return None, "db: no comparator", InconclusiveReason.PROBE
 
     return None, f"unknown assertion type '{atype}'", InconclusiveReason.PROBE
+
+
+def evaluate_assertions(
+    assertions: list[dict[str, Any]],
+    status: int | None,
+    headers: dict[str, str],
+    body: str,
+    db_results: dict[int, Any],
+) -> tuple[Verdict, InconclusiveReason | None, list[str]]:
+    """Evaluate a probe's assertions against one response.
+
+    THE single verdict loop (extracted from the executor's step 5,
+    Addendum 36): precedence FAIL > INCONCLUSIVE > PASS, and the
+    FIRST inconclusive reason is kept (defaulting to ENVIRONMENT).
+    The executor runs it live; proofdeploy.replay runs the SAME
+    function over recorded responses, so a replay can never drift
+    from the live semantics.
+    """
+    details: list[str] = []
+    saw_fail = False
+    saw_inconclusive = False
+    inconclusive_reason: InconclusiveReason | None = None
+    for ai, a in enumerate(assertions):
+        passed, detail, ireason = _check_assertion(
+            a, status, headers, body, db_results.get(ai)
+        )
+        details.append(detail)
+        if passed is None:
+            saw_inconclusive = True
+            if inconclusive_reason is None:
+                inconclusive_reason = ireason or InconclusiveReason.ENVIRONMENT
+        elif not passed:
+            saw_fail = True
+        # Continue checking to log all assertion outcomes.
+    if saw_fail:
+        return Verdict.FAIL, None, details
+    if saw_inconclusive:
+        return Verdict.INCONCLUSIVE, inconclusive_reason, details
+    return Verdict.PASS, None, details
 
 
 def _check_remote_method(method: str, url: str) -> tuple[bool, str]:
@@ -1300,27 +1355,12 @@ class Executor:
                 details.extend(db_logs)
                 db_results[ai] = db_result
 
-        # 5. Evaluate assertions. Precedence: FAIL > INCONCLUSIVE > PASS.
-        saw_fail = False
-        saw_inconclusive = False
-        inconclusive_reason: InconclusiveReason | None = None
-        for ai, a in enumerate(assertions):
-            passed, detail, ireason = _check_assertion(a, status, headers, body, db_results.get(ai))
-            details.append(detail)
-            if passed is None:
-                saw_inconclusive = True
-                if inconclusive_reason is None:
-                    inconclusive_reason = ireason or InconclusiveReason.ENVIRONMENT
-            elif not passed:
-                saw_fail = True
-            # Continue checking to log all assertion outcomes.
-
-        if saw_fail:
-            verdict, reason = Verdict.FAIL, None
-        elif saw_inconclusive:
-            verdict, reason = Verdict.INCONCLUSIVE, inconclusive_reason
-        else:
-            verdict, reason = Verdict.PASS, None
+        # 5. Evaluate assertions (the shared verdict loop —
+        # proofdeploy.replay uses the same function offline).
+        verdict, reason, eval_details = evaluate_assertions(
+            assertions, status, headers, body, db_results
+        )
+        details.extend(eval_details)
 
         return _attach_secrets(
             ProbeResult(
@@ -1334,6 +1374,8 @@ class Executor:
                 http_body=body,
                 writes=writes,
                 setup_requests=setup_requests,
+                # Step 5 ran: this is the ONLY return that may say so.
+                assertions_evaluated=True,
             )
         )
 

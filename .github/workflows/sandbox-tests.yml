@@ -34,8 +34,8 @@ jobs:
 
       - name: Lint and typecheck
         run: |
-          python -m ruff check proofdeploy tests
-          python -m mypy proofdeploy
+          python -m ruff check proofdeploy tests conformance
+          python -m mypy proofdeploy conformance
 
       - name: Run full test suite
         # The full suite (not just the sandbox tests): the sandbox
@@ -50,6 +50,18 @@ jobs:
           PD_REQUIRE_SANDBOX: "1"
         run: |
           python -m pytest tests/ -v
+
+      - name: Upload provision logs
+        # Addendum 35: the full provision logs of the conformance /
+        # node26 / uptime-kuma provisions (pd-logs/, written by the
+        # tests) — a failing install's real error line must survive
+        # even where an assertion message would trim it.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pd-logs
+          path: pd-logs/
+          retention-days: 7
 
       - name: Verify sandbox tests ran (not skipped)
         # B3: belt-and-braces check that the key sandbox tests were

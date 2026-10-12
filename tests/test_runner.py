@@ -535,7 +535,18 @@ def test_provision_prefers_package_manager_lockfile(tmp_path, monkeypatch):
         )[1],
     )
     assert result.package_manager == "pnpm"
-    assert recorded[0].startswith("pnpm install")
+    # WO-7 PR 2 + Addendum 35: a packageManager pin renders through
+    # corepack at the exact pinned version — bootstrapped into the
+    # checkout's .pd-tools (persisted) by the first step, then the
+    # install runs through the persisted corepack binary. Plan
+    # data, independent of the planning host's own corepack —
+    # never a silent fall-back to whatever pnpm is on PATH.
+    assert recorded[0].startswith("npm install --prefix ")
+    assert "corepack@0.36.0" in recorded[0]
+    assert ".pd-tools/node_modules/.bin/corepack pnpm@9.1.0 install" in (
+        recorded[1]
+    )
+    assert "--frozen-lockfile" in recorded[1]
 
 
 # --- frozen requirements.txt (finding 4) ---

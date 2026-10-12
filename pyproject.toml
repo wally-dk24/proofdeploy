@@ -35,6 +35,11 @@ select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF100"]
 
 [tool.mypy]
 python_version = "3.10"
+# The golden fixture trees repeat the same module names across
+# revisions (app.py in base/bug/fix/...): they are fixture DATA the
+# kit materializes, not a package — mypy cannot check duplicate
+# module names in one run. conformance/kit.py itself is checked.
+exclude = "conformance/golden/"
 strict = false
 warn_return_any = true
 warn_unused_configs = true

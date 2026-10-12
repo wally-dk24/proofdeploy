@@ -37,7 +37,10 @@ HARNESS_VERSION = "1.0.0"
 # name (Addendum 23 R1), and evidence records carry
 # provenance.harness. Readers accept 1.0.0 records (scalar
 # captured_values, no harness) unchanged.
-SCHEMA_VERSION = "1.1.0"
+# 1.2.0 (Addendum 36): per-probe results carry http_body_truncated —
+# the recorded body is capped at 2000 chars, and offline replay must
+# know when it is deciding from a truncated body (non-scoring).
+SCHEMA_VERSION = "1.2.0"
 
 # HTTP methods the schema allows. No CONNECT, TRACE, or custom verbs.
 ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})

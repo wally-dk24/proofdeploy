@@ -1,0 +1,57 @@
+# Sandbox focus runs (Addendum 35): iterate on ONE sandbox test
+# selection in minutes instead of the full 43-minute sandbox suite.
+#
+# Dispatch it with a pytest -k expression:
+#   gh workflow run sandbox-focus.yml --ref <branch> \
+#     -f expression="node-express-sqlite"
+# The matching tests run with -x and PD_REQUIRE_SANDBOX=1 (a skip
+# fails), and the tests' pd-logs/ are uploaded as an artifact — the
+# full provision logs, so a failing install's real error line can
+# be read directly instead of guessed from trimmed output.
+
+name: sandbox-focus
+
+on:
+  workflow_dispatch:
+    inputs:
+      expression:
+        description: "pytest -k expression (e.g. node-express-sqlite)"
+        required: true
+        type: string
+
+jobs:
+  focus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run focused sandbox tests
+        env:
+          PD_REQUIRE_SANDBOX: "1"
+        # --no-cov: a -k subset can never reach the repo's 80%
+        # coverage gate; the focus job judges the selected tests.
+        run: |
+          python -m pytest tests/ -x -q --no-cov -k "${{ inputs.expression }}"
+
+      - name: Upload provision logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pd-logs
+          path: pd-logs/
+          retention-days: 7

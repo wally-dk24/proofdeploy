@@ -312,9 +312,25 @@ def test_node_plan_package_manager_version_recorded(tmp_path):
     assert plan.refusal is None
     assert plan.package_manager == "pnpm"
     assert plan.package_manager_version == "9.1.0"
-    install = next(s for s in plan.steps if s.phase == "install")
-    argv = install.argv or []
+    install = [s for s in plan.steps if s.phase == "install"]
+    # Select the frozen step BY CONTENT (Addendum 37), never by
+    # position: it is the step whose argv runs the pinned manager
+    # frozen. (Position lied: since Addendum 35 the FIRST install
+    # step is the .pd-tools corepack bootstrap.)
+    frozen = next(
+        s for s in install
+        if f"pnpm@{plan.package_manager_version}" in (s.argv or [])
+        and "--frozen-lockfile" in (s.argv or [])
+    )
+    argv = frozen.argv or []
     assert "--frozen-lockfile" in argv
+    # The .pd-tools bootstrap step (the one installing a
+    # `corepack@<version>` spec) PRECEDES the frozen step.
+    bootstrap_idx = next(
+        i for i, s in enumerate(install)
+        if any(a.startswith("corepack@") for a in (s.argv or []))
+    )
+    assert bootstrap_idx < install.index(frozen)
 
 
 def test_plan_provisioning_unknown_snapshot_raises(tmp_path):

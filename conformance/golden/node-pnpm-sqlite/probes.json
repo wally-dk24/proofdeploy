@@ -1,0 +1,88 @@
+{
+  "bug_probes": [
+    {
+      "setup": [
+        {
+          "type": "http",
+          "act": {
+            "method": "POST",
+            "path": "/login",
+            "body": {
+              "username": "seeduser",
+              "password": "seedpass"
+            }
+          },
+          "capture": {
+            "TOKEN": {
+              "from": "body",
+              "json_path": "token"
+            }
+          }
+        }
+      ],
+      "act": {
+        "method": "GET",
+        "path": "/notes/1",
+        "headers": {
+          "Authorization": "Bearer ${TOKEN}"
+        }
+      },
+      "assert": [
+        {
+          "type": "status",
+          "equals": 200
+        },
+        {
+          "type": "body",
+          "json_path": {
+            "path": "done",
+            "equals": false
+          }
+        }
+      ]
+    }
+  ],
+  "clean_probes": [
+    {
+      "setup": [
+        {
+          "type": "http",
+          "act": {
+            "method": "POST",
+            "path": "/login",
+            "body": {
+              "username": "seeduser",
+              "password": "seedpass"
+            }
+          },
+          "capture": {
+            "TOKEN": {
+              "from": "body",
+              "json_path": "token"
+            }
+          }
+        }
+      ],
+      "act": {
+        "method": "GET",
+        "path": "/notes/1",
+        "headers": {
+          "Authorization": "Bearer ${TOKEN}"
+        }
+      },
+      "assert": [
+        {
+          "type": "status",
+          "equals": 200
+        },
+        {
+          "type": "body",
+          "json_path": {
+            "path": "done",
+            "equals": false
+          }
+        }
+      ]
+    }
+  ]
+}

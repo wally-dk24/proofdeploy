@@ -217,16 +217,61 @@ def check_sandbox_runtime(
     return image_version, image_digest, None
 
 
-def _sandbox_step_command(cmd: str) -> str:
+_ERROR_MARKERS_STRONG = ("npm error", "ERR_PNPM_", "ELIFECYCLE", "gyp ERR!")
+_ERROR_MARKERS_GENERIC = ("ERROR:", "Error:")
+
+
+def _first_error_line(lines: list) -> str | None:
+    """The first concrete error line in a list of log entries
+    (Addendum 33/35): a strong marker line (``npm error``,
+    ``ERR_PNPM_``, ``ELIFECYCLE``, ``gyp ERR!``) names WHY an
+    install failed, where the bare step failure does not; a generic
+    ``Error:`` line is next; if nothing matches, fall back to the
+    LAST non-empty line of the output — an unmatched failure still
+    gets its most concrete line into the provision reason instead
+    of a bare "install failed". Entries may be multi-line blobs;
+    scan line by line.
+
+    The ``$ podman ...`` command echo the sandbox logs before each
+    run is NOT evidence (Addendum 38): it is skipped entirely — a
+    marker inside the echoed command must not be named, and the
+    echo must not serve as the fallback line."""
+    last_nonempty: str | None = None
+    generic: str | None = None
+    for entry in lines:
+        for line in str(entry).splitlines():
+            stripped = line.strip()
+            if stripped.startswith("$ podman"):
+                continue
+            if stripped:
+                last_nonempty = stripped
+            if any(marker in line for marker in _ERROR_MARKERS_STRONG):
+                return stripped[:300]
+            if generic is None and any(
+                marker in line for marker in _ERROR_MARKERS_GENERIC
+            ):
+                generic = stripped
+    if generic is not None:
+        return generic[:300]
+    return last_nonempty[:300] if last_nonempty else None
+
+
+def _sandbox_step_command(cmd: str, runtime: str = "python") -> str:
     """Render a contract step for the sandbox (WO-7 plan executor).
 
-    The app runs with the venv's python: a step beginning with
+    Python: the app runs with the venv's python: a step beginning with
     `python`/`python3` is rewritten to the venv binary inside the
     checkout (/checkout/.venv/bin/python); any other step gets the
     venv's bin first on PATH for that command only. This is the exact
     rendering the pre-WO-7 sandbox path applied to build/migrate/seed
     and to the start command.
+
+    Node (WO-7 PR 2): node_modules lives inside the checkout, so its
+    .bin goes first on PATH for that command only — the Node analog
+    of the venv rendering. The command itself is untouched.
     """
+    if runtime == "node":
+        return f"env PATH=/checkout/node_modules/.bin:$PATH {cmd}"
     parts = cmd.split(maxsplit=1)
     if parts and parts[0] in ("python", "python3") and len(parts) == 2:
         return f"/checkout/.venv/bin/python {parts[1]}"
@@ -839,18 +884,36 @@ class Orchestrator:
         files = [bundle.diff, bundle.description]
         if bundle.skill is not None:
             files.append(bundle.skill)
-        for rel in sorted(
-            p.relative_to(bundle.snapshot).as_posix()
-            for p in bundle.snapshot.rglob("*")
-            if p.is_file() and not p.is_symlink()
-        ):
-            files.append(bundle.snapshot / rel)
-        for f in files:
+        snapshot_files = [
+            bundle.snapshot / rel
+            for rel in sorted(
+                p.relative_to(bundle.snapshot).as_posix()
+                for p in bundle.snapshot.rglob("*")
+                if p.is_file() and not p.is_symlink()
+            )
+        ]
+        # The contract file declares its own env values: their
+        # presence in proofdeploy.yml itself is the declaration, not
+        # a leak (WO-7's golden contracts declare a canary env value
+        # exactly this way). The exemption is scoped to that one file
+        # and those declared values: the values stay forbidden in the
+        # prompt (checked above), in the diff, and in every other
+        # bundle file, and they are still redacted from records and
+        # kept out of container environments downstream.
+        declared_env_values = {
+            v for v in contract.env.values() if isinstance(v, str)
+        }
+        for f in files + snapshot_files:
             try:
                 text = f.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            assert_no_secrets(text, forbidden, where=f"bundle file {f.name}")
+            values = forbidden
+            if f.parent == bundle.snapshot and f.name == "proofdeploy.yml":
+                values = [
+                    v for v in forbidden if v not in declared_env_values
+                ]
+            assert_no_secrets(text, values, where=f"bundle file {f.name}")
         self._say("leak check passed: prompt and bundle carry no secret values")
 
     def _author_probes(self, prompt: str) -> tuple[ProbeSet, ModelResponse]:
@@ -962,10 +1025,11 @@ class Orchestrator:
             f"(adapter: {plan.adapter})"
         )
         # S1 (Addendum 15): fail closed for ecosystems the sandbox does
-        # not support yet. Never half-provision (e.g. running a Node
-        # app's start command with no install at all). Node sandbox
-        # support is WO-7 PR 2.
-        if runtime_name != "python":
+        # not support. Never half-provision (e.g. running an app's
+        # start command with no install at all). Python and Node are
+        # supported (Node since WO-7 PR 2, behind the same adapter
+        # interface); anything else fails closed here.
+        if runtime_name not in ("python", "node"):
             logs.append(f"sandbox: runtime {runtime_name!r} not yet supported")
             provision = ProvisionResult(
                 status=ProvisionStatus.BUILD_FAILED,
@@ -989,7 +1053,7 @@ class Orchestrator:
                 logs=logs,
                 runtime=runtime_name,
                 lockfile_sha256=plan.lockfile_sha256,
-                package_manager="pip",
+                package_manager=plan.package_manager or "pip",
             )
             return _Side(
                 rev=rev, sha=sha, snapshot_dir=snapshot.dir,
@@ -1034,29 +1098,37 @@ class Orchestrator:
         # container, installing into that container's own
         # site-packages, which were discarded when it exited; the app
         # container then started without the dependencies and never
-        # became ready. The plan's venv lives INSIDE the checkout
-        # (/checkout/.venv), which is a bind mount shared by every
-        # container, so it persists from install to app start.
+        # became ready. The plan's persisted dirs live INSIDE the
+        # checkout (/checkout/.venv for Python, /checkout/node_modules
+        # for Node), which is a bind mount shared by every container,
+        # so they persist from install to app start.
         if plan.lockfile_name is None:
-            logs.append("no frozen lockfile found for python")
+            logs.append(f"no frozen lockfile found for {runtime_name}")
             return self._sandbox_failed_side(
                 sb, rev, sha, snapshot, contract, logs,
                 ProvisionStatus.BUILD_FAILED,
                 plan.refusal or
-                "no frozen lockfile found in snapshot for runtime 'python'",
+                f"no frozen lockfile found in snapshot for runtime "
+                f"{runtime_name!r}",
                 runtime_name, image_version, image_digest, None, plan,
+                package_manager=plan.package_manager,
             )
         lockfile_name, lockfile_sha = plan.lockfile_name, plan.lockfile_sha256
         assert lockfile_sha is not None
         logs.append(f"lockfile: {lockfile_name} sha256: {lockfile_sha[:16]}...")
-        # Fail closed for lockfiles the sandbox pip flow cannot
-        # install: the plan names a non-pip manager (uv/poetry).
-        if plan.package_manager != "pip":
+        # Fail closed for managers the sandbox executor cannot run:
+        # pip for Python (uv/poetry stay refused), npm/pnpm/yarn for
+        # Node (bun stays refused).
+        supported_managers = (
+            {"pip"} if runtime_name == "python" else {"npm", "pnpm", "yarn"}
+        )
+        if plan.package_manager not in supported_managers:
             logs.append(f"sandbox: lockfile {lockfile_name} not yet supported")
             return self._sandbox_failed_side(
                 sb, rev, sha, snapshot, contract, logs,
                 ProvisionStatus.BUILD_FAILED, "not yet supported in the sandbox",
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
+                package_manager=plan.package_manager,
             )
         if plan.refusal is not None:
             logs.append(plan.refusal)
@@ -1064,16 +1136,35 @@ class Orchestrator:
                 sb, rev, sha, snapshot, contract, logs,
                 ProvisionStatus.BUILD_FAILED, plan.refusal,
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
+                package_manager=plan.package_manager,
             )
 
         # Render the plan's steps for the sandbox executor: argv steps
-        # with the container's paths (checkout at /checkout, venv at
-        # /checkout/.venv, python3 from the pinned image) and the
-        # sandbox pip flags (--require-hashes --no-deps for a hashed
-        # requirements file); contract steps via _sandbox_step_command
-        # (venv python / venv first on PATH). The start step runs
-        # later, via Sandbox.start.
-        install_cmds: list[str] = []
+        # with the container's paths (checkout at /checkout, the
+        # persisted install dir — venv or node_modules — inside it)
+        # and the sandbox pip flags (--require-hashes --no-deps for a
+        # hashed requirements file); contract steps via
+        # _sandbox_step_command (venv python / venv first on PATH for
+        # Python; node_modules/.bin first on PATH for Node). The start
+        # step runs later, via Sandbox.start.
+        #
+        # Addendum 31: the rendered form of every step is kept as a
+        # descriptor and, once run, recorded on the provision with its
+        # real exit code — the plan alone (placeholders, executor-
+        # dependent flags) cannot say what ran.
+        argv_mapping = (
+            {
+                "{runtime_bin}": "python3",
+                "{venv}": "/checkout/.venv",
+                "{checkout}": "/checkout",
+            }
+            if runtime_name == "python"
+            else {
+                "{runtime_bin}": "node",
+                "{checkout}": "/checkout",
+            }
+        )
+        step_specs: list[dict] = []
         for step in plan.steps:
             if step.phase == "start":
                 continue
@@ -1082,46 +1173,113 @@ class Orchestrator:
             if step.argv is not None:
                 argv = render_argv(
                     step.argv,
-                    {
-                        "{runtime_bin}": "python3",
-                        "{venv}": "/checkout/.venv",
-                        "{checkout}": "/checkout",
-                    },
+                    argv_mapping,
                     pip_flags(plan, sandbox=True),
                 )
-                install_cmds.append(shlex.join(argv))
+                step_specs.append({
+                    "phase": step.phase,
+                    "command": shlex.join(argv),
+                    "argv_rendered": argv,
+                    "env": dict(step.env),
+                })
             elif step.shell is not None:
-                install_cmds.append(_sandbox_step_command(step.shell))
+                rendered = _sandbox_step_command(step.shell, runtime_name)
+                step_specs.append({
+                    "phase": step.phase,
+                    "command": rendered,
+                    "shell": rendered,
+                    "env": dict(step.env),
+                })
         # PIP_NO_CACHE_DIR=1: pip warns the cache dir isn't writable as
         # the sandbox user; the venv removes the running-as-root warning.
         install_env = dict(secret_free_env)
-        install_env["PIP_NO_CACHE_DIR"] = "1"
+        if runtime_name == "python":
+            install_env["PIP_NO_CACHE_DIR"] = "1"
         proxy_env = {k: v for k, v in os.environ.items() if "proxy" in k.lower()}
-        if not sb.install(
-            snapshot.dir, install_cmds, install_env, proxy_env, timeout=600
-        ):
+        step_results = sb.install_steps(
+            snapshot.dir, step_specs, install_env, proxy_env, timeout=600
+        )
+        executed: list[dict] = []
+        for spec, result in zip(step_specs, step_results, strict=False):
+            entry: dict = {"phase": spec["phase"], "executor": "sandbox"}
+            if "argv_rendered" in spec:
+                entry["argv_rendered"] = spec["argv_rendered"]
+            else:
+                entry["shell"] = spec["shell"]
+            entry["exit_code"] = result["exit_code"]
+            executed.append(entry)
+        install_ok = len(step_results) == len(step_specs) and all(
+            r["exit_code"] == 0 for r in step_results
+        )
+        if not install_ok:
             logs.extend(sb.log)
-            logs.append("sandbox install failed")
+            # Addendum 33/36: name the install's first real error
+            # line in the provision reason — "sandbox install
+            # failed" alone hid the cause behind pages of usage
+            # text. The scan reads the FAILED STEP's own output
+            # when the sandbox captured it (install_steps sets
+            # failed_step_output), never the whole provision log.
+            # Addendum 38: with NO captured step output there is
+            # nothing sound to scan — the whole log mixes in
+            # unrelated lines (the lockfile hash line was named
+            # that way, instead of the pip error). Name the
+            # failed step itself: index, phase, exit code.
+            step_output = getattr(sb, "failed_step_output", None)
+            reason = "sandbox install failed"
+            if step_output:
+                first_error = _first_error_line([step_output])
+                if first_error:
+                    reason = f"sandbox install failed: {first_error}"
+            else:
+                failed_step = next(
+                    (
+                        (i, r)
+                        for i, r in enumerate(step_results)
+                        if r["exit_code"] != 0
+                    ),
+                    None,
+                )
+                if failed_step is not None:
+                    i, r = failed_step
+                    reason = (
+                        f"sandbox install failed: install step {i} "
+                        f"({r['phase']}) exited {r['exit_code']}"
+                    )
+            logs.append(reason)
             return self._sandbox_failed_side(
                 sb, rev, sha, snapshot, contract, logs,
-                ProvisionStatus.BUILD_FAILED, "sandbox install failed",
+                ProvisionStatus.BUILD_FAILED, reason,
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
+                package_manager=plan.package_manager,
+                executed_steps=executed,
             )
         logs.extend(sb.log)
         sb.log.clear()
 
         app_name = f"pd-{tag}-{sha[:8]}"
-        # The app runs with the venv first on PATH (S3): the plan's
-        # start step, rendered by _sandbox_step_command — a start
-        # beginning with `python` uses the venv binary directly.
+        # The app runs with the persisted install dir first on PATH
+        # (S3): the plan's start step, rendered by
+        # _sandbox_step_command for the plan's runtime — a Python
+        # start beginning with `python` uses the venv binary directly;
+        # a Node start gets node_modules/.bin first on PATH.
         start_step = next(
             (s for s in plan.steps if s.phase == "start"), None
         )
         start_cmd = _sandbox_step_command(
             start_step.shell
             if start_step is not None and start_step.shell
-            else contract.start
+            else contract.start,
+            runtime_name,
         )
+        # Addendum 31: the start step is recorded as it is issued; its
+        # exit_code stays None (the app container's exit is not a
+        # completed step exit the executor observes).
+        executed.append({
+            "phase": "start",
+            "executor": "sandbox",
+            "shell": start_cmd,
+            "exit_code": None,
+        })
         try:
             app = sb.start(
                 snapshot.dir,
@@ -1143,6 +1301,8 @@ class Orchestrator:
                 sb, rev, sha, snapshot, contract, logs,
                 ProvisionStatus.START_FAILED, str(e)[:200],
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
+                package_manager=plan.package_manager,
+                executed_steps=executed,
             )
         if not app.wait_ready(contract.readiness or "/health", timeout=120):
             # S2: the record must say more than "not ready". Capture the
@@ -1167,6 +1327,8 @@ class Orchestrator:
                 sb, rev, sha, snapshot, contract, logs,
                 ProvisionStatus.START_FAILED, reason,
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
+                package_manager=plan.package_manager,
+                executed_steps=executed,
             )
         # S2: log tail on success too, for the record.
         app_log = sb.app_logs(app.name)
@@ -1180,10 +1342,11 @@ class Orchestrator:
             lockfile_sha256=lockfile_sha,
             runtime=runtime_name,
             runtime_version=image_version,
-            package_manager="pip",
+            package_manager=plan.package_manager,
             run_id=f"sandbox-{tag}-{sha[:8]}",
             install_plan=plan.to_dict(),
             install_plan_sha256=plan.sha256(),
+            executed_steps=executed,
         )
         provision.image_digest = image_digest
         # Stash the SandboxApp for cleanup; the finally block stops it.
@@ -1210,6 +1373,8 @@ class Orchestrator:
         image_digest: str | None,
         lockfile_sha256: str | None,
         plan: InstallPlan | None = None,
+        package_manager: str | None = None,
+        executed_steps: list[dict] | None = None,
     ) -> _Side:
         """Build a failed sandbox _Side with runtime facts populated (S3).
 
@@ -1224,7 +1389,8 @@ class Orchestrator:
             runtime=runtime_name,
             runtime_version=image_version,
             lockfile_sha256=lockfile_sha256,
-            package_manager="pip",
+            package_manager=package_manager or "pip",
+            executed_steps=executed_steps or [],
         )
         provision.image_digest = image_digest
         if plan is not None:
