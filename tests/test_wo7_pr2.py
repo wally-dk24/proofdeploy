@@ -1082,6 +1082,72 @@ def test_install_failure_reason_scans_only_the_failed_step(
     )
 
 
+def test_node_install_steps_carry_nodedir_env(tmp_path):
+    """Addendum 37 (the reviewer will plant its removal): EVERY
+    Node install step renders npm_config_nodedir=/usr/local in its
+    env, so a native module with no prebuild compiles against the
+    image's own headers — no download, no tarball extraction.
+    Python install steps do NOT carry it."""
+    import json as _json
+
+    from proofdeploy.provisioning import plan_provisioning
+    from proofdeploy.yml import RepoContract
+
+    contract = RepoContract(
+        build="node --check server.js",
+        start="node server.js",
+        readiness="/health",
+        env={},
+    )
+
+    def snap(name, files):
+        d = tmp_path / name
+        d.mkdir()
+        for fname, content in files.items():
+            (d / fname).write_text(content, encoding="utf-8")
+        return d
+
+    pkg = _json.dumps({"name": "t"}) + "\n"
+    cases = {
+        "npm": {"package.json": pkg, "package-lock.json": "{}\n"},
+        "pnpm": {
+            "package.json": _json.dumps(
+                {"name": "t", "packageManager": "pnpm@9.15.0"}
+            ) + "\n",
+            "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+        },
+        "yarn-classic": {
+            "package.json": pkg,
+            "yarn.lock": "# yarn lockfile v1\n",
+        },
+        "yarn-berry": {
+            "package.json": pkg,
+            "yarn.lock": "__metadata:\n  version: 8\n",
+        },
+    }
+    for name, files in cases.items():
+        files = {**files, "server.js": "// app\n"}
+        plan = plan_provisioning(snap(name, files), contract)
+        assert plan.refusal is None, (name, plan.refusal)
+        install = [s for s in plan.steps if s.phase == "install"]
+        assert install, name
+        for step in install:
+            assert step.env.get("npm_config_nodedir") == "/usr/local", (
+                name, step,
+            )
+    # Python: no nodedir anywhere.
+    py = snap("py", {
+        "requirements.txt": "flask==3.1.0\n",
+        "app.py": "# app\n",
+    })
+    py_contract = RepoContract(
+        build="", start="python app.py", readiness="/health", env={},
+    )
+    plan = plan_provisioning(py, py_contract)
+    for step in plan.steps:
+        assert "npm_config_nodedir" not in step.env
+
+
 def test_canary_scan_positive_controls(tmp_path):
     """The kit scan fails on a REAL canary token or the canary env
     VALUE anywhere under the records dir, and stays silent on the

@@ -43,8 +43,10 @@ jobs:
       - name: Run focused sandbox tests
         env:
           PD_REQUIRE_SANDBOX: "1"
+        # --no-cov: a -k subset can never reach the repo's 80%
+        # coverage gate; the focus job judges the selected tests.
         run: |
-          python -m pytest tests/ -x -q -k "${{ inputs.expression }}"
+          python -m pytest tests/ -x -q --no-cov -k "${{ inputs.expression }}"
 
       - name: Upload provision logs
         if: always()

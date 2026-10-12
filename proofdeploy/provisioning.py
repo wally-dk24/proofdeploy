@@ -387,6 +387,17 @@ class PythonAdapter:
 COREPACK_BOOTSTRAP_VERSION = "0.36.0"
 COREPACK_BIN = "{checkout}/.pd-tools/node_modules/.bin/corepack"
 
+# Addendum 37: every Node install step renders with this env. The
+# official Node images ship the exact runtime's headers in
+# /usr/local/include/node, so node-gyp compiles a native module
+# that has no prebuild against the LOCAL headers — no download
+# from nodejs.org and no tarball extraction. (The download path
+# dies in the sandbox install container: node-gyp's tar extraction
+# hits `TAR_ENTRY_ERROR EPERM: operation not permitted, fchown`
+# under the userns mapping + --cap-drop=ALL.) npm and pnpm both
+# honor npm_config_nodedir; it is plan data, so it is recorded.
+NODE_INSTALL_ENV = {"npm_config_nodedir": "/usr/local"}
+
 
 class NodeAdapter:
     """Node: frozen installs planned from the lockfile.
@@ -410,6 +421,11 @@ class NodeAdapter:
       wording: "workspaces not yet supported".
     - ``node_modules`` lives in the checkout (persisted_dirs), so it
       survives from the install container to the app container.
+    - Every install step's env carries
+      ``npm_config_nodedir=/usr/local`` (Addendum 37): the pinned
+      images ship the runtime's own headers there, so a native
+      module without a prebuild compiles locally — no nodejs.org
+      download, no tarball extraction.
     """
 
     name = "node"
@@ -474,10 +490,15 @@ class NodeAdapter:
         manager, argv = select_package_manager(
             snapshot_dir, "node", lockfile_name
         )
-        step_env: dict[str, str] = {}
-        if pm_name == manager and pm_version and manager in (
-            "pnpm", "yarn", "npm",
-        ):
+        # Addendum 37: EVERY Node install step carries the nodedir
+        # env (compile fallback against the image's own headers).
+        step_env: dict[str, str] = dict(NODE_INSTALL_ENV)
+        pinned = bool(
+            pm_name == manager
+            and pm_version
+            and manager in ("pnpm", "yarn", "npm")
+        )
+        if pinned:
             # The pin renders through corepack, as plan data: strip
             # whatever prefix select_package_manager chose (plain
             # binary, or corepack when the planning host has it) and
@@ -491,10 +512,10 @@ class NodeAdapter:
             elif frozen_args[:1] == [manager]:
                 frozen_args = frozen_args[1:]
             argv = [*corepack_prefix, *frozen_args]
-            step_env = {"COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+            step_env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
         steps: list[PlanStep] = []
         corepack_version: str | None = None
-        if step_env:
+        if pinned:
             # Addendum 35: the bootstrap is part of the pinned
             # rendering on EVERY row, in persisted form — corepack
             # is installed into the checkout's .pd-tools (which
@@ -512,6 +533,7 @@ class NodeAdapter:
                         "--no-save", "--no-audit", "--no-fund",
                         f"corepack@{COREPACK_BOOTSTRAP_VERSION}",
                     ],
+                    env=dict(NODE_INSTALL_ENV),
                 )
             )
         steps.append(PlanStep(phase="install", argv=argv, env=step_env))

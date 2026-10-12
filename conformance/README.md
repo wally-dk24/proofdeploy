@@ -24,6 +24,14 @@ row, proving a packageManager-pinned app provisions on the 26
 row — where corepack is not bundled and the adapter bootstraps it
 explicitly (into the checkout's `.pd-tools`, Addendum 35).
 
+`golden/node-express-sqlite/variant-forced-compile/` holds a
+one-file overlay (`.npmrc`: build-from-source + foreground-scripts)
+used by `tests/test_forced_compile.py`: it forces the native
+module to compile in the sandbox, proving the compile fallback —
+node-gyp builds against the image's own headers because every
+Node install step renders `npm_config_nodedir=/usr/local`
+(Addendum 37), ending with `gyp info ok` in the provision logs.
+
 Both Node goldens pin better-sqlite3 ^12.11.1. The original pin
 (^11.3.0, resolving 11.10.0) shipped prebuilt binaries only up to
 the Node 22 ABI: on the Node 24 row prebuild-install found no
