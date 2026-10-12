@@ -146,6 +146,12 @@ class ProbeResult:
     # (Addendum 10 follow-up: an infrastructure failure must not be
     # relabeled an author miss).
     sent: bool = True
+    # Whether step 5 (evaluate_assertions) actually ran for this
+    # probe (Addendum 38). Every early return leaves this False:
+    # the probe's assertions were never evaluated, so an offline
+    # replay must NOT re-decide it — replay carries the recorded
+    # INCONCLUSIVE verdict and reason instead of inventing one.
+    assertions_evaluated: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -164,6 +170,9 @@ class ProbeResult:
             "writes": self.writes,
             "details": self.details,
             "sent": self.sent,
+            # Addendum 38: replay honesty — False means the run
+            # returned before the assertions were evaluated.
+            "assertions_evaluated": self.assertions_evaluated,
         }
 
     @classmethod
@@ -185,6 +194,10 @@ class ProbeResult:
             setup_requests=d.get("setup_requests"),
             # Old records predate the field; default True (sent).
             sent=bool(d.get("sent", True)),
+            # Records predating Addendum 38 cannot prove their
+            # assertions were evaluated; default False (honest:
+            # replay will not re-decide them).
+            assertions_evaluated=bool(d.get("assertions_evaluated", False)),
         )
 
 
@@ -1361,6 +1374,8 @@ class Executor:
                 http_body=body,
                 writes=writes,
                 setup_requests=setup_requests,
+                # Step 5 ran: this is the ONLY return that may say so.
+                assertions_evaluated=True,
             )
         )
 

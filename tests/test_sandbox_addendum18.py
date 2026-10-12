@@ -567,9 +567,14 @@ def test_sandboxed_tampered_hash_fails_install(monkeypatch, tmp_path):
     logs = "\n".join(side.provision.logs)
 
     assert side.provision.status == ProvisionStatus.BUILD_FAILED, logs
-    # Addendum 35: the reason names the install's first error line
-    # (or, unmatched, its last line) after the shared prefix.
-    assert side.provision.reason.startswith("sandbox install failed"), logs
+    # Addendum 38: the fake captures no failed-step output, so the
+    # reason names the failed step itself — exactly. (The previous
+    # whole-log scan named an unrelated line here: "lockfile:
+    # requirements.txt sha256: 3d021a12..." — the pip error never
+    # reached the reason.)
+    assert side.provision.reason == (
+        "sandbox install failed: install step 1 (install) exited 1"
+    ), logs
     # S3: the lockfile hash is recorded even on this failure.
     assert side.provision.lockfile_sha256, logs
     # And the flag that arms pip's check was in the command.

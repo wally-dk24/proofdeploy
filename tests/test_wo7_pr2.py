@@ -886,12 +886,16 @@ def test_sandbox_install_failure_reason_names_first_error_line(
     )
 
     def failing_install(self, checkout, steps, env, proxy_env, timeout=600):
-        self.log.append(
+        blob = (
             "added 0 packages\n"
             "npm error code EUSAGE\n"
             "npm error some detail\n"
             "pages of usage text"
         )
+        self.log.append(blob)
+        # Addendum 38: model the real Sandbox.install_steps, which
+        # captures the failed step's output (since Addendum 36).
+        self.failed_step_output = blob
         return [{"phase": steps[0]["phase"], "exit_code": 1}]
 
     orch = _stub_sandbox(monkeypatch, snap, contract, failing_install)
@@ -926,6 +930,67 @@ def test_first_error_line_markers_and_fallback():
     assert _first_error_line(["", "  "]) is None
 
 
+def test_first_error_line_skips_podman_echo():
+    """Addendum 38: the `$ podman ...` command echo in the log is
+    not scan evidence — a marker inside the echoed command must
+    not be named, and the echo line must not serve as the
+    fallback line."""
+    from proofdeploy.orchestrator import _first_error_line
+
+    assert _first_error_line(
+        ["$ podman run --rm img bash -c 'npm error code EUSAGE'",
+         "plain tail"]
+    ) == "plain tail"
+    assert _first_error_line(
+        ["$ podman run --rm img true"]
+    ) is None
+    assert _first_error_line(
+        ["$ podman run --rm img true", "Error: real one"]
+    ) == "Error: real one"
+
+
+def test_sandbox_install_failure_reason_without_step_output_names_the_step(
+    monkeypatch, tmp_path
+):
+    """Addendum 38: with NO captured failed-step output, the
+    provision reason does not scan the whole provision log — an
+    unrelated line was named that way (the lockfile hash line in
+    the tampered-hash run). It names the failed step itself:
+    index, phase, exit code."""
+    from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps({"name": "t"}) + "\n", encoding="utf-8"
+    )
+    (snap / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (snap / "server.js").write_text("// app\n", encoding="utf-8")
+    contract = RepoContract(
+        build="node --check server.js",
+        start="node server.js",
+        readiness="/health",
+        env={},
+    )
+
+    def failing_install(self, checkout, steps, env, proxy_env, timeout=600):
+        # No failed_step_output is captured; the provision log
+        # carries an unrelated lockfile line the old whole-log
+        # scan would have named.
+        self.log.append(
+            "lockfile: package-lock.json sha256: 3d021a12abcdef..."
+        )
+        return [{"phase": steps[0]["phase"], "exit_code": 7}]
+
+    orch = _stub_sandbox(monkeypatch, snap, contract, failing_install)
+    side = orch._provision_side_sandbox("fakerev", 18100, snap / "unit", "t")
+    assert side.provision.status == ProvisionStatus.BUILD_FAILED
+    assert side.provision.reason == (
+        "sandbox install failed: install step 0 (install) exited 7"
+    )
+
+
 def test_sandbox_install_failure_reason_falls_back_to_last_line(
     monkeypatch, tmp_path
 ):
@@ -951,11 +1016,15 @@ def test_sandbox_install_failure_reason_falls_back_to_last_line(
     )
 
     def failing_install(self, checkout, steps, env, proxy_env, timeout=600):
-        self.log.append(
+        blob = (
             "fetching packages\n"
             "some neutral output\n"
             "the final concrete line of the step"
         )
+        self.log.append(blob)
+        # Addendum 38: model the real Sandbox.install_steps, which
+        # captures the failed step's output (since Addendum 36).
+        self.failed_step_output = blob
         return [{"phase": steps[0]["phase"], "exit_code": 1}]
 
     orch = _stub_sandbox(monkeypatch, snap, contract, failing_install)
@@ -1185,11 +1254,14 @@ def _replay_evidence():
         "probe_index": 0, "verdict": "fail", "sent": True,
         "http_status": 200, "http_headers": {},
         "http_body": json.dumps({"done": True}), "reason": None,
+        # Addendum 38: these model step-5-evaluated probes.
+        "assertions_evaluated": True,
     }
     fix = {
         "probe_index": 0, "verdict": "pass", "sent": True,
         "http_status": 200, "http_headers": {},
         "http_body": json.dumps({"done": False}), "reason": None,
+        "assertions_evaluated": True,
     }
     return {
         "record_type": "evidence", "run_kind": "bug",

@@ -230,12 +230,19 @@ def _first_error_line(lines: list) -> str | None:
     LAST non-empty line of the output — an unmatched failure still
     gets its most concrete line into the provision reason instead
     of a bare "install failed". Entries may be multi-line blobs;
-    scan line by line."""
+    scan line by line.
+
+    The ``$ podman ...`` command echo the sandbox logs before each
+    run is NOT evidence (Addendum 38): it is skipped entirely — a
+    marker inside the echoed command must not be named, and the
+    echo must not serve as the fallback line."""
     last_nonempty: str | None = None
     generic: str | None = None
     for entry in lines:
         for line in str(entry).splitlines():
             stripped = line.strip()
+            if stripped.startswith("$ podman"):
+                continue
             if stripped:
                 last_nonempty = stripped
             if any(marker in line for marker in _ERROR_MARKERS_STRONG):
@@ -1212,13 +1219,32 @@ class Orchestrator:
             # text. The scan reads the FAILED STEP's own output
             # when the sandbox captured it (install_steps sets
             # failed_step_output), never the whole provision log.
+            # Addendum 38: with NO captured step output there is
+            # nothing sound to scan — the whole log mixes in
+            # unrelated lines (the lockfile hash line was named
+            # that way, instead of the pip error). Name the
+            # failed step itself: index, phase, exit code.
             step_output = getattr(sb, "failed_step_output", None)
-            first_error = _first_error_line(
-                [step_output] if step_output else logs
-            )
             reason = "sandbox install failed"
-            if first_error:
-                reason = f"sandbox install failed: {first_error}"
+            if step_output:
+                first_error = _first_error_line([step_output])
+                if first_error:
+                    reason = f"sandbox install failed: {first_error}"
+            else:
+                failed_step = next(
+                    (
+                        (i, r)
+                        for i, r in enumerate(step_results)
+                        if r["exit_code"] != 0
+                    ),
+                    None,
+                )
+                if failed_step is not None:
+                    i, r = failed_step
+                    reason = (
+                        f"sandbox install failed: install step {i} "
+                        f"({r['phase']}) exited {r['exit_code']}"
+                    )
             logs.append(reason)
             return self._sandbox_failed_side(
                 sb, rev, sha, snapshot, contract, logs,
