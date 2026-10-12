@@ -18,6 +18,11 @@ on:
         description: "pytest -k expression (e.g. node-express-sqlite)"
         required: true
         type: string
+      network_mode:
+        description: "WO-7.3: force one sandbox network mode for the run (auto, isolated, none+socket). A forced mode the runner cannot create fails the run with the refusal and its reason — not a skip."
+        required: false
+        default: "auto"
+        type: string
 
 jobs:
   focus:
@@ -43,6 +48,7 @@ jobs:
       - name: Run focused sandbox tests
         env:
           PD_REQUIRE_SANDBOX: "1"
+          PD_FORCE_NETWORK_MODE: ${{ inputs.network_mode }}
         # --no-cov: a -k subset can never reach the repo's 80%
         # coverage gate; the focus job judges the selected tests.
         run: |
