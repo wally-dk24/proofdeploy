@@ -1206,10 +1206,16 @@ class Orchestrator:
         )
         if not install_ok:
             logs.extend(sb.log)
-            # Addendum 33: name the install's first real error line
-            # in the provision reason — "sandbox install failed"
-            # alone hid the cause behind pages of usage text.
-            first_error = _first_error_line(logs)
+            # Addendum 33/36: name the install's first real error
+            # line in the provision reason — "sandbox install
+            # failed" alone hid the cause behind pages of usage
+            # text. The scan reads the FAILED STEP's own output
+            # when the sandbox captured it (install_steps sets
+            # failed_step_output), never the whole provision log.
+            step_output = getattr(sb, "failed_step_output", None)
+            first_error = _first_error_line(
+                [step_output] if step_output else logs
+            )
             reason = "sandbox install failed"
             if first_error:
                 reason = f"sandbox install failed: {first_error}"

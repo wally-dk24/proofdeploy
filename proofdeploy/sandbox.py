@@ -321,20 +321,27 @@ def _podman_base() -> list[str]:
     return list(PODMAN)
 
 
-def _head_tail(text: str, head_lines: int = 40, tail_chars: int = 2000) -> str:
+def _head_tail(
+    text: str,
+    head_lines: int = 40,
+    head_chars: int = 4000,
+    tail_chars: int = 2000,
+) -> str:
     """Keep the HEAD and the TAIL of long command output.
 
     The old capture kept only the last 2000 characters: a tool that
     prints its real error first and then pages of usage/help text
     (npm does exactly this on EUSAGE) lost the error line entirely,
     which hid the actual cause of a failing install behind the help
-    text (Addendum 33). Keep the first ``head_lines`` lines plus the
+    text (Addendum 33). Keep the first ``head_lines`` lines (capped
+    at ``head_chars`` characters — the total is capped too,
+    Addendum 36: forty enormous lines are still enormous) plus the
     last ``tail_chars`` characters, with an elision marker between.
     """
     lines = text.splitlines()
-    if len(lines) <= head_lines:
+    if len(lines) <= head_lines and len(text) <= head_chars + tail_chars:
         return text
-    head = "\n".join(lines[:head_lines])
+    head = "\n".join(lines[:head_lines])[:head_chars]
     tail = text[-tail_chars:]
     elided = max(len(lines) - head_lines - tail.count("\n"), 0)
     return f"{head}\n[… {elided} lines elided …]\n{tail}"
@@ -526,6 +533,11 @@ class Sandbox:
     userns_opt_out: bool = field(default=False, repr=False)
     app_network_mode: str | None = field(default=None, repr=False)
     install_network: str | None = field(default=None, repr=False)
+    # The failed install step's OWN captured output (Addendum 36):
+    # set by install_steps when a step fails, so the provision
+    # reason's first-error scan reads that step only — never an
+    # earlier step's or another phase's error lines.
+    failed_step_output: str | None = field(default=None, repr=False)
 
     def _capabilities(self) -> SandboxCapabilities:
         if self._caps is None:
@@ -768,6 +780,7 @@ class Sandbox:
         # the checkout.
         full_env["HOME"] = "/checkout/.sandbox-home"
         results: list[dict] = []
+        self.failed_step_output = None
         for i, step in enumerate(steps):
             step_env = dict(full_env)
             step_env.update(step.get("env") or {})
@@ -779,10 +792,14 @@ class Sandbox:
             for k, v in step_env.items():
                 args += ["-e", f"{k}={v}"]
             args += [self.config.image, "bash", "-c", step["command"]]
+            log_mark = len(self.log)
             ok, reason = _run(args, timeout, self.log)
             rc = _exit_code_from_run(ok, reason)
             results.append({"phase": step["phase"], "exit_code": rc})
             if rc != 0:
+                # Addendum 36: keep THIS step's output slice — the
+                # provision reason scans it, and only it.
+                self.failed_step_output = "\n".join(self.log[log_mark:])
                 self.log.append(
                     f"install step {i} ({step['phase']}) failed: exit {rc}"
                 )

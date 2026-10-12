@@ -313,6 +313,28 @@ def test_case10_record_replays_to_same_verdict(golden):
         assert prov["status"] == "ready", (
             f"replay precondition: side not READY: {prov.get('reason')}"
         )
+    # Per-probe verdict AND reason, re-decided from the recorded
+    # responses, must equal the stored ones — on the bug run AND
+    # the clean run (Addendum 36).
+    from proofdeploy.replay import replay_side
+
+    def _pairs(results):
+        return [
+            (r.verdict.value, r.reason.value if r.reason else None)
+            for r in results
+        ]
+
+    def _stored_pairs(results):
+        return [(r["verdict"], r["reason"]) for r in results]
+
+    for results_key in ("fix_parent_results", "fix_results"):
+        assert _pairs(replay_side(evidence, results_key)) == (
+            _stored_pairs(evidence[results_key])
+        ), results_key
+    clean_evidence = golden.evidence["clean"]
+    assert _pairs(replay_side(clean_evidence, "c_results")) == (
+        _stored_pairs(clean_evidence["c_results"])
+    )
     stored = golden.scores["bug"]["verdict"]
     assert kit.replay_verdict(evidence) == stored
     tampered = copy.deepcopy(evidence)

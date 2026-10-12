@@ -18,12 +18,21 @@ different stack:
 | `golden/python-flask-sqlite` | Flask + stdlib sqlite3 | fully hashed `requirements.txt` | `requires-python: >=3.13,<3.14` → python 3.13.16 |
 
 `golden/node-pnpm-sqlite/variant-node26/` holds a two-file overlay
-(package.json + regenerated pnpm-lock.yaml) used by
+(package.json + the golden's pnpm-lock.yaml) used by
 `tests/test_node26_corepack.py`: engines widened to the Node 26
-row and better-sqlite3 bumped to ^13.0.3 (11.10.0's C++ predates
-Node 26's V8), proving a packageManager-pinned app provisions on
-the 26 row — where corepack is not bundled and the adapter
-bootstraps it explicitly.
+row, proving a packageManager-pinned app provisions on the 26
+row — where corepack is not bundled and the adapter bootstraps it
+explicitly (into the checkout's `.pd-tools`, Addendum 35).
+
+Both Node goldens pin better-sqlite3 ^12.11.1. The original pin
+(^11.3.0, resolving 11.10.0) shipped prebuilt binaries only up to
+the Node 22 ABI: on the Node 24 row prebuild-install found no
+prebuild, and the node-gyp fallback died extracting the Node
+headers tarball inside the sandbox install container
+(`TAR_ENTRY_ERROR EPERM: operation not permitted, fchown` — the
+userns-remapped, cap-dropped container cannot chown). 12.11.1
+ships prebuilds for the Node 24 (v137) and Node 26 (v147) ABIs,
+so the frozen installs take the prebuild path on both rows.
 
 Each app ships as revision **trees** under `golden/<app>/revisions/`
 (`base`, `bug`, `intermediate`, `fix-parent`, `fix`, `clean`,

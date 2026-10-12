@@ -200,61 +200,9 @@ def scan_records_for_canary(records_dir: Path, canary_value: str) -> list[str]:
 
 
 def replay_verdict(evidence: dict) -> str:
-    """Case 10's replay (Addendum 33): re-evaluate every probe's
-    assertions OFFLINE against the responses recorded in the
-    evidence record, then derive the verdict with the registered
-    scoring rule. This does NOT echo the stored per-probe verdicts:
-    tampering with a recorded response changes the outcome.
+    """Case 10's replay — a thin delegate to the product's ONE
+    replay implementation (proofdeploy.replay, Addendum 36), kept
+    here so kit callers have a single import surface."""
+    from proofdeploy.replay import replay_verdict as _replay_verdict
 
-    Returns the stored-verdict vocabulary: "candidate_catch",
-    "no_catch", or "inconclusive"."""
-    from proofdeploy.executor import (
-        InconclusiveReason,
-        ProbeResult,
-        Verdict,
-        _check_assertion,
-    )
-    from proofdeploy.runpair import RunPairVerdict, score_run_pair_detailed
-
-    probes = evidence.get("parsed_probes") or []
-
-    def rebuild(results: list | None) -> list:
-        rebuilt = []
-        for result in results or []:
-            idx = result.get("probe_index", 0)
-            probe = probes[idx] if 0 <= idx < len(probes) else {}
-            if not result.get("sent", True):
-                rebuilt.append(ProbeResult(
-                    probe_index=idx, verdict=Verdict.INCONCLUSIVE,
-                    reason=InconclusiveReason.PROBE, sent=False,
-                ))
-                continue
-            verdict = Verdict.PASS
-            reason = None
-            for assertion in probe.get("assert") or []:
-                passed, _detail, inc_reason = _check_assertion(
-                    assertion,
-                    result.get("http_status"),
-                    result.get("http_headers") or {},
-                    result.get("http_body") or "",
-                    None,
-                )
-                if passed is False:
-                    verdict = Verdict.FAIL
-                    reason = None
-                    break
-                if passed is None:
-                    verdict = Verdict.INCONCLUSIVE
-                    reason = inc_reason
-            rebuilt.append(ProbeResult(
-                probe_index=idx, verdict=verdict, reason=reason, sent=True,
-            ))
-        return rebuilt
-
-    detailed = score_run_pair_detailed(
-        rebuild(evidence.get("fix_parent_results")),
-        rebuild(evidence.get("fix_results")),
-    )
-    if detailed.verdict == RunPairVerdict.CATCH:
-        return "candidate_catch"
-    return str(detailed.verdict.value)
+    return _replay_verdict(evidence)

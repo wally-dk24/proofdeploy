@@ -966,6 +966,122 @@ def test_sandbox_install_failure_reason_falls_back_to_last_line(
     )
 
 
+def test_sandbox_executed_steps_carry_the_real_failure_code(
+    monkeypatch, tmp_path
+):
+    """Planted bug M9 (Addendum 36): executed_steps hard-coding
+    exit_code 0. A stubbed install that fails a step with code 7
+    must record 7 for that step — and the side is BUILD_FAILED."""
+    from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps({"name": "t"}) + "\n", encoding="utf-8"
+    )
+    (snap / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (snap / "server.js").write_text("// app\n", encoding="utf-8")
+    contract = RepoContract(
+        build="node --check server.js",
+        start="node server.js",
+        readiness="/health",
+        env={},
+    )
+
+    def failing_install(self, checkout, steps, env, proxy_env, timeout=600):
+        return [{"phase": steps[0]["phase"], "exit_code": 7}]
+
+    orch = _stub_sandbox(monkeypatch, snap, contract, failing_install)
+    side = orch._provision_side_sandbox("fakerev", 18098, snap / "unit", "t")
+    assert side.provision.status == ProvisionStatus.BUILD_FAILED
+    install = next(
+        e for e in side.provision.executed_steps if e["phase"] == "install"
+    )
+    assert install["exit_code"] == 7
+
+
+def test_run_rc_keeps_head_and_tail_of_stderr(monkeypatch):
+    """Planted bug M12 (Addendum 36): npm writes its errors to
+    STDERR — a tail-only stderr capture loses the first error line
+    behind the usage text even when stdout is captured whole. The
+    head+tail capture applies to stderr specifically."""
+    from proofdeploy import sandbox as sandbox_mod
+
+    big_stderr = "npm error code EUSAGE\n" + "".join(
+        f"filler line {i}\n" for i in range(5000)
+    ) + "STDERR_LAST\n"
+
+    def fake_run(args, capture_output, text, timeout):
+        return SimpleNamespace(stdout="", stderr=big_stderr, returncode=1)
+
+    monkeypatch.setattr(sandbox_mod.subprocess, "run", fake_run)
+    logs: list[str] = []
+    rc = sandbox_mod._run_rc(["podman", "run", "img"], 10, logs)
+    assert rc == 1
+    joined = "\n".join(logs)
+    assert "npm error code EUSAGE" in joined
+    assert "STDERR_LAST" in joined
+    assert "lines elided" in joined
+
+
+def test_run_rc_caps_total_output_for_giant_lines(monkeypatch):
+    """Addendum 36: the capture caps TOTAL characters too — forty
+    lines is few enough, but one 200k-char line must not come back
+    whole."""
+    from proofdeploy import sandbox as sandbox_mod
+
+    big = "npm error code EUSAGE " + "x" * 200_000 + "\n"
+
+    def fake_run(args, capture_output, text, timeout):
+        return SimpleNamespace(stdout=big, stderr="", returncode=1)
+
+    monkeypatch.setattr(sandbox_mod.subprocess, "run", fake_run)
+    logs: list[str] = []
+    rc = sandbox_mod._run_rc(["podman", "run", "img"], 10, logs)
+    assert rc == 1
+    joined = "\n".join(logs)
+    assert "npm error code EUSAGE" in joined
+    assert "lines elided" in joined
+    assert len(joined) < 20_000
+
+
+def test_install_failure_reason_scans_only_the_failed_step(
+    monkeypatch, tmp_path
+):
+    """Addendum 36: the reason's error scan reads the FAILED STEP's
+    own output — an error line from an earlier phase sharing the
+    provision log must not be named."""
+    from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps({"name": "t"}) + "\n", encoding="utf-8"
+    )
+    (snap / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (snap / "server.js").write_text("// app\n", encoding="utf-8")
+    contract = RepoContract(
+        build="node --check server.js",
+        start="node server.js",
+        readiness="/health",
+        env={},
+    )
+
+    def failing_install(self, checkout, steps, env, proxy_env, timeout=600):
+        self.log.append("npm error code EUSAGE from an earlier phase")
+        self.failed_step_output = "compiling...\ngyp ERR! build error"
+        return [{"phase": steps[0]["phase"], "exit_code": 1}]
+
+    orch = _stub_sandbox(monkeypatch, snap, contract, failing_install)
+    side = orch._provision_side_sandbox("fakerev", 18099, snap / "unit", "t")
+    assert side.provision.status == ProvisionStatus.BUILD_FAILED
+    assert side.provision.reason == (
+        "sandbox install failed: gyp ERR! build error"
+    )
+
+
 def test_canary_scan_positive_controls(tmp_path):
     """The kit scan fails on a REAL canary token or the canary env
     VALUE anywhere under the records dir, and stays silent on the
