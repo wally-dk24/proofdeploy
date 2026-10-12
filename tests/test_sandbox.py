@@ -466,6 +466,9 @@ def _completed(args, returncode=0, stdout="", stderr=""):
 
 def _probe_run(scenario):
     """Fake subprocess.run for check_sandbox_capabilities."""
+    # WO-7.4: probe network names are unique per probe; the inspect
+    # reply must key the IP by the name this probe actually created.
+    state = {"isolated_net": "pd-capability-probe"}
 
     def fake(cmd, **kwargs):
         text = " ".join(cmd)
@@ -478,6 +481,7 @@ def _probe_run(scenario):
         if "network" in text and "create" in text and "--internal" in text:
             if scenario == "net-create-fail":
                 return _completed(cmd, 1, "", "create failed")
+            state["isolated_net"] = cmd[-1]
             return _completed(cmd, 0, "pd-capability-probe\n", "")
         if "network" in text and "create" in text:
             if scenario == "build-create-fail":
@@ -496,25 +500,58 @@ def _probe_run(scenario):
                 return _completed(cmd, 1, "", "netavark: setns: EPERM")
             return _completed(cmd, 0, "", "")
         if "inspect" in text and "pd-capability-probe-app" in text:
-            if scenario == "isolated-no-ip":
-                # Container started but inspect shows no IP.
-                return _completed(
-                    cmd, 0,
-                    '[{"NetworkSettings": {"Networks": '
-                    '{"pd-capability-probe": {"IPAddress": ""}}}}]',
-                    "",
-                )
-            return _completed(
-                cmd, 0,
-                '[{"NetworkSettings": {"Networks": '
-                '{"pd-capability-probe": {"IPAddress": "10.89.0.2"}}}}]',
-                "",
-            )
+            ip = "" if scenario == "isolated-no-ip" else "10.89.0.2"
+            payload = json.dumps([{
+                "NetworkSettings": {
+                    "Networks": {state["isolated_net"]: {"IPAddress": ip}}
+                }
+            }])
+            return _completed(cmd, 0, payload, "")
         if "stop" in text and "pd-capability-probe-app" in text:
             return _completed(cmd, 0, "", "")
         return _completed(cmd, 0, "", "")
 
     return fake
+
+
+class _OkConn:
+    """A successfully connected socket stub (WO-7.4: the probe's
+    connect seam is socket.create_connection, polled)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def close(self):
+        pass
+
+
+def _probe_connect_ok(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(
+        sb_mod.socket, "create_connection", lambda *a, **k: _OkConn()
+    )
+
+
+def _probe_connect_refused(monkeypatch):
+    import proofdeploy.sandbox as sb_mod
+
+    def _refuse(*a, **k):
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(sb_mod.socket, "create_connection", _refuse)
+    _shrink_probe_poll(monkeypatch)
+
+
+def _shrink_probe_poll(monkeypatch):
+    """Keep a to-the-deadline poll from costing the test 10 s."""
+    import proofdeploy.sandbox as sb_mod
+
+    monkeypatch.setattr(sb_mod, "_PROBE_CONNECT_DEADLINE_S", 0.35)
+    monkeypatch.setattr(sb_mod, "_PROBE_CONNECT_INTERVAL_S", 0.05)
 
 
 def test_capability_probe_no_podman(monkeypatch):
@@ -572,7 +609,7 @@ def test_capability_probe_isolated_no_ip(monkeypatch):
 
     monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
     monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("isolated-no-ip"))
-    monkeypatch.setattr(sb_mod, "_tcp_reachable", lambda *a, **k: True)
+    _shrink_probe_poll(monkeypatch)
     caps = sb_mod.check_sandbox_capabilities()
     assert caps.isolated_network is False
     assert "IP" in caps.reason
@@ -584,7 +621,7 @@ def test_capability_probe_isolated_unreachable(monkeypatch):
 
     monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
     monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("all-ok"))
-    monkeypatch.setattr(sb_mod, "_tcp_reachable", lambda *a, **k: False)
+    _probe_connect_refused(monkeypatch)
     caps = sb_mod.check_sandbox_capabilities()
     assert caps.isolated_network is False
     assert "cannot reach" in caps.reason
@@ -595,7 +632,7 @@ def test_capability_probe_userns_fails(monkeypatch):
 
     monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
     monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("userns-fail"))
-    monkeypatch.setattr(sb_mod, "_tcp_reachable", lambda *a, **k: True)
+    _probe_connect_ok(monkeypatch)
     caps = sb_mod.check_sandbox_capabilities()
     assert caps.userns_remap is False
     assert "userns" in caps.reason.lower() or "isolated" in caps.reason.lower()
@@ -606,7 +643,7 @@ def test_capability_probe_all_capable(monkeypatch):
 
     monkeypatch.setattr(sb_mod.shutil, "which", lambda _: "/usr/bin/podman")
     monkeypatch.setattr(sb_mod.subprocess, "run", _probe_run("all-ok"))
-    monkeypatch.setattr(sb_mod, "_tcp_reachable", lambda *a, **k: True)
+    _probe_connect_ok(monkeypatch)
     caps = sb_mod.check_sandbox_capabilities()
     assert caps.podman is True
     assert caps.isolated_network is True
