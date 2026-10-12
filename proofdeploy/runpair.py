@@ -35,7 +35,7 @@ Unknown versions raise.
 
 Records:
 - Every record (evidence, score, judgment) and every per-probe result
-  carries ``schema_version`` (currently ``"1.2.0"``). Bump it when the
+  carries ``schema_version`` (currently ``"1.3.0"``). Bump it when the
   record format changes; readers must refuse unknown versions. Records
   written at 1.0.0 (scalar ``captured_values``, no harness provenance)
   still load and re-score.
@@ -612,6 +612,11 @@ def build_evidence_record(
     # network mode, userns mode, uid the app ran as). Empty when the
     # sandbox was not used.
     sandbox_evidence: dict[str, Any] | None = None,
+    # The write grant in effect per side (WO-7.3, schema 1.3.0):
+    # {side: {"provisioned": bool, "target_url": str | None,
+    # "network_mode": str | None}}. Non-scoring audit data: writes
+    # were allowed on a side iff its executor was provisioned.
+    write_grants: dict[str, Any] | None = None,
     # Whether the measured sides ran inside the sandbox. False only via
     # the explicit dev flag ``allow_unsandboxed``.
     sandboxed: bool = True,
@@ -745,6 +750,7 @@ def build_evidence_record(
         "author_prompt_builder_sha256": author_prompt_builder_sha256,
         "truncation_flags": truncation_flags or {},
         "sandbox_evidence": sandbox_evidence or {},
+        "write_grants": write_grants or {},
         "sandboxed": sandboxed,
         "measured_result": measured_result,
         # Caller provenance (Actions run URL/ID, runner image,
