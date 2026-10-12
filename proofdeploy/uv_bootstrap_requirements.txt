@@ -1,0 +1,10 @@
+# REG-A resolver bootstrap (WO-8.1, Addendum 46): the pinned uv
+# resolver, installed BY HASH into the checkout's .pd-tools before
+# a generated Python lock is resolved. The digest is the sha256 of
+# uv 0.13.0's manylinux x86_64 wheel on PyPI
+# (uv-0.13.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl,
+# https://pypi.org/pypi/uv/0.13.0/json). Installed with
+# --require-hashes --no-deps --only-binary :all: — a substituted
+# wheel fails the install step.
+uv==0.13.0 \
+    --hash=sha256:52c7da0fd9056d9551124777ec77de53f0df7017daf8f98a19e947b7837416ed

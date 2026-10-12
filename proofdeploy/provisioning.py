@@ -229,6 +229,11 @@ class InstallPlan:
     lock_resolver_version: str | None = None
     lock_cutoff: str | None = None
     lock_index_url: str | None = None
+    # Addendum 46: the sha256 of the COMMITTED bootstrap
+    # requirements file the resolver is installed from (the file
+    # pins the resolver's wheel by hash; see
+    # _uv_bootstrap_requirements).
+    lock_resolver_bootstrap_sha256: str | None = None
     generated_lockfile_name: str | None = None
     package_manager: str | None = None
     package_manager_version: str | None = None
@@ -329,6 +334,34 @@ UV_VERSION = "0.13.0"
 LOCK_INDEX_URL = "https://pypi.org/simple"
 LOCK_TARGET_PLATFORM = "x86_64-unknown-linux-gnu"
 GENERATED_LOCKFILE_NAME = ".pd-generated-requirements.txt"
+
+# Addendum 46: the resolver is pinned BY HASH, not by version
+# alone. The committed bootstrap requirements file (kept next to
+# this module) pins uv==0.13.0 with the sha256 of its manylinux
+# x86_64 wheel; a generated plan materializes that file verbatim
+# into the checkout's .pd-tools, installs from it with
+# --require-hashes, and records the file's sha256 on the plan
+# (lock_resolver_bootstrap_sha256).
+UV_BOOTSTRAP_REQUIREMENTS_FILE = "uv_bootstrap_requirements.txt"
+UV_BOOTSTRAP_CHECKOUT_PATH = ".pd-tools/uv-requirements.txt"
+
+# Writes argv[1]'s file with argv[2]'s exact bytes: a plan step
+# ([python, -c, THIS, <path>, <content>]) that materializes a
+# committed file into the checkout — the install container mounts
+# only the checkout, so a package file cannot be referenced in
+# place on every executor.
+_WRITE_FILE_CODE = (
+    "import pathlib,sys; "
+    "pathlib.Path(sys.argv[1]).write_bytes(sys.argv[2].encode())"
+)
+
+
+def _uv_bootstrap_requirements() -> tuple[str, str]:
+    """The committed resolver-bootstrap requirements: (text, sha256)."""
+    data = Path(__file__).with_name(
+        UV_BOOTSTRAP_REQUIREMENTS_FILE
+    ).read_bytes()
+    return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
 
 
 class PythonAdapter:
@@ -468,6 +501,7 @@ class PythonAdapter:
         # is actually being planned (see LockCutoff): planning a
         # committed lock above never touched the caller's source.
         cutoff = lock_cutoff() if callable(lock_cutoff) else lock_cutoff
+        bootstrap_text, bootstrap_sha256 = _uv_bootstrap_requirements()
         generated_base: dict[str, Any] = {
             "adapter": self.name,
             "runtime": "python",
@@ -478,6 +512,7 @@ class PythonAdapter:
             "lock_resolver": "uv",
             "lock_resolver_version": UV_VERSION,
             "lock_index_url": LOCK_INDEX_URL,
+            "lock_resolver_bootstrap_sha256": bootstrap_sha256,
             "generated_lockfile_name": GENERATED_LOCKFILE_NAME,
             **image,
         }
@@ -515,18 +550,45 @@ class PythonAdapter:
                     "{checkout}/.pd-tools",
                 ],
             ),
+            # Addendum 46: the resolver is installed BY HASH from
+            # the committed bootstrap requirements file. The file
+            # is materialized verbatim into .pd-tools first (the
+            # install container mounts only the checkout), then
+            # installed in hash-checking mode, binaries only: a
+            # wrong or substituted wheel fails this step.
+            PlanStep(
+                phase="install",
+                argv=[
+                    "{runtime_bin}",
+                    "-c",
+                    _WRITE_FILE_CODE,
+                    f"{{checkout}}/{UV_BOOTSTRAP_CHECKOUT_PATH}",
+                    bootstrap_text,
+                ],
+            ),
             PlanStep(
                 phase="install",
                 argv=[
                     "{checkout}/.pd-tools/bin/pip",
                     "install",
-                    f"uv=={UV_VERSION}",
+                    "--require-hashes",
+                    "--no-deps",
+                    "--only-binary",
+                    ":all:",
+                    "-r",
+                    f"{{checkout}}/{UV_BOOTSTRAP_CHECKOUT_PATH}",
                 ],
             ),
             # REG-A item 2: resolve the declared dependencies with
             # the pinned uv, hashes generated, for the selected
             # Python version and linux/x86_64, against the
             # registered index, with the unit's one cutoff.
+            # --no-header (Addendum 46): uv's header embeds the full
+            # command, including --output-file <path>, so without it
+            # the recorded sha256 of the generated lock depended on
+            # the checkout path — identical resolutions at fix^ and
+            # fix recorded different hashes. The command itself is
+            # already recorded in executed_steps.
             PlanStep(
                 phase="install",
                 argv=[
@@ -535,6 +597,7 @@ class PythonAdapter:
                     "compile",
                     f"{{checkout}}/{source_name}",
                     "--generate-hashes",
+                    "--no-header",
                     "--exclude-newer",
                     cutoff,
                     "--python-version",

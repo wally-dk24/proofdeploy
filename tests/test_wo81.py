@@ -223,9 +223,11 @@ def test_hashed_requirements_plans_committed_pip(tmp_path):
 
 def test_generated_plan_carries_every_registered_flag(tmp_path):
     """Planted bugs this catches: --exclude-newer dropped (the
-    resolve argv loses the flag or the cutoff value); uv unpinned
-    (the bootstrap names anything but exactly uv==0.13.0, or a
-    global install); --no-deps dropped (the sandbox rendering of
+    resolve argv loses the flag or the cutoff value); the resolver
+    bootstrap weakened (installed by bare version instead of by
+    hash from the committed file, or as a global install);
+    --no-header dropped (the generated lock's hash becomes
+    path-dependent); --no-deps dropped (the sandbox rendering of
     the install step loses it)."""
     snap = _python_snapshot(
         tmp_path, pyproject=PYPROJECT_312, requirements="flask==3.1.0\n"
@@ -250,13 +252,26 @@ def test_generated_plan_carries_every_registered_flag(tmp_path):
     assert plan.persisted_dirs == [".venv", ".pd-tools"]
 
     installs = _steps(plan)
-    # Order: tools venv, uv bootstrap, resolve, frozen install.
+    # Order: tools venv, bootstrap writer, hash-checked bootstrap
+    # install, resolve, frozen install.
     joined = [" ".join(s.argv or []) for s in installs]
     assert "{checkout}/.pd-tools" in joined[0] and "venv" in joined[0]
-    bootstrap = installs[1].argv or []
-    assert "uv==0.13.0" in bootstrap  # the resolver, exactly pinned
+    # Addendum 46: the resolver is installed BY HASH from the
+    # committed bootstrap requirements file — never a bare version
+    # install, never a global install. The writer step materializes
+    # the committed file into .pd-tools; the bootstrap installs
+    # from it in hash-checking mode. (tests/test_wo81_addendum46.py
+    # pins the file's contents and the recorded sha256.)
+    bootstrap = installs[2].argv or []
+    assert bootstrap[0] == "{checkout}/.pd-tools/bin/pip"
+    assert "--require-hashes" in bootstrap
+    assert "--no-deps" in bootstrap
+    assert "--only-binary" in bootstrap and ":all:" in bootstrap
+    assert bootstrap[bootstrap.index("-r") + 1] == (
+        "{checkout}/.pd-tools/uv-requirements.txt"
+    )
     assert "-g" not in bootstrap and "--global" not in bootstrap
-    assert (installs[1].argv or [])[0].startswith("{checkout}/.pd-tools/")
+    assert plan.lock_resolver_bootstrap_sha256 is not None
 
     resolve = _resolve_step(plan)
     argv = resolve.argv or []
@@ -264,6 +279,9 @@ def test_generated_plan_carries_every_registered_flag(tmp_path):
     assert argv[1:3] == ["pip", "compile"]
     assert "{checkout}/requirements.txt" in argv
     assert "--generate-hashes" in argv
+    # Addendum 46: no header — the generated lock's recorded sha256
+    # must not depend on the checkout path.
+    assert "--no-header" in argv
     assert argv[argv.index("--exclude-newer") + 1] == CUTOFF
     assert argv[argv.index("--python-version") + 1] == plan.selected_version
     assert argv[argv.index("--python-platform") + 1] == (
@@ -740,6 +758,37 @@ def test_host_side_provision_passes_the_run_cutoff(monkeypatch, tmp_path):
     orch._run_lock_cutoff = "2020-01-01T00:00:00Z"
     orch._provision_side(_Runner(), info["bug"], 18999, unit, "fix-parent")
     assert captured["lock_cutoff"] == "2020-01-01T00:00:00Z"  # run's wins
+
+
+def test_run_cutoff_cleared_after_measure_bug(monkeypatch, tmp_path, app_server):
+    """Addendum 46 should-fix: the run cutoff must not leak out of
+    measure_*. After measure_bug returns, a direct single-side
+    provision falls back to the SIDE'S OWN commit time — not the
+    finished run's fix cutoff."""
+    from proofdeploy.runner import ProvisionResult
+
+    orch, out, info = _stubbed_orchestrator(monkeypatch, tmp_path, app_server)
+    summary = orch.measure_bug()
+    assert summary["parent_ready"] is True, summary
+    assert orch._run_lock_cutoff is None
+
+    captured: dict = {}
+
+    class _Runner:
+        def provision(self, **kw):
+            captured.update(kw)
+            return ProvisionResult(status=ProvisionStatus.BUILD_FAILED,
+                                   reason="stub runner")
+
+    unit = tmp_path / "unit2"
+    unit.mkdir()
+    orch._provision_side(_Runner(), info["bug"], 18999, unit, "fix-parent")
+    fallback = captured["lock_cutoff"]
+    assert callable(fallback)
+    # The bug commit's own committer time (2025-07-01) — a stale
+    # leak would hand back the finished run's FIX_CUTOFF string
+    # (2026-01-02) instead.
+    assert fallback() == "2025-07-01T00:00:05Z"
 
 
 def test_committed_lock_never_evaluates_the_cutoff(tmp_path):

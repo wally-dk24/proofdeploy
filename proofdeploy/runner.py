@@ -507,28 +507,42 @@ def verify_lockfile(snapshot_dir: Path, runtime: str) -> str:
     return found[1]
 
 
-def check_requirements_frozen(req_path: Path) -> str | None:
-    """Check that requirements.txt is a COMPLETE lock. Reason if not.
+# REG-A completeness allowlist (WO-8.1, Addendum 46): the global
+# pip options a requirements file may carry while still being, on
+# its own, the complete lock. Everything else on an option line —
+# an include, an editable, or an option not listed here — means
+# the file alone does not pin the installed set.
+_FROZEN_GLOBAL_OPTIONS = frozenset({
+    "--index-url", "-i", "--extra-index-url", "--find-links", "-f",
+    "--trusted-host", "--pre", "--prefer-binary", "--only-binary",
+    "--no-binary",
+})
+_FROZEN_INCLUDE_OPTIONS = frozenset({
+    "-r", "--requirement", "-c", "--constraint",
+})
+_FROZEN_EDITABLE_OPTIONS = frozenset({"-e", "--editable"})
 
-    REG-A (docs/registration/python-lock-rule.md item 1, WO-8.1): a
-    requirements file is a complete lock only when every package-spec
-    entry carries ``--hash``. An ``==``-pinned file without hashes is
-    NOT a lock under the rule — it goes through lock generation
-    instead (the WAL-76 gap: the old check accepted ``==`` alone, and
-    the file then installed with ``--no-deps``, so missing transitive
-    dependencies surfaced only as a start failure).
 
-    Entries are logical lines: a trailing backslash continues an
-    entry (the pip-compile form puts each ``--hash=`` on its own
-    continuation line). Blank lines, ``#`` comments, and ``-``/``--``
-    option directives (e.g. ``--index-url``, ``-r includes``) are not
-    package specs and are exempt. A file with no spec entries at all
-    is trivially complete (the empty set is fully pinned).
+def _split_option_token(head: str) -> tuple[str, str | None]:
+    """Split an option token into (option, inline value).
+
+    Handles ``--opt=value``, the short attached form (``-rbase.txt``),
+    and a bare option whose value is the next token (None here).
     """
-    try:
-        lines = req_path.read_text(encoding="utf-8").splitlines()
-    except OSError as e:
-        return f"cannot read requirements.txt: {e}"
+    if "=" in head:
+        opt, _, value = head.partition("=")
+        return opt, value or None
+    if head.startswith("-") and not head.startswith("--") and len(head) > 2:
+        return head[:2], head[2:]
+    return head, None
+
+
+def _logical_entries(lines: list[str]) -> list[tuple[int, str]]:
+    """Join backslash-continued physical lines into logical entries.
+
+    The pip-compile form puts each ``--hash=`` on its own
+    continuation line; an entry is checked as a whole.
+    """
     entries: list[tuple[int, str]] = []
     start: int | None = None
     buf: list[str] = []
@@ -546,16 +560,142 @@ def check_requirements_frozen(req_path: Path) -> str | None:
         buf = []
     if buf and start is not None:
         entries.append((start, " ".join(buf)))
-    for lineno, entry in entries:
-        s = entry.strip()
-        if not s or s.startswith("#") or s.startswith("-"):
+    return entries
+
+
+def _strip_inline_comment(entry: str) -> str:
+    """Remove an inline comment: whitespace followed by ``#``.
+
+    A ``--hash`` appearing only inside a comment is not a hash
+    (Addendum 46) — strip before looking for one.
+    """
+    return re.split(r"\s+#", entry, maxsplit=1)[0]
+
+
+def _check_requirements_file(
+    path: Path, root: Path, seen: frozenset[Path]
+) -> str | None:
+    """Check one requirements file; reason if it is not complete.
+
+    ``root`` is the checkout root (the top-level file's directory):
+    includes must resolve INSIDE it. ``seen`` guards include cycles.
+    """
+    try:
+        display = path.relative_to(root).as_posix()
+    except ValueError:
+        display = path.name
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        return f"cannot read {display}: {e}"
+    for lineno, entry in _logical_entries(lines):
+        body = _strip_inline_comment(entry).strip()
+        if not body or body.startswith("#"):
             continue
-        if not re.search(r"--hash(?:=|\s|$)", entry):
+        tokens = body.split()
+        head = tokens[0]
+        if head.startswith("-"):
+            opt, inline = _split_option_token(head)
+            if opt in _FROZEN_GLOBAL_OPTIONS:
+                continue
+            if opt in _FROZEN_INCLUDE_OPTIONS:
+                target = inline
+                if target is None and len(tokens) > 1:
+                    target = tokens[1]
+                reason = _check_include(
+                    target, path, root, seen, display, lineno
+                )
+                if reason is not None:
+                    return reason
+                continue
+            if opt in _FROZEN_EDITABLE_OPTIONS:
+                return (
+                    f"{display} line {lineno} is an editable install "
+                    f"({head}); an editable pins no artifact "
+                    f"(not a complete lock under the Python lock rule)"
+                )
             return (
-                f"requirements.txt line {lineno} carries no --hash: "
-                f"{s[:60]} (not a complete lock under the Python lock rule)"
+                f"{display} line {lineno} uses option {opt}, which the "
+                f"Python lock rule does not exempt "
+                f"(not a complete lock under the Python lock rule)"
+            )
+        if not re.search(r"--hash(?:=|\s|$)", body):
+            return (
+                f"{display} line {lineno} carries no --hash: "
+                f"{body[:60]} (not a complete lock under the Python lock rule)"
             )
     return None
+
+
+def _check_include(
+    target: str | None,
+    including: Path,
+    root: Path,
+    seen: frozenset[Path],
+    display: str,
+    lineno: int,
+) -> str | None:
+    """Follow one -r/-c include; reason if it cannot be part of the lock."""
+    where = f"{display} line {lineno}"
+    suffix = "(not a complete lock under the Python lock rule)"
+    if not target:
+        return f"{where} includes no file {suffix}"
+    if "://" in target or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", target):
+        return (
+            f"{where} includes {target!r} by URL; an include by URL "
+            f"is not part of the checkout {suffix}"
+        )
+    resolved = (including.parent / target).resolve()
+    if not resolved.is_relative_to(root):
+        return (
+            f"{where} includes {target!r}, which resolves outside "
+            f"the checkout {suffix}"
+        )
+    if not resolved.is_file():
+        return f"{where} includes {target!r}, which does not exist {suffix}"
+    if resolved in seen:
+        return None  # include cycle: already vetted on this chain
+    return _check_requirements_file(
+        resolved, root, seen | {resolved}
+    )
+
+
+def check_requirements_frozen(req_path: Path) -> str | None:
+    """Check that requirements.txt is a COMPLETE lock. Reason if not.
+
+    REG-A (docs/registration/python-lock-rule.md item 1, WO-8.1): a
+    requirements file is a complete lock only when every package-spec
+    entry carries ``--hash``. An ``==``-pinned file without hashes is
+    NOT a lock under the rule — it goes through lock generation
+    instead (the WAL-76 gap: the old check accepted ``==`` alone, and
+    the file then installed with ``--no-deps``, so missing transitive
+    dependencies surfaced only as a start failure).
+
+    Addendum 46 tightens the check to an ALLOWLIST. The old check
+    skipped every option line, so it called three incomplete files
+    complete (each then failed as BUILD_FAILED under
+    ``--require-hashes`` instead of going to generation):
+
+    - an include-only file (``-r requirements/base.txt`` with the
+      include unhashed): includes are now FOLLOWED — ``-r`` /
+      ``--requirement`` and ``-c`` / ``--constraint`` targets inside
+      the checkout are checked the same way, recursively, with a
+      cycle guard; an include outside the checkout, a URL include,
+      or a missing file is not complete;
+    - an editable (``-e .``): an editable pins no artifact;
+    - a pin whose ``--hash`` appears only inside a comment: an
+      inline comment (whitespace, then ``#``) is stripped before
+      looking for ``--hash``.
+
+    Only the global pip options are exempt: ``--index-url``/``-i``,
+    ``--extra-index-url``, ``--find-links``/``-f``, ``--trusted-host``,
+    ``--pre``, ``--prefer-binary``, ``--only-binary``, ``--no-binary``.
+    Entries are logical lines (a trailing backslash continues an
+    entry). A file with no spec entries at all is trivially complete
+    (the empty set is fully pinned).
+    """
+    top = req_path.resolve()
+    return _check_requirements_file(top, top.parent, frozenset({top}))
 
 
 def _is_yarn_berry(snapshot_dir: Path) -> bool:

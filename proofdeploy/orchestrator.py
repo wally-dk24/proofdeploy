@@ -1744,11 +1744,6 @@ class Orchestrator:
         sides: list[_Side] = []
         parent_results = None
         fix_results = None
-        # WO-8.1 (REG-A item 2): the unit's ONE lock-resolution
-        # cutoff is the FIX commit's committer time — the same value
-        # for fix^ and fix, resolved once here, before either side
-        # is provisioned (never per side).
-        self._run_lock_cutoff = self._commit_cutoff(fix_sha)
         if use_sandbox:
             # WO-7.3: resolve the run's network mode ONCE, before the
             # first side. A refusal propagates (typed environment
@@ -1756,6 +1751,14 @@ class Orchestrator:
             # a failed run, never a skip and never a scored result.
             self._resolve_run_network_mode()
         try:
+            # WO-8.1 (REG-A item 2): the unit's ONE lock-resolution
+            # cutoff is the FIX commit's committer time — the same
+            # value for fix^ and fix, resolved once here, before
+            # either side is provisioned (never per side). Set
+            # inside the try so the finally clears it on EVERY exit
+            # (Addendum 46): a leaked cutoff would silently become
+            # the next unit's — or a direct provision's — cutoff.
+            self._run_lock_cutoff = self._commit_cutoff(fix_sha)
             if use_sandbox:
                 sides.append(
                     self._provision_side_sandbox(
@@ -1922,6 +1925,8 @@ class Orchestrator:
                 },
             )
         finally:
+            # Addendum 46: the run cutoff dies with the run.
+            self._run_lock_cutoff = None
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
                     proc = side.provision.proc
@@ -2038,10 +2043,6 @@ class Orchestrator:
         prov_workdir = cfg.workdir / "provisioner"
         prov_workdir.mkdir(parents=True, exist_ok=True)
         runner = Provisioner(workdir=prov_workdir)
-        # WO-8.1 (REG-A item 2): the clean unit's lock-resolution
-        # cutoff is C's own committer time (tip_sha is C, resolved
-        # by _build_bundle above).
-        self._run_lock_cutoff = self._commit_cutoff(tip_sha)
         sides: list[_Side] = []
         c_results = None
         if use_sandbox:
@@ -2049,6 +2050,12 @@ class Orchestrator:
             # side is provisioned (same rule as measure_bug).
             self._resolve_run_network_mode()
         try:
+            # WO-8.1 (REG-A item 2): the clean unit's lock-resolution
+            # cutoff is C's own committer time (tip_sha is C, resolved
+            # by _build_bundle above). Set inside the try so the
+            # finally clears it on every exit (Addendum 46, as in
+            # measure_bug).
+            self._run_lock_cutoff = self._commit_cutoff(tip_sha)
             if use_sandbox:
                 sides.append(
                     self._provision_side_sandbox(cfg.rev_clean, _free_port(), unit_dir, "clean")
@@ -2160,6 +2167,8 @@ class Orchestrator:
                 },
             )
         finally:
+            # Addendum 46: the run cutoff dies with the run.
+            self._run_lock_cutoff = None
             for side in sides:
                 if side.provision and side.provision.ready and side.provision.run_id:
                     proc = side.provision.proc
