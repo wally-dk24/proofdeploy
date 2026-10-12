@@ -21,6 +21,12 @@ The WO-7.4 rules proven here:
   behind by an earlier probe can never poison this one.
 - Cleanup (stop the probe container, remove the probe network)
   happens in a ``finally`` — even when the probe itself raises.
+  Addendum 45: an ``OSError`` from the probe does NOT prove this,
+  because the probe's ``except`` catches it and a cleanup line
+  placed after the try/except would run anyway; the ``finally``
+  is only exercised by an exception the ``except`` does not catch.
+  The build network's ``finally`` cleanup is under the same rule:
+  its network must be gone after success AND after a raising run.
 - When the capability is absent, the recorded reason carries the
   connect attempts and the last error, so a refusal can be told
   apart from a race that polling should have absorbed.
@@ -32,6 +38,8 @@ unreachable reason names neither attempts nor the last error.
 """
 import json
 import subprocess
+
+import pytest
 
 import proofdeploy.sandbox as sb_mod
 
@@ -49,13 +57,17 @@ class _FakePodman:
     exist; it can be seeded with stale leftovers.
     """
 
-    def __init__(self, *, stale_networks=(), fail_isolated_run=None):
+    def __init__(
+        self, *, stale_networks=(), fail_isolated_run=None,
+        fail_build_run=None,
+    ):
         self.calls = []
         self.networks = set(stale_networks)
         self.isolated_created = []  # --internal network names, in order
         self.run_attempts = []  # (container, network) per run -d
         self.container_net = {}
         self.fail_isolated_run = fail_isolated_run
+        self.fail_build_run = fail_build_run
 
     def __call__(self, cmd, **kwargs):
         cmd = [str(c) for c in cmd]
@@ -93,7 +105,12 @@ class _FakePodman:
                 raise self.fail_isolated_run
             self.container_net[name] = net
             return _completed(cmd, 0, "", "")
-        # stop, the --uidmap probe, the build-network run: succeed.
+        if "run" in cmd and "--net" in cmd:
+            # The build-network probe run (no -d, no --name).
+            if self.fail_build_run is not None:
+                raise self.fail_build_run
+            return _completed(cmd, 0, "", "")
+        # stop and the --uidmap probe: succeed.
         return _completed(cmd, 0, "", "")
 
 
@@ -168,6 +185,65 @@ def test_probe_cleans_up_on_exception(monkeypatch):
     assert any(
         "stop" in c and container in c for c in podman.calls
     ), "probe container was not stopped after the exception"
+
+
+def test_probe_cleans_up_on_uncaught_exception(monkeypatch):
+    """Addendum 45 (M3): the test above cannot prove the cleanup
+    lives in the ``finally`` — its ``OSError`` is caught by the
+    probe's ``except``, so a cleanup line placed AFTER the
+    try/except would run and pass it too. A ``RuntimeError`` is
+    not caught: it propagates out of the probe, and only a real
+    ``finally`` still stops the container and removes the
+    network on the way out."""
+    podman = _FakePodman(
+        fail_isolated_run=RuntimeError("podman run exploded")
+    )
+    connect, _state = _flaky_socket(failures=0)
+    _patch_probe(monkeypatch, podman, connect)
+    with pytest.raises(RuntimeError):
+        sb_mod.check_sandbox_capabilities()
+    container, net = podman.run_attempts[-1]
+    assert any(
+        "network" in c and "rm" in c and net in c for c in podman.calls
+    ), "probe network was not removed after the uncaught exception"
+    assert any(
+        "stop" in c and container in c for c in podman.calls
+    ), "probe container was not stopped after the uncaught exception"
+
+
+def test_probe_build_network_removed_on_success_and_on_raise(
+    monkeypatch,
+):
+    """Addendum 45 (M6): the build network has its own ``finally``
+    cleanup, and nothing else in the suite would notice if it were
+    deleted — the probe would still report the capability, just
+    leak a ``pd-capability-probe-build-*`` network per run. The
+    network must be gone afterwards on the success path AND when
+    its ``podman run`` raises."""
+    podman = _FakePodman()
+    connect, _state = _flaky_socket(failures=0)
+    _patch_probe(monkeypatch, podman, connect)
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.build_network is True
+    assert not any(
+        n.startswith("pd-capability-probe-build-")
+        for n in podman.networks
+    ), f"build probe network leaked on success: {sorted(podman.networks)}"
+
+    podman = _FakePodman(
+        fail_build_run=OSError("podman run exploded")
+    )
+    connect, _state = _flaky_socket(failures=0)
+    _patch_probe(monkeypatch, podman, connect)
+    caps = sb_mod.check_sandbox_capabilities()
+    assert caps.build_network is False
+    assert not any(
+        n.startswith("pd-capability-probe-build-")
+        for n in podman.networks
+    ), (
+        "build probe network leaked after a raising run: "
+        f"{sorted(podman.networks)}"
+    )
 
 
 def test_probe_reason_records_attempts_and_last_error(monkeypatch):
