@@ -31,7 +31,7 @@ from proofdeploy.orchestrator import (
     Orchestrator,
     _free_port,
 )
-from proofdeploy.runpair import read_records, write_score_record
+from proofdeploy.runpair import read_records
 from proofdeploy.sandbox import (
     PODMAN,
     sandbox_evidence,
@@ -229,9 +229,26 @@ def test_case8_clean_commit_no_fail(golden):
 # ---------------------------------------------------------------------------
 
 
-def test_case9_no_canary_in_records(golden):
-    """Case 9: no committed record contains the canary token prefix
-    or this app's canary env value."""
+def test_case9_no_canary_in_records(golden, tmp_path):
+    """Case 9: no committed record contains a REAL canary token or
+    this app's canary env value. Positive controls first (Addendum
+    33): a planted real token MUST be reported, and the golden
+    apps' source-line form (the token prefix literal in code, which
+    legitimately rides in the recorded prompt) must NOT be — a
+    disabled or prefix-only scan fails one of these and turns the
+    kit red."""
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "runs.jsonl").write_text(
+        '{"t": "pdcanary-0123456789abcdef"}\n', encoding="utf-8"
+    )
+    assert kit.scan_records_for_canary(planted, golden.canary) != []
+    source_form = tmp_path / "source-form"
+    source_form.mkdir()
+    (source_form / "runs.jsonl").write_text(
+        'token = "pdcanary-" + secrets.token_hex(8)\n', encoding="utf-8"
+    )
+    assert kit.scan_records_for_canary(source_form, golden.canary) == []
     violations = kit.scan_records_for_canary(golden.records_dir, golden.canary)
     assert violations == [], violations
     # The canary env value is not public, so it must not even appear
@@ -241,30 +258,33 @@ def test_case9_no_canary_in_records(golden):
 
 
 def test_case10_record_replays_to_same_verdict(golden):
-    """Case 10: re-scoring the COMMITTED evidence reproduces the
-    stored verdict, for both the bug run and the clean run."""
-    repo = golden.records_dir
-    bug_score_path = write_score_record(
-        repo, repo,
-        evidence_record_id=golden.bug["evidence_record_id"],
-        run_kind="bug",
-        bug_id=f"conformance-{golden.app}",
-    )
-    assert bug_score_path is not None
-    clean_score_path = write_score_record(
-        repo, repo,
-        evidence_record_id=golden.clean["evidence_record_id"],
-        run_kind="clean",
-        clean_id=f"conformance-{golden.app}",
-    )
-    assert clean_score_path is not None
-    scores = [
-        r for r in read_records(repo) if r.get("record_type") == "score"
-    ]
-    bug_scores = [s for s in scores if s.get("run_kind") == "bug"]
-    clean_scores = [s for s in scores if s.get("run_kind") == "clean"]
-    assert bug_scores[-1]["verdict"] == golden.scores["bug"]["verdict"]
-    assert clean_scores[-1]["verdict"] == golden.scores["clean"]["verdict"]
+    """Case 10 (Addendum 33): replaying the committed evidence —
+    re-evaluating every probe's assertions against the RECORDED
+    responses — reproduces the stored verdict. A tampered recorded
+    response changes the replay outcome even though the stored
+    per-probe verdicts are untouched, proving the replay re-checks
+    the assertions instead of echoing the stored verdicts."""
+    import copy
+
+    evidence = golden.evidence["bug"]
+    stored = golden.scores["bug"]["verdict"]
+    assert kit.replay_verdict(evidence) == stored
+    tampered = copy.deepcopy(evidence)
+    flipped = 0
+    for result in tampered["fix_results"]:
+        try:
+            body = json.loads(result.get("http_body") or "")
+        except json.JSONDecodeError:
+            continue
+        if isinstance(body, dict) and "done" in body:
+            body["done"] = True  # the buggy value, on the fix side
+            result["http_body"] = json.dumps(body)
+            flipped += 1
+    assert flipped >= 1
+    # The stored verdicts in the tampered copy still claim the
+    # catch; the replay must not.
+    assert tampered["fix_results"][0]["verdict"] == "pass"
+    assert kit.replay_verdict(tampered) != stored
 
 
 # ---------------------------------------------------------------------------

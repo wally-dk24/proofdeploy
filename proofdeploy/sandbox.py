@@ -321,6 +321,25 @@ def _podman_base() -> list[str]:
     return list(PODMAN)
 
 
+def _head_tail(text: str, head_lines: int = 40, tail_chars: int = 2000) -> str:
+    """Keep the HEAD and the TAIL of long command output.
+
+    The old capture kept only the last 2000 characters: a tool that
+    prints its real error first and then pages of usage/help text
+    (npm does exactly this on EUSAGE) lost the error line entirely,
+    which hid the actual cause of a failing install behind the help
+    text (Addendum 33). Keep the first ``head_lines`` lines plus the
+    last ``tail_chars`` characters, with an elision marker between.
+    """
+    lines = text.splitlines()
+    if len(lines) <= head_lines:
+        return text
+    head = "\n".join(lines[:head_lines])
+    tail = text[-tail_chars:]
+    elided = max(len(lines) - head_lines - tail.count("\n"), 0)
+    return f"{head}\n[… {elided} lines elided …]\n{tail}"
+
+
 def _run_rc(
     args: list[str], timeout: int, logs: list[str]
 ) -> int:
@@ -342,9 +361,9 @@ def _run_rc(
         logs.append(f"timed out after {timeout}s")
         return -1
     if proc.stdout:
-        logs.append(proc.stdout[-2000:])
+        logs.append(_head_tail(proc.stdout))
     if proc.stderr:
-        logs.append(proc.stderr[-2000:])
+        logs.append(_head_tail(proc.stderr))
     return proc.returncode
 
 
@@ -752,6 +771,10 @@ class Sandbox:
         for i, step in enumerate(steps):
             step_env = dict(full_env)
             step_env.update(step.get("env") or {})
+            # Strip secrets AFTER the step env is merged (Addendum
+            # 33): a blocklisted key arriving via a step's own env
+            # must not reach the container either.
+            step_env = _strip_secret_env(step_env)
             args = self._common_args(checkout, f"sandbox-install-{i}", True)
             for k, v in step_env.items():
                 args += ["-e", f"{k}={v}"]

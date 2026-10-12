@@ -17,6 +17,14 @@ different stack:
 | `golden/node-pnpm-sqlite` | Express + better-sqlite3 | `pnpm-lock.yaml` → corepack `pnpm@9.15.0 install --frozen-lockfile` | `packageManager: pnpm@9.15.0`; `engines.node: >=20 <25` |
 | `golden/python-flask-sqlite` | Flask + stdlib sqlite3 | fully hashed `requirements.txt` | `requires-python: >=3.13,<3.14` → python 3.13.16 |
 
+`golden/node-pnpm-sqlite/variant-node26/` holds a two-file overlay
+(package.json + regenerated pnpm-lock.yaml) used by
+`tests/test_node26_corepack.py`: engines widened to the Node 26
+row and better-sqlite3 bumped to ^13.0.3 (11.10.0's C++ predates
+Node 26's V8), proving a packageManager-pinned app provisions on
+the 26 row — where corepack is not bundled and the adapter
+bootstraps it explicitly.
+
 Each app ships as revision **trees** under `golden/<app>/revisions/`
 (`base`, `bug`, `intermediate`, `fix-parent`, `fix`, `clean`,
 `lockmismatch`). `kit.materialize_golden()` rebuilds the app's own

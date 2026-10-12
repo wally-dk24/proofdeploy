@@ -9,7 +9,9 @@ The test clones the repo (shallow), adds a proofdeploy.yml contract
 as a local commit, and provisions that commit through the sandbox
 executor — the same adapter-planned path as every measured run. It
 asserts READY, the plan's selected version (26.11.1), and the version
-the target reports inside the container.
+the target reports inside the container. The contract's build step
+is kuma's own ``npm run build``: the app refuses to start without
+the built frontend (``dist/index.html``).
 
 Runs in the sandbox-tests CI job; locally it skips without a capable
 sandbox (in CI a skip fails the job, per PD_REQUIRE_SANDBOX).
@@ -45,7 +47,7 @@ requires_sandbox = pytest.mark.skipif(
 pytestmark = requires_sandbox
 
 CONTRACT = """\
-build: "node --check server/server.js"
+build: "npm run build"
 start: "node --import=tsx server/server.js"
 readiness: "/setup-database-info"
 env: {}
@@ -74,6 +76,9 @@ def test_uptime_kuma_head_ready_in_sandbox(tmp_path):
         check=True, capture_output=True, timeout=600,
     )
     upstream_head = _git(repo, "rev-parse", "HEAD")
+    # Addendum 33: the upstream commit this proof provisioned, in
+    # the job log (kuma moves; the SHA pins what was exercised).
+    print(f"uptime-kuma upstream HEAD: {upstream_head}")
     (repo / "proofdeploy.yml").write_text(CONTRACT, encoding="utf-8")
     _git(repo, "config", "user.name", "conformance-kit")
     _git(repo, "config", "user.email", "kit@proofdeploy.invalid")

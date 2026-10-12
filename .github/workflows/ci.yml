@@ -25,6 +25,6 @@ jobs:
       - name: tests
         run: python -m pytest -q -W error::ResourceWarning
       - name: lint
-        run: ruff check proofdeploy tests
+        run: ruff check proofdeploy tests conformance
       - name: typecheck
-        run: mypy proofdeploy
+        run: mypy proofdeploy conformance

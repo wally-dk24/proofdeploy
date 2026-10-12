@@ -34,8 +34,8 @@ jobs:
 
       - name: Lint and typecheck
         run: |
-          python -m ruff check proofdeploy tests
-          python -m mypy proofdeploy
+          python -m ruff check proofdeploy tests conformance
+          python -m mypy proofdeploy conformance
 
       - name: Run full test suite
         # The full suite (not just the sandbox tests): the sandbox

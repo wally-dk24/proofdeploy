@@ -217,6 +217,22 @@ def check_sandbox_runtime(
     return image_version, image_digest, None
 
 
+def _first_error_line(lines: list) -> str | None:
+    """The first concrete error line in a list of log entries
+    (Addendum 33): an ``npm error`` / ``ERR_PNPM_`` / ``ERROR:`` line
+    names WHY an install failed, where the bare step failure does
+    not. Entries may be multi-line blobs; scan line by line."""
+    for entry in lines:
+        for line in str(entry).splitlines():
+            if (
+                "npm error" in line
+                or "ERR_PNPM_" in line
+                or "ERROR:" in line
+            ):
+                return line.strip()[:300]
+    return None
+
+
 def _sandbox_step_command(cmd: str, runtime: str = "python") -> str:
     """Render a contract step for the sandbox (WO-7 plan executor).
 
@@ -1174,10 +1190,17 @@ class Orchestrator:
         )
         if not install_ok:
             logs.extend(sb.log)
-            logs.append("sandbox install failed")
+            # Addendum 33: name the install's first real error line
+            # in the provision reason — "sandbox install failed"
+            # alone hid the cause behind pages of usage text.
+            first_error = _first_error_line(logs)
+            reason = "sandbox install failed"
+            if first_error:
+                reason = f"sandbox install failed: {first_error}"
+            logs.append(reason)
             return self._sandbox_failed_side(
                 sb, rev, sha, snapshot, contract, logs,
-                ProvisionStatus.BUILD_FAILED, "sandbox install failed",
+                ProvisionStatus.BUILD_FAILED, reason,
                 runtime_name, image_version, image_digest, lockfile_sha, plan,
                 package_manager=plan.package_manager,
                 executed_steps=executed,

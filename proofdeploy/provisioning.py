@@ -376,6 +376,23 @@ class PythonAdapter:
         )
 
 
+# Corepack is not bundled with Node from version 25 onward (verified
+# against the pinned node:26.11.1 image), so a packageManager-pinned
+# plan on those rows bootstraps it explicitly at this pinned version,
+# installed via npm (present on every Node row) as an install step.
+COREPACK_BOOTSTRAP_VERSION = "0.36.0"
+
+
+def _node_major_needs_corepack_bootstrap(version: Any) -> bool:
+    """True when the selected Node row does not bundle corepack."""
+    if not version:
+        return False
+    try:
+        return int(str(version).split(".")[0]) >= 25
+    except ValueError:
+        return False
+
+
 class NodeAdapter:
     """Node: frozen installs planned from the lockfile.
 
@@ -478,6 +495,27 @@ class NodeAdapter:
                 frozen_args = frozen_args[1:]
             argv = [*corepack_prefix, *frozen_args]
             step_env = {"COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+        steps: list[PlanStep] = []
+        if step_env and _node_major_needs_corepack_bootstrap(
+            image.get("selected_version")
+        ):
+            # Corepack is not bundled from Node 25 onward (verified on
+            # the pinned node:26.11.1 image: `corepack: command not
+            # found`, npm present). A packageManager-pinned install on
+            # those rows first installs a pinned corepack via npm —
+            # npm ships on every Node row — as its own install step,
+            # recorded like every other executed step (Addendum 31).
+            steps.append(
+                PlanStep(
+                    phase="install",
+                    argv=[
+                        "npm", "install", "-g",
+                        f"corepack@{COREPACK_BOOTSTRAP_VERSION}",
+                    ],
+                )
+            )
+        steps.append(PlanStep(phase="install", argv=argv, env=step_env))
+        steps.extend(_contract_steps(contract))
         return InstallPlan(
             **base,
             lockfile_name=lockfile_name,
@@ -486,10 +524,7 @@ class NodeAdapter:
             package_manager_version=(
                 pm_version if pm_name == manager else None
             ),
-            steps=[
-                PlanStep(phase="install", argv=argv, env=step_env),
-                *_contract_steps(contract),
-            ],
+            steps=steps,
             persisted_dirs=["node_modules"],
         )
 

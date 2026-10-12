@@ -42,6 +42,7 @@ skipping.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -130,7 +131,7 @@ def load_probes(app: str) -> dict[str, list[dict[str, Any]]]:
     }
 
 
-def canned_runner(probes: list[dict[str, Any]]):
+def canned_runner(probes: list[dict[str, Any]]) -> Any:
     """A model_runner that answers with fixed probes (NO model).
 
     The author is canned for conformance: the same probes on every
@@ -156,18 +157,90 @@ def canary_env_value(app: str) -> str:
     return str(data["env"]["CANARY_SECRET"])
 
 
+_CANARY_TOKEN_RE = re.compile(r"pdcanary-[0-9a-f]{16}")
+
+
 def scan_records_for_canary(records_dir: Path, canary_value: str) -> list[str]:
-    """Case 9's scan: every committed record file is searched for the
-    canary token prefix and the appʼs canary env value. Returns a list
-    of violation descriptions (empty = clean).
+    """Case 9's scan: no committed record may contain a REAL canary
+    token (``pdcanary-`` + the 16 hex chars the apps mint) or the
+    canary env value, in ANY file under the records directory.
+
+    The bare prefix is NOT a hit: the golden apps' own source line
+    (``token = "pdcanary-" + secrets.token_hex(8)``) legitimately
+    rides in the recorded author prompt whenever the diff touches
+    the app file — that is the token FORMAT in code, not a leaked
+    token (Addendum 33: the scan was a false positive on it). A real
+    leak carries the full token or the env value, and both are
+    caught here. Returns violation descriptions (empty = clean).
     """
     violations: list[str] = []
-    log = records_dir / "runs.jsonl"
-    files = [log] if log.is_file() else []
-    for path in files:
-        text = path.read_text(encoding="utf-8")
-        if CANARY_PREFIX in text:
-            violations.append(f"{path.name}: contains {CANARY_PREFIX!r}")
+    for path in sorted(Path(records_dir).rglob("*")):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if _CANARY_TOKEN_RE.search(text):
+            violations.append(f"{path.name}: contains a canary token")
         if canary_value and canary_value in text:
             violations.append(f"{path.name}: contains the canary env value")
     return violations
+
+
+def replay_verdict(evidence: dict) -> str:
+    """Case 10's replay (Addendum 33): re-evaluate every probe's
+    assertions OFFLINE against the responses recorded in the
+    evidence record, then derive the verdict with the registered
+    scoring rule. This does NOT echo the stored per-probe verdicts:
+    tampering with a recorded response changes the outcome.
+
+    Returns the stored-verdict vocabulary: "candidate_catch",
+    "no_catch", or "inconclusive"."""
+    from proofdeploy.executor import (
+        InconclusiveReason,
+        ProbeResult,
+        Verdict,
+        _check_assertion,
+    )
+    from proofdeploy.runpair import RunPairVerdict, score_run_pair_detailed
+
+    probes = evidence.get("parsed_probes") or []
+
+    def rebuild(results: list | None) -> list:
+        rebuilt = []
+        for result in results or []:
+            idx = result.get("probe_index", 0)
+            probe = probes[idx] if 0 <= idx < len(probes) else {}
+            if not result.get("sent", True):
+                rebuilt.append(ProbeResult(
+                    probe_index=idx, verdict=Verdict.INCONCLUSIVE,
+                    reason=InconclusiveReason.PROBE, sent=False,
+                ))
+                continue
+            verdict = Verdict.PASS
+            reason = None
+            for assertion in probe.get("assert") or []:
+                passed, _detail, inc_reason = _check_assertion(
+                    assertion,
+                    result.get("http_status"),
+                    result.get("http_headers") or {},
+                    result.get("http_body") or "",
+                    None,
+                )
+                if passed is False:
+                    verdict = Verdict.FAIL
+                    reason = None
+                    break
+                if passed is None:
+                    verdict = Verdict.INCONCLUSIVE
+                    reason = inc_reason
+            rebuilt.append(ProbeResult(
+                probe_index=idx, verdict=verdict, reason=reason, sent=True,
+            ))
+        return rebuilt
+
+    detailed = score_run_pair_detailed(
+        rebuild(evidence.get("fix_parent_results")),
+        rebuild(evidence.get("fix_results")),
+    )
+    if detailed.verdict == RunPairVerdict.CATCH:
+        return "candidate_catch"
+    return str(detailed.verdict.value)

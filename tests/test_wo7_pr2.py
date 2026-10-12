@@ -25,6 +25,7 @@ executor, no executed_steps on a provision) and passes on the branch.
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -703,3 +704,228 @@ def test_leak_check_still_refuses_other_secrets_in_contract_file(tmp_path):
     orch = Orchestrator(cfg)
     with pytest.raises(SecretLeakError):
         orch._leak_check_bundle(bundle, "a clean prompt", contract)
+
+
+# ---------------------------------------------------------------------------
+# Addendum 33: log capture (head + tail), secret-strip order in
+# install_steps, corepack bootstrap on Node >= 25 rows, the canary
+# scan's positive controls, and offline assertion replay (case 10).
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "conformance"))
+import kit  # noqa: E402
+
+
+def test_run_rc_keeps_head_and_tail_of_long_output(monkeypatch):
+    """A failed step prints its real error FIRST, then pages of usage
+    text: the old capture kept only the last 2000 chars and lost the
+    error line entirely (the WO-7 PR 2 Node-install misdiagnosis).
+    The capture must keep the head (first 40 lines) AND the tail,
+    with an elision marker between them."""
+    from proofdeploy import sandbox as sandbox_mod
+
+    big = "npm error code EUSAGE\n" + "".join(
+        f"filler line {i}\n" for i in range(5000)
+    ) + "LASTLINE\n"
+
+    def fake_run(args, capture_output, text, timeout):
+        return SimpleNamespace(stdout=big, stderr="", returncode=1)
+
+    monkeypatch.setattr(sandbox_mod.subprocess, "run", fake_run)
+    logs: list[str] = []
+    rc = sandbox_mod._run_rc(["podman", "run", "img"], 10, logs)
+    assert rc == 1
+    joined = "\n".join(logs)
+    assert "npm error code EUSAGE" in joined
+    assert "LASTLINE" in joined
+    assert "lines elided" in joined
+
+
+def test_install_steps_strips_secret_step_env(monkeypatch, tmp_path):
+    """Secrets are stripped AFTER the per-step env is merged: a
+    blocklisted key arriving via a step's own env must never reach
+    the container's -e args, while legitimate step env survives."""
+    from proofdeploy import sandbox as sandbox_mod
+    from proofdeploy.sandbox import Sandbox, SandboxConfig
+
+    captured: list[list[str]] = []
+
+    def fake_run(args, timeout, logs):
+        captured.append(list(args))
+        return True, ""
+
+    monkeypatch.setattr(sandbox_mod, "_run", fake_run)
+    sb = Sandbox(SandboxConfig(image="img:tag", allow_no_userns=True))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    steps = [{
+        "phase": "install",
+        "command": "true",
+        "env": {
+            "GROQ_API_KEY": "shh-secret",
+            "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+        },
+    }]
+    results = sb.install_steps(checkout, steps, {}, {})
+    assert results == [{"phase": "install", "exit_code": 0}]
+    flat = [a for args in captured for a in args]
+    assert not any("GROQ_API_KEY" in a for a in flat)
+    assert "COREPACK_ENABLE_DOWNLOAD_PROMPT=0" in flat
+
+
+def _install_steps(plan):
+    return [s for s in plan.steps if s.phase == "install"]
+
+
+def test_node26_pin_plan_bootstraps_corepack(tmp_path):
+    """Corepack is not bundled from Node 25 onward: a packageManager-
+    pinned app selecting the 26 row gets an explicit, pinned corepack
+    bootstrap step BEFORE the corepack install step."""
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={
+            "name": "t",
+            "packageManager": "pnpm@9.15.0",
+            "engines": {"node": ">=26 <27"},
+        },
+        lockfiles={"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
+    )
+    plan = plan_provisioning(snap, _contract())
+    assert plan.refusal is None
+    assert plan.selected_version == "26.11.1"
+    assert plan.package_manager_version == "9.15.0"
+    steps = _install_steps(plan)
+    assert len(steps) == 2
+    assert steps[0].argv == ["npm", "install", "-g", "corepack@0.36.0"]
+    assert steps[1].argv == [
+        "corepack", "pnpm@9.15.0", "install", "--frozen-lockfile",
+    ]
+
+
+def test_node24_pin_plan_has_no_corepack_bootstrap(tmp_path):
+    """Node 24 still bundles corepack: no bootstrap step there."""
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={
+            "name": "t",
+            "packageManager": "pnpm@9.15.0",
+            "engines": {"node": ">=20 <25"},
+        },
+        lockfiles={"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
+    )
+    plan = plan_provisioning(snap, _contract())
+    assert plan.refusal is None
+    assert plan.selected_version == "24.21.0"
+    steps = _install_steps(plan)
+    assert len(steps) == 1
+    assert steps[0].argv == [
+        "corepack", "pnpm@9.15.0", "install", "--frozen-lockfile",
+    ]
+
+
+def test_sandbox_install_failure_reason_names_first_error_line(
+    monkeypatch, tmp_path
+):
+    """Addendum 33: the provision reason for a failed install names
+    the install's first concrete error line — not just "sandbox
+    install failed" — so the cause survives in the record."""
+    from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps({"name": "t"}) + "\n", encoding="utf-8"
+    )
+    (snap / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (snap / "server.js").write_text("// app\n", encoding="utf-8")
+    contract = RepoContract(
+        build="node --check server.js",
+        start="node server.js",
+        readiness="/health",
+        env={},
+    )
+
+    def failing_install(self, checkout, steps, env, proxy_env, timeout=600):
+        self.log.append(
+            "added 0 packages\n"
+            "npm error code EUSAGE\n"
+            "npm error some detail\n"
+            "pages of usage text"
+        )
+        return [{"phase": steps[0]["phase"], "exit_code": 1}]
+
+    orch = _stub_sandbox(monkeypatch, snap, contract, failing_install)
+    side = orch._provision_side_sandbox("fakerev", 18096, snap / "unit", "t")
+    assert side.provision.status == ProvisionStatus.BUILD_FAILED
+    assert side.provision.reason == (
+        "sandbox install failed: npm error code EUSAGE"
+    )
+
+
+def test_canary_scan_positive_controls(tmp_path):
+    """The kit scan fails on a REAL canary token or the canary env
+    VALUE anywhere under the records dir, and stays silent on the
+    golden apps' source-line form (the token prefix literal in code,
+    which legitimately rides in the recorded prompt)."""
+    records = tmp_path / "records"
+    records.mkdir()
+    (records / "runs.jsonl").write_text(
+        'token = "pdcanary-" + secrets.token_hex(8)\n', encoding="utf-8"
+    )
+    assert kit.scan_records_for_canary(records, "pdcanary-env-zz42") == []
+    (records / "runs.jsonl").write_text(
+        '{"http_body": "{\\"token\\": \\"pdcanary-0123456789abcdef\\"}"}\n',
+        encoding="utf-8",
+    )
+    assert kit.scan_records_for_canary(records, "pdcanary-env-zz42") != []
+    (records / "runs.jsonl").write_text('{"clean": true}\n', encoding="utf-8")
+    (records / "extra.json").write_text(
+        '{"env": "pdcanary-env-zz42"}\n', encoding="utf-8"
+    )
+    assert kit.scan_records_for_canary(records, "pdcanary-env-zz42") != []
+
+
+def _replay_evidence():
+    probe = {
+        "act": {"method": "GET", "path": "/notes/1"},
+        "setup": [],
+        "assert": [
+            {"type": "status", "equals": 200},
+            {"type": "body",
+             "json_path": {"path": "done", "equals": False}},
+        ],
+    }
+    parent = {
+        "probe_index": 0, "verdict": "fail", "sent": True,
+        "http_status": 200, "http_headers": {},
+        "http_body": json.dumps({"done": True}), "reason": None,
+    }
+    fix = {
+        "probe_index": 0, "verdict": "pass", "sent": True,
+        "http_status": 200, "http_headers": {},
+        "http_body": json.dumps({"done": False}), "reason": None,
+    }
+    return {
+        "record_type": "evidence", "run_kind": "bug",
+        "parsed_probes": [probe],
+        "fix_parent_results": [parent], "fix_results": [fix],
+    }
+
+
+def test_replay_rechecks_assertions_against_recorded_responses():
+    """Case 10 (Addendum 33): replay re-evaluates each probe's
+    assertions against the RECORDED response — it does not echo the
+    stored verdicts. The untouched record replays to the stored
+    verdict; a tampered recorded response changes the outcome even
+    though the stored per-probe verdicts still claim the catch."""
+    import copy
+
+    evidence = _replay_evidence()
+    assert kit.replay_verdict(evidence) == "candidate_catch"
+    tampered = copy.deepcopy(evidence)
+    tampered["fix_results"][0]["http_body"] = json.dumps({"done": True})
+    # The stored verdicts are untouched by the tamper: a re-score
+    # would still report the catch. The replay must not.
+    assert tampered["fix_results"][0]["verdict"] == "pass"
+    assert kit.replay_verdict(tampered) == "no_catch"
