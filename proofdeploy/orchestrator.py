@@ -54,7 +54,9 @@ from proofdeploy.executor import (
 from proofdeploy.fixture import (
     assemble_author_bundle,
     create_snapshot,
+    template_filename,
     template_hash,
+    template_path,
 )
 from proofdeploy.leakcheck import (
     assert_no_secrets,
@@ -490,12 +492,18 @@ class Orchestrator:
         contract = load_contract(snapshot.dir / "proofdeploy.yml")
 
         bundle_dir = unit_dir / "author-bundle"
+        # REG-B: the template choice is mechanical, made here from the
+        # parsed contract — before any model call. A declared credential
+        # (top-level auth:) selects the credential template; anything
+        # else selects the no-credential template.
+        selected_template = template_path(template_filename(contract.auth is not None))
         bundle = assemble_author_bundle(
             diff_path=diff_path,
             snapshot_dir=snapshot.dir,
             yml_fixture=contract.fixture,
             output_dir=bundle_dir,
-            expected_template_hash=template_hash(),
+            expected_template_hash=template_hash(selected_template),
+            template_file=selected_template,
             source_sha=snapshot.sha,
             diff_range=f"{base_sha}..{tip_sha}",
             skill_path=cfg.skill_path,

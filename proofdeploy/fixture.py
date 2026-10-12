@@ -42,11 +42,34 @@ BUNDLE_ALLOWLIST_NO_SKILL = ("diff.patch", "snapshot", "fixture-description.txt"
 EXPECTED_SKILL_HASH = "e42f12d71ea9f5ceee0f6d13b553f7cb13426954053db684ae4e2a6a8d73f5f9"
 
 TEMPLATE_FILENAME = "fixture_template.txt"
+NO_CREDENTIAL_TEMPLATE_FILENAME = "fixture_template_nocredential.txt"
+
+# Registered sha256 of both frozen templates (REG-B registration,
+# docs/registration/fixture-template-nocredential.md item 4). Any change
+# to either file invalidates prior runs that used it; the answer-key
+# check verifies the selected template against these values.
+REGISTERED_TEMPLATE_SHA256 = {
+    TEMPLATE_FILENAME: "0994d1e367ddb3c679e750451dd67eab3a3d974fc1620b7f750216cdcdf0323b",
+    NO_CREDENTIAL_TEMPLATE_FILENAME: (
+        "6cb8edafa3211ccd3c275648bf3a2cc5ddadbbc876aa65d8105be5186b4188e9"
+    ),
+}
 
 
-def template_path() -> Path:
-    """Path to the frozen template file shipped with the package."""
-    return Path(__file__).with_name(TEMPLATE_FILENAME)
+def template_filename(declares_credential: bool) -> str:
+    """REG-B item 3: the template choice is mechanical.
+
+    A contract that declares a credential (a top-level `auth:` mapping)
+    uses the credential template; any other contract uses the
+    no-credential template. The choice is made before any model call,
+    by the caller, from the parsed contract alone.
+    """
+    return TEMPLATE_FILENAME if declares_credential else NO_CREDENTIAL_TEMPLATE_FILENAME
+
+
+def template_path(filename: str | None = None) -> Path:
+    """Path to a frozen template file shipped with the package."""
+    return Path(__file__).with_name(filename or TEMPLATE_FILENAME)
 
 
 def template_hash(path: str | Path | None = None) -> str:
@@ -64,22 +87,27 @@ def _strip_comments(text: str) -> str:
 def render_description(template_text: str, fields: dict[str, str]) -> str:
     """Fill the template's {placeholders} from the yml fixture mapping.
 
-    Fail-closed: every TEMPLATE_FIELD must be present and a non-empty string;
-    after substitution, any remaining {...} other than ${AUTH_TOKEN} raises.
-    ${AUTH_TOKEN} passes through untouched for the runner to inject.
-    """
-    missing = [f for f in TEMPLATE_FIELDS if not fields.get(f)]
-    if missing:
-        raise ValueError(f"fixture mapping missing fields: {', '.join(missing)}")
-    for f in TEMPLATE_FIELDS:
-        if not isinstance(fields[f], str):
-            raise ValueError(f"fixture field '{f}' must be a string")
+    Fail-closed: every field the template uses must be present and a
+    non-empty string; after substitution, any remaining {...} other than
+    ${AUTH_TOKEN} raises. ${AUTH_TOKEN} passes through untouched for the
+    runner to inject.
 
+    REG-B: which fields are required follows the template. The credential
+    template uses all five fields; the no-credential template has no
+    {auth_scope}, so auth_scope is not required when it is used.
+    """
     body = _strip_comments(template_text)
     # Protect the runner placeholder from brace scanning, then restore it.
     sentinel = "\x00AUTH_TOKEN\x00"
     body = body.replace("${AUTH_TOKEN}", sentinel)
-    for f in TEMPLATE_FIELDS:
+    used = [f for f in TEMPLATE_FIELDS if "{" + f + "}" in body]
+    missing = [f for f in used if not fields.get(f)]
+    if missing:
+        raise ValueError(f"fixture mapping missing fields: {', '.join(missing)}")
+    for f in used:
+        if not isinstance(fields[f], str):
+            raise ValueError(f"fixture field '{f}' must be a string")
+    for f in used:
         body = body.replace("{" + f + "}", fields[f])
     if "{" in body or "}" in body:
         raise ValueError(
@@ -277,6 +305,12 @@ def assemble_author_bundle(
     the registered skill content. In no_skill mode (the baseline arm), the
     bundle omits skill-author.md and the manifest records no skill hash.
 
+    REG-B: the caller selects the template mechanically from the contract
+    (see template_filename) and identifies it via template_file +
+    expected_template_hash; the manifest records the selection as
+    fixture_template {file, sha256} so the answer-key check can recompute
+    it from the contract and refuse a mismatch.
+
     Fail-closed throughout: template hash mismatch, skill hash mismatch,
     non-empty output dir, `.git` at any depth in the snapshot, symlinks in
     the snapshot, or a final bundle whose contents differ from the allowlist
@@ -344,6 +378,7 @@ def assemble_author_bundle(
     manifest: dict[str, Any] = {
         "assembled_at": datetime.now(timezone.utc).isoformat(),
         "template_sha256": actual_hash,
+        "fixture_template": {"file": tpath.name, "sha256": actual_hash},
         "allowlist": list(allowlist),
         "snapshot_tree_sha256": _tree_hash(out_snap),
         "files": {

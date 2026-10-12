@@ -31,6 +31,7 @@ regardless of length when the record is stored.
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
@@ -213,19 +214,55 @@ def check_bundle_answer_key(
             )
         skill_text = skill_path.read_text(encoding="utf-8")
 
-    # 5. The fixture description matches its approved hash: re-render
-    #    from the approved frozen template and B's fixture, byte-compare.
-    from proofdeploy.fixture import render_description, template_hash, template_path
+    # 5. The fixture description matches the approved template for B's
+    #    contract (REG-B). The template choice is mechanical: a top-level
+    #    auth: mapping in B's proofdeploy.yml selects the credential
+    #    template, anything else the no-credential template. Re-derive
+    #    the selection from B's contract (never from the manifest),
+    #    verify the selected template against its registered sha256,
+    #    verify the manifest's fixture_template record against the
+    #    recomputation, re-render, and byte-compare.
+    from proofdeploy.fixture import (
+        REGISTERED_TEMPLATE_SHA256,
+        render_description,
+        template_filename,
+        template_path,
+    )
+    from proofdeploy.yml import RepoContract
 
-    template_text = template_path().read_text(encoding="utf-8")
-    if hashlib.sha256(template_text.encode("utf-8")).hexdigest() != template_hash():
+    try:
+        yml_text = _git_text(repo_dir, "show", f"{bug_sha}:proofdeploy.yml")
+        contract = RepoContract.from_dict(yaml.safe_load(yml_text))
+    except Exception as e:
+        raise AnswerKeyLeakError(
+            f"answer-key check: cannot load B's contract: {e}"
+        ) from e
+    selected_name = template_filename(contract.auth is not None)
+    selected_path = template_path(selected_name)
+    selected_hash = hashlib.sha256(selected_path.read_bytes()).hexdigest()
+    if selected_hash != REGISTERED_TEMPLATE_SHA256[selected_name]:
         raise AnswerKeyLeakError(
             "answer-key check: fixture template is not the approved frozen template"
         )
+    if not manifest_path.is_file():
+        raise AnswerKeyLeakError("answer-key check: bundle has no manifest")
     try:
-        yml_text = _git_text(repo_dir, "show", f"{bug_sha}:proofdeploy.yml")
-        fixture_fields = yaml.safe_load(yml_text).get("fixture") or {}
-        expected_desc = render_description(template_text, fixture_fields)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise AnswerKeyLeakError(
+            f"answer-key check: bundle manifest is not readable JSON: {e}"
+        ) from e
+    if not isinstance(manifest, dict) or manifest.get("fixture_template") != {
+        "file": selected_name,
+        "sha256": selected_hash,
+    }:
+        raise AnswerKeyLeakError(
+            "answer-key check: manifest fixture_template does not match "
+            "the recomputed template selection"
+        )
+    template_text = selected_path.read_text(encoding="utf-8")
+    try:
+        expected_desc = render_description(template_text, contract.fixture)
     except Exception as e:
         raise AnswerKeyLeakError(
             f"answer-key check: cannot re-render fixture description from B: {e}"
