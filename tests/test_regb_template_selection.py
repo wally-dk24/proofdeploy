@@ -361,3 +361,86 @@ def test_answer_key_refuses_inverted_selection(tmp_path):
         check_bundle_answer_key(
             ctx["bundle"], ctx["manifest"], ctx["prompt"], **_check_kwargs(info)
         )
+
+
+# ---------------------------------------------------------------------------
+# The registered-hash comparison itself, and the assembler's fail-closed
+# hash (Addendum 48). Everywhere else the template is hashed against
+# itself or against a manifest that was written from the same file, so a
+# tampered template file is self-consistent; only the comparison against
+# REGISTERED_TEMPLATE_SHA256 refuses it. These tests point the selection
+# at a one-byte-tampered copy so that comparison is the only thing that
+# can fire.
+# ---------------------------------------------------------------------------
+
+
+def _tampered_template_copy(tmp_path, name):
+    """A copy of a frozen template with exactly one byte changed."""
+    pristine = fixture.template_path(name).read_bytes()
+    tampered = pristine.replace(b"Repository:", b"Repositorx:", 1)
+    assert tampered != pristine
+    assert len(tampered) == len(pristine)
+    path = tmp_path / name
+    path.write_bytes(tampered)
+    return path
+
+
+def _patch_template_path(monkeypatch, module, name, path):
+    """Make module.template_path resolve `name` to the tampered copy."""
+    real = module.template_path
+
+    def fake(filename=None):
+        if filename == name:
+            return path
+        return real(filename)
+
+    monkeypatch.setattr(module, "template_path", fake)
+
+
+def test_answer_key_refuses_tampered_template_file(tmp_path, monkeypatch):
+    """Plant D's target: the registered-sha256 comparison inside
+    check_bundle_answer_key. The bundle and manifest are assembled from
+    the same tampered copy, so the manifest comparison and the
+    re-render comparison both agree; only the registered-hash
+    comparison can refuse."""
+    info = _repo(tmp_path, _YML_NO_AUTH)
+    name = "fixture_template_nocredential.txt"
+    tampered = _tampered_template_copy(tmp_path, name)
+    _patch_template_path(monkeypatch, fixture, name, tampered)
+    ctx = _bundle(tmp_path, info)
+    with pytest.raises(AnswerKeyLeakError, match="approved frozen template"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_check_kwargs(info)
+        )
+
+
+def test_build_bundle_refuses_tampered_template(tmp_path, monkeypatch):
+    """The orchestrator hands the assembler the REGISTERED hash, not a
+    hash of the file itself, so assembly refuses a tampered template
+    copy before any bundle is written."""
+    from proofdeploy import orchestrator as orchestrator_mod
+    from proofdeploy.orchestrator import MeasureConfig, Orchestrator
+
+    info = _repo(tmp_path, _YML_NO_AUTH)
+    name = "fixture_template_nocredential.txt"
+    tampered = _tampered_template_copy(tmp_path, name)
+    _patch_template_path(monkeypatch, orchestrator_mod, name, tampered)
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=tmp_path / "records",
+        workdir=tmp_path / "work",
+        no_skill=True,
+        bug_id="regb-tampered",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+    )
+    unit_dir = tmp_path / "work" / "unit"
+    unit_dir.mkdir(parents=True)
+    with pytest.raises(ValueError, match="template hash mismatch"):
+        Orchestrator(cfg)._build_bundle(
+            unit_dir,
+            unit_id="regb-tampered",
+            rev_base=info["base"],
+            rev_tip=info["bug"],
+        )
