@@ -44,7 +44,13 @@ HARNESS_VERSION = "1.0.0"
 # ({provisioned, target_url, network_mode} per side) and the run's
 # resolved network mode in provenance — non-scoring fields; records
 # at 1.0.0 / 1.1.0 / 1.2.0 still load (readers default the new keys).
-SCHEMA_VERSION = "1.3.0"
+# 1.4.0 (WO-8.1 / REG-A): each side's provision carries the Python
+# lock facts — the install plan's lock_source (committed/generated)
+# with resolver, resolver version, cutoff and index URL for a
+# generated lock, and the provision's generated_lock (the generated
+# lock text and its sha256). Non-scoring fields; records at
+# 1.0.0–1.3.0 still load (readers default the new keys).
+SCHEMA_VERSION = "1.4.0"
 
 # HTTP methods the schema allows. No CONNECT, TRACE, or custom verbs.
 ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})

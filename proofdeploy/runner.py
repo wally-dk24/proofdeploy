@@ -74,6 +74,12 @@ class ProvisionResult:
     # them differently (pip flags differ host vs sandbox), so the
     # record — not the plan — is what proves what ran.
     executed_steps: list[dict] = field(default_factory=list)
+    # REG-A (WO-8.1): for a GENERATED Python lock, the generated lock
+    # text and its sha256, read back from the checkout after the
+    # resolve step ran: {"text": ..., "sha256": ...}. None for a
+    # committed lock (whose own sha256 is lockfile_sha256) and when
+    # generation never produced a file.
+    generated_lock: dict | None = None
     # Live process handle on READY. Caller-owned: the caller must terminate
     # it when done and call cleanup_run(run_id). Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
@@ -97,6 +103,7 @@ class ProvisionResult:
             "install_plan": self.install_plan,
             "install_plan_sha256": self.install_plan_sha256,
             "executed_steps": self.executed_steps,
+            "generated_lock": self.generated_lock,
             "logs": self.logs,
         }
 
@@ -110,7 +117,7 @@ LOCKFILES = {
         "bun.lock",
         "bun.lockb",
     ),
-    "python": ("uv.lock", "poetry.lock", "requirements.txt"),
+    "python": ("uv.lock", "poetry.lock", "pdm.lock", "requirements.txt"),
 }
 
 
@@ -501,24 +508,52 @@ def verify_lockfile(snapshot_dir: Path, runtime: str) -> str:
 
 
 def check_requirements_frozen(req_path: Path) -> str | None:
-    """Check that requirements.txt is frozen. Returns a reason if not.
+    """Check that requirements.txt is a COMPLETE lock. Reason if not.
 
-    Finding 4: every package-spec line must be pinned with `==`. Blank
-    lines, `#` comments, and `-`/`--` option directives (e.g. `--index-url`,
-    `-r includes`) are not package specs and are exempt.
+    REG-A (docs/registration/python-lock-rule.md item 1, WO-8.1): a
+    requirements file is a complete lock only when every package-spec
+    entry carries ``--hash``. An ``==``-pinned file without hashes is
+    NOT a lock under the rule — it goes through lock generation
+    instead (the WAL-76 gap: the old check accepted ``==`` alone, and
+    the file then installed with ``--no-deps``, so missing transitive
+    dependencies surfaced only as a start failure).
+
+    Entries are logical lines: a trailing backslash continues an
+    entry (the pip-compile form puts each ``--hash=`` on its own
+    continuation line). Blank lines, ``#`` comments, and ``-``/``--``
+    option directives (e.g. ``--index-url``, ``-r includes``) are not
+    package specs and are exempt. A file with no spec entries at all
+    is trivially complete (the empty set is fully pinned).
     """
     try:
         lines = req_path.read_text(encoding="utf-8").splitlines()
     except OSError as e:
         return f"cannot read requirements.txt: {e}"
-    for lineno, line in enumerate(lines, 1):
-        s = line.strip()
+    entries: list[tuple[int, str]] = []
+    start: int | None = None
+    buf: list[str] = []
+    for lineno, raw in enumerate(lines, 1):
+        line = raw.rstrip()
+        if start is None:
+            start = lineno
+            buf = [line]
+        else:
+            buf.append(line)
+        if line.endswith("\\"):
+            continue
+        entries.append((start, " ".join(buf)))
+        start = None
+        buf = []
+    if buf and start is not None:
+        entries.append((start, " ".join(buf)))
+    for lineno, entry in entries:
+        s = entry.strip()
         if not s or s.startswith("#") or s.startswith("-"):
             continue
-        if "==" not in s:
+        if not re.search(r"--hash(?:=|\s|$)", entry):
             return (
-                f"requirements.txt line {lineno} is not pinned with '==': "
-                f"{s[:60]} (not a frozen lockfile)"
+                f"requirements.txt line {lineno} carries no --hash: "
+                f"{s[:60]} (not a complete lock under the Python lock rule)"
             )
     return None
 
@@ -582,7 +617,12 @@ def select_package_manager(
         if lockfile_name == "uv.lock":
             return "uv", ["uv", "sync", "--frozen"]
         if lockfile_name == "poetry.lock":
-            return "poetry", ["poetry", "install"]
+            # REG-A item 1: the frozen form is `poetry install --sync`
+            # (install exactly the locked set, never update the lock).
+            return "poetry", ["poetry", "install", "--sync"]
+        if lockfile_name == "pdm.lock":
+            # REG-A item 1: `pdm sync` installs exactly the locked set.
+            return "pdm", ["pdm", "sync"]
         if lockfile_name == "requirements.txt":
             # The pip binary path is filled in by provision() (isolated venv).
             return "pip", ["pip", "install"]
@@ -900,6 +940,7 @@ class Provisioner:
         port: int,
         expected_lockfile_sha256: str | None = None,
         require_lockfile_match: bool = True,
+        lock_cutoff: Any = None,
     ) -> ProvisionResult:
         """Provision a target: install, build, migrate, seed, start, readiness.
 
@@ -952,6 +993,12 @@ class Provisioner:
             plan_provisioning,
         )
 
+        # REG-A (WO-8.1): the generated lock read back after the
+        # resolve step runs (text + sha256 for the evidence). Set
+        # once, right after the install step succeeds; _bail and the
+        # result builders below attach it when present.
+        gen_lock: dict | None = None
+
         def _bail(
             status: ProvisionStatus,
             reason: str,
@@ -962,16 +1009,23 @@ class Provisioner:
             self.cleanup_run(run_id, logs)
             result = self._fail(status, reason, logs, run_id=run_id, **kw)
             result.executed_steps = executed
+            if gen_lock is not None:
+                result.generated_lock = gen_lock
             if _plan is not None:
                 result.install_plan = _plan.to_dict()
                 result.install_plan_sha256 = _plan.sha256()
             return result
 
         # 1. Plan through the adapter: runtime detection, declared
-        # range, lockfile selection, and the frozen check all happen
-        # there now (one source of truth, shared with the sandbox).
+        # range, lockfile selection, and the REG-A completeness check
+        # all happen there now (one source of truth, shared with the
+        # sandbox). lock_cutoff is the unit's resolution cutoff for a
+        # generated Python lock (REG-A item 2) — a timestamp or a
+        # lazy zero-arg callable producing one (provisioning's
+        # LockCutoff); the adapter evaluates it only when a
+        # generated lock is planned.
         try:
-            plan = plan_provisioning(snap, contract)
+            plan = plan_provisioning(snap, contract, lock_cutoff=lock_cutoff)
         except ValueError as e:
             return _bail(ProvisionStatus.BUILD_FAILED, str(e))
         runtime = plan.runtime
@@ -1048,8 +1102,17 @@ class Provisioner:
                 lockfile_sha256=lockfile_sha,
             )
 
-        # 4. Lockfile match check (required for measured runs).
-        if require_lockfile_match and expected_lockfile_sha256 is None:
+        # 4. Lockfile match check (required for measured runs). A
+        # GENERATED lock (REG-A) has no committed lockfile to pin:
+        # the plan's lockfile_sha256 is the declared source file's
+        # hash, and the generated lock's own text + sha256 land in
+        # the evidence instead — so the "hash required" bail applies
+        # only to committed locks.
+        if (
+            require_lockfile_match
+            and expected_lockfile_sha256 is None
+            and plan.lock_source != "generated"
+        ):
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
                 "lockfile hash required for measured runs "
@@ -1241,6 +1304,36 @@ class Provisioner:
                 lockfile_sha256=lockfile_sha,
             )
 
+        # REG-A (WO-8.1): read the generated lock back for the
+        # evidence (its text and sha256 are recorded, item 4). The
+        # resolve step wrote it into the checkout; a generated plan
+        # whose file is missing after a successful install is a
+        # BUILD_FAILED, never a silent pass.
+        if plan.lock_source == "generated":
+            assert plan.generated_lockfile_name is not None
+            gen_path = snap / plan.generated_lockfile_name
+            try:
+                gen_text = gen_path.read_text(encoding="utf-8")
+            except OSError:
+                return _bail(
+                    ProvisionStatus.BUILD_FAILED,
+                    "generated lock missing after install: "
+                    f"{plan.generated_lockfile_name}",
+                    plan,
+                    runtime=runtime,
+                    runtime_version=actual_version,
+                    package_manager=package_manager,
+                    lockfile_sha256=lockfile_sha,
+                )
+            gen_lock = {
+                "text": gen_text,
+                "sha256": hashlib.sha256(gen_text.encode()).hexdigest(),
+            }
+            logs.append(
+                f"generated lock: {plan.generated_lockfile_name} "
+                f"sha256 {gen_lock['sha256'][:16]}..."
+            )
+
         # 8. Contract steps in order: build, migrate, seed (from the
         # plan's steps; the sandbox executor runs the same steps).
         for step in plan.steps:
@@ -1310,6 +1403,8 @@ class Provisioner:
             result.install_plan = plan.to_dict()
             result.install_plan_sha256 = plan.sha256()
             result.executed_steps = executed
+            if gen_lock is not None:
+                result.generated_lock = gen_lock
             return result
 
         # Addendum 31: the start step is recorded as it is issued;
@@ -1392,6 +1487,7 @@ class Provisioner:
                 install_plan=plan.to_dict(),
                 install_plan_sha256=plan.sha256(),
                 executed_steps=executed,
+                generated_lock=gen_lock,
                 proc=proc,
             )
         finally:
