@@ -177,9 +177,23 @@ def test_option_lines_are_not_spec_entries(tmp_path):
 @pytest.mark.parametrize(
     "lockfile,manager,argv",
     [
-        ("uv.lock", "uv", ["uv", "sync", "--frozen"]),
-        ("poetry.lock", "poetry", ["poetry", "install", "--sync"]),
-        ("pdm.lock", "pdm", ["pdm", "sync"]),
+        (
+            "uv.lock",
+            "uv",
+            [
+                "{checkout}/.pd-tools/bin/uv",
+                "sync",
+                "--frozen",
+                "--python",
+                "{runtime_bin}",
+            ],
+        ),
+        (
+            "poetry.lock",
+            "poetry",
+            ["{checkout}/.pd-tools/bin/poetry", "install", "--sync"],
+        ),
+        ("pdm.lock", "pdm", ["{checkout}/.pd-tools/bin/pdm", "sync"]),
     ],
 )
 def test_committed_lockfile_plans_frozen(tmp_path, lockfile, manager, argv):
@@ -195,8 +209,14 @@ def test_committed_lockfile_plans_frozen(tmp_path, lockfile, manager, argv):
     assert plan.lock_cutoff is None
     assert plan.package_manager == manager
     installs = _steps(plan)
-    assert len(installs) == 1
-    assert installs[0].argv == argv
+    # WO-8.1b: the frozen install is the LAST install step, run by
+    # the manager the plan bootstrapped into .pd-tools by hash —
+    # never a bare manager binary off PATH. (Pre-WO-8.1b the plan
+    # was the single bare argv and the sandbox refused it.)
+    assert installs[-1].argv == argv
+    assert any(
+        "--require-hashes" in (s.argv or []) for s in installs
+    ), installs
     assert find_lockfile(snap, "python") is not None
     assert find_lockfile(snap, "python")[0] == lockfile
 

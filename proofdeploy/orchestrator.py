@@ -84,6 +84,7 @@ from proofdeploy.runner import (
     Provisioner,
     ProvisionResult,
     ProvisionStatus,
+    _first_error_line,
     find_lockfile,
 )
 from proofdeploy.runpair import (
@@ -226,43 +227,10 @@ def check_sandbox_runtime(
     return image_version, image_digest, None
 
 
-_ERROR_MARKERS_STRONG = ("npm error", "ERR_PNPM_", "ELIFECYCLE", "gyp ERR!")
-_ERROR_MARKERS_GENERIC = ("ERROR:", "Error:")
-
-
-def _first_error_line(lines: list) -> str | None:
-    """The first concrete error line in a list of log entries
-    (Addendum 33/35): a strong marker line (``npm error``,
-    ``ERR_PNPM_``, ``ELIFECYCLE``, ``gyp ERR!``) names WHY an
-    install failed, where the bare step failure does not; a generic
-    ``Error:`` line is next; if nothing matches, fall back to the
-    LAST non-empty line of the output — an unmatched failure still
-    gets its most concrete line into the provision reason instead
-    of a bare "install failed". Entries may be multi-line blobs;
-    scan line by line.
-
-    The ``$ podman ...`` command echo the sandbox logs before each
-    run is NOT evidence (Addendum 38): it is skipped entirely — a
-    marker inside the echoed command must not be named, and the
-    echo must not serve as the fallback line."""
-    last_nonempty: str | None = None
-    generic: str | None = None
-    for entry in lines:
-        for line in str(entry).splitlines():
-            stripped = line.strip()
-            if stripped.startswith("$ podman"):
-                continue
-            if stripped:
-                last_nonempty = stripped
-            if any(marker in line for marker in _ERROR_MARKERS_STRONG):
-                return stripped[:300]
-            if generic is None and any(
-                marker in line for marker in _ERROR_MARKERS_GENERIC
-            ):
-                generic = stripped
-    if generic is not None:
-        return generic[:300]
-    return last_nonempty[:300] if last_nonempty else None
+# _first_error_line (Addendum 33/35) is defined in
+# proofdeploy.runner and imported above: since WO-8.1b both
+# executors surface a failed step's first error line in the
+# provision reason, so the helper has one home there.
 
 
 def _sandbox_step_command(cmd: str, runtime: str = "python") -> str:
@@ -1242,10 +1210,14 @@ class Orchestrator:
         assert lockfile_sha is not None
         logs.append(f"lockfile: {lockfile_name} sha256: {lockfile_sha[:16]}...")
         # Fail closed for managers the sandbox executor cannot run:
-        # pip for Python (uv/poetry stay refused), npm/pnpm/yarn for
-        # Node (bun stays refused).
+        # pip and the committed-lock managers for Python (WO-8.1b:
+        # uv/poetry/pdm plans carry their own hash-pinned bootstrap
+        # and frozen install, so they run), npm/pnpm/yarn for Node
+        # (bun stays refused).
         supported_managers = (
-            {"pip"} if runtime_name == "python" else {"npm", "pnpm", "yarn"}
+            {"pip", "uv", "poetry", "pdm"}
+            if runtime_name == "python"
+            else {"npm", "pnpm", "yarn"}
         )
         if plan.package_manager not in supported_managers:
             logs.append(f"sandbox: lockfile {lockfile_name} not yet supported")
@@ -1295,6 +1267,15 @@ class Orchestrator:
                 continue
             if step.executor not in (None, "sandbox"):
                 continue
+            # WO-8.1b: a step's env values render through the same
+            # placeholder mapping as its argv (e.g. the uv plan's
+            # UV_PROJECT_ENVIRONMENT={venv} must become
+            # /checkout/.venv here, the snapshot's .venv on the
+            # host). Values without tokens are unchanged.
+            step_env = {
+                key: render_argv([value], argv_mapping, [])[0]
+                for key, value in step.env.items()
+            }
             if step.argv is not None:
                 argv = render_argv(
                     step.argv,
@@ -1305,7 +1286,7 @@ class Orchestrator:
                     "phase": step.phase,
                     "command": shlex.join(argv),
                     "argv_rendered": argv,
-                    "env": dict(step.env),
+                    "env": step_env,
                 })
             elif step.shell is not None:
                 rendered = _sandbox_step_command(step.shell, runtime_name)
@@ -1313,7 +1294,7 @@ class Orchestrator:
                     "phase": step.phase,
                     "command": rendered,
                     "shell": rendered,
-                    "env": dict(step.env),
+                    "env": step_env,
                 })
         # PIP_NO_CACHE_DIR=1: pip warns the cache dir isn't writable as
         # the sandbox user; the venv removes the running-as-root warning.

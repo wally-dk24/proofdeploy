@@ -167,7 +167,8 @@ def test_bridge_socket_mount_is_short_and_outside_checkout(monkeypatch, tmp_path
 
 
 # ---------------------------------------------------------------------------
-# Test 2 (SB3): non-requirements.txt lockfiles fail closed in the sandbox.
+# Test 2 (SB3, amended by WO-8.1b): committed manager lockfiles
+# (uv.lock / poetry.lock / pdm.lock) provision in the sandbox.
 # ---------------------------------------------------------------------------
 
 
@@ -217,21 +218,32 @@ def _stub_provision_side(monkeypatch, snap: Path, install=None):
     return orch
 
 
-@pytest.mark.parametrize("lockfile", ["uv.lock", "poetry.lock"])
-def test_sandbox_rejects_non_requirements_lockfile(
-    monkeypatch, tmp_path, lockfile
+@pytest.mark.parametrize(
+    "lockfile,frozen_cmd",
+    [
+        ("uv.lock", "/checkout/.pd-tools/bin/uv sync --frozen --python python3"),
+        ("poetry.lock", "/checkout/.pd-tools/bin/poetry install --sync"),
+        ("pdm.lock", "/checkout/.pd-tools/bin/pdm sync"),
+    ],
+)
+def test_sandbox_provisions_manager_lockfile(
+    monkeypatch, tmp_path, lockfile, frozen_cmd
 ):
-    """SB3: a non-requirements.txt lockfile fails closed in the sandbox
-    path: BUILD_FAILED with "not yet supported in the sandbox".
+    """SB3, as amended by WO-8.1b: a committed uv.lock / poetry.lock
+    / pdm.lock is NO LONGER refused in the sandbox — the plan
+    carries the manager's hash-pinned bootstrap and frozen
+    install, and the sandbox runs them. (Pre-WO-8.1b this test
+    asserted the refusal: BUILD_FAILED "not yet supported in the
+    sandbox" — the defect WO-8.1b removes. The fail-closed
+    property survives for managers with no plan support, e.g.
+    bun on the Node side.) Podman-free: drives the real
+    `_provision_side_sandbox` with stubbed git/snapshot/contract/
+    podman/runtime checks; the fake install reports success and
+    the run is stopped at app start.
 
-    The sandbox pip flow can only install requirements.txt; anything
-    else must fail closed, never half-provision. Podman-free: drives
-    the real `_provision_side_sandbox` with stubbed git/snapshot/
-    contract/podman/runtime checks (the install is never reached).
-
-    Planted bug: remove the `lockfile_name != "requirements.txt"`
-    check -> the run proceeds past lockfile selection and the reason is
-    no longer "not yet supported in the sandbox" -> FAIL.
+    Planted bug: restore the pip-only manager gate -> the reason
+    is "not yet supported in the sandbox" again and no install
+    command is captured -> FAIL.
     """
     import hashlib
 
@@ -243,9 +255,8 @@ def test_sandbox_rejects_non_requirements_lockfile(
     (snap / "requirements.txt").write_text("# no third-party deps\n")
     (snap / lockfile).write_text("fake lockfile content\n")
 
-    orch = _stub_provision_side(
-        monkeypatch, snap, install=_CaptureInstall()
-    )
+    cap = _CaptureInstall()
+    orch = _stub_provision_side(monkeypatch, snap, install=cap)
 
     def _stop_after_install(self, *a, **k):
         raise SandboxError("test stops after install")
@@ -254,10 +265,13 @@ def test_sandbox_rejects_non_requirements_lockfile(
     side = orch._provision_side_sandbox("fakerev", 18080, snap / "unit", "t")
     logs = "\n".join(side.provision.logs)
 
-    assert side.provision.status == ProvisionStatus.BUILD_FAILED, logs
-    assert side.provision.reason == "not yet supported in the sandbox", logs
+    assert side.provision.reason != "not yet supported in the sandbox", logs
+    # The install ran (the fake reports every step exit 0); the run
+    # was stopped at app start, like the pip path's stubbed runs.
+    assert side.provision.status == ProvisionStatus.START_FAILED, logs
+    assert frozen_cmd in cap.commands, cap.commands
     assert lockfile in logs, logs
-    # S3: the lockfile hash is recorded even on this failure.
+    # S3: the lockfile hash is recorded.
     expected_sha = hashlib.sha256(b"fake lockfile content\n").hexdigest()
     assert side.provision.lockfile_sha256 == expected_sha
 
