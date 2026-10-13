@@ -35,6 +35,15 @@ against the pinned tools before the change was written —
   the backend name + pinned version outright. Poetry's
   ``install --sync`` is unchanged (kept per REG-A).
 
+Reviewer's owed items (2026-10-13), covered at the bottom of
+this file: (1) sdist-only locked DEPENDENCIES — the fixtures'
+locks are proven wheel-only below, and poetry/pdm plans record
+the scoped typed limitation for the general case (uv's
+sync-step cutoff governs its dependency builds too); (2) the
+build_backend field shown reaching the side's committed
+provision block in the evidence record build_evidence_record
+produces — the exact dict the orchestrator commits.
+
 And for every manager: the side's record carries the backend
 name + resolved version — the plan's fields, completed by the
 executors reading the built wheel's Generator back from the
@@ -241,11 +250,19 @@ def test_uv_with_failing_cutoff_source_records_limitation():
 
 
 def test_pdm_build_cutoff_is_a_typed_limitation():
-    from proofdeploy.provisioning import PDM_BUILD_CUTOFF_LIMITATION
+    from proofdeploy.provisioning import (
+        PDM_BUILD_CUTOFF_LIMITATION,
+        PDM_SDIST_DEPENDENCY_LIMITATION,
+    )
 
     plan = _plan("pdm", lock_cutoff=CUTOFF)
     assert plan.build_cutoff is None
-    assert plan.build_limitations == [PDM_BUILD_CUTOFF_LIMITATION]
+    # The root-build limitation first; the sdist-dependency
+    # limitation (owed item 1) rides second on the same plan.
+    assert plan.build_limitations == [
+        PDM_BUILD_CUTOFF_LIMITATION,
+        PDM_SDIST_DEPENDENCY_LIMITATION,
+    ]
     limitation = plan.build_limitations[0]
     assert limitation.startswith("build-backend-cutoff-unavailable:")
     # The reason names the mechanism that makes it a limitation,
@@ -257,12 +274,25 @@ def test_pdm_build_cutoff_is_a_typed_limitation():
         assert "EXCLUDE_NEWER" not in json.dumps(step.env)
 
 
-def test_poetry_needs_no_limitation():
-    """Poetry's root build resolves nothing from the index (the
+def test_poetry_root_build_needs_no_cutoff_limitation():
+    """Poetry's ROOT build resolves nothing from the index (the
     backend is the bootstrap-pinned poetry-core), so there is
-    nothing to constrain and no limitation to record."""
+    nothing to constrain and no CUTOFF limitation to record.
+    The one limitation on a poetry plan is the sdist-dependency
+    one (owed item 1), which is about locked dependencies, not
+    the root."""
+    from proofdeploy.provisioning import (
+        POETRY_SDIST_DEPENDENCY_LIMITATION,
+    )
+
     plan = _plan("poetry", lock_cutoff=CUTOFF)
-    assert plan.build_limitations == []
+    assert plan.build_limitations == [
+        POETRY_SDIST_DEPENDENCY_LIMITATION
+    ]
+    assert not any(
+        lim.startswith("build-backend-cutoff-unavailable:")
+        for lim in plan.build_limitations
+    )
     assert plan.build_cutoff is None
 
 
@@ -588,3 +618,125 @@ def test_host_record_carries_poetry_core_backend(tmp_path):
             result.proc.kill()
             result.proc.wait(timeout=10)
         prov.cleanup_run(result.run_id, [])
+
+
+# ---------------------------------------------------------------------------
+# Reviewer's owed item 1: sdist-only locked dependencies.
+#
+# The root-project record says nothing about how poetry / pdm
+# treat a locked DEPENDENCY that ships only as an sdist — such a
+# dependency must be BUILT at install time, and building it
+# resolves its build backend fresh. Two-part answer: the
+# committed fixtures never hit the case (their locks are proven
+# wheel-only here), and for the general case both plans record
+# the scoped typed limitation. uv records none: UV_EXCLUDE_NEWER
+# sits on the sync step and governs every resolution that step
+# performs, dependency builds included.
+# ---------------------------------------------------------------------------
+
+
+def _locked_packages(lock_text: str) -> list[str]:
+    """The [[package]] blocks of a TOML lock (light scan; the
+    fixtures' locks are small and machine-generated)."""
+    return lock_text.split("[[package]]")[1:]
+
+
+def test_fixture_locks_are_wheel_only():
+    """Every locked package in all three committed fixture
+    locks carries at least one wheel, so no fixture install
+    ever builds a dependency from an sdist. (The root project
+    itself is not a locked dependency — in uv.lock it is the
+    editable package, skipped here.)"""
+    for manager in ("poetry", "pdm"):
+        lock_name = PINNED[manager][1]
+        text = (FIXTURES / manager / lock_name).read_text(
+            encoding="utf-8"
+        )
+        blocks = _locked_packages(text)
+        assert blocks, f"{lock_name}: no locked packages parsed"
+        for block in blocks:
+            name = block.split('name = "', 1)[1].split('"', 1)[0]
+            assert ".whl" in block, (
+                f"{lock_name}: locked package {name} has no "
+                "wheel in its files — an install would build "
+                "it from its sdist"
+            )
+    uv_text = (FIXTURES / "uv" / "uv.lock").read_text(
+        encoding="utf-8"
+    )
+    for block in _locked_packages(uv_text):
+        if "source = { editable" in block:
+            continue  # the root project itself, not a dependency
+        name = block.split('name = "', 1)[1].split('"', 1)[0]
+        assert "wheels = [" in block and ".whl" in block, (
+            f"uv.lock: locked package {name} has no wheel — an "
+            "install would build it from its sdist"
+        )
+
+
+@pytest.mark.parametrize(
+    "manager,constant",
+    [
+        ("poetry", "POETRY_SDIST_DEPENDENCY_LIMITATION"),
+        ("pdm", "PDM_SDIST_DEPENDENCY_LIMITATION"),
+    ],
+)
+def test_sdist_dependency_limitation_recorded(manager, constant):
+    """The general case is on the plan, in registered wording,
+    scoped to sdist-only locked dependencies — conditional (it
+    states what happens IF a lock carries one), naming the
+    mechanism (fresh, unconstrained backend resolution) and the
+    root build's separate footing."""
+    import proofdeploy.provisioning as provisioning
+
+    limitation = getattr(provisioning, constant)
+    plan = _plan(manager, lock_cutoff=CUTOFF)
+    assert limitation in plan.build_limitations
+    assert limitation.startswith(
+        "sdist-dependency-build-unconstrained:"
+    )
+    assert "only as an sdist" in limitation
+    assert "fresh from the index" in limitation
+    assert "unconstrained by the unit cutoff" in limitation
+
+
+def test_uv_records_no_sdist_dependency_limitation():
+    """uv's cutoff is an env var on the sync step itself, so it
+    governs dependency build resolution as well as the root's —
+    no sdist limitation is recorded for uv."""
+    plan = _plan("uv", lock_cutoff=CUTOFF)
+    assert plan.build_limitations == []
+
+
+# ---------------------------------------------------------------------------
+# Reviewer's owed item 2: build_backend reaches the COMMITTED
+# evidence record — shown in the side's provision block of the
+# record build_evidence_record produces (the exact dict the
+# orchestrator commits for a run pair), surviving the JSON
+# round-trip a committed record file is. Removing build_backend
+# from ProvisionResult.to_dict fails this test.
+# ---------------------------------------------------------------------------
+
+
+def test_build_backend_in_committed_evidence_record():
+    from proofdeploy.runner import ProvisionResult, ProvisionStatus
+    from proofdeploy.runpair import build_evidence_record
+
+    provision = ProvisionResult(
+        status=ProvisionStatus.READY,
+        target_url="http://127.0.0.1:1",
+        runtime="python",
+        runtime_version="3.12",
+        package_manager="uv",
+        build_backend={"name": "setuptools", "version": "67.8.0"},
+    )
+    record = build_evidence_record(
+        run_kind="bug",
+        bug_id="owed-item-2",
+        fix_provision=provision.to_dict(),
+    )
+    committed = json.loads(json.dumps(record))
+    assert committed["fix_provision"]["build_backend"] == {
+        "name": "setuptools",
+        "version": "67.8.0",
+    }

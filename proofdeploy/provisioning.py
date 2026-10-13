@@ -68,10 +68,22 @@ to the unit's cutoff where the tool allows it (uv:
 ``UV_EXCLUDE_NEWER`` on the sync step, which a ``--frozen`` sync
 applies to the build resolution only, never to the lock's own
 files), and records a typed limitation where it cannot (pdm —
-see ``PDM_BUILD_CUTOFF_LIMITATION``). Poetry needs neither: it
-builds the root project itself with the poetry-core pinned by
-hash in its bootstrap file, so no backend resolution happens at
-install time at all. The pip paths never install the root
+see ``PDM_BUILD_CUTOFF_LIMITATION``). Poetry needs neither for
+the ROOT project: it builds the root itself with the poetry-core
+pinned by hash in its bootstrap file, so no backend resolution
+happens for the root at install time. One level down, a locked
+DEPENDENCY that ships only as an sdist (no compatible wheel in
+the lock) is built by poetry and pdm alike with its build
+backend resolved fresh from the index, unconstrained by the
+unit cutoff — neither tool offers a build-scoped cutoff for
+dependency builds — so both plans record that as a typed
+limitation scoped to sdist dependency builds (see
+``POETRY_SDIST_DEPENDENCY_LIMITATION`` /
+``PDM_SDIST_DEPENDENCY_LIMITATION``); uv's sync-step cutoff
+governs its dependency builds too, so uv records none. The
+committed fixtures' locks are wheel-only (every locked package
+carries a compatible wheel), so the case does not arise for
+them. The pip paths never install the root
 project, so they carry none of this. The executors complete the
 evidence by reading the built project's dist-info back from the
 checkout venv (``build_backend_evidence``): the backend name and
@@ -505,6 +517,47 @@ PDM_BUILD_CUTOFF_LIMITATION = (
     "would break the frozen install (REG-A item 1)"
 )
 
+# WO-8.1c (reviewer's owed item 1, 2026-10-13): the typed
+# limitation recorded on committed poetry and pdm plans for
+# SDIST-ONLY LOCKED DEPENDENCIES. The root-project record does
+# not cover this case: when a locked dependency ships only as
+# an sdist (no compatible wheel in the lock), the installer
+# must BUILD that dependency, and building it resolves the
+# dependency's own build backend fresh from the index. Neither
+# poetry 2.5.1 nor pdm 2.29.2 offers a build-scoped date cutoff
+# for dependency builds (pdm's only cutoff is the
+# resolution-wide strategy above; poetry has none), so that
+# resolution is unconstrained by the unit cutoff. uv needs no
+# such limitation: UV_EXCLUDE_NEWER sits on the sync step and
+# governs every resolution that step performs, dependency
+# builds included. The limitation is conditional in wording —
+# it states what happens IF a lock carries an sdist-only
+# dependency. The committed fixtures' locks are wheel-only
+# (tests/test_wo81c.py proves every locked package in all
+# three locks carries a compatible wheel), so the case does
+# not arise for them.
+POETRY_SDIST_DEPENDENCY_LIMITATION = (
+    "sdist-dependency-build-unconstrained: if a locked "
+    "dependency ships only as an sdist (no compatible wheel "
+    "in the lock), poetry 2.5.1 builds it by resolving the "
+    "dependency's build backend fresh from the index, "
+    "unconstrained by the unit cutoff — poetry offers no "
+    "build-scoped cutoff for dependency builds (the root "
+    "project's own build is unaffected: poetry builds it "
+    "with its bootstrap-pinned poetry-core)"
+)
+
+PDM_SDIST_DEPENDENCY_LIMITATION = (
+    "sdist-dependency-build-unconstrained: if a locked "
+    "dependency ships only as an sdist (no compatible wheel "
+    "in the lock), pdm 2.29.2 builds it by resolving the "
+    "dependency's build backend fresh from the index, "
+    "unconstrained by the unit cutoff — pdm offers no "
+    "build-scoped cutoff for dependency builds (its only "
+    "date cutoff is the resolution-wide strategy in the "
+    "build-backend-cutoff-unavailable limitation above)"
+)
+
 # PEP 517's default build backend, used when pyproject.toml
 # declares no [build-system] build-backend.
 PEP517_DEFAULT_BACKEND = "setuptools.build_meta"
@@ -631,10 +684,15 @@ def _build_backend_plan(
     - poetry builds the root project itself with the poetry-core
       bundled in its hash-pinned bootstrap, so the backend and
       its version are plan facts and nothing resolves at build
-      time — no cutoff applies and none is missing.
+      time — no cutoff applies and none is missing. A locked
+      sdist-only DEPENDENCY is a different case (poetry builds
+      it with a freshly resolved backend): the scoped typed
+      limitation POETRY_SDIST_DEPENDENCY_LIMITATION.
     - pdm resolves the declared backend fresh inside build
       isolation and offers no build-scoped cutoff (see
-      PDM_BUILD_CUTOFF_LIMITATION): the typed limitation.
+      PDM_BUILD_CUTOFF_LIMITATION): the typed limitation. The
+      same gap applies one level down to sdist-only locked
+      dependencies: PDM_SDIST_DEPENDENCY_LIMITATION as well.
     - uv resolves the declared backend fresh too, but
       UV_EXCLUDE_NEWER constrains that resolution to the unit
       cutoff on the sync step (verified against uv 0.13.0: a
@@ -656,7 +714,9 @@ def _build_backend_plan(
                 bootstrap_text, "poetry-core"
             ),
             "build_cutoff": None,
-            "build_limitations": [],
+            "build_limitations": [
+                POETRY_SDIST_DEPENDENCY_LIMITATION
+            ],
         }
     declared_backend, requires = _declared_build_system(
         snapshot_dir / "pyproject.toml"
@@ -673,7 +733,10 @@ def _build_backend_plan(
         return {
             **base,
             "build_cutoff": None,
-            "build_limitations": [PDM_BUILD_CUTOFF_LIMITATION],
+            "build_limitations": [
+                PDM_BUILD_CUTOFF_LIMITATION,
+                PDM_SDIST_DEPENDENCY_LIMITATION,
+            ],
         }
     # uv: constrain the build to the unit's cutoff, when one is
     # available. The evaluation is the guarded exception to the
