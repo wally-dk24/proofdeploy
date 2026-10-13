@@ -44,6 +44,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -520,6 +521,18 @@ def test_directus_login_refresh_proof_in_sandbox(tmp_path):
         refresh_token = ctx.bindings.get("REFRESH_TOKEN")
         assert refresh_token
         ctx.token_expires_at = 0.0
+        # Directus access tokens are JWTs whose claims carry iat/exp
+        # at SECOND granularity and no session claim, so a refresh
+        # answered within the same wall-clock second as the login
+        # legitimately returns a byte-identical access token (the
+        # refresh token still rotates) — verified against a local
+        # directus@12.5.0: an immediate refresh returned the login
+        # token unchanged; a refresh after crossing a second
+        # boundary returned a different one. Wait past the next
+        # second boundary so the refreshed token must carry a later
+        # iat and the rotation assertion below tests the provider,
+        # not the clock phase.
+        time.sleep(1.1 - (time.time() % 1))
         assert executor._ensure_credential(ctx, details, writes) is None
         assert any(
             d == "credential provider: POST /auth/refresh" for d in details
