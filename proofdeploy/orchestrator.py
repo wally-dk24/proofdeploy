@@ -1277,6 +1277,10 @@ class Orchestrator:
             logs.append(
                 "auth bootstrap: generated " + ", ".join(sorted(bootstrap))
             )
+            # Addendum 43 condition 3: the generated VALUES are
+            # registered with the sandbox so its logs (command echoes
+            # carry -e KEY=VALUE) can never hold them.
+            sb.register_secret_values(bootstrap.values())
 
         # S1 (Addendum 15): one install path, now the adapter's plan.
         # The old sandbox code ran `pip install` in a --rm install

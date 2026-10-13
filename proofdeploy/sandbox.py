@@ -53,6 +53,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -458,6 +459,47 @@ def _podman_base() -> list[str]:
     return list(PODMAN)
 
 
+#: The record redaction marker (same string as runpair.REDACTED).
+REDACTED = "***REDACTED***"
+
+
+def _scrub_secrets(text: str, secrets: set[str]) -> str:
+    """Replace every registered secret value in ``text`` with the marker."""
+    for value in sorted((s for s in secrets if s), key=len, reverse=True):
+        text = text.replace(value, REDACTED)
+    return text
+
+
+class _ScrubLog(list):  # type: ignore[type-arg]
+    """A sandbox log that can never hold a registered secret value.
+
+    WO-8.3 (Addendum 43, condition 3): per-run generated credentials
+    are redacted from every record — and the sandbox's logs ARE a
+    record surface (they land in evidence records and in CI logs).
+    Podman command lines are echoed into this log with their
+    ``-e KEY=VALUE`` pairs, so the scrub lives here, on the one list
+    every sandbox phase appends to: a registered value is masked on
+    append, and registering a value re-scrubs lines already logged.
+    """
+
+    def __init__(self, secrets: set[str]) -> None:
+        super().__init__()
+        self._secrets = secrets
+
+    def append(self, item: str) -> None:
+        super().append(_scrub_secrets(item, self._secrets))
+
+    def extend(self, items: Iterable[str]) -> None:
+        for item in items:
+            self.append(item)
+
+    def rescrub(self) -> None:
+        for i, item in enumerate(self):
+            scrubbed = _scrub_secrets(item, self._secrets)
+            if scrubbed != item:
+                self[i] = scrubbed
+
+
 def _head_tail(
     text: str,
     head_lines: int = 40,
@@ -661,6 +703,10 @@ class Sandbox:
 
     config: SandboxConfig
     log: list[str] = field(default_factory=list)
+    # Per-run generated values (WO-8.3 bootstrap credentials) that must
+    # never appear in this sandbox's logs; see _ScrubLog. Registered by
+    # the orchestrator before any container runs.
+    secret_values: set[str] = field(default_factory=set, repr=False)
     _caps: SandboxCapabilities | None = field(default=None, repr=False)
     _network_name: str | None = field(default=None, repr=False)
     _build_network_name: str | None = field(default=None, repr=False)
@@ -675,6 +721,23 @@ class Sandbox:
     # reason's first-error scan reads that step only — never an
     # earlier step's or another phase's error lines.
     failed_step_output: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        scrubbed = _ScrubLog(self.secret_values)
+        scrubbed.extend(self.log)
+        self.log = scrubbed
+
+    def register_secret_values(self, values) -> None:  # type: ignore[no-untyped-def]
+        """Register per-run generated values to keep out of the logs.
+
+        Masked in every line appended from now on, and in lines
+        already logged (re-scrubbed in place). Empty values ignored.
+        """
+        new = {v for v in values if v}
+        if new - self.secret_values:
+            self.secret_values |= new
+            if isinstance(self.log, _ScrubLog):
+                self.log.rescrub()
 
     def _capabilities(self) -> SandboxCapabilities:
         if self._caps is None:

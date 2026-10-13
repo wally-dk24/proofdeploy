@@ -685,6 +685,25 @@ def test_record_names_bootstrap_generated_never_values(tmp_path):
         assert value not in blob
 
 
+def test_sandbox_log_never_holds_registered_secret():
+    """A43 condition 3 at the sandbox layer: podman command echoes
+    carry -e KEY=VALUE into the provision logs (they land in evidence
+    records and CI logs). Once the orchestrator registers a side's
+    generated values, no log line — already written or future — may
+    hold one. Non-secret values stay readable."""
+    from proofdeploy.sandbox import Sandbox, SandboxConfig
+
+    sb = Sandbox(SandboxConfig())
+    sb.log.append("$ podman run -e ADMIN_PASSWORD=hunter2 -e APP_DB=app.db img")
+    sb.register_secret_values(["hunter2"])
+    joined = "\n".join(sb.log)
+    assert "hunter2" not in joined
+    assert "***REDACTED***" in joined
+    assert "app.db" in joined
+    sb.log.append("output mentioning hunter2 again")
+    assert "hunter2" not in "\n".join(sb.log)
+
+
 def test_older_records_still_load(tmp_path):
     """Schema discipline: a 1.3.0 record (no auth_bootstrap) loads."""
     old = {
