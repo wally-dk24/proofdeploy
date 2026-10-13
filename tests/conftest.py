@@ -55,6 +55,41 @@ def _target_procs(tmp_root: str, baseline: set[str]) -> list[str]:
     return pids
 
 
+# The suite's one definition of "sandbox-gated": a skipif whose reason
+# names the sandbox capabilities. Used by the B3 hook below (a sandbox
+# skip becomes a failure under PD_REQUIRE_SANDBOX=1) and by the WAL-102
+# collection hook (the same tests get the `sandbox` marker, so CI can
+# select them exactly).
+_SANDBOX_SKIP_KEYWORDS = ("podman", "sandbox", "bridge", "userns", "container")
+
+
+def _sandbox_skip_reason(marker) -> str | None:
+    """Return the marker's reason if it is a sandbox-capability skipif."""
+    reason = marker.kwargs.get("reason", "")
+    if any(kw in reason.lower() for kw in _SANDBOX_SKIP_KEYWORDS):
+        return reason
+    return None
+
+
+def pytest_itemcollected(item):
+    """WAL-102: tag sandbox-gated tests with the `sandbox` marker.
+
+    A test is sandbox-gated iff it carries a skipif whose reason names
+    the sandbox capabilities — keyed on the marks a test actually
+    carries, never on its file name: podman-free sandbox unit tests
+    (test_provisioning_sandbox.py, test_sandbox_addendum18.py) carry
+    no such skipif and stay in the host selection, while sandbox tests
+    living in mixed files (test_orchestrator.py) are selected
+    correctly. The ci job runs -m "not sandbox"; the sandbox-tests job
+    runs -m sandbox with PD_REQUIRE_SANDBOX=1. Every test is in
+    exactly one selection.
+    """
+    for marker in item.iter_markers(name="skipif"):
+        if _sandbox_skip_reason(marker) is not None:
+            item.add_marker(pytest.mark.sandbox)
+            return
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
     """B3: with PD_REQUIRE_SANDBOX=1, sandbox skips become failures.
@@ -73,11 +108,8 @@ def pytest_runtest_setup(item):
         would_skip = bool(condition) if isinstance(condition, bool) else False
         if not would_skip:
             continue
-        reason = marker.kwargs.get("reason", "")
-        if any(
-            kw in reason.lower()
-            for kw in ("podman", "sandbox", "bridge", "userns", "container")
-        ):
+        reason = _sandbox_skip_reason(marker)
+        if reason is not None:
             pytest.fail(
                 f"B3: test {item.nodeid} would skip with "
                 f"PD_REQUIRE_SANDBOX=1 (reason: {reason}). "
