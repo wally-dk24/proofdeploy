@@ -7,8 +7,16 @@
 # selection (-m sandbox, auto-marked by tests/conftest.py) instead of
 # the full suite. The full suite still runs on every PR — as the union
 # of the ci workflow's host selection and this selection; both jobs
-# print the partition counts. The selection is sharded by file group
-# (matrix below) so the wall time is the slowest shard, not the sum.
+# print the partition counts. The selection is sharded (matrix below)
+# so the wall time is the slowest shard, not the sum. WAL-109 (split):
+# the old apps/core/provisions grouping is rebalanced by measured
+# duration toward ~10 minutes per shard — conformance runs one shard
+# per golden variant (nodeids), provisions splits into the manager
+# variants and the standalone app provisions, core splits by file.
+# Which shard selects which test is proven by
+# scripts/check_test_manifest.py against
+# tests/expected_sandbox_nodeids.txt (the same 48 nodeids as before;
+# only the assignment moved).
 # Lint/typecheck are NOT repeated here: the ci workflow's identical
 # commands are the gate.
 
@@ -82,12 +90,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - shard: core
-            files: "tests/test_sandbox.py tests/test_orchestrator.py"
-          - shard: apps
-            files: "tests/test_conformance.py"
-          - shard: provisions
-            files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py tests/test_wo81_generated_variant.py tests/test_wo81b_sandbox.py"
+          - shard: core-sandbox
+            files: "tests/test_sandbox.py"
+          - shard: core-orchestrator
+            files: "tests/test_orchestrator.py"
+          - shard: apps-node-express
+            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-express-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-express-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-express-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-express-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-express-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-express-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-express-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-express-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-express-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-express-sqlite]"
+          - shard: apps-node-pnpm
+            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-pnpm-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-pnpm-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-pnpm-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-pnpm-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-pnpm-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-pnpm-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-pnpm-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-pnpm-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-pnpm-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-pnpm-sqlite]"
+          - shard: apps-python-flask
+            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[python-flask-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[python-flask-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[python-flask-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[python-flask-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[python-flask-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[python-flask-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[python-flask-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[python-flask-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[python-flask-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[python-flask-sqlite]"
+          - shard: provisions-managers
+            files: "tests/test_wo81b_sandbox.py tests/test_wo81_generated_variant.py"
+          - shard: provisions-apps
+            files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py"
     name: sandbox (${{ matrix.shard }})
     steps:
       - name: Gate (WAL-101)
@@ -137,7 +153,7 @@ jobs:
         run: |
           count() { python -m pytest --collect-only -q -o addopts="" -p no:cacheprovider "$@" 2>/dev/null | grep -c "::" || true; }
           sand=$(count -m "sandbox")
-          shard_count=$(count ${{ matrix.files }} -m "sandbox")
+          shard_count=$(count ${{ matrix.files }} ${{ matrix.nodeids }} -m "sandbox")
           echo "collection: sandbox(full)=$sand shard(${{ matrix.shard }})=$shard_count"
           echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
           # WAL-109: the file-set partition guard that used to be
@@ -165,7 +181,7 @@ jobs:
           PD_REQUIRE_SANDBOX: "1"
           COVERAGE_FILE: .coverage.sandbox-${{ matrix.shard }}
         run: |
-          python -m pytest ${{ matrix.files }} -m sandbox -q --durations=25 \
+          python -m pytest ${{ matrix.files }} ${{ matrix.nodeids }} -m sandbox -q --durations=25 \
             -o addopts="--cov=proofdeploy --cov-report=term-missing" \
             --junitxml=/tmp/sandbox-${{ matrix.shard }}.xml
 
