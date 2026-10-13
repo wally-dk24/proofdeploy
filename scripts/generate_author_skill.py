@@ -41,9 +41,12 @@ def main():
     # Clean up trailing spaces before newlines
     content = re.sub(r' +(\n)', r'\1', content)
 
-    # Verify no evaluation-revealing language remains
+    # Verify no evaluation-revealing language remains. Explicit raises, not
+    # asserts: `python -O` strips assert statements, which would silently
+    # bypass this leak check and let tagged content reach the registered file.
     for pattern in [r'\[DEV:', 'TRAIN', r'T<n>', r', T\d+\)', '``']:
-        assert not re.search(pattern, content), f"Leak: {pattern} still present"
+        if re.search(pattern, content):
+            raise RuntimeError(f"Leak: {pattern} still present")
 
     DST.write_text(content)
     print(f"Wrote {DST}")
