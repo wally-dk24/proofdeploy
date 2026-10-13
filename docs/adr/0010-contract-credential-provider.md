@@ -86,3 +86,18 @@ The provider family is completed per Addenda 43/44:
   evidence record names them only as "generated".
 - `yml.py` validates all four modes and their key sets; unknown keys
   or modes are refused at load.
+- **What the WO-8.3 real-app proofs do and do not prove** (reviewer
+  note, Addendum 62): the Directus and Ghost sandbox proofs vendor
+  the apps' npm release tarballs with a test-generated lockfile.
+  They prove the auth providers against the real apps; they are
+  **not** adapter coverage — the provisioning adapter would refuse
+  such repos as customer checkouts today (see the Ghost/pnpm finding
+  recorded with PR #61). This note also stands as the milestone-doc
+  statement of that boundary until the WO-8 milestone doc lands.
+- **Addendum 62 hardening**: auth endpoint paths are constrained at
+  load to plain absolute paths on the target, and the executor
+  refuses any provider URL whose parsed host/port differ from the
+  target's (a concatenated path must never be able to send the
+  credential request — generated values included — to a third
+  party); the `key_file` read refuses symlinks, resolves inside
+  the checkout, and is size-capped.
