@@ -651,6 +651,7 @@ tests/test_wo83.py::test_record_names_bootstrap_generated_never_values
 tests/test_wo83.py::test_refresh_mode_logs_in_then_refreshes_near_expiry
 tests/test_wo83.py::test_refresh_mode_with_login_validates
 tests/test_wo83.py::test_register_mode_still_works_on_golden
+tests/test_wo83.py::test_sandbox_log_never_holds_registered_secret
 tests/test_wo83.py::test_side_bootstrap_absent_means_no_values
 tests/test_wo83.py::test_side_bootstrap_and_record_shapes
 tests/test_wo83.py::test_unknown_auth_key_refused
