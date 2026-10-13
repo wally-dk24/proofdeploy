@@ -78,6 +78,7 @@ from proofdeploy.model_client import (
 from proofdeploy.probe import ProbeSet
 from proofdeploy.provisioning import (
     InstallPlan,
+    build_backend_evidence,
     pip_flags,
     plan_provisioning,
     render_argv,
@@ -400,8 +401,12 @@ class Orchestrator:
         single-side provision (tests, dev), where a lone side is
         its own unit so its own committer time IS the unit's. Lazy
         because the adapter evaluates it only when a generated lock
-        is planned: a committed lock, a Node plan, or an image
-        refusal never reads a commit time at all."""
+        is planned — plus WO-8.1c's one guarded exception: a
+        committed uv plan evaluates it to constrain the root
+        project's build (UV_EXCLUDE_NEWER), under a guard that
+        keeps a failing cutoff source from tripping the plan, so
+        a Node plan or an image refusal still never reads a
+        commit time at all."""
         if self._run_lock_cutoff is not None:
             return self._run_lock_cutoff
         return lambda: self._commit_cutoff(sha)
@@ -1346,6 +1351,19 @@ class Orchestrator:
                 )
             except OSError:
                 gen_lock = None
+        # WO-8.1c: a committed manager's install built the root
+        # project; read the backend that actually built it back
+        # for the evidence (the built wheel's Generator, stamped
+        # in the checkout venv). Captured whenever it exists,
+        # like the generated lock; never affects the outcome.
+        build_backend_ev: dict | None = None
+        if plan.build_backend is not None:
+            build_backend_ev = build_backend_evidence(plan, snapshot.dir)
+            if build_backend_ev is not None:
+                logs.append(
+                    f"build backend: {build_backend_ev['name']} "
+                    f"{build_backend_ev['version']}"
+                )
         install_ok = len(step_results) == len(step_specs) and all(
             r["exit_code"] == 0 for r in step_results
         )
@@ -1391,6 +1409,7 @@ class Orchestrator:
                 package_manager=plan.package_manager,
                 executed_steps=executed,
                 generated_lock=gen_lock,
+                build_backend=build_backend_ev,
             )
         logs.extend(sb.log)
         sb.log.clear()
@@ -1443,6 +1462,7 @@ class Orchestrator:
                 package_manager=plan.package_manager,
                 executed_steps=executed,
                 generated_lock=gen_lock,
+                build_backend=build_backend_ev,
             )
         if not app.wait_ready(contract.readiness or "/health", timeout=120):
             # S2: the record must say more than "not ready". Capture the
@@ -1470,6 +1490,7 @@ class Orchestrator:
                 package_manager=plan.package_manager,
                 executed_steps=executed,
                 generated_lock=gen_lock,
+                build_backend=build_backend_ev,
             )
         # S2: log tail on success too, for the record.
         app_log = sb.app_logs(app.name)
@@ -1489,6 +1510,7 @@ class Orchestrator:
             install_plan_sha256=plan.sha256(),
             executed_steps=executed,
             generated_lock=gen_lock,
+            build_backend=build_backend_ev,
         )
         provision.image_digest = image_digest
         # Stash the SandboxApp for cleanup; the finally block stops it.
@@ -1518,6 +1540,7 @@ class Orchestrator:
         package_manager: str | None = None,
         executed_steps: list[dict] | None = None,
         generated_lock: dict | None = None,
+        build_backend: dict | None = None,
     ) -> _Side:
         """Build a failed sandbox _Side with runtime facts populated (S3).
 
@@ -1535,6 +1558,7 @@ class Orchestrator:
             package_manager=package_manager or "pip",
             executed_steps=executed_steps or [],
             generated_lock=generated_lock,
+            build_backend=build_backend,
         )
         provision.image_digest = image_digest
         if plan is not None:
