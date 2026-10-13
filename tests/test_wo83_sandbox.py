@@ -726,9 +726,18 @@ def test_ghost_ghost_jwt_proof_in_sandbox(tmp_path):
     )
     assert (repo / "package.json").is_file()
     assert (repo / "index.js").is_file()
-    _npm_lockfile(repo, legacy_peer_deps=True)
-    assert (repo / "package-lock.json").is_file()
-    (repo / ".npmrc").write_text("legacy-peer-deps=true\n", encoding="utf-8")
+    # The published tarball retains the monorepo's pnpm-workspace.yaml
+    # (a dependency catalog for building Ghost from source), and the
+    # provisioning adapter refuses workspace trees on principle. The
+    # installed application is the single root package — the
+    # Ghost-CLI layout — installed from its OWN committed
+    # pnpm-lock.yaml with its pinned packageManager (pnpm). Removing
+    # the scaffolding file makes the vendored tree read as what it
+    # is; nothing else in the tree is touched. (First CI run of this
+    # proof failed on exactly this: plan refusal "workspaces not yet
+    # supported".)
+    (repo / "pnpm-workspace.yaml").unlink(missing_ok=True)
+    assert (repo / "pnpm-lock.yaml").is_file()
     (repo / "seed-ghost.js").write_text(GHOST_SEED_JS, encoding="utf-8")
     (repo / "proofdeploy.yml").write_text(GHOST_APP_CONTRACT, encoding="utf-8")
     _git(repo, "init", "-q")
