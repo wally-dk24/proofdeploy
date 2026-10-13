@@ -10,7 +10,13 @@ name: ci
 # the selections is the full suite; every job prints the partition
 # counts, and each shard asserts its own collected count against the
 # matrix's expected count, so a test added without updating the matrix
-# fails loudly instead of running twice or not at all.
+# fails loudly instead of running twice or not at all. Each host shard
+# also writes a JUnit report, and a verify step asserts from it that
+# every collected test ran and none skipped (Addendum 55): the host
+# selection has no PD_REQUIRE_SANDBOX net, so without this a
+# sandbox-gated test whose skipif reason missed the conftest keywords
+# would not be marked `sandbox`, would be collected here, and would
+# silently skip — running nowhere.
 #
 # Shards are file groups, balanced on measured per-file durations
 # (JUnit, local): the host selection is 508.6s of test time, and the
@@ -35,9 +41,10 @@ name: ci
 # coverage with the same --cov flags minus --cov-fail-under and
 # upload the data for the aggregate. Lint and typecheck are their
 # own job, so a lint failure reports in ~1 minute instead of after
-# the long test run. pytest-xdist is no longer used in CI: it
-# measured ~neutral on this wait-bound suite (508s vs 522s local),
-# and the matrix now provides the parallelism; serial shards also
+# the long test run. pytest-xdist was removed from the dev
+# dependencies in the Addendum 55 round: it was already unused in CI
+# (it measured ~neutral on this wait-bound suite, 508s vs 522s
+# local), the matrix now provides the parallelism, and serial shards
 # keep one coverage data file per shard.
 #
 # WAL-101 (inert gating): a PR whose changed files are all inert
@@ -278,7 +285,43 @@ jobs:
           COVERAGE_FILE: .coverage.host-${{ matrix.shard }}
         run: |
           python -m pytest ${{ matrix.files }} ${{ matrix.nodeids }} -q -W error::ResourceWarning -m "not sandbox" --durations=25 \
-            -o addopts="--cov=proofdeploy --cov-report=term-missing"
+            -o addopts="--cov=proofdeploy --cov-report=term-missing" \
+            --junitxml=/tmp/host-${{ matrix.shard }}.xml
+      - name: Verify shard tests ran (none skipped)
+        # Addendum 55: mirror of the sandbox shards' JUnit check. The
+        # host selection has no PD_REQUIRE_SANDBOX safety net, and the
+        # partition leans on skip-reason wording (tests/conftest.py):
+        # a future sandbox-gated test worded without the keywords
+        # would not be marked `sandbox`, would be collected by a host
+        # shard, and would silently skip — running nowhere. Asserting
+        # tests == expected AND skipped == 0 from this shard's own
+        # JUnit report closes that permanently.
+        if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
+        env:
+          EXPECTED: ${{ matrix.expected }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          import xml.etree.ElementTree as ET
+
+          path = f"/tmp/host-{os.environ['SHARD']}.xml"
+          expected = int(os.environ["EXPECTED"])
+          suite = ET.parse(path).getroot()
+          if suite.tag != "testsuite":
+              suite = suite.find("testsuite")
+          tests = int(suite.get("tests"))
+          skipped = int(suite.get("skipped"))
+          print(f"junit: tests={tests} skipped={skipped} expected={expected}")
+          assert skipped == 0, (
+              "A55: host tests SKIPPED in a host shard; a skipped host "
+              "test runs nowhere"
+          )
+          assert tests == expected, (
+              f"A55: ran {tests} tests but {expected} were collected for this shard"
+          )
+          print("A55: every collected host test in this shard ran; none skipped")
+          EOF
       - name: Upload coverage data (union floor, enforced by the test job)
         # actions/upload-artifact v4
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -339,7 +382,7 @@ jobs:
         if: steps.gate.outputs.proceed == 'true'
       - name: Download shard coverage data
         # actions/download-artifact v4
-        uses: actions/download-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         if: steps.gate.outputs.proceed == 'true'
         with:
           pattern: coverage-host-*

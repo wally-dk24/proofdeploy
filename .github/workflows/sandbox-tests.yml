@@ -12,7 +12,10 @@
 # Lint/typecheck are NOT repeated here: the ci workflow's identical
 # commands are the gate. The digest-pinned images are cached as a
 # podman save tarball keyed by images.lock.json (see the cache steps);
-# a cache miss degrades to today's pull-on-demand behavior.
+# a cache miss degrades to today's pull-on-demand behavior. After a
+# load, every lock image is checked against its pinned digest
+# (Addendum 55; see the verify step for what can and cannot be
+# concluded from a loaded image's manifest digest).
 
 name: sandbox-tests
 
@@ -130,7 +133,8 @@ jobs:
       - name: Restore podman image cache
         id: imgcache
         if: steps.gate.outputs.proceed == 'true'
-        uses: actions/cache/restore@v4
+        # actions/cache v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: pd-images.tar
           key: podman-images-${{ hashFiles('proofdeploy/images.lock.json') }}
@@ -143,6 +147,94 @@ jobs:
           else
             echo "no image cache; tests will pull on demand (and this run will populate the cache)"
           fi
+
+      - name: Verify cached image digests against the lock
+        # Addendum 55: the cache must not be trusted blindly — every
+        # lock image is checked against its pinned digest and the
+        # outcome is logged per image. One subtlety, proven locally
+        # against a real save/load/pull cycle: podman re-serializes
+        # manifests on save/load, so a cache-loaded image carries a
+        # locally synthesized manifest digest (same config ID and
+        # layers) and still resolves under its digest name. Such a
+        # record is reported as present, never removed — the pin is
+        # enforced by podman itself at every digest-addressed pull
+        # and run. What IS removed: an image bound to the plain tag
+        # whose digest is not the pin — it came from neither the
+        # digest path nor a cache load (loaded images are unnamed),
+        # so nothing may run it under the expected name.
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          python3 - <<'EOF'
+          import json
+          import subprocess
+
+          LOCK = "proofdeploy/images.lock.json"
+
+
+          def run(*args):
+              return subprocess.run(args, capture_output=True, text=True)
+
+
+          def inspect_digest(name):
+              """Digest of the image bound to `name`, or None if unresolvable."""
+              r = run("podman", "image", "inspect", "--format", "{{.Digest}}", name)
+              if r.returncode == 0 and r.stdout.strip():
+                  return r.stdout.strip()
+              return None
+
+
+          images = json.load(open(LOCK))["images"]
+          verified = present = removed = absent = 0
+          for img in images:
+              ref, pinned = img["ref"], img["digest"]
+              by_digest = inspect_digest(f"{ref}@{pinned}")
+              if by_digest is not None:
+                  if by_digest == pinned:
+                      verified += 1
+                      print(f"image cache: digest verified for {ref} ({pinned})")
+                  else:
+                      # Podman deduplicates by image (config) ID: a record created
+                      # by a save/load cycle carries a locally re-serialized
+                      # manifest digest yet still resolves under the digest name.
+                      # Its content is the lock content (same config ID and
+                      # layers); removing it would only destroy the cache. The
+                      # pin itself is enforced by podman at every digest-addressed
+                      # pull and run.
+                      present += 1
+                      print(
+                          f"image cache: {ref} present (local manifest digest {by_digest});"
+                          " digest identity is enforced by podman at pull/run time"
+                      )
+                  continue
+              by_tag = inspect_digest(ref)
+              if by_tag is not None:
+                  if by_tag == pinned:
+                      verified += 1
+                      print(f"image cache: digest verified for {ref} ({pinned})")
+                  else:
+                      # A tag-bound image whose digest is not the pin came from
+                      # neither the lock's digest path nor a cache load (loaded
+                      # images are unnamed). Remove the binding so nothing can
+                      # run it under the expected name; the digest path re-pulls.
+                      removed += 1
+                      print(
+                          f"image cache: DIGEST MISMATCH for {ref}: local {by_tag} != pinned {pinned};"
+                          " removing the tag binding so the image is re-pulled by digest"
+                      )
+                      r = run("podman", "rmi", ref)
+                      if r.returncode != 0:
+                          print(f"image cache: WARNING: podman rmi {ref} failed: {r.stderr.strip()}")
+                  continue
+              absent += 1
+              print(f"image cache: {ref} not present locally; it will be pulled on demand")
+          print(
+              f"image cache verification: {verified}/{len(images)} lock images digest-verified;"
+              f" {present} present (digest enforced at pull/run); {removed} removed (digest mismatch);"
+              f" {absent} absent (pull on demand)"
+          )
+          if verified == len(images):
+              print("image cache: all lock images verified from cache; no pulls needed")
+          EOF
 
       - name: Install package and dev dependencies
         if: steps.gate.outputs.proceed == 'true'
@@ -217,7 +309,15 @@ jobs:
           done
           present=$(for r in $refs; do podman image exists "$r" && echo "$r"; done)
           if [ -n "$present" ]; then
-            podman save -o pd-images.tar $present
+            # A55: save by image ID, never by ref@digest name. The
+            # runners' podman rejects a tag@digest save argument as an
+            # "invalid additional tag" (exit 125 — the first cache
+            # build failed exactly there, on python:3.11.17); an image
+            # ID is unambiguous in every podman version. This step is
+            # core-shard-only by design (see the gate above), so this
+            # one save path serves every shard.
+            ids=$(for r in $present; do podman image inspect --format '{{.Id}}' "$r"; done)
+            podman save -o pd-images.tar $ids
             echo "have_tar=true" >> "$GITHUB_OUTPUT"
             ls -lh pd-images.tar
           else
@@ -227,7 +327,8 @@ jobs:
 
       - name: Save podman image cache
         if: ${{ matrix.shard == 'core' && steps.imgtar.outputs.have_tar == 'true' }}
-        uses: actions/cache/save@v4
+        # actions/cache v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: pd-images.tar
           key: podman-images-${{ hashFiles('proofdeploy/images.lock.json') }}
