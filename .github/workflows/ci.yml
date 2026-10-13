@@ -247,6 +247,7 @@ jobs:
           tests/test_executor.py
           tests/test_executor_addendum20.py
           tests/test_fixture.py
+          tests/test_generate_author_skill.py
           tests/test_leakcheck.py
           tests/test_model_client.py
           tests/test_orchestrator.py
