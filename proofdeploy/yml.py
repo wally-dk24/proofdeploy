@@ -168,7 +168,10 @@ def _auth_path(auth: dict, key: str, *, required: bool = True) -> str | None:
     (userinfo), no '//' (scheme-relative host), no '@' anywhere, no
     backslash, no scheme.
     """
-    val = _auth_str(auth, key, required=required)
+    if required:
+        val: str | None = _auth_str(auth, key)
+    else:
+        val = _auth_str(auth, key, required=False)
     if val is None:
         return None
     if (
