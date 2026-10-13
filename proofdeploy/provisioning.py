@@ -51,9 +51,15 @@ checkout at ``/checkout/.venv`` (the sandbox executor renders it
 there; the host executor renders the same step at its per-run venv
 dir), ``PIP_NO_CACHE_DIR=1``, the venv first on PATH for
 build/migrate/seed/start, the lockfile sha256 recorded and
-verified, seed runs, and unsupported lockfiles refused by the
-sandbox executor with BUILD_FAILED "not yet supported in the
-sandbox". The Node adapter
+verified, and seed runs. A committed ``uv.lock`` / ``poetry.lock``
+/ ``pdm.lock`` plans the same way for both executors (WO-8.1b):
+the checkout venv created from the selected interpreter, the
+manager bootstrapped into ``.pd-tools`` by hash from its committed
+bootstrap file at its pinned version (uv 0.13.0, poetry 2.5.1,
+pdm 2.29.2), the tool's own lock-freshness check where its install
+command does not refuse a stale lock itself, and the frozen
+install (``uv sync --frozen``, ``poetry install --sync``,
+``pdm sync``). The Node adapter
 plans frozen installs from the lockfile for both executors: npm ci /
 pnpm install --frozen-lockfile / yarn classic --frozen-lockfile or
 berry --immutable, a packageManager pin rendered through corepack,
@@ -234,6 +240,13 @@ class InstallPlan:
     # pins the resolver's wheel by hash; see
     # _uv_bootstrap_requirements).
     lock_resolver_bootstrap_sha256: str | None = None
+    # WO-8.1b: for a committed uv.lock / poetry.lock / pdm.lock
+    # plan, the sha256 of the COMMITTED bootstrap requirements
+    # file the lock manager is installed from (the same pattern:
+    # the file pins the manager's wheel(s) by hash; see
+    # _manager_bootstrap_steps). The generated path keeps its own
+    # field above; a plan carries at most one of the two.
+    manager_bootstrap_sha256: str | None = None
     generated_lockfile_name: str | None = None
     package_manager: str | None = None
     package_manager_version: str | None = None
@@ -356,19 +369,181 @@ _WRITE_FILE_CODE = (
 )
 
 
+def _bootstrap_requirements(file_name: str) -> tuple[str, str]:
+    """A committed bootstrap requirements file: (text, sha256)."""
+    data = Path(__file__).with_name(file_name).read_bytes()
+    return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
+
+
 def _uv_bootstrap_requirements() -> tuple[str, str]:
     """The committed resolver-bootstrap requirements: (text, sha256)."""
-    data = Path(__file__).with_name(
-        UV_BOOTSTRAP_REQUIREMENTS_FILE
-    ).read_bytes()
-    return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
+    return _bootstrap_requirements(UV_BOOTSTRAP_REQUIREMENTS_FILE)
+
+
+# WO-8.1b: the committed-lock managers, their pinned versions, and
+# their bootstrap files (committed next to this module, the
+# Addendum 46 pattern). uv's pin is UV_VERSION — the REG-A
+# resolver pin: the same hash-pinned wheel that resolves a
+# generated lock also installs a committed uv.lock frozen. The
+# poetry / pdm pins follow the resolver's rule (pin a version
+# whose release is at least 14 days old when pinned): Poetry
+# 2.5.1 was released 2026-09-20 and PDM 2.29.2 on 2026-09-17,
+# pinned 2026-10-12. Neither is a single wheel, so their
+# bootstrap files pin the manager's full dependency closure, each
+# line hashed, installed --require-hashes --no-deps
+# --only-binary :all:.
+POETRY_VERSION = "2.5.1"
+PDM_VERSION = "2.29.2"
+POETRY_BOOTSTRAP_REQUIREMENTS_FILE = "poetry_bootstrap_requirements.txt"
+PDM_BOOTSTRAP_REQUIREMENTS_FILE = "pdm_bootstrap_requirements.txt"
+POETRY_BOOTSTRAP_CHECKOUT_PATH = ".pd-tools/poetry-requirements.txt"
+PDM_BOOTSTRAP_CHECKOUT_PATH = ".pd-tools/pdm-requirements.txt"
+
+_LOCK_MANAGERS: dict[str, tuple[str, str, str]] = {
+    # manager -> (bootstrap file, its path inside the checkout,
+    #             pinned version)
+    "uv": (
+        UV_BOOTSTRAP_REQUIREMENTS_FILE,
+        UV_BOOTSTRAP_CHECKOUT_PATH,
+        UV_VERSION,
+    ),
+    "poetry": (
+        POETRY_BOOTSTRAP_REQUIREMENTS_FILE,
+        POETRY_BOOTSTRAP_CHECKOUT_PATH,
+        POETRY_VERSION,
+    ),
+    "pdm": (
+        PDM_BOOTSTRAP_REQUIREMENTS_FILE,
+        PDM_BOOTSTRAP_CHECKOUT_PATH,
+        PDM_VERSION,
+    ),
+}
+
+# Committed Python lockfiles (REG-A item 1) and their managers.
+_COMMITTED_LOCK_MANAGERS = {
+    "uv.lock": "uv",
+    "poetry.lock": "poetry",
+    "pdm.lock": "pdm",
+}
+
+
+def _manager_bootstrap_steps(manager: str) -> list[PlanStep]:
+    """Bootstrap a pinned lock manager into the checkout's
+    .pd-tools, BY HASH from its committed bootstrap requirements
+    file (the Addendum 46 resolver pattern, generalized): a tools
+    venv, the file materialized verbatim into it, then a
+    hash-checking binaries-only install. A wrong or substituted
+    wheel fails the install step. The binary lands at
+    {checkout}/.pd-tools/bin/<manager> on every executor."""
+    file_name, checkout_path, _version = _LOCK_MANAGERS[manager]
+    bootstrap_text, _sha256 = _bootstrap_requirements(file_name)
+    return [
+        PlanStep(
+            phase="install",
+            argv=["{runtime_bin}", "-m", "venv", "{checkout}/.pd-tools"],
+        ),
+        PlanStep(
+            phase="install",
+            argv=[
+                "{runtime_bin}",
+                "-c",
+                _WRITE_FILE_CODE,
+                f"{{checkout}}/{checkout_path}",
+                bootstrap_text,
+            ],
+        ),
+        PlanStep(
+            phase="install",
+            argv=[
+                "{checkout}/.pd-tools/bin/pip",
+                "install",
+                "--require-hashes",
+                "--no-deps",
+                "--only-binary",
+                ":all:",
+                "-r",
+                f"{{checkout}}/{checkout_path}",
+            ],
+        ),
+    ]
+
+
+def _manager_frozen_steps(manager: str) -> list[PlanStep]:
+    """The frozen install of a committed lock, per manager
+    (REG-A item 1), preceded — where the tool's install command
+    does not itself refuse a stale lock — by the tool's own
+    lock-freshness check (WO-8.1b item 4: a lock out of sync with
+    pyproject.toml is BUILD_FAILED carrying the tool's error
+    line, never a silent install of the wrong set).
+
+    Verified against the pinned tools (2026-10-12):
+    - uv 0.13.0: `uv sync --frozen` installs a stale lock
+      silently (exit 0); `uv lock --check` exits 1 with
+      "error: The lockfile at `uv.lock` needs to be updated...".
+    - pdm 2.29.2: `pdm sync` warns but exits 0 on a stale lock;
+      `pdm lock --check` exits 1.
+    - poetry 2.5.1: `poetry install --sync` itself exits 1 on a
+      stale lock ("pyproject.toml changed significantly since
+      poetry.lock was last generated..."), so no separate check
+      step is needed — or wanted: a second check would only
+      duplicate the refusal.
+    """
+    mgr_bin = f"{{checkout}}/.pd-tools/bin/{manager}"
+    if manager == "uv":
+        return [
+            PlanStep(phase="install", argv=[mgr_bin, "lock", "--check"]),
+            PlanStep(
+                phase="install",
+                argv=[
+                    mgr_bin,
+                    "sync",
+                    "--frozen",
+                    # The interpreter the plan selected (the host
+                    # executor used to append this itself; it is
+                    # plan data now, so the sandbox gets the same
+                    # pin).
+                    "--python",
+                    "{runtime_bin}",
+                ],
+                # The venv is the checkout's .venv (created by the
+                # plan's venv step), named explicitly so the
+                # install target cannot drift with the tool's
+                # project discovery.
+                env={"UV_PROJECT_ENVIRONMENT": "{venv}"},
+            ),
+        ]
+    if manager == "poetry":
+        return [
+            PlanStep(
+                phase="install",
+                argv=[mgr_bin, "install", "--sync"],
+                # In-project venvs: the plan's venv step has
+                # already created {checkout}/.venv from the
+                # selected interpreter, and poetry adopts an
+                # existing in-project .venv; the env var states
+                # the same intent in poetry's own configuration.
+                env={"POETRY_VIRTUALENVS_IN_PROJECT": "true"},
+            ),
+        ]
+    if manager == "pdm":
+        return [
+            PlanStep(phase="install", argv=[mgr_bin, "lock", "--check"]),
+            PlanStep(phase="install", argv=[mgr_bin, "sync"]),
+        ]
+    raise ValueError(f"unsupported lock manager: {manager}")
 
 
 class PythonAdapter:
     """Python: REG-A — complete committed locks (uv.lock /
     poetry.lock / pdm.lock / fully hashed requirements.txt) install
     frozen; anything else is resolved into a generated hashed lock
-    by the pinned uv at the unit's cutoff, then installed frozen."""
+    by the pinned uv at the unit's cutoff, then installed frozen.
+
+    A committed manager lock (uv/poetry/pdm) plans its full frozen
+    install (WO-8.1b): checkout venv from the selected interpreter,
+    the pinned manager bootstrapped by hash into .pd-tools, the
+    freshness check where the tool needs one, the frozen install.
+    """
 
     name = "python"
 
@@ -408,9 +583,43 @@ class PythonAdapter:
         # (check_requirements_frozen is now exactly that check).
         if found is not None and found[0] != "requirements.txt":
             lockfile_name, lockfile_sha = found
-            manager, argv = select_package_manager(
-                snapshot_dir, "python", lockfile_name
+            # WO-8.1b: a committed uv.lock / poetry.lock / pdm.lock
+            # installs frozen IN BOTH EXECUTORS. The plan carries
+            # the whole mechanism (never a bare manager binary off
+            # PATH): the checkout venv created from the selected
+            # interpreter (uv is pointed at it, poetry and pdm
+            # adopt an existing in-project .venv), the manager
+            # bootstrapped into .pd-tools BY HASH from its
+            # committed bootstrap file at its pinned version, the
+            # freshness check where the tool's install command
+            # does not refuse a stale lock itself, the frozen
+            # install, and the sandbox venv sanity check the pip
+            # plans carry.
+            manager = _COMMITTED_LOCK_MANAGERS[lockfile_name]
+            _file, _path, manager_version = _LOCK_MANAGERS[manager]
+            _text, manager_bootstrap_sha256 = _bootstrap_requirements(
+                _file
             )
+            steps = [
+                PlanStep(
+                    phase="venv",
+                    argv=["{runtime_bin}", "-m", "venv", "{venv}"],
+                ),
+                *_manager_bootstrap_steps(manager),
+                *_manager_frozen_steps(manager),
+                # Sandbox-only sanity check (Addendum 15, B2), as
+                # on the pip paths.
+                PlanStep(
+                    phase="verify",
+                    argv=[
+                        "/checkout/.venv/bin/python",
+                        "-c",
+                        "import sys; print(sys.prefix)",
+                    ],
+                    executor="sandbox",
+                ),
+                *_contract_steps(contract),
+            ]
             return InstallPlan(
                 adapter=self.name,
                 runtime="python",
@@ -420,11 +629,10 @@ class PythonAdapter:
                 lock_source="committed",
                 **image,
                 package_manager=manager,
-                steps=[
-                    PlanStep(phase="install", argv=argv),
-                    *_contract_steps(contract),
-                ],
-                persisted_dirs=[".venv"] if manager == "uv" else [],
+                package_manager_version=manager_version,
+                manager_bootstrap_sha256=manager_bootstrap_sha256,
+                steps=steps,
+                persisted_dirs=[".venv", ".pd-tools"],
             )
         if found is not None and check_requirements_frozen(
             snapshot_dir / "requirements.txt"

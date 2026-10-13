@@ -1,0 +1,4 @@
+build: "python -m py_compile app.py"
+start: "python app.py"
+readiness: "/health"
+env: {}
