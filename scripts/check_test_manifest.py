@@ -30,7 +30,7 @@ proves, from real pytest collection:
     union == full);
   * every manifest nodeid is selected by exactly one shard of
     its workflow's matrix (ci.yml host shards by files/nodeids,
-    sandbox-tests.yml shards by files) — a test no shard selects,
+    sandbox-tests.yml shards by files/nodeids) — a test no shard selects,
     or two shards select, is named here, fast, instead of
     running twice or not at all in a 30-minute job.
 
