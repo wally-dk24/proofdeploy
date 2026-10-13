@@ -54,7 +54,12 @@ HARNESS_VERSION = "1.0.0"
 # summary: env names recorded as "generated", never their values).
 # All non-scoring fields; records at 1.0.0–1.3.0 still load
 # (readers default the new keys).
-SCHEMA_VERSION = "1.4.0"
+# 1.5.0 (Addendum 62): no field changes — the bump separates the
+# field sets that accumulated under 1.4.0, so one version number
+# never covers two sets again. The full set 1.5.0 names: WO-8.1's
+# lock facts, WO-8.1c's build-backend facts, and WO-8.3's
+# auth_bootstrap. Records at 1.0.0–1.4.0 still load.
+SCHEMA_VERSION = "1.5.0"
 
 # HTTP methods the schema allows. No CONNECT, TRACE, or custom verbs.
 ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})

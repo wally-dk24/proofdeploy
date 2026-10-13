@@ -631,7 +631,7 @@ def build_evidence_record(
     scoring_version: str = DEFAULT_SCORING_VERSION,
     fix_parent_provision: dict[str, Any] | None = None,
     fix_provision: dict[str, Any] | None = None,
-    # WO-8.3 (schema 1.4.0): per-side auth bootstrap summary, e.g.
+    # WO-8.3 (schema 1.5.0): per-side auth bootstrap summary, e.g.
     # {"fix": {"generated": ["ADMIN_EMAIL", "ADMIN_PASSWORD"]}} — env
     # NAMES only, recorded as "generated"; the values never appear in
     # any record (they ride the redaction channels instead).

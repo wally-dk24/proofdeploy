@@ -275,11 +275,11 @@ def _result(verdict: Verdict, token: str) -> ProbeResult:
 
 
 def test_schema_bump_and_old_record_loads_and_rescores(tmp_path):
-    # The current version moves with each schema bump (1.4.0:
-    # WO-8.1's REG-A lock fields + WO-8.3's auth_bootstrap field);
+    # The current version moves with each schema bump (1.5.0:
+    # Addendum 62 names the union of the 1.4.0-era field sets);
     # the downgrade below exercises the old shapes, which is the
     # point of this test.
-    assert SCHEMA_VERSION == "1.4.0"
+    assert SCHEMA_VERSION == "1.5.0"
 
     token = "sess-schema-check-0123456789"
     record = build_evidence_record(
@@ -290,7 +290,7 @@ def test_schema_bump_and_old_record_loads_and_rescores(tmp_path):
         fix_parent_results=[_result(Verdict.FAIL, token)],
         fix_results=[_result(Verdict.PASS, token)],
     )
-    assert record["schema_version"] == "1.4.0"
+    assert record["schema_version"] == "1.5.0"
     assert record["provenance"]["harness"]["commit"]
 
     # Downgrade the record to the 1.0.0 shape: scalar captured_values,
