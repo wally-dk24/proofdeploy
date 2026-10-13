@@ -642,6 +642,33 @@ class Executor:
             ctx.known_names.add("AUTH_TOKEN")
         return ctx
 
+    def _provider_url(self, path: str) -> str | None:
+        """The credential provider's URL for `path`, or None off-target.
+
+        Defense in depth behind the contract validator (Addendum 62):
+        the URL is built by concatenation and the write gate allows
+        any host for a provisioned executor (WO-7.3), so before any
+        credential request is sent, the built URL's parsed host and
+        port must equal the target's. A mismatch is a refusal — the
+        request, generated credentials included, never leaves the
+        provisioned target.
+        """
+
+        def host_port(url: str) -> tuple[str | None, int]:
+            parsed = urllib.parse.urlparse(url)
+            try:
+                port = parsed.port
+            except ValueError:
+                return (None, -1)
+            if port is None:
+                port = 443 if parsed.scheme == "https" else 80
+            return (parsed.hostname, port)
+
+        url = self.target_url.rstrip("/") + path
+        if host_port(url) != host_port(self.target_url):
+            return None
+        return url
+
     def _ensure_credential(
         self, ctx: SetupContext, details: list[str], writes: list[str]
     ) -> InconclusiveReason | None:
@@ -729,9 +756,9 @@ class Executor:
         cfg = provider.config
         path = cfg.get("path")
         token_path = cfg.get("token_json_path")
-        if not isinstance(path, str) or not path.startswith("/"):
+        if not isinstance(path, str) or not path:
             details.append(
-                "credential provider failed: credential_config needs 'path' starting with '/'"
+                "credential provider failed: credential_config needs a non-empty 'path'"
             )
             return InconclusiveReason.AUTH
         if not isinstance(token_path, str) or not token_path:
@@ -756,7 +783,13 @@ class Executor:
         except PlaceholderError as e:
             details.append(f"credential provider failed: {e}")
             return InconclusiveReason.AUTH
-        url = self.target_url.rstrip("/") + path
+        url = self._provider_url(path)
+        if url is None:
+            details.append(
+                "credential provider refused: provider URL leaves the target "
+                "(its host/port do not match the target's)"
+            )
+            return InconclusiveReason.AUTH
         allowed, detail = _check_remote_method(method, url, self.provisioned)
         if not allowed:
             details.append(f"credential provider refused: {detail}")
@@ -834,10 +867,9 @@ class Executor:
         (and only they) reach the login. A declared refresh token in
         the response is bound as ${REFRESH_TOKEN} for later renewals.
         """
-        if not path.startswith("/"):
+        if not path:
             details.append(
-                "credential provider failed: credential_config needs a login "
-                "'path' starting with '/'"
+                "credential provider failed: credential_config needs a login 'path'"
             )
             return InconclusiveReason.AUTH
         method = method.upper()
@@ -846,7 +878,13 @@ class Executor:
         except PlaceholderError as e:
             details.append(f"credential provider failed: {e}")
             return InconclusiveReason.AUTH
-        url = self.target_url.rstrip("/") + path
+        url = self._provider_url(path)
+        if url is None:
+            details.append(
+                "credential provider refused: provider URL leaves the target "
+                "(its host/port do not match the target's)"
+            )
+            return InconclusiveReason.AUTH
         allowed, detail = _check_remote_method(method, url, self.provisioned)
         if not allowed:
             details.append(f"credential provider refused: {detail}")
@@ -898,9 +936,9 @@ class Executor:
         cfg = provider.config
         path = cfg.get("path")
         token_path = cfg.get("token_json_path")
-        if not isinstance(path, str) or not path.startswith("/"):
+        if not isinstance(path, str) or not path:
             details.append(
-                "credential provider failed: credential_config needs 'path' starting with '/'"
+                "credential provider failed: credential_config needs a non-empty 'path'"
             )
             return InconclusiveReason.AUTH
         if not isinstance(token_path, str) or not token_path:
@@ -939,9 +977,9 @@ class Executor:
         cfg = provider.config
         path = cfg.get("path")
         token_path = cfg.get("token_json_path")
-        if not isinstance(path, str) or not path.startswith("/"):
+        if not isinstance(path, str) or not path:
             details.append(
-                "credential provider failed: register mode needs 'path' starting with '/'"
+                "credential provider failed: register mode needs a non-empty 'path'"
             )
             return InconclusiveReason.AUTH
         if not isinstance(token_path, str) or not token_path:
@@ -966,7 +1004,13 @@ class Executor:
         except PlaceholderError as e:
             details.append(f"credential provider failed: {e}")
             return InconclusiveReason.AUTH
-        url = self.target_url.rstrip("/") + path
+        url = self._provider_url(path)
+        if url is None:
+            details.append(
+                "credential provider refused: provider URL leaves the target "
+                "(its host/port do not match the target's)"
+            )
+            return InconclusiveReason.AUTH
         allowed, detail = self._check_write_allowed(method, "credential provider")
         if not allowed:
             details.append(f"credential provider refused: {detail}")

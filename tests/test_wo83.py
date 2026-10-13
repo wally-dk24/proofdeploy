@@ -676,7 +676,7 @@ def test_record_names_bootstrap_generated_never_values(tmp_path):
         clean_id="c1",
         auth_bootstrap={"c": {"generated": sorted(bootstrap)}},
     )
-    assert record["schema_version"] == "1.4.0"
+    assert record["schema_version"] == "1.5.0"
     assert record["auth_bootstrap"] == {
         "c": {"generated": ["ADMIN_EMAIL", "ADMIN_PASSWORD"]}
     }
@@ -716,4 +716,253 @@ def test_older_records_still_load(tmp_path):
     records = read_records(tmp_path)
     assert records[0]["record_id"] == "old1"
     assert records[0].get("auth_bootstrap") is None
-    assert SCHEMA_VERSION == "1.4.0"
+    assert SCHEMA_VERSION == "1.5.0"
+
+
+# ── Addendum 62: an auth path must not be able to rewrite the target ──
+#
+# The provider builds its URL by concatenating the contract's path
+# onto the target URL, and the write gate (WO-7.3) allows any host
+# for a provisioned executor — so a path like "@evil.example/x"
+# (userinfo) would send the login POST, generated credentials in the
+# body, to a third party. Two layers refuse it: the validator at
+# load, and the executor's parsed host/port check before any send.
+
+_EVIL_AUTH_PATHS = [
+    "@evil.example/x",  # userinfo: rewrites the host outright
+    "//evil.example/x",  # scheme-relative host
+    "http://evil.example/x",  # a scheme, not a path
+    "login",  # no leading slash at all
+    "/log\\in",  # backslash escape
+    "/x://evil.example",  # a scheme embedded in the path
+]
+
+
+def _register_yaml(path: str) -> str:
+    return (
+        "  mode: register\n"
+        f"  path: '{path}'\n"
+        "  method: POST\n"
+        "  username_field: username\n"
+        "  password_field: password\n"
+        "  token_json_path: token\n"
+    )
+
+
+@pytest.mark.parametrize("bad_path", _EVIL_AUTH_PATHS)
+def test_register_path_cannot_rewrite_host(tmp_path, bad_path):
+    with pytest.raises(ValueError, match=r"auth\.path"):
+        _contract(tmp_path, _register_yaml(bad_path))
+
+
+@pytest.mark.parametrize("bad_path", _EVIL_AUTH_PATHS)
+def test_login_path_cannot_rewrite_host(tmp_path, bad_path):
+    with pytest.raises(ValueError, match=r"auth\.path"):
+        _contract(
+            tmp_path,
+            "  mode: login\n"
+            f"  path: '{bad_path}'\n"
+            "  token_json_path: token\n",
+        )
+
+
+@pytest.mark.parametrize("bad_path", _EVIL_AUTH_PATHS)
+def test_refresh_path_cannot_rewrite_host(tmp_path, bad_path):
+    with pytest.raises(ValueError, match=r"auth\.path"):
+        _contract(
+            tmp_path,
+            "  mode: refresh\n"
+            f"  path: '{bad_path}'\n"
+            "  token_json_path: token\n",
+        )
+
+
+@pytest.mark.parametrize("bad_path", _EVIL_AUTH_PATHS)
+def test_refresh_login_path_cannot_rewrite_host(tmp_path, bad_path):
+    with pytest.raises(ValueError, match=r"auth\.login_path"):
+        _contract(
+            tmp_path,
+            "  mode: refresh\n"
+            "  path: /auth/refresh\n"
+            "  token_json_path: token\n"
+            f"  login_path: '{bad_path}'\n",
+        )
+
+
+def _recording_server():
+    """A listening server that records every request path it receives."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    hits: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _record(self):
+            hits.append(self.path)
+            body = json.dumps(
+                {"access_token": "tok", "refresh_token": "ref", "expires_in": 3600}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = _record
+        do_POST = _record
+
+        def log_message(self, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, hits
+
+
+@pytest.fixture()
+def two_servers():
+    a, hits_a = _recording_server()
+    b, hits_b = _recording_server()
+    yield (
+        f"http://127.0.0.1:{a.server_address[1]}",
+        f"http://127.0.0.1:{b.server_address[1]}",
+        hits_a,
+        hits_b,
+    )
+    a.shutdown()
+    b.shutdown()
+
+
+def _probe_result_for(ex: Executor) -> ProbeResult:
+    return ex.run_probe(
+        {
+            "act": {"method": "GET", "path": "/ok"},
+            "assert": [{"type": "status", "equals": 200}],
+        }
+    )
+
+
+def test_provider_login_url_cannot_leave_target(two_servers):
+    target, other, _hits_target, hits_other = two_servers
+    other_port = other.rsplit(":", 1)[1]
+    ex = Executor(
+        target_url=target,
+        provisioned=True,
+        credential_config={
+            "mode": "login",
+            "path": f"@127.0.0.1:{other_port}/login",
+            "token_json_path": "access_token",
+            "body": {"email": "e@example.com", "password": "pw"},
+        },
+    )
+    result = _probe_result_for(ex)
+    assert result.verdict == Verdict.INCONCLUSIVE
+    assert result.reason == InconclusiveReason.AUTH
+    assert any("leaves the target" in d for d in result.details)
+    assert hits_other == []  # no request reaches the second server
+
+
+def test_provider_register_url_cannot_leave_target(two_servers):
+    target, other, _hits_target, hits_other = two_servers
+    other_port = other.rsplit(":", 1)[1]
+    ex = Executor(
+        target_url=target,
+        provisioned=True,
+        credential_config={
+            "mode": "register",
+            "path": f"@127.0.0.1:{other_port}/register",
+            "token_json_path": "access_token",
+            "username_field": "username",
+            "password_field": "password",
+            "method": "POST",
+        },
+    )
+    result = _probe_result_for(ex)
+    assert result.verdict == Verdict.INCONCLUSIVE
+    assert result.reason == InconclusiveReason.AUTH
+    assert any("leaves the target" in d for d in result.details)
+    assert hits_other == []
+
+
+def test_provider_refresh_login_url_cannot_leave_target(two_servers):
+    target, other, _hits_target, hits_other = two_servers
+    other_port = other.rsplit(":", 1)[1]
+    ex = Executor(
+        target_url=target,
+        provisioned=True,
+        credential_config={
+            "mode": "refresh",
+            "path": "/auth/refresh",
+            "token_json_path": "access_token",
+            "refresh_token_json_path": "refresh_token",
+            "login_path": f"@127.0.0.1:{other_port}/login",
+            "login_body": {"email": "e@example.com", "password": "pw"},
+        },
+    )
+    result = _probe_result_for(ex)
+    assert result.verdict == Verdict.INCONCLUSIVE
+    assert result.reason == InconclusiveReason.AUTH
+    assert any("leaves the target" in d for d in result.details)
+    assert hits_other == []
+
+
+# ── Addendum 62: the ghost_jwt key file must stay a real checkout file ──
+#
+# The contract check was lexical only, and the instance's own seed
+# writes the checkout — so a seed could plant a symlink and have the
+# orchestrator read a host file as the key. Symlinks (the file or any
+# directory component), escapes, and oversized files are key_error.
+
+
+def test_credential_config_refuses_symlink_key_file(tmp_path):
+    host_file = tmp_path.parent / f"{tmp_path.name}-host-secret.txt"
+    host_file.write_text("host-secret-key-material", encoding="utf-8")
+    key_dir = tmp_path / ".pd-auth"
+    key_dir.mkdir()
+    (key_dir / "admin_key").symlink_to(host_file)
+    contract = _contract(
+        tmp_path, "  mode: ghost_jwt\n  key_file: .pd-auth/admin_key\n"
+    )
+    cfg = _orchestrator(tmp_path)._credential_config(_side(tmp_path, contract))
+    assert cfg is not None
+    assert "key_value" not in cfg
+    assert "symlink" in cfg["key_error"]
+
+
+def test_credential_config_refuses_symlinked_dir_component(tmp_path):
+    host_dir = tmp_path.parent / f"{tmp_path.name}-host-dir"
+    host_dir.mkdir()
+    (host_dir / "admin_key").write_text("host-secret-key-material", encoding="utf-8")
+    (tmp_path / ".pd-auth").symlink_to(host_dir, target_is_directory=True)
+    contract = _contract(
+        tmp_path, "  mode: ghost_jwt\n  key_file: .pd-auth/admin_key\n"
+    )
+    cfg = _orchestrator(tmp_path)._credential_config(_side(tmp_path, contract))
+    assert cfg is not None
+    assert "key_value" not in cfg
+    assert "symlink" in cfg["key_error"]
+
+
+def test_credential_config_refuses_oversized_key_file(tmp_path):
+    key_dir = tmp_path / ".pd-auth"
+    key_dir.mkdir()
+    (key_dir / "admin_key").write_text("k" * 70_000, encoding="utf-8")
+    contract = _contract(
+        tmp_path, "  mode: ghost_jwt\n  key_file: .pd-auth/admin_key\n"
+    )
+    cfg = _orchestrator(tmp_path)._credential_config(_side(tmp_path, contract))
+    assert cfg is not None
+    assert "key_value" not in cfg
+    assert "too large" in cfg["key_error"]
+
+
+# ── Addendum 62: schema 1.5.0 names the union; 1.4.0 records load ──
+
+
+def test_schema_140_records_still_load(tmp_path):
+    record = build_evidence_record(run_kind="bug", bug_id="WO83-SCHEMA-140")
+    record["schema_version"] = "1.4.0"
+    runs = tmp_path / "runs.jsonl"
+    runs.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    loaded = read_records(tmp_path)
+    assert len(loaded) == 1
+    assert loaded[0]["schema_version"] == "1.4.0"

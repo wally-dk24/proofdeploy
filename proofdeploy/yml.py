@@ -157,6 +157,35 @@ def _auth_str(auth: dict, key: str, *, required: bool = True) -> str | None:
     return val
 
 
+def _auth_path(auth: dict, key: str, *, required: bool = True) -> str | None:
+    """One auth endpoint path, constrained to the target (Addendum 62).
+
+    The credential provider builds its URL by concatenating this path
+    onto the target URL, and the executor's write gate allows any
+    host for a provisioned target (WO-7.3) — so the path itself must
+    be a plain absolute path on the target. Anything that could
+    rewrite the URL's authority is refused at load: no leading '@'
+    (userinfo), no '//' (scheme-relative host), no '@' anywhere, no
+    backslash, no scheme.
+    """
+    val = _auth_str(auth, key, required=required)
+    if val is None:
+        return None
+    if (
+        not val.startswith("/")
+        or val.startswith("//")
+        or "@" in val
+        or "\\" in val
+        or "://" in val
+    ):
+        raise ValueError(
+            f"proofdeploy.yml 'auth.{key}' must be an absolute path on "
+            "the target (starts with '/', no '//', '@', '\\' or scheme), "
+            f"got: {val!r}"
+        )
+    return val
+
+
 def _auth_str_map(auth: dict, key: str) -> dict[str, str] | None:
     """One optional string-to-string mapping field of the auth mapping.
 
@@ -235,10 +264,11 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
     if bootstrap is not None:
         out["bootstrap_env"] = bootstrap
     if mode == "register":
-        for key in ("path", "method", "username_field", "password_field", "token_json_path"):
+        out["path"] = _auth_path(auth, "path")
+        for key in ("method", "username_field", "password_field", "token_json_path"):
             out[key] = _auth_str(auth, key)
     elif mode == "login":
-        out["path"] = _auth_str(auth, "path")
+        out["path"] = _auth_path(auth, "path")
         out["token_json_path"] = _auth_str(auth, "token_json_path")
         method = _auth_str(auth, "method", required=False)
         if method is not None:
@@ -250,7 +280,7 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
         if expires is not None:
             out["expires_in_json_path"] = expires
     elif mode == "refresh":
-        out["path"] = _auth_str(auth, "path")
+        out["path"] = _auth_path(auth, "path")
         out["token_json_path"] = _auth_str(auth, "token_json_path")
         method = _auth_str(auth, "method", required=False)
         if method is not None:
@@ -263,7 +293,7 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
             val = _auth_str(auth, key, required=False)
             if val is not None:
                 out[key] = val
-        login_path = _auth_str(auth, "login_path", required=False)
+        login_path = _auth_path(auth, "login_path", required=False)
         if login_path is not None:
             out["login_path"] = login_path
     elif mode == "ghost_jwt":

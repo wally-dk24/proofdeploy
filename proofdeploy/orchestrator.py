@@ -1707,22 +1707,56 @@ class Orchestrator:
         if cfg.get("mode") == "ghost_jwt":
             key_file = cfg.pop("key_file", None)
             if isinstance(key_file, str) and key_file:
-                key_path = side.snapshot_dir / key_file
-                try:
-                    key_value = key_path.read_text(encoding="utf-8").strip()
-                except OSError:
-                    key_value = ""
+                key_value, key_problem = self._read_key_file(side, key_file)
                 if key_value:
                     cfg["key_value"] = key_value
                     if key_value not in side.generated_secrets:
                         side.generated_secrets.append(key_value)
                 else:
-                    cfg["key_error"] = (
+                    cfg["key_error"] = key_problem or (
                         f"auth key file not found or empty: {key_file} "
                         "(declared by the contract; the instance's seed "
                         "must write it during provisioning)"
                     )
         return cfg
+
+    # A Ghost Admin key is a short "id:secret" string; this cap sits
+    # far above any real key and far below a file worth smuggling.
+    _KEY_FILE_MAX_BYTES = 65536
+
+    def _read_key_file(self, side: _Side, key_file: str) -> tuple[str, str | None]:
+        """Read a contract-declared `ghost_jwt` key file, hardened.
+
+        The instance's own seed writes the checkout, so the file is
+        app-controlled (Addendum 62): the contract check in yml.py is
+        lexical, and a planted symlink would otherwise have the
+        orchestrator read a HOST file as the key. The file must be a
+        regular file inside the snapshot — no symlink at the file or
+        at any directory component, the resolved path stays inside
+        the snapshot, and the size is capped. Returns (value, None)
+        on success, ("", problem) for a refusal, and ("", None) for
+        a plain missing/unreadable file (the caller words that case).
+        """
+        root = side.snapshot_dir.resolve()
+        node = root
+        for part in Path(key_file).parts:
+            node = node / part
+            if node.is_symlink():
+                return "", f"auth key file must not be a symlink: {key_file}"
+        resolved = (root / key_file).resolve()
+        if resolved != root and root not in resolved.parents:
+            return "", f"auth key file resolves outside the checkout: {key_file}"
+        try:
+            if not resolved.is_file():
+                return "", None
+            if resolved.stat().st_size > self._KEY_FILE_MAX_BYTES:
+                return "", (
+                    f"auth key file too large: {key_file} "
+                    f"(limit {self._KEY_FILE_MAX_BYTES} bytes)"
+                )
+            return resolved.read_text(encoding="utf-8").strip(), None
+        except OSError:
+            return "", None
 
     def _make_executor(self, side: _Side) -> Executor:
         assert side.provision and side.provision.target_url
