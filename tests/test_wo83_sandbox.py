@@ -726,18 +726,40 @@ def test_ghost_ghost_jwt_proof_in_sandbox(tmp_path):
     )
     assert (repo / "package.json").is_file()
     assert (repo / "index.js").is_file()
-    # The published tarball retains the monorepo's pnpm-workspace.yaml
-    # (a dependency catalog for building Ghost from source), and the
-    # provisioning adapter refuses workspace trees on principle. The
-    # installed application is the single root package — the
-    # Ghost-CLI layout — installed from its OWN committed
-    # pnpm-lock.yaml with its pinned packageManager (pnpm). Removing
-    # the scaffolding file makes the vendored tree read as what it
-    # is; nothing else in the tree is touched. (First CI run of this
-    # proof failed on exactly this: plan refusal "workspaces not yet
-    # supported".)
+    # Vendor the tree the way Ghost-CLI installs Ghost in production:
+    # with npm. The published tarball is the monorepo's root package
+    # plus its pnpm scaffolding, and Ghost's pnpm path cannot be
+    # provisioned by the adapter (each step verified on CI or locally
+    # during this work order):
+    # - the tarball ships pnpm-workspace.yaml (catalog + overrides
+    #   for building Ghost from source); the adapter refuses
+    #   workspace trees on principle -> plan refusal "workspaces not
+    #   yet supported" (first CI run of this proof);
+    # - with the file removed, the SHIPPED pnpm-lock.yaml no longer
+    #   matches the tree's config (its overrides live in that file)
+    #   -> ERR_PNPM_LOCKFILE_CONFIG_MISMATCH (second CI run);
+    # - a regenerated pnpm lockfile installs until pnpm 12's build
+    #   approvals: ERR_PNPM_IGNORED_BUILDS for better-sqlite3, re2,
+    #   dtrace-provider — and pnpm 12 takes approvals ONLY from
+    #   pnpm-workspace.yaml (the package.json pnpm field is ignored;
+    #   verified locally). Approving builds needs the one file the
+    #   adapter refuses.
+    # So the proof presents the tree as the single npm package it is
+    # installed as in production: the pnpm scaffolding and pin are
+    # removed (nothing else in the tree is touched), and the lockfile
+    # is generated with npm, as for Directus. Verified locally in the
+    # pinned node image: lockfile generation, npm ci (native bindings
+    # for better-sqlite3 and re2 built), and Ghost booting to a 200
+    # on the contract env.
     (repo / "pnpm-workspace.yaml").unlink(missing_ok=True)
-    assert (repo / "pnpm-lock.yaml").is_file()
+    (repo / "pnpm-lock.yaml").unlink(missing_ok=True)
+    pkg_path = repo / "package.json"
+    pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
+    assert pkg.pop("packageManager", "").startswith("pnpm@")
+    pkg_path.write_text(json.dumps(pkg, indent=2) + "\n", encoding="utf-8")
+    _npm_lockfile(repo, legacy_peer_deps=True)
+    assert (repo / "package-lock.json").is_file()
+    (repo / ".npmrc").write_text("legacy-peer-deps=true\n", encoding="utf-8")
     (repo / "seed-ghost.js").write_text(GHOST_SEED_JS, encoding="utf-8")
     (repo / "proofdeploy.yml").write_text(GHOST_APP_CONTRACT, encoding="utf-8")
     _git(repo, "init", "-q")
