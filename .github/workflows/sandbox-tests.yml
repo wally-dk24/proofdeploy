@@ -140,25 +140,13 @@ jobs:
           shard_count=$(count ${{ matrix.files }} -m "sandbox")
           echo "collection: sandbox(full)=$sand shard(${{ matrix.shard }})=$shard_count"
           echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
-          # Partition guard: the set of files containing sandbox tests
-          # must be exactly the files covered by the shard matrix. A
-          # sandbox test added to a new file fails every shard loudly
-          # instead of being silently unselected.
-          files=$(python -m pytest --collect-only -q -o addopts="" -p no:cacheprovider -m "sandbox" 2>/dev/null | grep "::" | sed 's/::.*//' | sort -u)
-          expected="tests/test_conformance.py
-          tests/test_forced_compile.py
-          tests/test_node26_corepack.py
-          tests/test_node_headers.py
-          tests/test_orchestrator.py
-          tests/test_sandbox.py
-          tests/test_uptime_kuma.py
-          tests/test_wo81_generated_variant.py
-          tests/test_wo81b_sandbox.py"
-          if [ "$files" != "$expected" ]; then
-            echo "::error::sandbox tests live outside the shard matrix; update the matrix in sandbox-tests.yml"
-            diff <(echo "$expected") <(echo "$files") || true
-            exit 1
-          fi
+          # WAL-109: the file-set partition guard that used to be
+          # embedded here (a hardcoded list of the files holding
+          # sandbox tests) is owned by scripts/check_test_manifest.py
+          # in the ci workflow's lint job: the collected sandbox
+          # selection must equal tests/expected_sandbox_nodeids.txt
+          # and every test must be selected by exactly one shard of
+          # this matrix.
 
       - name: Run sandbox selection (this shard)
         # B3 (Addendum 16): PD_REQUIRE_SANDBOX=1 turns any sandbox
