@@ -1292,7 +1292,12 @@ class Orchestrator:
         # for Node), which is a bind mount shared by every container,
         # so they persist from install to app start.
         if plan.lockfile_name is None:
-            logs.append(f"no frozen lockfile found for {runtime_name}")
+            # Name the plan's actual refusal: a generic "no lockfile"
+            # line masked a workspaces refusal during WO-8.3's first
+            # CI run and sent diagnosis to the wrong layer.
+            logs.append(
+                plan.refusal or f"no frozen lockfile found for {runtime_name}"
+            )
             return self._sandbox_failed_side(
                 sb, rev, sha, snapshot, contract, logs,
                 ProvisionStatus.BUILD_FAILED,
