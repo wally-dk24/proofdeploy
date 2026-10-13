@@ -80,6 +80,14 @@ class ProvisionResult:
     # committed lock (whose own sha256 is lockfile_sha256) and when
     # generation never produced a file.
     generated_lock: dict | None = None
+    # WO-8.1c: for a committed-manager plan (which builds the root
+    # project during install), the build backend that actually
+    # built it: {"name": ..., "version": ...}, read back from the
+    # built wheel's Generator by the executors (provisioning's
+    # build_backend_evidence). Evidence only — non-scoring. None
+    # when the install never built the root project (the pip
+    # paths) or nothing could be determined.
+    build_backend: dict | None = None
     # Live process handle on READY. Caller-owned: the caller must terminate
     # it when done and call cleanup_run(run_id). Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
@@ -104,6 +112,7 @@ class ProvisionResult:
             "install_plan_sha256": self.install_plan_sha256,
             "executed_steps": self.executed_steps,
             "generated_lock": self.generated_lock,
+            "build_backend": self.build_backend,
             "logs": self.logs,
         }
 
@@ -1177,6 +1186,7 @@ class Provisioner:
         # module's helpers, so a top-level import would be circular.
         from proofdeploy.provisioning import (
             InstallPlan,
+            build_backend_evidence,
             plan_provisioning,
         )
 
@@ -1185,6 +1195,11 @@ class Provisioner:
         # once, right after the install step succeeds; _bail and the
         # result builders below attach it when present.
         gen_lock: dict | None = None
+
+        # WO-8.1c: the build backend that actually built the root
+        # project, read back the same way (see
+        # build_backend_evidence); attached wherever gen_lock is.
+        build_backend_ev: dict | None = None
 
         def _bail(
             status: ProvisionStatus,
@@ -1198,6 +1213,8 @@ class Provisioner:
             result.executed_steps = executed
             if gen_lock is not None:
                 result.generated_lock = gen_lock
+            if build_backend_ev is not None:
+                result.build_backend = build_backend_ev
             if _plan is not None:
                 result.install_plan = _plan.to_dict()
                 result.install_plan_sha256 = _plan.sha256()
@@ -1559,6 +1576,19 @@ class Provisioner:
                 f"sha256 {gen_lock['sha256'][:16]}..."
             )
 
+        # WO-8.1c: a committed manager's install built the root
+        # project; read the backend that actually built it back
+        # for the evidence (the built wheel's Generator, stamped
+        # in the checkout venv the managers install into). Never
+        # affects the outcome — evidence only.
+        if plan.build_backend is not None:
+            build_backend_ev = build_backend_evidence(plan, snap)
+            if build_backend_ev is not None:
+                logs.append(
+                    f"build backend: {build_backend_ev['name']} "
+                    f"{build_backend_ev['version']}"
+                )
+
         # 8. Contract steps in order: build, migrate, seed (from the
         # plan's steps; the sandbox executor runs the same steps).
         for step in plan.steps:
@@ -1630,6 +1660,8 @@ class Provisioner:
             result.executed_steps = executed
             if gen_lock is not None:
                 result.generated_lock = gen_lock
+            if build_backend_ev is not None:
+                result.build_backend = build_backend_ev
             return result
 
         # Addendum 31: the start step is recorded as it is issued;
@@ -1713,6 +1745,7 @@ class Provisioner:
                 install_plan_sha256=plan.sha256(),
                 executed_steps=executed,
                 generated_lock=gen_lock,
+                build_backend=build_backend_ev,
                 proc=proc,
             )
         finally:

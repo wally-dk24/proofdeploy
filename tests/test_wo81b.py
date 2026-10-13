@@ -88,7 +88,15 @@ FROZEN_ARGV = {
 }
 
 FROZEN_ENV = {
-    "uv": {"UV_PROJECT_ENVIRONMENT": "{venv}"},
+    # WO-8.1c: the shape test below plans with lock_cutoff
+    # "2026-01-02T03:04:05Z", which now also rides the uv sync
+    # step as UV_EXCLUDE_NEWER (it constrains the root project's
+    # build-isolation resolution to the unit cutoff; the frozen
+    # lock itself is unaffected).
+    "uv": {
+        "UV_PROJECT_ENVIRONMENT": "{venv}",
+        "UV_EXCLUDE_NEWER": "2026-01-02T03:04:05Z",
+    },
     "poetry": {"POETRY_VIRTUALENVS_IN_PROJECT": "true"},
     "pdm": {},
 }
