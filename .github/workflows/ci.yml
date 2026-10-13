@@ -184,7 +184,7 @@ jobs:
           - shard: executor
             files: "tests/test_cli.py tests/test_executor.py tests/test_model_client.py tests/test_regb_template_selection.py tests/test_sandbox_addendum18.py tests/test_wo74.py tests/test_wo81_addendum46.py tests/test_wo81c.py tests/test_yml.py"
             nodeids: "tests/test_orchestrator.py::test_evidence_record_carries_provenance tests/test_orchestrator.py::test_inconclusive_unsandboxed_records_not_measured tests/test_orchestrator.py::test_measure_bug_model_overflow_no_retry tests/test_orchestrator.py::test_measure_bug_no_skill_arm_end_to_end tests/test_orchestrator.py::test_measure_bug_refuses_seeded_fix_diff tests/test_orchestrator.py::test_measure_clean_model_overflow_no_retry tests/test_orchestrator.py::test_no_auth_app_clean_run tests/test_orchestrator.py::test_no_auth_app_does_not_crash tests/test_orchestrator.py::test_no_auth_app_model_failure tests/test_orchestrator.py::test_no_blocks_records_author_output_invalid tests/test_orchestrator.py::test_sandboxed_crash_records_measured tests/test_orchestrator.py::test_target_process_group_killed tests/test_orchestrator.py::test_target_process_stopped_after_crash tests/test_orchestrator.py::test_target_process_stopped_after_run tests/test_orchestrator.py::test_unreachable_target_with_invalid_block_scores_inconclusive tests/test_wo81b.py::test_host_mismatch_lock_is_build_failed_with_tool_line tests/test_wo81b.py::test_host_provisions_committed_lock_ready[uv]"
-            expected: 169
+            expected: 174
 
     name: host (${{ matrix.shard }})
     steps:
