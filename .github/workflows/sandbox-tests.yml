@@ -89,7 +89,7 @@ jobs:
           - shard: apps
             files: "tests/test_conformance.py"
           - shard: provisions
-            files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py tests/test_wo81_generated_variant.py"
+            files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py tests/test_wo81_generated_variant.py tests/test_wo81b_sandbox.py"
     name: sandbox (${{ matrix.shard }})
     steps:
       - name: Gate (WAL-101)
@@ -171,7 +171,8 @@ jobs:
           tests/test_orchestrator.py
           tests/test_sandbox.py
           tests/test_uptime_kuma.py
-          tests/test_wo81_generated_variant.py"
+          tests/test_wo81_generated_variant.py
+          tests/test_wo81b_sandbox.py"
           if [ "$files" != "$expected" ]; then
             echo "::error::sandbox tests live outside the shard matrix; update the matrix in sandbox-tests.yml"
             diff <(echo "$expected") <(echo "$files") || true
