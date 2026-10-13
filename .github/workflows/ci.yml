@@ -8,9 +8,15 @@ name: ci
 # in three shards (matrix in the host job), each on its own runner;
 # the sandbox-tests workflow runs the sandbox selection. The union of
 # the selections is the full suite; every job prints the partition
-# counts, and each shard asserts its own collected count against the
-# matrix's expected count, so a test added without updating the matrix
-# fails loudly instead of running twice or not at all. Each host shard
+# counts, and each shard's JUnit verify asserts every test it
+# collected ran and none skipped. The exact-set proof — every
+# collected test named, and selected by exactly one shard — lives
+# in the generated test manifest (tests/expected_*_nodeids.txt),
+# checked by scripts/check_test_manifest.py in the lint job
+# (WAL-109: the hardcoded per-shard counts and embedded file lists
+# that used to sit in these matrices were replaced by the manifest;
+# a test added without regenerating it fails the lint job in ~a
+# minute with the nodeids named). Each host shard
 # also writes a JUnit report, and a verify step asserts from it that
 # every collected test ran and none skipped (Addendum 55): the host
 # selection has no PD_REQUIRE_SANDBOX net, so without this a
@@ -27,7 +33,8 @@ name: ci
 # test_wo81b.py (74.7s, four real-install tests carrying 74.5s of it)
 # is split the same way.
 # Rebalance the same way when durations move: measure, re-pack,
-# update files/nodeids/expected together.
+# update files/nodeids together, and regenerate the test manifest
+# (python scripts/check_test_manifest.py --write).
 #
 # The required `test` check is the aggregate job at the bottom. It
 # runs whenever its inputs ran (never a skipped job), succeeds iff
@@ -163,6 +170,15 @@ jobs:
       - name: typecheck
         if: steps.gate.outputs.proceed == 'true'
         run: mypy proofdeploy conformance
+      - name: Test manifest (WAL-109)
+        # The exact-set partition proof, fast: the collected
+        # suite must equal tests/expected_*_nodeids.txt and
+        # every test must be selected by exactly one shard.
+        # Adding/removing/renaming a test without regenerating
+        # the manifest fails HERE, in ~a minute, with the
+        # nodeids named — not ten minutes into a shard run.
+        if: steps.gate.outputs.proceed == 'true'
+        run: python scripts/check_test_manifest.py
 
   host:
     needs: changes
@@ -176,15 +192,12 @@ jobs:
           - shard: goldens
             files: "tests/test_executor_addendum20.py tests/test_leakcheck.py tests/test_orchestrator_addendum25.py tests/test_probe.py tests/test_provisioning_sandbox.py tests/test_replay.py tests/test_runner.py tests/test_runpair_addendum21.py tests/test_runpair_addendum24.py tests/test_runpair_addendum25.py tests/test_wo7_pr2.py"
             nodeids: "tests/test_orchestrator.py::test_check_sandbox_runtime_mismatch_fails_closed tests/test_orchestrator.py::test_clean_no_valid_probe_is_false_alarm tests/test_orchestrator.py::test_measure_bug_end_to_end tests/test_orchestrator.py::test_measure_bug_leak_check_fails_closed tests/test_orchestrator.py::test_measure_bug_model_transport_retry_succeeds tests/test_orchestrator.py::test_measure_bug_model_transport_retry_twice tests/test_orchestrator.py::test_measure_bug_refuses_fix_sha_in_snapshot tests/test_orchestrator.py::test_measure_bug_uses_fix_parent_not_b tests/test_orchestrator.py::test_measure_clean_model_transport_retry_succeeds tests/test_orchestrator.py::test_measure_clean_model_transport_retry_twice tests/test_orchestrator.py::test_sandboxed_clean_run_records_measured tests/test_orchestrator.py::test_unsandboxed_clean_run_records_not_measured tests/test_orchestrator.py::test_unsandboxed_normal_run_records_not_measured tests/test_wo81b.py::test_host_provisions_committed_lock_ready[poetry]"
-            expected: 212
           - shard: contracts
             files: "tests/test_change_model.py tests/test_examples.py tests/test_fixture.py tests/test_orchestrator_addendum23.py tests/test_orchestrator_addendum24.py tests/test_provisioning.py tests/test_runpair.py tests/test_runpair_addendum23.py tests/test_sandbox.py tests/test_setup_auth.py tests/test_wo73.py tests/test_wo81.py"
             nodeids: "tests/test_orchestrator.py::test_all_blocks_invalid_records_author_output_invalid tests/test_orchestrator.py::test_check_sandbox_runtime_match tests/test_orchestrator.py::test_check_sandbox_runtime_no_declared_range tests/test_orchestrator.py::test_crash_after_authoring_records_inconclusive tests/test_orchestrator.py::test_declared_registration_provider tests/test_orchestrator.py::test_inconclusive_sandboxed_counts tests/test_orchestrator.py::test_inconclusive_unsandboxed_dev_does_not_count tests/test_orchestrator.py::test_measure_bug_provisioning_failure_is_inconclusive tests/test_orchestrator.py::test_measure_clean_end_to_end tests/test_orchestrator.py::test_measure_config_sandbox_on_by_default tests/test_orchestrator.py::test_measure_needs_revs tests/test_orchestrator.py::test_mixed_valid_invalid_blocks tests/test_orchestrator.py::test_non_json_block_records_author_output_invalid tests/test_orchestrator.py::test_provider_failure_is_inconclusive_auth tests/test_orchestrator.py::test_unsandboxed_run_is_marked_not_measured tests/test_wo81b.py::test_bootstrap_file_pins_exact_version_with_hashes[pdm] tests/test_wo81b.py::test_bootstrap_file_pins_exact_version_with_hashes[poetry] tests/test_wo81b.py::test_bootstrap_file_pins_exact_version_with_hashes[uv] tests/test_wo81b.py::test_committed_lock_plan_shape[pdm] tests/test_wo81b.py::test_committed_lock_plan_shape[poetry] tests/test_wo81b.py::test_committed_lock_plan_shape[uv] tests/test_wo81b.py::test_first_error_line_names_uv_lock_check_error tests/test_wo81b.py::test_host_provisions_committed_lock_ready[pdm] tests/test_wo81b.py::test_manager_versions_pinned_in_code tests/test_wo81b.py::test_sandbox_runs_manager_plan[pdm] tests/test_wo81b.py::test_sandbox_runs_manager_plan[poetry] tests/test_wo81b.py::test_sandbox_runs_manager_plan[uv]"
-            expected: 245
           - shard: executor
             files: "tests/test_cli.py tests/test_executor.py tests/test_model_client.py tests/test_regb_template_selection.py tests/test_sandbox_addendum18.py tests/test_wo74.py tests/test_wo81_addendum46.py tests/test_yml.py"
             nodeids: "tests/test_orchestrator.py::test_evidence_record_carries_provenance tests/test_orchestrator.py::test_inconclusive_unsandboxed_records_not_measured tests/test_orchestrator.py::test_measure_bug_model_overflow_no_retry tests/test_orchestrator.py::test_measure_bug_no_skill_arm_end_to_end tests/test_orchestrator.py::test_measure_bug_refuses_seeded_fix_diff tests/test_orchestrator.py::test_measure_clean_model_overflow_no_retry tests/test_orchestrator.py::test_no_auth_app_clean_run tests/test_orchestrator.py::test_no_auth_app_does_not_crash tests/test_orchestrator.py::test_no_auth_app_model_failure tests/test_orchestrator.py::test_no_blocks_records_author_output_invalid tests/test_orchestrator.py::test_sandboxed_crash_records_measured tests/test_orchestrator.py::test_target_process_group_killed tests/test_orchestrator.py::test_target_process_stopped_after_crash tests/test_orchestrator.py::test_target_process_stopped_after_run tests/test_orchestrator.py::test_unreachable_target_with_invalid_block_scores_inconclusive tests/test_wo81b.py::test_host_mismatch_lock_is_build_failed_with_tool_line tests/test_wo81b.py::test_host_provisions_committed_lock_ready[uv]"
-            expected: 148
 
     name: host (${{ matrix.shard }})
     steps:
@@ -219,6 +232,7 @@ jobs:
       - run: pip install -e ".[dev]"
         if: steps.gate.outputs.proceed == 'true'
       - name: Selection counts (WAL-102 partition proof)
+        id: counts
         if: steps.gate.outputs.proceed == 'true'
         run: |
           count() { python -m pytest --collect-only -q -o addopts="" -p no:cacheprovider "$@" 2>/dev/null | grep -c "::" || true; }
@@ -226,59 +240,20 @@ jobs:
           host=$(count -m "not sandbox")
           sand=$(count -m "sandbox")
           shard_count=$(count ${{ matrix.files }} ${{ matrix.nodeids }} -m "not sandbox")
-          echo "collection: full=$full host=$host sandbox=$sand shard(${{ matrix.shard }})=$shard_count expected=${{ matrix.expected }}"
+          echo "collection: full=$full host=$host sandbox=$sand shard(${{ matrix.shard }})=$shard_count"
+          echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
           if [ "$((host + sand))" -ne "$full" ]; then
             echo "::error::partition broken: host($host) + sandbox($sand) != full($full)"
             exit 1
           fi
-          if [ "$shard_count" -ne "${{ matrix.expected }}" ]; then
-            echo "::error::shard ${{ matrix.shard }} collected $shard_count host tests, matrix expects ${{ matrix.expected }}; a host test was added, removed, or moved without updating the matrix in ci.yml"
-            exit 1
-          fi
-          # Partition guard: the set of files containing host tests
-          # must be exactly the files covered by the shard matrix
-          # (counting test_orchestrator.py, whose tests the matrix
-          # splits by nodeid). A host test added to a new file fails
-          # every shard loudly instead of being silently unselected.
-          files=$(python -m pytest --collect-only -q -o addopts="" -p no:cacheprovider -m "not sandbox" 2>/dev/null | grep "::" | sed 's/::.*//' | sort -u)
-          expected="tests/test_change_model.py
-          tests/test_cli.py
-          tests/test_examples.py
-          tests/test_executor.py
-          tests/test_executor_addendum20.py
-          tests/test_fixture.py
-          tests/test_leakcheck.py
-          tests/test_model_client.py
-          tests/test_orchestrator.py
-          tests/test_orchestrator_addendum23.py
-          tests/test_orchestrator_addendum24.py
-          tests/test_orchestrator_addendum25.py
-          tests/test_probe.py
-          tests/test_provisioning.py
-          tests/test_provisioning_sandbox.py
-          tests/test_regb_template_selection.py
-          tests/test_replay.py
-          tests/test_runner.py
-          tests/test_runpair.py
-          tests/test_runpair_addendum21.py
-          tests/test_runpair_addendum23.py
-          tests/test_runpair_addendum24.py
-          tests/test_runpair_addendum25.py
-          tests/test_sandbox.py
-          tests/test_sandbox_addendum18.py
-          tests/test_setup_auth.py
-          tests/test_wo73.py
-          tests/test_wo74.py
-          tests/test_wo7_pr2.py
-          tests/test_wo81.py
-          tests/test_wo81_addendum46.py
-          tests/test_wo81b.py
-          tests/test_yml.py"
-          if [ "$files" != "$expected" ]; then
-            echo "::error::host tests live outside the shard matrix; update the matrix in ci.yml"
-            diff <(echo "$expected") <(echo "$files") || true
-            exit 1
-          fi
+          # WAL-109: no hardcoded per-shard counts or file lists
+          # live here anymore. The exact-set proof — every
+          # collected test named in tests/expected_*_nodeids.txt
+          # and selected by exactly one shard — is owned by
+          # scripts/check_test_manifest.py, run in the lint job
+          # (and locally before pushing). This step keeps the
+          # runtime partition equality and hands the shard's own
+          # collected count to the JUnit verify step below.
       - name: tests (this shard)
         if: steps.gate.outputs.proceed == 'true'
         env:
@@ -298,7 +273,7 @@ jobs:
         # JUnit report closes that permanently.
         if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
         env:
-          EXPECTED: ${{ matrix.expected }}
+          EXPECTED: ${{ steps.counts.outputs.shard_count }}
           SHARD: ${{ matrix.shard }}
         run: |
           python3 - <<'EOF'
