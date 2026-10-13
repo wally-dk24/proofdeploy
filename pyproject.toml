@@ -25,6 +25,9 @@ proofdeploy = "proofdeploy.cli:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=proofdeploy --cov-report=term-missing --cov-fail-under=80"
+markers = [
+    "sandbox: tests that need the container sandbox (podman); auto-applied by tests/conftest.py to tests carrying a sandbox-capability skipif; selected with -m sandbox in the sandbox-tests CI job, deselected with -m 'not sandbox' in the ci job",
+]
 
 [tool.ruff]
 target-version = "py310"

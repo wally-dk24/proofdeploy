@@ -2,6 +2,23 @@
 #
 # Do NOT claim CI works until a real run log exists; see
 # docs/sandbox-ci.md "What the first CI run must show".
+#
+# WAL-102 (CI optimization): this workflow now runs ONLY the sandbox
+# selection (-m sandbox, auto-marked by tests/conftest.py) instead of
+# the full suite. The full suite still runs on every PR — as the union
+# of the ci workflow's host selection and this selection; both jobs
+# print the partition counts. The selection is sharded (matrix below)
+# so the wall time is the slowest shard, not the sum. WAL-109 (split):
+# the old apps/core/provisions grouping is rebalanced by measured
+# duration toward ~10 minutes per shard — conformance runs one shard
+# per golden variant (nodeids), provisions splits into the manager
+# variants and the standalone app provisions, core splits by file.
+# Which shard selects which test is proven by
+# scripts/check_test_manifest.py against
+# tests/expected_sandbox_nodeids.txt (the same 48 nodeids as before;
+# only the assignment moved).
+# Lint/typecheck are NOT repeated here: the ci workflow's identical
+# commands are the gate.
 
 name: sandbox-tests
 
@@ -16,70 +33,206 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  sandbox:
+  changes:
+    # WAL-101: same inert-change decision as the ci workflow. Only
+    # pull_request events are ever gated; pushes to main, dispatches,
+    # and any doubtful diff (empty included) always run everything.
     runs-on: ubuntu-latest
+    outputs:
+      run_heavy: ${{ steps.decide.outputs.run_heavy }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decide heavy steps
+        id: decide
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "run_heavy=true" >> "$GITHUB_OUTPUT"
+            echo "event=$GITHUB_EVENT_NAME: heavy steps always run"
+            exit 0
+          fi
+          files=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          echo "changed files:"
+          echo "$files"
+          heavy=true
+          if [ -n "$files" ]; then
+            heavy=false
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              case "$f" in
+                # Load-bearing despite living under docs/: tests read
+                # the registered skill file and check its sha256
+                # (tests/test_leakcheck.py). Never inert.
+                docs/evaluation/*) echo "NON-INERT (test input): $f"; heavy=true ;;
+                docs/*) echo "inert: $f" ;;
+                README.md|CONTRIBUTING.md|SECURITY.md|CHANGELOG.md|CODE_OF_CONDUCT.md) echo "inert: $f" ;;
+                LICENSE|LICENSE.*) echo "inert: $f" ;;
+                .gitignore|.gitattributes|.editorconfig) echo "inert: $f" ;;
+                *) echo "NON-INERT: $f"; heavy=true ;;
+              esac
+            done <<< "$files"
+          else
+            echo "empty diff: defaulting to RUN"
+          fi
+          echo "run_heavy=$heavy" >> "$GITHUB_OUTPUT"
+          echo "decision: run_heavy=$heavy"
+
+  sandbox:
+    needs: changes
+    # WAL-101: same fail-closed gate pattern as the ci workflow.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: core-sandbox
+            files: "tests/test_sandbox.py"
+          - shard: core-orchestrator
+            files: "tests/test_orchestrator.py"
+          - shard: apps-node-express
+            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-express-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-express-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-express-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-express-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-express-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-express-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-express-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-express-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-express-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-express-sqlite]"
+          - shard: apps-node-pnpm
+            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-pnpm-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-pnpm-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-pnpm-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-pnpm-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-pnpm-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-pnpm-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-pnpm-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-pnpm-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-pnpm-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-pnpm-sqlite]"
+          - shard: apps-python-flask
+            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[python-flask-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[python-flask-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[python-flask-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[python-flask-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[python-flask-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[python-flask-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[python-flask-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[python-flask-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[python-flask-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[python-flask-sqlite]"
+          - shard: provisions-managers
+            files: "tests/test_wo81b_sandbox.py tests/test_wo81_generated_variant.py"
+          - shard: provisions-apps
+            files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py"
+    name: sandbox (${{ matrix.shard }})
+    steps:
+      - name: Gate (WAL-101)
+        id: gate
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "::error::changes job did not succeed; failing closed"
+            exit 1
+          fi
+          # Only the two exact decisions may pass this gate; an
+          # unset/empty output fails closed instead of skipping green.
+          case "${{ needs.changes.outputs.run_heavy }}" in
+            true|false) ;;
+            *) echo "::error::unexpected run_heavy value '${{ needs.changes.outputs.run_heavy }}'; failing closed"; exit 1 ;;
+          esac
+          echo "proceed=${{ needs.changes.outputs.run_heavy }}" >> "$GITHUB_OUTPUT"
+          echo "run_heavy=${{ needs.changes.outputs.run_heavy }}"
+      - name: Inert change — heavy steps skipped (WAL-101)
+        if: steps.gate.outputs.proceed == 'false'
+        run: echo "Every changed file is inert (documentation/text only); the sandbox selection does not run for this PR."
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.proceed == 'true'
 
       - name: Set up Python
         uses: actions/setup-python@v5
+        if: steps.gate.outputs.proceed == 'true'
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install podman
+        if: steps.gate.outputs.proceed == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y podman
 
       - name: Install package and dev dependencies
+        if: steps.gate.outputs.proceed == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Lint and typecheck
+      - name: Selection counts (WAL-102 partition proof)
+        id: counts
+        if: steps.gate.outputs.proceed == 'true'
         run: |
-          python -m ruff check proofdeploy tests conformance
-          python -m mypy proofdeploy conformance
+          count() { python -m pytest --collect-only -q -o addopts="" -p no:cacheprovider "$@" 2>/dev/null | grep -c "::" || true; }
+          sand=$(count -m "sandbox")
+          shard_count=$(count ${{ matrix.files }} ${{ matrix.nodeids }} -m "sandbox")
+          echo "collection: sandbox(full)=$sand shard(${{ matrix.shard }})=$shard_count"
+          echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
+          # WAL-109: the file-set partition guard that used to be
+          # embedded here (a hardcoded list of the files holding
+          # sandbox tests) is owned by scripts/check_test_manifest.py
+          # in the ci workflow's lint job: the collected sandbox
+          # selection must equal tests/expected_sandbox_nodeids.txt
+          # and every test must be selected by exactly one shard of
+          # this matrix.
 
-      - name: Run full test suite
-        # The full suite (not just the sandbox tests): the sandbox
-        # tests must actually RUN here rather than skip, proving the
-        # runner can do real container isolation.
-        #
+      - name: Run sandbox selection (this shard)
         # B3 (Addendum 16): PD_REQUIRE_SANDBOX=1 turns any sandbox
-        # test skip into a failure. A silently-skipping sandbox test
-        # hides real bugs (the T1 miss); this job must prove the
-        # tests ran.
+        # test skip into a failure; the Verify step below additionally
+        # asserts from the JUnit report that every collected test ran
+        # and none skipped.
+        #
+        # The 80% coverage floor (pyproject addopts) is NOT applied to
+        # this subset — a subset cannot reach a whole-suite floor. It
+        # is enforced in the ci workflow on the host selection, which
+        # bounds the union from below (coverage combine only adds
+        # covered lines). This job still records coverage data and
+        # uploads it for the union audit.
+        if: steps.gate.outputs.proceed == 'true'
         env:
           PD_REQUIRE_SANDBOX: "1"
+          COVERAGE_FILE: .coverage.sandbox-${{ matrix.shard }}
         run: |
-          python -m pytest tests/ -v
+          python -m pytest ${{ matrix.files }} ${{ matrix.nodeids }} -m sandbox -q --durations=25 \
+            -o addopts="--cov=proofdeploy --cov-report=term-missing" \
+            --junitxml=/tmp/sandbox-${{ matrix.shard }}.xml
 
       - name: Upload provision logs
         # Addendum 35: the full provision logs of the conformance /
         # node26 / uptime-kuma provisions (pd-logs/, written by the
         # tests) — a failing install's real error line must survive
         # even where an assertion message would trim it.
-        if: always()
+        if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pd-logs
+          name: pd-logs-${{ matrix.shard }}
           path: pd-logs/
           retention-days: 7
 
       - name: Verify sandbox tests ran (not skipped)
-        # B3: belt-and-braces check that the key sandbox tests were
-        # collected and ran. Fails the job if they skipped.
+        # B3 successor: reads THIS run's JUnit report (the old step
+        # re-ran three already-run tests for 393s). Proves the shard's
+        # collected sandbox tests all ran and none skipped.
+        if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
+        env:
+          EXPECTED: ${{ steps.counts.outputs.shard_count }}
+          SHARD: ${{ matrix.shard }}
         run: |
-          python -m pytest tests/test_sandbox.py::test_sandbox_install_and_run tests/test_orchestrator.py::test_sandboxed_provision_keeps_installed_dependencies tests/test_orchestrator.py::test_sandboxed_failed_start_captures_app_log -v --no-header -q 2>&1 | tee /tmp/sandbox-verify.log
-          if grep -q "SKIPPED" /tmp/sandbox-verify.log; then
-            echo "B3: expected sandbox tests SKIPPED — failing the job"
-            exit 1
-          fi
-          if ! grep -q "3 passed" /tmp/sandbox-verify.log; then
-            echo "B3: expected 3 sandbox tests to pass"
-            exit 1
-          fi
+          python3 - <<'EOF'
+          import os
+          import xml.etree.ElementTree as ET
+
+          path = f"/tmp/sandbox-{os.environ['SHARD']}.xml"
+          expected = int(os.environ["EXPECTED"])
+          suite = ET.parse(path).getroot()
+          if suite.tag != "testsuite":
+              suite = suite.find("testsuite")
+          tests = int(suite.get("tests"))
+          skipped = int(suite.get("skipped"))
+          print(f"junit: tests={tests} skipped={skipped} expected={expected}")
+          assert skipped == 0, "B3: sandbox tests SKIPPED in the sandbox job"
+          assert tests == expected, (
+              f"B3: ran {tests} tests but {expected} were collected for this shard"
+          )
+          print("B3: every collected sandbox test in this shard ran; none skipped")
+          EOF
+
+      - name: Upload coverage data (union audit)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: steps.gate.outputs.proceed == 'true'
+        with:
+          name: coverage-sandbox-${{ matrix.shard }}
+          path: .coverage.sandbox-${{ matrix.shard }}
+          include-hidden-files: true
+          retention-days: 7
 
       - name: Show sandbox capability probe
         # The probe output says which isolation modes this runner
@@ -88,6 +241,7 @@ jobs:
         # before trusting measured runs here: recent Ubuntu runners may
         # restrict user namespaces, in which case the measurement gate
         # refuses and a different runner/VM is needed.
+        if: steps.gate.outputs.proceed == 'true'
         run: |
           python -c "
           from proofdeploy.sandbox import check_sandbox_capabilities

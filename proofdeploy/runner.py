@@ -80,6 +80,14 @@ class ProvisionResult:
     # committed lock (whose own sha256 is lockfile_sha256) and when
     # generation never produced a file.
     generated_lock: dict | None = None
+    # WO-8.1c: for a committed-manager plan (which builds the root
+    # project during install), the build backend that actually
+    # built it: {"name": ..., "version": ...}, read back from the
+    # built wheel's Generator by the executors (provisioning's
+    # build_backend_evidence). Evidence only — non-scoring. None
+    # when the install never built the root project (the pip
+    # paths) or nothing could be determined.
+    build_backend: dict | None = None
     # Live process handle on READY. Caller-owned: the caller must terminate
     # it when done and call cleanup_run(run_id). Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
@@ -104,6 +112,7 @@ class ProvisionResult:
             "install_plan_sha256": self.install_plan_sha256,
             "executed_steps": self.executed_steps,
             "generated_lock": self.generated_lock,
+            "build_backend": self.build_backend,
             "logs": self.logs,
         }
 
@@ -119,6 +128,53 @@ LOCKFILES = {
     ),
     "python": ("uv.lock", "poetry.lock", "pdm.lock", "requirements.txt"),
 }
+
+
+# Error-line extraction for failed install output (Addendum
+# 33/35): a strong marker line (``npm error``, ``ERR_PNPM_``,
+# ``ELIFECYCLE``, ``gyp ERR!``) names WHY an install failed, where
+# the bare step failure does not; a generic error line is next;
+# if nothing matches, fall back to the LAST non-empty line of the
+# output — an unmatched failure still gets its most concrete line
+# into the provision reason instead of a bare "install failed".
+# Defined here (WO-8.1b) so BOTH executors surface a build
+# failure's first error line the same way; the orchestrator's
+# sandbox path imports it from this module. The generic class
+# covers pip's ``ERROR:``, Python's ``Error:`` (e.g. a traceback's
+# final line) and the Rust-family tools' lowercase ``error:``
+# (uv's lock check: "error: The lockfile at `uv.lock` needs to be
+# updated..." — without it, that failure named uv's trailing
+# hint line instead of its error).
+_ERROR_MARKERS_STRONG = ("npm error", "ERR_PNPM_", "ELIFECYCLE", "gyp ERR!")
+_ERROR_MARKERS_GENERIC = ("ERROR:", "Error:", "error:")
+
+
+def _first_error_line(lines: list) -> str | None:
+    """The first concrete error line in a list of log entries.
+
+    Entries may be multi-line blobs; scan line by line. The
+    ``$ podman ...`` command echo the sandbox logs before each
+    run is NOT evidence (Addendum 38): it is skipped entirely — a
+    marker inside the echoed command must not be named, and the
+    echo must not serve as the fallback line."""
+    last_nonempty: str | None = None
+    generic: str | None = None
+    for entry in lines:
+        for line in str(entry).splitlines():
+            stripped = line.strip()
+            if stripped.startswith("$ podman"):
+                continue
+            if stripped:
+                last_nonempty = stripped
+            if any(marker in line for marker in _ERROR_MARKERS_STRONG):
+                return stripped[:300]
+            if generic is None and any(
+                marker in line for marker in _ERROR_MARKERS_GENERIC
+            ):
+                generic = stripped
+    if generic is not None:
+        return generic[:300]
+    return last_nonempty[:300] if last_nonempty is not None else None
 
 
 def _exit_code_from_reason(ok: bool, reason: str | None) -> int | None:
@@ -1138,6 +1194,7 @@ class Provisioner:
         # module's helpers, so a top-level import would be circular.
         from proofdeploy.provisioning import (
             InstallPlan,
+            build_backend_evidence,
             plan_provisioning,
         )
 
@@ -1146,6 +1203,11 @@ class Provisioner:
         # once, right after the install step succeeds; _bail and the
         # result builders below attach it when present.
         gen_lock: dict | None = None
+
+        # WO-8.1c: the build backend that actually built the root
+        # project, read back the same way (see
+        # build_backend_evidence); attached wherever gen_lock is.
+        build_backend_ev: dict | None = None
 
         def _bail(
             status: ProvisionStatus,
@@ -1159,6 +1221,8 @@ class Provisioner:
             result.executed_steps = executed
             if gen_lock is not None:
                 result.generated_lock = gen_lock
+            if build_backend_ev is not None:
+                result.build_backend = build_backend_ev
             if _plan is not None:
                 result.install_plan = _plan.to_dict()
                 result.install_plan_sha256 = _plan.sha256()
@@ -1337,6 +1401,37 @@ class Provisioner:
                 )
             venv_bin = str(venv_dir / "bin")
             logs.append(f"venv: {venv_dir} (bin first on PATH)")
+        elif package_manager in ("uv", "poetry", "pdm"):
+            # WO-8.1b: the manager installs into the CHECKOUT venv
+            # (snap/.venv) — the venv the plan's steps target
+            # ({venv} renders to it below). It is created here,
+            # from the selected runtime: uv is pointed at it by
+            # the plan (UV_PROJECT_ENVIRONMENT + --python), poetry
+            # and pdm adopt an existing in-project .venv. From here
+            # on it is treated exactly like the pip venv: its bin
+            # goes first on PATH for install/build/migrate/seed/
+            # start, so the app and the contract steps run against
+            # the manager-installed environment.
+            venv_dir = snap / ".venv"
+            ok, venv_reason = _run_step(
+                [runtime_bin, "-m", "venv", str(venv_dir)],
+                snap,
+                self.build_timeout,
+                probe_env,
+                phase="venv",
+            )
+            if not ok:
+                return _bail(
+                    ProvisionStatus.BUILD_FAILED,
+                    f"could not create isolated venv: {venv_reason}",
+                    plan,
+                    runtime=runtime,
+                    runtime_version=actual_version,
+                    package_manager=package_manager,
+                    lockfile_sha256=lockfile_sha,
+                )
+            venv_bin = str(venv_dir / "bin")
+            logs.append(f"venv: {venv_dir} (bin first on PATH)")
         first_on_path = run_bin or venv_bin
         step_env = build_env(contract_env, prepend_path=first_on_path)
 
@@ -1358,10 +1453,29 @@ class Provisioner:
         actual_version = effective
         logs.append(f"runtime version in use: {actual_version}")
 
-        # Render the plan's install step for this executor. pip's argv
-        # is a template (venv/checkout/flags placeholders); other
-        # managers' argv may carry {checkout} (the persisted corepack
-        # paths) and {runtime_bin}, rendered the same way.
+        # Render the plan's install steps for this executor. pip's
+        # argv is a template (venv/checkout/flags placeholders);
+        # other managers' argv may carry {checkout} (the persisted
+        # corepack paths), {venv} (WO-8.1b: the checkout venv the
+        # lock managers install into) and {runtime_bin}, rendered
+        # the same way — as are the steps' env values (e.g. the uv
+        # plan's UV_PROJECT_ENVIRONMENT={venv}).
+        step_mapping: dict[str, str] = {
+            "{runtime_bin}": runtime_bin,
+            "{checkout}": str(snap),
+        }
+        if venv_dir is not None:
+            step_mapping["{venv}"] = str(venv_dir)
+
+        def _step_env(step: Any) -> dict[str, str]:
+            return {
+                **step_env,
+                **{
+                    key: render_argv([value], step_mapping, [])[0]
+                    for key, value in step.env.items()
+                },
+            }
+
         if package_manager == "pip":
             assert venv_dir is not None
             install_cmd = render_argv(
@@ -1375,76 +1489,64 @@ class Provisioner:
             )
         else:
             install_cmd = render_argv(
-                install_step.argv,
-                {
-                    "{runtime_bin}": runtime_bin,
-                    "{checkout}": str(snap),
-                },
-                [],
+                install_step.argv, step_mapping, []
             )
 
-        # 6c. Tools that choose their own Python must use the selected one.
-        if package_manager == "uv":
-            install_cmd = [*install_cmd, "--python", runtime_bin]
-            logs.append(f"uv pinned to python: {runtime_bin}")
-        elif package_manager == "poetry":
-            ok, reason = self._exec(
-                ["poetry", "env", "use", runtime_bin],
-                snap,
-                self.build_timeout,
-                logs,
-                step_env,
-            )
-            if not ok:
-                return _bail(
-                    ProvisionStatus.BUILD_FAILED,
-                    f"poetry env use failed: {reason}",
-                    plan,
-                    runtime=runtime,
-                    runtime_version=actual_version,
-                    package_manager=package_manager,
-                    lockfile_sha256=lockfile_sha,
-                )
+        # Tools that choose their own Python use the selected one
+        # BY PLAN (WO-8.1b): the uv plan's install step carries
+        # --python {runtime_bin} itself, and the poetry/pdm plans
+        # install into the checkout venv created above from the
+        # selected runtime. (Pre-WO-8.1b the host executor appended
+        # --python for uv and ran a bare `poetry env use` with a
+        # system poetry here — the sandbox could do neither, which
+        # is why those plans were sandbox-refused.)
 
-        # 7. Install (frozen). Python pip installs into the per-run venv,
-        # never the host environment. The plan step's own env rides
-        # along (e.g. COREPACK_ENABLE_DOWNLOAD_PROMPT=0 for a
-        # packageManager-pinned Node install). Bootstrap steps (the
-        # persisted corepack install) run first, in plan order.
+        # 7. Install (frozen). Python pip installs into the per-run
+        # venv, never the host environment; the WO-8.1b managers
+        # install into the checkout venv. The plan step's own env
+        # rides along (e.g. COREPACK_ENABLE_DOWNLOAD_PROMPT=0 for a
+        # packageManager-pinned Node install). Bootstrap steps
+        # (the persisted corepack install; WO-8.1b: the .pd-tools
+        # manager bootstrap and the lock-freshness check) run
+        # first, in plan order. A failed step's reason carries the
+        # step output's first error line when it has one — the
+        # same surfacing the sandbox path applies (Addendum 33) —
+        # so a stale committed lock is BUILD_FAILED with the
+        # tool's own line (e.g. uv's "error: The lockfile at
+        # `uv.lock` needs to be updated...") on both executors.
         for boot in install_steps[:-1]:
             assert boot.argv is not None
-            boot_cmd = render_argv(
-                boot.argv,
-                {
-                    "{runtime_bin}": runtime_bin,
-                    "{checkout}": str(snap),
-                },
-                [],
-            )
+            boot_cmd = render_argv(boot.argv, step_mapping, [])
+            log_mark = len(logs)
             ok, reason = _run_step(
                 boot_cmd, snap, self.build_timeout,
-                {**step_env, **boot.env},
+                _step_env(boot),
                 phase="install",
             )
             if not ok:
+                first_error = _first_error_line(logs[log_mark:])
                 return _bail(
                     ProvisionStatus.BUILD_FAILED,
-                    f"install bootstrap failed: {reason}",
+                    "install step failed: "
+                    f"{first_error if first_error is not None else reason}",
                     plan,
                     runtime=runtime,
                     runtime_version=actual_version,
                     package_manager=package_manager,
                     lockfile_sha256=lockfile_sha,
                 )
-        install_env = {**step_env, **install_step.env}
+        install_env = _step_env(install_step)
+        log_mark = len(logs)
         ok, reason = _run_step(
             install_cmd, snap, self.build_timeout, install_env,
             phase="install",
         )
         if not ok:
+            first_error = _first_error_line(logs[log_mark:])
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
-                f"install failed: {reason}",
+                "install failed: "
+                f"{first_error if first_error is not None else reason}",
                 plan,
                 runtime=runtime,
                 runtime_version=actual_version,
@@ -1481,6 +1583,19 @@ class Provisioner:
                 f"generated lock: {plan.generated_lockfile_name} "
                 f"sha256 {gen_lock['sha256'][:16]}..."
             )
+
+        # WO-8.1c: a committed manager's install built the root
+        # project; read the backend that actually built it back
+        # for the evidence (the built wheel's Generator, stamped
+        # in the checkout venv the managers install into). Never
+        # affects the outcome — evidence only.
+        if plan.build_backend is not None:
+            build_backend_ev = build_backend_evidence(plan, snap)
+            if build_backend_ev is not None:
+                logs.append(
+                    f"build backend: {build_backend_ev['name']} "
+                    f"{build_backend_ev['version']}"
+                )
 
         # 8. Contract steps in order: build, migrate, seed (from the
         # plan's steps; the sandbox executor runs the same steps).
@@ -1553,6 +1668,8 @@ class Provisioner:
             result.executed_steps = executed
             if gen_lock is not None:
                 result.generated_lock = gen_lock
+            if build_backend_ev is not None:
+                result.build_backend = build_backend_ev
             return result
 
         # Addendum 31: the start step is recorded as it is issued;
@@ -1636,6 +1753,7 @@ class Provisioner:
                 install_plan_sha256=plan.sha256(),
                 executed_steps=executed,
                 generated_lock=gen_lock,
+                build_backend=build_backend_ev,
                 proc=proc,
             )
         finally:

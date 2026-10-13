@@ -78,6 +78,7 @@ from proofdeploy.model_client import (
 from proofdeploy.probe import ProbeSet
 from proofdeploy.provisioning import (
     InstallPlan,
+    build_backend_evidence,
     pip_flags,
     plan_provisioning,
     render_argv,
@@ -86,6 +87,7 @@ from proofdeploy.runner import (
     Provisioner,
     ProvisionResult,
     ProvisionStatus,
+    _first_error_line,
     find_lockfile,
 )
 from proofdeploy.runpair import (
@@ -229,43 +231,10 @@ def check_sandbox_runtime(
     return image_version, image_digest, None
 
 
-_ERROR_MARKERS_STRONG = ("npm error", "ERR_PNPM_", "ELIFECYCLE", "gyp ERR!")
-_ERROR_MARKERS_GENERIC = ("ERROR:", "Error:")
-
-
-def _first_error_line(lines: list) -> str | None:
-    """The first concrete error line in a list of log entries
-    (Addendum 33/35): a strong marker line (``npm error``,
-    ``ERR_PNPM_``, ``ELIFECYCLE``, ``gyp ERR!``) names WHY an
-    install failed, where the bare step failure does not; a generic
-    ``Error:`` line is next; if nothing matches, fall back to the
-    LAST non-empty line of the output — an unmatched failure still
-    gets its most concrete line into the provision reason instead
-    of a bare "install failed". Entries may be multi-line blobs;
-    scan line by line.
-
-    The ``$ podman ...`` command echo the sandbox logs before each
-    run is NOT evidence (Addendum 38): it is skipped entirely — a
-    marker inside the echoed command must not be named, and the
-    echo must not serve as the fallback line."""
-    last_nonempty: str | None = None
-    generic: str | None = None
-    for entry in lines:
-        for line in str(entry).splitlines():
-            stripped = line.strip()
-            if stripped.startswith("$ podman"):
-                continue
-            if stripped:
-                last_nonempty = stripped
-            if any(marker in line for marker in _ERROR_MARKERS_STRONG):
-                return stripped[:300]
-            if generic is None and any(
-                marker in line for marker in _ERROR_MARKERS_GENERIC
-            ):
-                generic = stripped
-    if generic is not None:
-        return generic[:300]
-    return last_nonempty[:300] if last_nonempty else None
+# _first_error_line (Addendum 33/35) is defined in
+# proofdeploy.runner and imported above: since WO-8.1b both
+# executors surface a failed step's first error line in the
+# provision reason, so the helper has one home there.
 
 
 def _sandbox_step_command(cmd: str, runtime: str = "python") -> str:
@@ -445,8 +414,12 @@ class Orchestrator:
         single-side provision (tests, dev), where a lone side is
         its own unit so its own committer time IS the unit's. Lazy
         because the adapter evaluates it only when a generated lock
-        is planned: a committed lock, a Node plan, or an image
-        refusal never reads a commit time at all."""
+        is planned — plus WO-8.1c's one guarded exception: a
+        committed uv plan evaluates it to constrain the root
+        project's build (UV_EXCLUDE_NEWER), under a guard that
+        keeps a failing cutoff source from tripping the plan, so
+        a Node plan or an image refusal still never reads a
+        commit time at all."""
         if self._run_lock_cutoff is not None:
             return self._run_lock_cutoff
         return lambda: self._commit_cutoff(sha)
@@ -1330,10 +1303,14 @@ class Orchestrator:
         assert lockfile_sha is not None
         logs.append(f"lockfile: {lockfile_name} sha256: {lockfile_sha[:16]}...")
         # Fail closed for managers the sandbox executor cannot run:
-        # pip for Python (uv/poetry stay refused), npm/pnpm/yarn for
-        # Node (bun stays refused).
+        # pip and the committed-lock managers for Python (WO-8.1b:
+        # uv/poetry/pdm plans carry their own hash-pinned bootstrap
+        # and frozen install, so they run), npm/pnpm/yarn for Node
+        # (bun stays refused).
         supported_managers = (
-            {"pip"} if runtime_name == "python" else {"npm", "pnpm", "yarn"}
+            {"pip", "uv", "poetry", "pdm"}
+            if runtime_name == "python"
+            else {"npm", "pnpm", "yarn"}
         )
         if plan.package_manager not in supported_managers:
             logs.append(f"sandbox: lockfile {lockfile_name} not yet supported")
@@ -1385,6 +1362,15 @@ class Orchestrator:
                 continue
             if step.executor not in (None, "sandbox"):
                 continue
+            # WO-8.1b: a step's env values render through the same
+            # placeholder mapping as its argv (e.g. the uv plan's
+            # UV_PROJECT_ENVIRONMENT={venv} must become
+            # /checkout/.venv here, the snapshot's .venv on the
+            # host). Values without tokens are unchanged.
+            step_env = {
+                key: render_argv([value], argv_mapping, [])[0]
+                for key, value in step.env.items()
+            }
             if step.argv is not None:
                 argv = render_argv(
                     step.argv,
@@ -1395,7 +1381,7 @@ class Orchestrator:
                     "phase": step.phase,
                     "command": shlex.join(argv),
                     "argv_rendered": argv,
-                    "env": dict(step.env),
+                    "env": step_env,
                 })
             elif step.shell is not None:
                 rendered = _sandbox_step_command(step.shell, runtime_name)
@@ -1403,7 +1389,7 @@ class Orchestrator:
                     "phase": step.phase,
                     "command": rendered,
                     "shell": rendered,
-                    "env": dict(step.env),
+                    "env": step_env,
                 })
         # PIP_NO_CACHE_DIR=1: pip warns the cache dir isn't writable as
         # the sandbox user; the venv removes the running-as-root warning.
@@ -1450,6 +1436,19 @@ class Orchestrator:
                 )
             except OSError:
                 gen_lock = None
+        # WO-8.1c: a committed manager's install built the root
+        # project; read the backend that actually built it back
+        # for the evidence (the built wheel's Generator, stamped
+        # in the checkout venv). Captured whenever it exists,
+        # like the generated lock; never affects the outcome.
+        build_backend_ev: dict | None = None
+        if plan.build_backend is not None:
+            build_backend_ev = build_backend_evidence(plan, snapshot.dir)
+            if build_backend_ev is not None:
+                logs.append(
+                    f"build backend: {build_backend_ev['name']} "
+                    f"{build_backend_ev['version']}"
+                )
         install_ok = len(step_results) == len(step_specs) and all(
             r["exit_code"] == 0 for r in step_results
         )
@@ -1496,6 +1495,7 @@ class Orchestrator:
                 executed_steps=executed,
                 bootstrap=bootstrap,
                 generated_lock=gen_lock,
+                build_backend=build_backend_ev,
             )
         logs.extend(sb.log)
         sb.log.clear()
@@ -1553,6 +1553,7 @@ class Orchestrator:
                 executed_steps=executed,
                 bootstrap=bootstrap,
                 generated_lock=gen_lock,
+                build_backend=build_backend_ev,
             )
         if not app.wait_ready(contract.readiness or "/health", timeout=120):
             # S2: the record must say more than "not ready". Capture the
@@ -1581,6 +1582,7 @@ class Orchestrator:
                 executed_steps=executed,
                 bootstrap=bootstrap,
                 generated_lock=gen_lock,
+                build_backend=build_backend_ev,
             )
         # S2: log tail on success too, for the record.
         app_log = sb.app_logs(app.name)
@@ -1600,6 +1602,7 @@ class Orchestrator:
             install_plan_sha256=plan.sha256(),
             executed_steps=executed,
             generated_lock=gen_lock,
+            build_backend=build_backend_ev,
         )
         provision.image_digest = image_digest
         # Stash the SandboxApp for cleanup; the finally block stops it.
@@ -1632,6 +1635,7 @@ class Orchestrator:
         executed_steps: list[dict] | None = None,
         bootstrap: dict[str, str] | None = None,
         generated_lock: dict | None = None,
+        build_backend: dict | None = None,
     ) -> _Side:
         """Build a failed sandbox _Side with runtime facts populated (S3).
 
@@ -1649,6 +1653,7 @@ class Orchestrator:
             package_manager=package_manager or "pip",
             executed_steps=executed_steps or [],
             generated_lock=generated_lock,
+            build_backend=build_backend,
         )
         provision.image_digest = image_digest
         if plan is not None:

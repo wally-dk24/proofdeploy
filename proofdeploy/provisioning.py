@@ -51,9 +51,44 @@ checkout at ``/checkout/.venv`` (the sandbox executor renders it
 there; the host executor renders the same step at its per-run venv
 dir), ``PIP_NO_CACHE_DIR=1``, the venv first on PATH for
 build/migrate/seed/start, the lockfile sha256 recorded and
-verified, seed runs, and unsupported lockfiles refused by the
-sandbox executor with BUILD_FAILED "not yet supported in the
-sandbox". The Node adapter
+verified, and seed runs. A committed ``uv.lock`` / ``poetry.lock``
+/ ``pdm.lock`` plans the same way for both executors (WO-8.1b):
+the checkout venv created from the selected interpreter, the
+manager bootstrapped into ``.pd-tools`` by hash from its committed
+bootstrap file at its pinned version (uv 0.13.0, poetry 2.5.1,
+pdm 2.29.2), the tool's own lock-freshness check where its install
+command does not refuse a stale lock itself, and the frozen
+install (``uv sync --frozen``, ``poetry install --sync``,
+``pdm sync``). A committed manager's install also builds the
+project ITSELF, and that build's backend resolution is the
+WO-8.1c concern: the plan records the build backend (name, and
+the resolved version where the plan itself determines it) as
+non-scoring evidence, constrains the build-isolation resolution
+to the unit's cutoff where the tool allows it (uv:
+``UV_EXCLUDE_NEWER`` on the sync step, which a ``--frozen`` sync
+applies to the build resolution only, never to the lock's own
+files), and records a typed limitation where it cannot (pdm —
+see ``PDM_BUILD_CUTOFF_LIMITATION``). Poetry needs neither for
+the ROOT project: it builds the root itself with the poetry-core
+pinned by hash in its bootstrap file, so no backend resolution
+happens for the root at install time. One level down, a locked
+DEPENDENCY that ships only as an sdist (no compatible wheel in
+the lock) is built by poetry and pdm alike with its build
+backend resolved fresh from the index, unconstrained by the
+unit cutoff — neither tool offers a build-scoped cutoff for
+dependency builds — so both plans record that as a typed
+limitation scoped to sdist dependency builds (see
+``POETRY_SDIST_DEPENDENCY_LIMITATION`` /
+``PDM_SDIST_DEPENDENCY_LIMITATION``); uv's sync-step cutoff
+governs its dependency builds too, so uv records none. The
+committed fixtures' locks are wheel-only (every locked package
+carries a compatible wheel), so the case does not arise for
+them. The pip paths never install the root
+project, so they carry none of this. The executors complete the
+evidence by reading the built project's dist-info back from the
+checkout venv (``build_backend_evidence``): the backend name and
+version that ACTUALLY built the project, as stamped by the tool
+in the wheel's ``Generator``. The Node adapter
 plans frozen installs from the lockfile for both executors: npm ci /
 pnpm install --frozen-lockfile / yarn classic --frozen-lockfile or
 berry --immutable, a packageManager pin rendered through corepack,
@@ -65,6 +100,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -87,6 +123,11 @@ from proofdeploy.runner import (
 # when a generated lock is actually planned, so planning a
 # committed lock or a Node plan never pays for, or trips over, the
 # caller's cutoff source), or None (no cutoff available).
+# WO-8.1c adds one guarded exception: a committed UV plan also
+# evaluates it, solely to constrain the build-isolation resolution
+# (UV_EXCLUDE_NEWER on the sync step) — guarded, so a cutoff source
+# that fails still never trips a committed plan; the plan records
+# a typed build limitation instead (see _build_backend_plan).
 LockCutoff = str | Callable[[], str | None] | None
 
 # Lines used when a repo declares no version range: the runtimes the
@@ -234,6 +275,44 @@ class InstallPlan:
     # pins the resolver's wheel by hash; see
     # _uv_bootstrap_requirements).
     lock_resolver_bootstrap_sha256: str | None = None
+    # WO-8.1b: for a committed uv.lock / poetry.lock / pdm.lock
+    # plan, the sha256 of the COMMITTED bootstrap requirements
+    # file the lock manager is installed from (the same pattern:
+    # the file pins the manager's wheel(s) by hash; see
+    # _manager_bootstrap_steps). The generated path keeps its own
+    # field above; a plan carries at most one of the two.
+    manager_bootstrap_sha256: str | None = None
+    # WO-8.1c: the build of the root project itself, which a
+    # committed manager's install performs (uv sync / poetry
+    # install / pdm sync build the project; the pip paths never
+    # install the root project, so they leave all of these unset).
+    # Evidence only — non-scoring. build_backend is the backend
+    # that builds the root under this plan, as its PEP 517 module:
+    # for uv / pdm the [build-system] build-backend declared in
+    # pyproject.toml (or the PEP 517 default when undeclared);
+    # for poetry it is poetry.core.masonry.api, because poetry
+    # builds the root project itself with its bundled poetry-core
+    # (verified against the pinned poetry 2.5.1: installing the
+    # fixture's root fetched no setuptools at all and stamped the
+    # wheel "Generator: poetry-core 2.5.0"; the declared backend
+    # governs other frontends, not `poetry install`).
+    # build_backend_name is that backend's distribution name.
+    # build_backend_version is the resolved version when the plan
+    # itself determines it — poetry's, from the poetry-core pin in
+    # the committed bootstrap file. For uv / pdm the version is
+    # resolved fresh from the index at build time, so the field
+    # stays None here and the executors record what ACTUALLY built
+    # the project on the provision instead (build_backend_evidence
+    # reads the built wheel's Generator back from the venv).
+    # build_cutoff is the unit cutoff the build-isolation
+    # resolution was constrained to, where the tool allows it
+    # (uv only); build_limitations carries the typed limitation,
+    # in registered wording, where it does not.
+    build_backend: str | None = None
+    build_backend_name: str | None = None
+    build_backend_version: str | None = None
+    build_cutoff: str | None = None
+    build_limitations: list[str] = field(default_factory=list)
     generated_lockfile_name: str | None = None
     package_manager: str | None = None
     package_manager_version: str | None = None
@@ -356,19 +435,553 @@ _WRITE_FILE_CODE = (
 )
 
 
+def _bootstrap_requirements(file_name: str) -> tuple[str, str]:
+    """A committed bootstrap requirements file: (text, sha256)."""
+    data = Path(__file__).with_name(file_name).read_bytes()
+    return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
+
+
 def _uv_bootstrap_requirements() -> tuple[str, str]:
     """The committed resolver-bootstrap requirements: (text, sha256)."""
-    data = Path(__file__).with_name(
-        UV_BOOTSTRAP_REQUIREMENTS_FILE
-    ).read_bytes()
-    return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
+    return _bootstrap_requirements(UV_BOOTSTRAP_REQUIREMENTS_FILE)
+
+
+# WO-8.1b: the committed-lock managers, their pinned versions, and
+# their bootstrap files (committed next to this module, the
+# Addendum 46 pattern). uv's pin is UV_VERSION — the REG-A
+# resolver pin: the same hash-pinned wheel that resolves a
+# generated lock also installs a committed uv.lock frozen. The
+# poetry / pdm pins follow the resolver's rule (pin a version
+# whose release is at least 14 days old when pinned): Poetry
+# 2.5.1 was released 2026-09-20 and PDM 2.29.2 on 2026-09-17,
+# pinned 2026-10-12. Neither is a single wheel, so their
+# bootstrap files pin the manager's full dependency closure, each
+# line hashed, installed --require-hashes --no-deps
+# --only-binary :all:.
+POETRY_VERSION = "2.5.1"
+PDM_VERSION = "2.29.2"
+POETRY_BOOTSTRAP_REQUIREMENTS_FILE = "poetry_bootstrap_requirements.txt"
+PDM_BOOTSTRAP_REQUIREMENTS_FILE = "pdm_bootstrap_requirements.txt"
+POETRY_BOOTSTRAP_CHECKOUT_PATH = ".pd-tools/poetry-requirements.txt"
+PDM_BOOTSTRAP_CHECKOUT_PATH = ".pd-tools/pdm-requirements.txt"
+
+_LOCK_MANAGERS: dict[str, tuple[str, str, str]] = {
+    # manager -> (bootstrap file, its path inside the checkout,
+    #             pinned version)
+    "uv": (
+        UV_BOOTSTRAP_REQUIREMENTS_FILE,
+        UV_BOOTSTRAP_CHECKOUT_PATH,
+        UV_VERSION,
+    ),
+    "poetry": (
+        POETRY_BOOTSTRAP_REQUIREMENTS_FILE,
+        POETRY_BOOTSTRAP_CHECKOUT_PATH,
+        POETRY_VERSION,
+    ),
+    "pdm": (
+        PDM_BOOTSTRAP_REQUIREMENTS_FILE,
+        PDM_BOOTSTRAP_CHECKOUT_PATH,
+        PDM_VERSION,
+    ),
+}
+
+# Committed Python lockfiles (REG-A item 1) and their managers.
+_COMMITTED_LOCK_MANAGERS = {
+    "uv.lock": "uv",
+    "poetry.lock": "poetry",
+    "pdm.lock": "pdm",
+}
+
+# WO-8.1c: the typed limitation recorded on a committed pdm plan.
+# pdm 2.29.2's only date cutoff is the resolution strategy
+# `strategy.exclude-newer` (config file, or the project's own
+# [tool.pdm.resolution]) and the `pdm lock --exclude-newer` flag;
+# `pdm sync` has neither a flag nor an environment variable for
+# it (the config item declares no env_var). The strategy is
+# resolution-wide, not build-scoped — verified empirically
+# against the pinned tool (2026-10-13): with the strategy set to
+# 2023-06-01, `pdm sync` REFUSED the committed lock's own six
+# 1.17.0 (uploaded 2024-12-04) with CandidateNotFound, because
+# the installer fetches locked files through the same filtered
+# finder. Constraining pdm's build that way would break REG-A
+# item 1's frozen install, so the build-isolation resolution
+# stays unconstrained and the plan says so, in this wording.
+PDM_BUILD_CUTOFF_LIMITATION = (
+    "build-backend-cutoff-unavailable: pdm 2.29.2 cannot "
+    "constrain its build-isolation resolution to the unit "
+    "cutoff — its only date cutoff (strategy.exclude-newer / "
+    "pdm lock --exclude-newer) is a resolution-wide strategy "
+    "that also filters the committed lock's own files when "
+    "pdm sync fetches them, and it has no per-invocation form "
+    "(no sync flag, no environment variable), so using it "
+    "would break the frozen install (REG-A item 1)"
+)
+
+# WO-8.1c (reviewer's owed item 1, 2026-10-13): the typed
+# limitation recorded on committed poetry and pdm plans for
+# SDIST-ONLY LOCKED DEPENDENCIES. The root-project record does
+# not cover this case: when a locked dependency ships only as
+# an sdist (no compatible wheel in the lock), the installer
+# must BUILD that dependency, and building it resolves the
+# dependency's own build backend fresh from the index. Neither
+# poetry 2.5.1 nor pdm 2.29.2 offers a build-scoped date cutoff
+# for dependency builds (pdm's only cutoff is the
+# resolution-wide strategy above; poetry has none), so that
+# resolution is unconstrained by the unit cutoff. uv needs no
+# such limitation: UV_EXCLUDE_NEWER sits on the sync step and
+# governs every resolution that step performs, dependency
+# builds included. The limitation is conditional in wording —
+# it states what happens IF a lock carries an sdist-only
+# dependency. The committed fixtures' locks are wheel-only
+# (tests/test_wo81c.py proves every locked package in all
+# three locks carries a compatible wheel), so the case does
+# not arise for them.
+POETRY_SDIST_DEPENDENCY_LIMITATION = (
+    "sdist-dependency-build-unconstrained: if a locked "
+    "dependency ships only as an sdist (no compatible wheel "
+    "in the lock), poetry 2.5.1 builds it by resolving the "
+    "dependency's build backend fresh from the index, "
+    "unconstrained by the unit cutoff — poetry offers no "
+    "build-scoped cutoff for dependency builds (the root "
+    "project's own build is unaffected: poetry builds it "
+    "with its bootstrap-pinned poetry-core)"
+)
+
+PDM_SDIST_DEPENDENCY_LIMITATION = (
+    "sdist-dependency-build-unconstrained: if a locked "
+    "dependency ships only as an sdist (no compatible wheel "
+    "in the lock), pdm 2.29.2 builds it by resolving the "
+    "dependency's build backend fresh from the index, "
+    "unconstrained by the unit cutoff — pdm offers no "
+    "build-scoped cutoff for dependency builds (its only "
+    "date cutoff is the resolution-wide strategy in the "
+    "build-backend-cutoff-unavailable limitation above)"
+)
+
+# PEP 517's default build backend, used when pyproject.toml
+# declares no [build-system] build-backend.
+PEP517_DEFAULT_BACKEND = "setuptools.build_meta"
+
+# Build-backend module -> distribution name, for the common
+# backends (the record names the distribution, the plan's steps
+# never do). Unlisted modules fall back to a [build-system]
+# requires entry naming the same root, then to the module root.
+_BACKEND_DISTRIBUTIONS = {
+    "setuptools.build_meta": "setuptools",
+    "setuptools.build_meta:__legacy__": "setuptools",
+    "poetry.core.masonry.api": "poetry-core",
+    "pdm.backend": "pdm-backend",
+    "hatchling.build": "hatchling",
+    "flit_core.buildapi": "flit_core",
+    "uv_build": "uv_build",
+    "scikit_build_core.build": "scikit-build-core",
+    "maturin": "maturin",
+    "mesonpy": "meson-python",
+}
+
+
+def _toml_section(text: str, header: str) -> str | None:
+    """The body of one ``[header]`` section of a TOML file, or
+    None. Deliberately a light scan, not a TOML parser — the same
+    approach as runner._requires_python_from_toml (the product
+    runs on Python 3.10, which has no stdlib tomllib)."""
+    m = re.search(
+        rf"^\[{re.escape(header)}\][^\n]*$", text, re.MULTILINE
+    )
+    if m is None:
+        return None
+    body = text[m.end():]
+    nxt = re.search(r"^\[", body, re.MULTILINE)
+    if nxt is not None:
+        body = body[: nxt.start()]
+    return body
+
+
+def _declared_build_system(
+    pyproject: Path,
+) -> tuple[str | None, list[str]]:
+    """A pyproject's [build-system]: (build-backend, requires
+    names). (None, []) when undeclared or unreadable — PEP 517
+    then defaults the backend, and the caller applies that."""
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return None, []
+    section = _toml_section(text, "build-system")
+    if section is None:
+        return None, []
+    backend = None
+    m = re.search(
+        r"^build-backend\s*=\s*[\"']([^\"']+)[\"']",
+        section,
+        re.MULTILINE,
+    )
+    if m:
+        backend = m.group(1).strip() or None
+    requires: list[str] = []
+    rm = re.search(
+        r"^requires\s*=\s*\[(.*?)\]", section, re.MULTILINE | re.DOTALL
+    )
+    if rm:
+        for raw in re.findall(r"[\"']([^\"']+)[\"']", rm.group(1)):
+            name = re.split(r"[<>=!~;\[ ]", raw.strip(), maxsplit=1)[0]
+            if name:
+                requires.append(name.strip())
+    return backend, requires
+
+
+def _backend_distribution_name(
+    backend: str, requires: list[str]
+) -> str:
+    """The distribution name for a build-backend module."""
+    if backend in _BACKEND_DISTRIBUTIONS:
+        return _BACKEND_DISTRIBUTIONS[backend]
+    root = re.split(r"[.:]", backend, maxsplit=1)[0]
+    for name in requires:
+        if name.replace("-", "_").lower() == root.replace("-", "_").lower():
+            return name
+        if name.replace("-", "_").lower().startswith(
+            root.replace("-", "_").lower()
+        ):
+            return name
+    return root
+
+
+def _pinned_requirement_version(text: str, dist: str) -> str | None:
+    """The version a committed bootstrap requirements file pins
+    for `dist` (a ``dist==X`` line), or None."""
+    m = re.search(
+        rf"^{re.escape(dist)}==([^\s;\\]+)", text, re.MULTILINE
+    )
+    return m.group(1) if m else None
+
+
+def _uv_build_cutoff_limitation(error_name: str | None) -> str:
+    """Registered wording: a committed uv plan whose build could
+    not be constrained to the unit cutoff, and why."""
+    if error_name is not None:
+        cause = (
+            f"evaluating the unit cutoff failed ({error_name})"
+        )
+    else:
+        cause = "no unit cutoff was available for this plan"
+    return (
+        "build-backend-cutoff-unavailable: "
+        f"{cause}, so uv's build-isolation resolution is "
+        "unconstrained (UV_EXCLUDE_NEWER is not set on the "
+        "sync step)"
+    )
+
+
+def _build_backend_plan(
+    snapshot_dir: Path,
+    manager: str,
+    lock_cutoff: LockCutoff,
+) -> dict[str, Any]:
+    """WO-8.1c: the plan's build-backend facts for a committed
+    manager (the InstallPlan build_* fields), per manager:
+
+    - poetry builds the root project itself with the poetry-core
+      bundled in its hash-pinned bootstrap, so the backend and
+      its version are plan facts and nothing resolves at build
+      time — no cutoff applies and none is missing. A locked
+      sdist-only DEPENDENCY is a different case (poetry builds
+      it with a freshly resolved backend): the scoped typed
+      limitation POETRY_SDIST_DEPENDENCY_LIMITATION.
+    - pdm resolves the declared backend fresh inside build
+      isolation and offers no build-scoped cutoff (see
+      PDM_BUILD_CUTOFF_LIMITATION): the typed limitation. The
+      same gap applies one level down to sdist-only locked
+      dependencies: PDM_SDIST_DEPENDENCY_LIMITATION as well.
+    - uv resolves the declared backend fresh too, but
+      UV_EXCLUDE_NEWER constrains that resolution to the unit
+      cutoff on the sync step (verified against uv 0.13.0: a
+      2023-06-01 cutoff built the fixture with setuptools 67.8.0
+      instead of the unconstrained 84.0.0, while the frozen
+      lock's own files installed regardless of the cutoff).
+      The cutoff source is evaluated guarded: a committed plan
+      never trips over it (the LockCutoff contract); a failure
+      or an absent cutoff records the typed limitation instead.
+    """
+    if manager == "poetry":
+        bootstrap_text, _sha = _bootstrap_requirements(
+            POETRY_BOOTSTRAP_REQUIREMENTS_FILE
+        )
+        return {
+            "build_backend": "poetry.core.masonry.api",
+            "build_backend_name": "poetry-core",
+            "build_backend_version": _pinned_requirement_version(
+                bootstrap_text, "poetry-core"
+            ),
+            "build_cutoff": None,
+            "build_limitations": [
+                POETRY_SDIST_DEPENDENCY_LIMITATION
+            ],
+        }
+    declared_backend, requires = _declared_build_system(
+        snapshot_dir / "pyproject.toml"
+    )
+    backend = declared_backend or PEP517_DEFAULT_BACKEND
+    base: dict[str, Any] = {
+        "build_backend": backend,
+        "build_backend_name": _backend_distribution_name(
+            backend, requires
+        ),
+        "build_backend_version": None,
+    }
+    if manager == "pdm":
+        return {
+            **base,
+            "build_cutoff": None,
+            "build_limitations": [
+                PDM_BUILD_CUTOFF_LIMITATION,
+                PDM_SDIST_DEPENDENCY_LIMITATION,
+            ],
+        }
+    # uv: constrain the build to the unit's cutoff, when one is
+    # available. The evaluation is the guarded exception to the
+    # committed path's laziness (see the LockCutoff comment).
+    cutoff: str | None = None
+    error_name: str | None = None
+    try:
+        value = lock_cutoff() if callable(lock_cutoff) else lock_cutoff
+        cutoff = value or None
+    except Exception as e:  # the cutoff source must not trip the plan
+        error_name = type(e).__name__
+    if cutoff is not None:
+        return {**base, "build_cutoff": cutoff, "build_limitations": []}
+    return {
+        **base,
+        "build_cutoff": None,
+        "build_limitations": [_uv_build_cutoff_limitation(error_name)],
+    }
+
+
+def _project_name_declared(pyproject: Path) -> str | None:
+    """The project's declared name: PEP 621 [project] name, or
+    Poetry's [tool.poetry] name. None when undeclared/unreadable."""
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for header in ("project", "tool.poetry"):
+        section = _toml_section(text, header)
+        if section is None:
+            continue
+        m = re.search(
+            r"^name\s*=\s*[\"']([^\"']+)[\"']", section, re.MULTILINE
+        )
+        if m:
+            return m.group(1).strip() or None
+    return None
+
+
+def _parse_wheel_generator(text: str) -> tuple[str, str] | None:
+    """A built wheel's WHEEL Generator: (name, version), in both
+    stamped forms — ``setuptools (84.0.0)`` and ``poetry-core
+    2.5.0``. The Generator names the tool that actually produced
+    the wheel, at the version it actually ran."""
+    m = re.search(r"^Generator:\s*(.+)$", text, re.MULTILINE)
+    if m is None:
+        return None
+    value = m.group(1).strip()
+    pm = re.match(r"^(.*?)\s*\(([^()]*)\)\s*$", value)
+    if pm:
+        name, version = pm.group(1).strip(), pm.group(2).strip()
+    else:
+        parts = value.rsplit(" ", 1)
+        if len(parts) != 2:
+            return None
+        name, version = parts[0].strip(), parts[1].strip()
+    if not name or not version:
+        return None
+    return name, version
+
+
+def build_backend_evidence(
+    plan: InstallPlan, checkout_dir: Path
+) -> dict[str, str] | None:
+    """WO-8.1c executor evidence: the build backend that
+    ACTUALLY built the root project for this plan, as
+    {"name": ..., "version": ...} — read back from the built
+    project's dist-info WHEEL in the checkout's .venv (its
+    Generator line is stamped by the tool that ran the build,
+    at the version it resolved). Falls back to the plan's own
+    pinned fact when no build artifact exists but the plan
+    determines the backend (poetry: no root build happens for a
+    package-mode = false project, yet the backend that WOULD
+    build it is the bootstrap-pinned poetry-core). None when
+    the plan builds no root project (the pip paths) or nothing
+    can be determined. Evidence only: never raises, never
+    affects the provision's outcome."""
+    if plan.build_backend is None:
+        return None
+    found: tuple[str, str] | None = None
+    try:
+        project = _project_name_declared(checkout_dir / "pyproject.toml")
+        if project:
+            want = re.sub(r"[-_.]+", "_", project).lower()
+            venv_lib = checkout_dir / ".venv" / "lib"
+            for site_packages in sorted(
+                venv_lib.glob("python*/site-packages")
+            ):
+                for dist_info in sorted(site_packages.glob("*.dist-info")):
+                    stem = dist_info.name[: -len(".dist-info")]
+                    have = re.sub(r"[-_.]+", "_", stem).lower()
+                    if have != want and not have.startswith(want + "_"):
+                        continue
+                    wheel = dist_info / "WHEEL"
+                    if not wheel.is_file():
+                        continue
+                    found = _parse_wheel_generator(
+                        wheel.read_text(encoding="utf-8")
+                    )
+                    if found is not None:
+                        break
+                if found is not None:
+                    break
+    except Exception:
+        found = None
+    if found is not None:
+        return {"name": found[0], "version": found[1]}
+    if plan.build_backend_name and plan.build_backend_version:
+        return {
+            "name": plan.build_backend_name,
+            "version": plan.build_backend_version,
+        }
+    return None
+
+
+def _manager_bootstrap_steps(manager: str) -> list[PlanStep]:
+    """Bootstrap a pinned lock manager into the checkout's
+    .pd-tools, BY HASH from its committed bootstrap requirements
+    file (the Addendum 46 resolver pattern, generalized): a tools
+    venv, the file materialized verbatim into it, then a
+    hash-checking binaries-only install. A wrong or substituted
+    wheel fails the install step. The binary lands at
+    {checkout}/.pd-tools/bin/<manager> on every executor."""
+    file_name, checkout_path, _version = _LOCK_MANAGERS[manager]
+    bootstrap_text, _sha256 = _bootstrap_requirements(file_name)
+    return [
+        PlanStep(
+            phase="install",
+            argv=["{runtime_bin}", "-m", "venv", "{checkout}/.pd-tools"],
+        ),
+        PlanStep(
+            phase="install",
+            argv=[
+                "{runtime_bin}",
+                "-c",
+                _WRITE_FILE_CODE,
+                f"{{checkout}}/{checkout_path}",
+                bootstrap_text,
+            ],
+        ),
+        PlanStep(
+            phase="install",
+            argv=[
+                "{checkout}/.pd-tools/bin/pip",
+                "install",
+                "--require-hashes",
+                "--no-deps",
+                "--only-binary",
+                ":all:",
+                "-r",
+                f"{{checkout}}/{checkout_path}",
+            ],
+        ),
+    ]
+
+
+def _manager_frozen_steps(
+    manager: str, build_cutoff: str | None = None
+) -> list[PlanStep]:
+    """The frozen install of a committed lock, per manager
+    (REG-A item 1), preceded — where the tool's install command
+    does not itself refuse a stale lock — by the tool's own
+    lock-freshness check (WO-8.1b item 4: a lock out of sync with
+    pyproject.toml is BUILD_FAILED carrying the tool's error
+    line, never a silent install of the wrong set).
+
+    Verified against the pinned tools (2026-10-12):
+    - uv 0.13.0: `uv sync --frozen` installs a stale lock
+      silently (exit 0); `uv lock --check` exits 1 with
+      "error: The lockfile at `uv.lock` needs to be updated...".
+    - pdm 2.29.2: `pdm sync` warns but exits 0 on a stale lock;
+      `pdm lock --check` exits 1.
+    - poetry 2.5.1: `poetry install --sync` itself exits 1 on a
+      stale lock ("pyproject.toml changed significantly since
+      poetry.lock was last generated..."), so no separate check
+      step is needed — or wanted: a second check would only
+      duplicate the refusal.
+
+    WO-8.1c: when the plan carries a build cutoff (uv only — see
+    _build_backend_plan), the sync step's env gains
+    UV_EXCLUDE_NEWER=<cutoff>: the one place the unit's cutoff
+    can reach the build of the root project. On a --frozen sync
+    it constrains ONLY the fresh resolution inside build
+    isolation; the lock's own files install regardless (both
+    verified against uv 0.13.0, 2026-10-13).
+    """
+    mgr_bin = f"{{checkout}}/.pd-tools/bin/{manager}"
+    if manager == "uv":
+        sync_env = {"UV_PROJECT_ENVIRONMENT": "{venv}"}
+        if build_cutoff is not None:
+            sync_env["UV_EXCLUDE_NEWER"] = build_cutoff
+        return [
+            PlanStep(phase="install", argv=[mgr_bin, "lock", "--check"]),
+            PlanStep(
+                phase="install",
+                argv=[
+                    mgr_bin,
+                    "sync",
+                    "--frozen",
+                    # The interpreter the plan selected (the host
+                    # executor used to append this itself; it is
+                    # plan data now, so the sandbox gets the same
+                    # pin).
+                    "--python",
+                    "{runtime_bin}",
+                ],
+                # The venv is the checkout's .venv (created by the
+                # plan's venv step), named explicitly so the
+                # install target cannot drift with the tool's
+                # project discovery.
+                env=sync_env,
+            ),
+        ]
+    if manager == "poetry":
+        return [
+            PlanStep(
+                phase="install",
+                argv=[mgr_bin, "install", "--sync"],
+                # In-project venvs: the plan's venv step has
+                # already created {checkout}/.venv from the
+                # selected interpreter, and poetry adopts an
+                # existing in-project .venv; the env var states
+                # the same intent in poetry's own configuration.
+                env={"POETRY_VIRTUALENVS_IN_PROJECT": "true"},
+            ),
+        ]
+    if manager == "pdm":
+        return [
+            PlanStep(phase="install", argv=[mgr_bin, "lock", "--check"]),
+            PlanStep(phase="install", argv=[mgr_bin, "sync"]),
+        ]
+    raise ValueError(f"unsupported lock manager: {manager}")
 
 
 class PythonAdapter:
     """Python: REG-A — complete committed locks (uv.lock /
     poetry.lock / pdm.lock / fully hashed requirements.txt) install
     frozen; anything else is resolved into a generated hashed lock
-    by the pinned uv at the unit's cutoff, then installed frozen."""
+    by the pinned uv at the unit's cutoff, then installed frozen.
+
+    A committed manager lock (uv/poetry/pdm) plans its full frozen
+    install (WO-8.1b): checkout venv from the selected interpreter,
+    the pinned manager bootstrapped by hash into .pd-tools, the
+    freshness check where the tool needs one, the frozen install.
+    """
 
     name = "python"
 
@@ -408,9 +1021,50 @@ class PythonAdapter:
         # (check_requirements_frozen is now exactly that check).
         if found is not None and found[0] != "requirements.txt":
             lockfile_name, lockfile_sha = found
-            manager, argv = select_package_manager(
-                snapshot_dir, "python", lockfile_name
+            # WO-8.1b: a committed uv.lock / poetry.lock / pdm.lock
+            # installs frozen IN BOTH EXECUTORS. The plan carries
+            # the whole mechanism (never a bare manager binary off
+            # PATH): the checkout venv created from the selected
+            # interpreter (uv is pointed at it, poetry and pdm
+            # adopt an existing in-project .venv), the manager
+            # bootstrapped into .pd-tools BY HASH from its
+            # committed bootstrap file at its pinned version, the
+            # freshness check where the tool's install command
+            # does not refuse a stale lock itself, the frozen
+            # install, and the sandbox venv sanity check the pip
+            # plans carry.
+            manager = _COMMITTED_LOCK_MANAGERS[lockfile_name]
+            _file, _path, manager_version = _LOCK_MANAGERS[manager]
+            _text, manager_bootstrap_sha256 = _bootstrap_requirements(
+                _file
             )
+            # WO-8.1c: the root project's build — the backend
+            # evidence, the cutoff constraint where the tool
+            # allows it (its value rides the frozen steps), and
+            # the typed limitation where it does not.
+            build = _build_backend_plan(
+                snapshot_dir, manager, lock_cutoff
+            )
+            steps = [
+                PlanStep(
+                    phase="venv",
+                    argv=["{runtime_bin}", "-m", "venv", "{venv}"],
+                ),
+                *_manager_bootstrap_steps(manager),
+                *_manager_frozen_steps(manager, build["build_cutoff"]),
+                # Sandbox-only sanity check (Addendum 15, B2), as
+                # on the pip paths.
+                PlanStep(
+                    phase="verify",
+                    argv=[
+                        "/checkout/.venv/bin/python",
+                        "-c",
+                        "import sys; print(sys.prefix)",
+                    ],
+                    executor="sandbox",
+                ),
+                *_contract_steps(contract),
+            ]
             return InstallPlan(
                 adapter=self.name,
                 runtime="python",
@@ -420,11 +1074,15 @@ class PythonAdapter:
                 lock_source="committed",
                 **image,
                 package_manager=manager,
-                steps=[
-                    PlanStep(phase="install", argv=argv),
-                    *_contract_steps(contract),
-                ],
-                persisted_dirs=[".venv"] if manager == "uv" else [],
+                package_manager_version=manager_version,
+                manager_bootstrap_sha256=manager_bootstrap_sha256,
+                build_backend=build["build_backend"],
+                build_backend_name=build["build_backend_name"],
+                build_backend_version=build["build_backend_version"],
+                build_cutoff=build["build_cutoff"],
+                build_limitations=build["build_limitations"],
+                steps=steps,
+                persisted_dirs=[".venv", ".pd-tools"],
             )
         if found is not None and check_requirements_frozen(
             snapshot_dir / "requirements.txt"
