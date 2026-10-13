@@ -141,9 +141,17 @@ jobs:
 
       - name: Load cached podman images
         if: steps.gate.outputs.proceed == 'true'
+        # Every podman invocation in this workflow MUST carry the
+        # product's storage prefix (proofdeploy/sandbox.py PODMAN:
+        # --storage-driver vfs --cgroup-manager=cgroupfs). On a fresh
+        # runner the first podman touch initializes the storage
+        # database with that call's graph driver; a bare invocation
+        # creates an overlay DB, and podman then refuses every
+        # product (vfs) open with "database graph driver overlay
+        # does not match our graph driver vfs" (exit 125 in tests).
         run: |
           if [ -f pd-images.tar ]; then
-            podman load -i pd-images.tar
+            podman --storage-driver vfs --cgroup-manager=cgroupfs load -i pd-images.tar
           else
             echo "no image cache; tests will pull on demand (and this run will populate the cache)"
           fi
@@ -175,9 +183,16 @@ jobs:
               return subprocess.run(args, capture_output=True, text=True)
 
 
+          # Aligned with proofdeploy/sandbox.py PODMAN: on a cache
+          # miss this step is the run's first podman touch, so a bare
+          # invocation would initialize the storage DB as overlay and
+          # break every product (vfs) open that follows.
+          PODMAN = ("podman", "--storage-driver", "vfs", "--cgroup-manager=cgroupfs")
+
+
           def inspect_digest(name):
               """Digest of the image bound to `name`, or None if unresolvable."""
-              r = run("podman", "image", "inspect", "--format", "{{.Digest}}", name)
+              r = run(*PODMAN, "image", "inspect", "--format", "{{.Digest}}", name)
               if r.returncode == 0 and r.stdout.strip():
                   return r.stdout.strip()
               return None
@@ -221,7 +236,7 @@ jobs:
                           f"image cache: DIGEST MISMATCH for {ref}: local {by_tag} != pinned {pinned};"
                           " removing the tag binding so the image is re-pulled by digest"
                       )
-                      r = run("podman", "rmi", ref)
+                      r = run(*PODMAN, "rmi", ref)
                       if r.returncode != 0:
                           print(f"image cache: WARNING: podman rmi {ref} failed: {r.stderr.strip()}")
                   continue
@@ -305,9 +320,9 @@ jobs:
               print(img['ref'] + '@' + img['digest'])
           ")
           for r in $refs; do
-            podman image exists "$r" || podman pull "$r" || echo "WARN: pull failed for $r; cache will be partial"
+            podman --storage-driver vfs --cgroup-manager=cgroupfs image exists "$r" || podman --storage-driver vfs --cgroup-manager=cgroupfs pull "$r" || echo "WARN: pull failed for $r; cache will be partial"
           done
-          present=$(for r in $refs; do podman image exists "$r" && echo "$r"; done)
+          present=$(for r in $refs; do podman --storage-driver vfs --cgroup-manager=cgroupfs image exists "$r" && echo "$r"; done)
           if [ -n "$present" ]; then
             # A55: save by image ID, never by ref@digest name. The
             # runners' podman rejects a tag@digest save argument as an
@@ -316,8 +331,8 @@ jobs:
             # ID is unambiguous in every podman version. This step is
             # core-shard-only by design (see the gate above), so this
             # one save path serves every shard.
-            ids=$(for r in $present; do podman image inspect --format '{{.Id}}' "$r"; done)
-            podman save -o pd-images.tar $ids
+            ids=$(for r in $present; do podman --storage-driver vfs --cgroup-manager=cgroupfs image inspect --format '{{.Id}}' "$r"; done)
+            podman --storage-driver vfs --cgroup-manager=cgroupfs save -o pd-images.tar $ids
             echo "have_tar=true" >> "$GITHUB_OUTPUT"
             ls -lh pd-images.tar
           else
