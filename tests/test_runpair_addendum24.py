@@ -275,9 +275,10 @@ def _result(verdict: Verdict, token: str) -> ProbeResult:
 
 
 def test_schema_bump_and_old_record_loads_and_rescores(tmp_path):
-    # The current version moves with each schema bump (1.4.0: WO-8.3's
-    # auth_bootstrap field); the downgrade below exercises the old
-    # shapes, which is the point of this test.
+    # The current version moves with each schema bump (1.4.0:
+    # WO-8.1's REG-A lock fields + WO-8.3's auth_bootstrap field);
+    # the downgrade below exercises the old shapes, which is the
+    # point of this test.
     assert SCHEMA_VERSION == "1.4.0"
 
     token = "sess-schema-check-0123456789"

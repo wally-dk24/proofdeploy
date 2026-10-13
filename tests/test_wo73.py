@@ -572,6 +572,8 @@ def test_schema_130_and_old_records_still_load(tmp_path):
     from proofdeploy.probe import SCHEMA_VERSION
     from proofdeploy.runpair import build_evidence_record, read_records
 
+    # Schema 1.4.0 (WO-8.1 REG-A lock fields + WO-8.3 auth_bootstrap);
+    # the 1.3.0 write_grants behavior pinned here is unchanged.
     assert SCHEMA_VERSION == "1.4.0"
     record = build_evidence_record(run_kind="bug", bug_id="WO73-SCHEMA")
     assert record["schema_version"] == "1.4.0"

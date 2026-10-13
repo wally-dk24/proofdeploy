@@ -44,13 +44,16 @@ HARNESS_VERSION = "1.0.0"
 # ({provisioned, target_url, network_mode} per side) and the run's
 # resolved network mode in provenance — non-scoring fields; records
 # at 1.0.0 / 1.1.0 / 1.2.0 still load (readers default the new keys).
-# 1.4.0 (WO-8.3): evidence records carry auth_bootstrap (per-side
-# auth bootstrap summary: env names recorded as "generated", never
-# their values) — a non-scoring field; records at 1.0.0–1.3.0 still
-# load (readers default the new key). Coordination note: WO-8.1's
-# branch also takes the version to 1.4.0 for its lock-evidence
-# fields; the two bumps are independent additions under the same
-# minor version and reconcile at merge.
+# 1.4.0 (WO-8.1 / REG-A + WO-8.3): two independent additions under
+# one minor version. WO-8.1: each side's provision carries the
+# Python lock facts — the install plan's lock_source
+# (committed/generated) with resolver, resolver version, cutoff and
+# index URL for a generated lock, and the provision's
+# generated_lock (the generated lock text and its sha256). WO-8.3:
+# evidence records carry auth_bootstrap (per-side auth bootstrap
+# summary: env names recorded as "generated", never their values).
+# All non-scoring fields; records at 1.0.0–1.3.0 still load
+# (readers default the new keys).
 SCHEMA_VERSION = "1.4.0"
 
 # HTTP methods the schema allows. No CONNECT, TRACE, or custom verbs.

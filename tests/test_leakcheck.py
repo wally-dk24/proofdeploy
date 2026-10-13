@@ -137,7 +137,9 @@ def _eq_bundle(root: Path, info: dict[str, str]) -> dict:
     """Build a real bundle (B^->B diff + B snapshot) and its prompt."""
     from proofdeploy.fixture import (
         assemble_author_bundle,
+        template_filename,
         template_hash,
+        template_path,
     )
     from proofdeploy.model_client import build_author_prompt
 
@@ -169,6 +171,9 @@ def _eq_bundle(root: Path, info: dict[str, str]) -> dict:
 
     skill_hash = hashlib.sha256(skill_path.read_bytes()).hexdigest()
     bundle_dir = work / "bundle"
+    # REG-B: _YML declares no auth:, so the mechanical selection is the
+    # no-credential template (as the orchestrator would choose).
+    selected_template = template_path(template_filename(False))
     assemble_author_bundle(
         diff_path=diff_path,
         snapshot_dir=snap_src,
@@ -180,7 +185,8 @@ def _eq_bundle(root: Path, info: dict[str, str]) -> dict:
             "flags_note": "none",
         },
         output_dir=bundle_dir,
-        expected_template_hash=template_hash(),
+        expected_template_hash=template_hash(selected_template),
+        template_file=selected_template,
         source_sha=info["bug"],
         diff_range=f"{info['base']}..{info['bug']}",
         skill_path=skill_path,
@@ -373,7 +379,12 @@ def test_tampered_skill_arm_copy_refused(tmp_path):
     """
     import hashlib
 
-    from proofdeploy.fixture import assemble_author_bundle, template_hash
+    from proofdeploy.fixture import (
+        assemble_author_bundle,
+        template_filename,
+        template_hash,
+        template_path,
+    )
     from proofdeploy.model_client import build_author_prompt
 
     info = _eq_repo(tmp_path)
@@ -400,6 +411,9 @@ def test_tampered_skill_arm_copy_refused(tmp_path):
     real_skill = Path(__file__).parent.parent / "docs" / "evaluation" / "skill" / "skill-author.md"
     skill_hash = hashlib.sha256(real_skill.read_bytes()).hexdigest()
     bundle_dir = work / "bundle"
+    # REG-B: _YML declares no auth:, so the mechanical selection is the
+    # no-credential template (as the orchestrator would choose).
+    selected_template = template_path(template_filename(False))
     assemble_author_bundle(
         diff_path=diff_path,
         snapshot_dir=snap_src,
@@ -411,7 +425,8 @@ def test_tampered_skill_arm_copy_refused(tmp_path):
             "flags_note": "none",
         },
         output_dir=bundle_dir,
-        expected_template_hash=template_hash(),
+        expected_template_hash=template_hash(selected_template),
+        template_file=selected_template,
         source_sha=info["bug"],
         diff_range=f"{info['base']}..{info['bug']}",
         skill_path=real_skill,
