@@ -296,11 +296,13 @@ def _harness_error_row(
     network_mode: str | None,
     exc: Exception,
 ) -> dict[str, Any]:
-    """A row for a side whose unit failed before provisioning could
-    start (the cutoff fetch or read): status BUILD_FAILED, typed
-    reason prefixed ``harness error:`` carrying the underlying error
-    with its stderr. No harness commit exists for such a side, so
-    harness_sha records the registered SHA itself."""
+    """A row for a side the harness itself failed before a
+    provision result existed (the unit's cutoff fetch/read, or the
+    side's own fetch/contract commit): status BUILD_FAILED, typed
+    reason prefixed ``harness error:`` carrying the underlying
+    error with its stderr. No harness commit exists for such a
+    side, so harness_sha is None — the registered SHA stands in
+    its own field and is never duplicated into this one."""
     message = str(exc)
     return {
         "kind": "readiness",
@@ -308,7 +310,7 @@ def _harness_error_row(
         "repo": unit["repo"],
         "role": side_spec["role"],
         "registered_sha": side_spec["sha"],
-        "harness_sha": side_spec["sha"],
+        "harness_sha": None,
         "declared_runtime": None,
         "selected_runtime": None,
         "runtime_version": None,
@@ -390,45 +392,63 @@ def provision_repo(
     network_mode = orch._run_network_mode
     contract = contract_path(repo)
     rows: list[dict[str, Any]] = []
+
+    def record_harness_error(
+        unit: dict[str, Any], side_spec: dict[str, Any], exc: Exception
+    ) -> dict[str, Any]:
+        row = _harness_error_row(unit, side_spec, attempt, network_mode, exc)
+        dump_logs(
+            f"readiness-{unit['unit_id']}-"
+            f"{_TAG_BY_ROLE[str(side_spec['role'])]}-a{attempt}",
+            [f"readiness provision raised: {exc}"],
+        )
+        return row
+
     for unit in units:
         try:
             fetch_sha(clone, cutoff_sha(unit))
             orch._run_lock_cutoff = orch._commit_cutoff(cutoff_sha(unit))
+        except Exception as exc:
+            # The unit's cutoff stage failed (its cutoff commit
+            # cannot be fetched, its cutoff cannot be read): the
+            # whole unit gets harness-error rows and the run
+            # continues — one unit's failure must not kill the
+            # repo's run or lose the other units' rows, so the rows
+            # file is always written. (Vendure, run 38597095147:
+            # one failed fetch ended the run and the repo's rows
+            # file was never written.)
             for side_spec in unit["sides"]:
                 if only is not None and (
                     unit["unit_id"], side_spec["role"]
                 ) not in only:
                     continue
+                row = record_harness_error(unit, side_spec, exc)
+                rows.append(row)
+                print(json.dumps(row), flush=True)
+            continue
+        for side_spec in unit["sides"]:
+            if only is not None and (
+                unit["unit_id"], side_spec["role"]
+            ) not in only:
+                continue
+            try:
                 row = provision_side(
                     orch, clone, unit, side_spec, contract,
                     attempt, workdir, network_mode,
                 )
-                rows.append(row)
-                print(json.dumps(row), flush=True)
-        except Exception as exc:
-            # One unit's harness-level failure (its cutoff commit
-            # cannot be fetched, its cutoff cannot be read) must not
-            # kill the repo's run or lose the other units' rows:
-            # record a typed harness-error row for each of the
-            # unit's sides and continue with the next unit, so the
-            # rows file is always written. (Vendure, run
-            # 38597095147: one failed fetch ended the run and the
-            # repo's rows file was never written.)
-            for side_spec in unit["sides"]:
-                if only is not None and (
-                    unit["unit_id"], side_spec["role"]
-                ) not in only:
-                    continue
-                row = _harness_error_row(
-                    unit, side_spec, attempt, network_mode, exc
-                )
-                rows.append(row)
-                print(json.dumps(row), flush=True)
-                dump_logs(
-                    f"readiness-{unit['unit_id']}-"
-                    f"{_TAG_BY_ROLE[str(side_spec['role'])]}-a{attempt}",
-                    [f"readiness provision raised: {exc}"],
-                )
+            except Exception as exc:
+                # A failure inside one side (its own fetch, its
+                # contract commit) writes a harness-error row for
+                # THAT side only: exactly one row per attempted
+                # (unit, role), and the unit's other sides keep
+                # their own rows. (The first cut wrapped the whole
+                # side loop in the unit try, so this except
+                # re-wrote error rows for sides that had already
+                # provisioned — one side showed both READY and
+                # BUILD_FAILED.)
+                row = record_harness_error(unit, side_spec, exc)
+            rows.append(row)
+            print(json.dumps(row), flush=True)
     return {
         "kind": "readiness",
         "repo": repo,
