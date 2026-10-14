@@ -1,0 +1,4 @@
+build: "pnpm run bootstrap && pnpm run build"
+migrate: "pnpm run migrate:db"
+start: "server__host=0.0.0.0 server__port=$PORT pnpm dev"
+readiness: "/"

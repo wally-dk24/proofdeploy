@@ -1,0 +1,6 @@
+build: "bun install && bun run build"
+seed: "cd packages/dev-server && bun run populate"
+start: "cd packages/dev-server && bun run start"
+readiness: "/health"
+env:
+  DB: sqlite

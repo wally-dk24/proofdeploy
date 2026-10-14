@@ -1,0 +1,21 @@
+build: "true"
+start: "directus start"
+readiness: "/server/ping"
+migrate: "directus bootstrap"
+env:
+  DB_CLIENT: sqlite3
+  DB_FILENAME: /checkout/data.db
+auth:
+  mode: refresh
+  path: /auth/refresh
+  method: POST
+  body:
+    refresh_token: "${REFRESH_TOKEN}"
+  token_json_path: data.access_token
+  refresh_token_json_path: data.refresh_token
+  expires_in_json_path: data.expires
+  login_path: /auth/login
+  login_body:
+    email: "${ADMIN_EMAIL}"
+    password: "${ADMIN_PASSWORD}"
+  bootstrap_env: [ADMIN_EMAIL, ADMIN_PASSWORD, SECRET]
