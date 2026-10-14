@@ -244,3 +244,118 @@ repo's own canonical sample application.
   no server file was invented to disguise that.
 - `readiness`: `"/"` — `README.md`'s only route:
   `app.get('/', (c) => c.text('Hono!'))`.
+
+## Contract-fix pass (2026-10-14) — appended entries
+
+Each entry: old value, new value, the HEAD file and lines the new
+value comes from, and why. HEAD here is each repo's HEAD on
+2026-10-14, re-read for this pass.
+
+### bottlepy/bottle — HEAD `8ec5fe29420d14998c0d86885083983eaea8b839`
+
+- `start`:
+  - old: "python -c \"from bottle import route, run, template; index = route('/hello/<name>')(lambda name: template('<b>Hello {{name}}</b>!', name=name)); run(host='localhost', port=8080)\""
+  - new: "python -c \"import os; from bottle import route, run, template; index = route('/hello/<name>')(lambda name: template('<b>Hello {{name}}</b>!', name=name)); run(host='localhost', port=int(os.environ['PORT']))\""
+  - source: `README.rst:48-54` — the README's "Hello World" example
+    (`from bottle import route, run, template` at :48, the
+    `/hello/<name>` route at :50, `run(host='localhost', port=8080)`
+    at :54).
+  - why: the example is unchanged except the port, which now comes
+    from the `PORT` environment variable the harness sets, so the
+    listener binds the port the readiness check probes. The
+    hardcoded 8080 made the app listen on a port nothing probed.
+
+### nestjs/nest — HEAD `bb3d572080ba5c3a34b65fcc39ca598c324cb32f`
+
+- `build`:
+  - old: "npm ci && npm run build && npm --prefix sample/01-cats-app install --legacy-peer-deps && npm --prefix sample/01-cats-app run build"
+  - new: "npm ci && npm run build && npm --prefix sample/34-hmr-esm install --legacy-peer-deps && npm --prefix sample/34-hmr-esm run build"
+  - source: `sample/34-hmr-esm/package.json` — scripts `build`
+    (`nest build`) and `start:prod` (`node dist/main`), the same
+    script names the old sample's `package.json` carries.
+  - why: the sample swap below; the build steps keep their shape.
+- `start`:
+  - old: "npm --prefix sample/01-cats-app run start:prod"
+  - new: "npm --prefix sample/34-hmr-esm run start:prod"
+  - source: `sample/34-hmr-esm/src/main.ts:11` —
+    `await app.listen(process.env.PORT ?? 3000);` (the old sample's
+    `sample/01-cats-app/src/main.ts:9` is
+    `await app.listen(3000);`).
+  - why: this sample reads `PORT` from the environment, so the
+    listener binds the probed port; it serves the same cats
+    controller shape (`sample/34-hmr-esm/src/cats/cats.controller.ts:10`,
+    `@Controller('cats')`), so `readiness` stays `/cats`.
+
+### django/django — HEAD `80c997fc23b08897d8611b5439c1877485a4676f`
+
+JUDGMENT CALL (flagged): the registered entry point is a framework
+command, not an app. This change generates a project with the
+repo's own documented scaffolding inside the build step and starts
+that project; the generated site routes only `admin/`, so the
+readiness path `/` is answered by Django's default 404 response,
+not a routed view. Recorded here so the call is visible.
+
+- `build`:
+  - old: "python -m pip install ."
+  - new: "python -m pip install . && django-admin startproject readiness_site ."
+  - source: `docs/intro/tutorial01.txt:47-52` — "run the following
+    command to bootstrap a new Django project:
+    `$ django-admin startproject mysite djangotutorial`"
+    (also `docs/ref/django-admin.txt:1424-1427`).
+  - why: a checkout of the framework has nothing to serve; the
+    documented scaffolding creates the runnable project in place.
+- `start`:
+  - old: "django-admin"
+  - new: "python manage.py runserver 0.0.0.0:$PORT --noreload"
+  - source: `docs/intro/tutorial01.txt:110-115` — the documented
+    dev-server command `$ python manage.py runserver`; the bind
+    address carries the harness's `PORT`. The generated project's
+    URLconf is `django/conf/project_template/project_name/urls.py-tpl:20-22`
+    (`path('admin/', admin.site.urls)` only).
+  - why: `django-admin` alone starts nothing; `runserver` is the
+    repo's own way to serve the generated project over HTTP.
+
+### LMCache/LMCache — HEAD `65320eaa8ebc5e5039ace88d8bb39a88f6859a63`
+
+- `start`:
+  - old: "lmcache_server"
+  - new: "lmcache server --http-host 0.0.0.0 --http-port $PORT"
+  - source: `pyproject.toml:47-50` registers both entry points;
+    `lmcache_server` is `lmcache.v1.server.__main__:main`, a raw
+    socket server (`lmcache/v1/server/__main__.py:30-32` binds a
+    `socket.SOCK_STREAM` and parses a binary protocol — it cannot
+    answer HTTP). The HTTP entry point is the `lmcache server`
+    subcommand: `lmcache/cli/commands/server.py:2` ("launch the
+    LMCache request server and HTTP API"), serving the FastAPI app
+    in `lmcache/v1/multiprocess/http_server.py:180,246-253`; its
+    `--http-host` / `--http-port` flags are defined at
+    `lmcache/v1/multiprocess/config.py:705-735` (defaults
+    127.0.0.1 / 8080 at :241-245).
+  - why: the old entry point speaks a binary socket protocol, so
+    no HTTP readiness check could ever pass against it; the new
+    one is the repo's own HTTP API server, bound to the harness's
+    `PORT` through its own flags.
+- `readiness`:
+  - old: "/"
+  - new: "/healthcheck"
+  - source: `lmcache/v1/multiprocess/http_apis/info_api.py:41-44` —
+    `@router.get("/healthcheck")`, documented there as the
+    "Health check endpoint for k8s liveness/readiness probes".
+  - why: the repo's own documented readiness route replaces the
+    root path.
+
+## 2026-10-14 - nestjs__nest.yml - sample swap REVERTED on review
+
+- **Old value (this branch, briefly):** build/start on `sample/34-hmr-esm`; readiness `/cats`.
+- **New value:** the previous contract, restored unchanged - build/start on `sample/01-cats-app`; readiness `/cats`.
+- **Why (two facts, both recorded at the reviewer's direction):**
+  1. `sample/34-hmr-esm`'s `start:prod` crashes on start at HEAD on Node v24.20.0: it maps its routes and announces it is listening, then its `module.hot` guard (compiled into `dist/main.js` next to a top-level `await`) throws `ReferenceError: ... ERR_AMBIGUOUS_MODULE_SYNTAX` and the process exits. A contract must not ship a known-crashing start.
+  2. Neither sample carries a lockfile (`sample/01-cats-app` and `sample/34-hmr-esm` both lack `package-lock.json`), so `npm --prefix sample/... install` is NOT a frozen install (readiness run rule 9). The restored contract has the same defect; it is recorded here rather than left implicit.
+
+## 2026-10-14 - rule-4 ruling recorded: fastify, hono, nest (framework repos)
+
+- The reviewer ruled: fastify, hono and nest are framework repos, and none has a runnable app at HEAD that both honors `PORT` and installs frozen. Their contracts stay UNCHANGED (no edit accompanies this entry):
+  - fastify: no example at HEAD reads `PORT` (all 19 files under `examples/` checked; `examples/simple.js:28` hardcodes port 3000).
+  - hono: no startable HTTP server exists in the repo at HEAD; the contract's start remains the documented `npm create hono@latest` scaffolder.
+  - nest: per the revert entry above.
+- Two generic items go to WO-8.4 scoping (not this PR): (a) contract-declared port - the harness bridges to the app's own port instead of requiring `$PORT` (the generic-alignment principle); (b) library repos - their measured runs use `harness_app`, so their readiness should prove that path rather than a stand-in example.
