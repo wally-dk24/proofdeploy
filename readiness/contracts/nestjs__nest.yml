@@ -1,3 +1,3 @@
-build: "npm ci && npm run build && npm --prefix sample/01-cats-app install --legacy-peer-deps && npm --prefix sample/01-cats-app run build"
-start: "npm --prefix sample/01-cats-app run start:prod"
+build: "npm ci && npm run build && npm --prefix sample/34-hmr-esm install --legacy-peer-deps && npm --prefix sample/34-hmr-esm run build"
+start: "npm --prefix sample/34-hmr-esm run start:prod"
 readiness: "/cats"
