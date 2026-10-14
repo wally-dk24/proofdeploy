@@ -793,3 +793,90 @@ def test_row_package_manager_comes_from_plan_only() -> None:
         BUG_UNIT, BUG_UNIT["sides"][0], "h" * 40, 1, "isolated", side2
     )
     assert row2["package_manager"] == "bun"
+
+
+def test_provision_repo_mid_unit_failure_one_row_per_side(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A failure INSIDE the side loop (here commit_contract raising
+    # on the second side, after the first side provisioned READY)
+    # must write exactly one row per attempted side: the failed
+    # side gets a harness-error row, the provisioned side keeps its
+    # single READY row, and the next unit still provisions. The
+    # first cut wrapped the whole unit in one try, so the except
+    # re-wrote error rows for every side — one side showed both
+    # READY and BUILD_FAILED (reviewer repro on PR #76).
+    src, parent, fix = _source_with_commits(tmp_path)
+    repo = "example/widgets"
+    workdir = tmp_path / "work"
+    _seed_clone(workdir, repo, src)
+    contract = tmp_path / "widgets.yml"
+    contract.write_text(
+        'build: "true"\nstart: "python app.py"\nreadiness: "/"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rp, "contract_path", lambda r: contract)
+    monkeypatch.setattr(rp, "assert_measurement_gate", lambda: None)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    real_commit_contract = rp.commit_contract
+    fix_calls = {"n": 0}
+
+    def flaky_commit_contract(
+        clone: Path, registered_sha: str, contract_path_arg: Path
+    ) -> str:
+        # Raise only for T-MID's fix side (the first fix call;
+        # T-NEXT shares the SHAs and must provision cleanly).
+        if registered_sha == fix:
+            fix_calls["n"] += 1
+            if fix_calls["n"] == 1:
+                raise RuntimeError("fatal: simulated contract failure")
+        return real_commit_contract(clone, registered_sha, contract_path_arg)
+
+    monkeypatch.setattr(rp, "commit_contract", flaky_commit_contract)
+
+    def fake_method(
+        self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
+    ) -> SimpleNamespace:
+        return _fake_side()
+
+    monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", fake_method)
+    monkeypatch.chdir(tmp_path)
+    unit = {
+        "unit_id": "T-MID",
+        "repo": repo,
+        "class": "train-bug",
+        "sides": [
+            {"role": "fix^", "sha": parent},
+            {"role": "fix", "sha": fix},
+        ],
+    }
+    manifest: dict[str, Any] = {
+        "units": [
+            unit,
+            {
+                "unit_id": "T-NEXT",
+                "repo": repo,
+                "class": "train-bug",
+                "sides": [
+                    {"role": "fix^", "sha": parent},
+                    {"role": "fix", "sha": fix},
+                ],
+            },
+        ]
+    }
+    result = rp.provision_repo(manifest, repo, workdir, 1)
+    rows = result["rows"]
+    mid = [(r["role"], r["status"]) for r in rows if r["unit"] == "T-MID"]
+    assert mid == [("fix^", "READY"), ("fix", "BUILD_FAILED")]
+    fix_row = next(
+        r for r in rows if r["unit"] == "T-MID" and r["role"] == "fix"
+    )
+    assert str(fix_row["typed_reason"]).startswith("harness error:")
+    assert "simulated contract failure" in str(fix_row["typed_reason"])
+    # Ruling: no harness commit exists for such a side, so
+    # harness_sha is None — the registered SHA stands in its own
+    # field and is never duplicated into this one.
+    assert fix_row["harness_sha"] is None
+    nxt = [r["status"] for r in rows if r["unit"] == "T-NEXT"]
+    assert nxt == ["READY", "READY"]
+    assert len(rows) == 4
