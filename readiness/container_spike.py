@@ -19,9 +19,13 @@ Per registered side of a repo (``readiness/manifest.json``):
   with more than one service is typed ``multi-service not in
   spike`` and never built; a single-service compose must declare a
   ``build`` section (an image-only service is out of spike scope);
-* the image is built with podman: network allowed during the
-  build only, the build context is the snapshot directory and
-  nothing else, no secrets and no build args are passed;
+* the image is built with podman: the build runs on the native
+  install path's explicit ``pd-build`` bridge network (network
+  during the build only), userns-remapped and with
+  ``--cap-drop=ALL`` -- a Dockerfile's RUN steps are untrusted
+  code and must not execute as host root any more than the run
+  may. The build context is the snapshot directory and nothing
+  else, no secrets and no build args are passed;
 * every ``FROM`` image's resolved digest is recorded from
   ``podman image inspect`` after the build pulled it;
 * the install verdict is judged from the Dockerfile's own install
@@ -37,9 +41,13 @@ Per registered side of a repo (``readiness/manifest.json``):
   Unix-socket bridge pattern (an in-container forwarder on
   ``/pd-sock/app.sock``, a host-side TCP proxy in front of it),
   ``--cap-drop=ALL``, ``no-new-privileges``, and podman's userns
-  remapping when the host supports it (the sandbox's own rule).
-  The only env ever passed is ``PORT``, and only when the port
-  source is ``$PORT`` itself.
+  remapping. Like the sandbox, the spike fails closed when the
+  host cannot remap: no build and no run happen at all. Only the
+  explicit dev flag ``--allow-no-userns-fallback`` lets a run
+  proceed without remapping (as ``--user 65534``), and every row
+  of such a run records ``userns_fallback: true``. The only env
+  ever passed is ``PORT``, and only when the port source is
+  ``$PORT`` itself.
 
 One row per side goes to the rows JSON, labelled
 ``"container-spike"``; per-side build/run logs go to
@@ -97,6 +105,16 @@ _TAG_BY_ROLE = {"fix^": "fix-parent", "fix": "fix", "C": "clean"}
 BUILD_TIMEOUT_S = 7200
 PROBE_TIMEOUT_S = 180
 SOCKET_TIMEOUT_S = 15
+
+# The explicit bridge network for builds: the native install
+# path's network (proofdeploy.sandbox._ensure_build_network).
+BUILD_NETWORK = "pd-build"
+
+
+class UsernsUnavailableError(RuntimeError):
+    """The host cannot do userns remapping and the explicit dev
+    fallback was not enabled: the spike refuses to build or run
+    (the sandbox's fail-closed rule)."""
 
 # The in-container socket forwarder, Node flavour. Semantically the
 # sandbox's _BRIDGE_SCRIPT (Unix socket -> 127.0.0.1:<port>), for
@@ -408,14 +426,37 @@ def find_container_file(snapshot: Path) -> tuple[Path | None, Path | None]:
 # ---------------------------------------------------------------------------
 
 
-def build_command(base: list[str], tag: str, dockerfile: Path, context: Path) -> list[str]:
+def build_user_args_for(userns_remap: bool) -> list[str]:
+    """The build's userns/cap args. A Dockerfile's RUN steps are
+    untrusted code: with remapping available they execute as
+    container root mapped away from host root (the build-form
+    uid/gid maps), and capabilities are dropped either way.
+    Without remapping there is nothing to map -- a run only
+    reaches a build at all behind the dev fallback flag -- and
+    ``--cap-drop=ALL`` still applies."""
+    if userns_remap:
+        return ["--userns-uid-map", "0:1:65536",
+                "--userns-gid-map", "0:1:65536", "--cap-drop=ALL"]
+    return ["--cap-drop=ALL"]
+
+
+def build_command(
+    base: list[str],
+    tag: str,
+    dockerfile: Path,
+    context: Path,
+    build_user_args: list[str],
+) -> list[str]:
     """The build invocation. The context is the snapshot dir and
     nothing else is mounted or passed: no -v, no --secret, no
-    --build-arg. Network during the build is podman's default for
-    RUN steps; nothing here disables it, and nothing here widens
-    it."""
+    --build-arg. The build runs on the explicit ``pd-build``
+    bridge network -- the native install path's network -- never
+    on podman's default and never on the host network: RUN steps
+    are untrusted code and must not land in the host namespace
+    or on an unnamed default."""
     return [
-        *base, "build", "-t", tag, "-f", str(dockerfile), str(context),
+        *base, "build", *build_user_args, "--network", BUILD_NETWORK,
+        "-t", tag, "-f", str(dockerfile), str(context),
     ]
 
 
@@ -451,16 +492,26 @@ def run_command(
     return args
 
 
-def user_args_for(caps_userns_remap: bool) -> list[str]:
-    """Mirror Sandbox._user_args: userns remapping when the host
-    can, else the nobody fallback — both with cap-drop=ALL and
-    no-new-privileges. (The sandbox fails closed instead of
-    falling back; the spike records the fallback in its run log,
-    because a spike run on a remapping host is the evidence that
-    matters and CI runners remap.)"""
+def user_args_for(
+    caps_userns_remap: bool, allow_no_userns_fallback: bool = False
+) -> list[str]:
+    """Mirror Sandbox._user_args, including its fail-closed rule.
+
+    Userns remapping when the host can. When it cannot, the
+    default is REFUSAL (UsernsUnavailableError): no build and no
+    run happen, exactly as the sandbox refuses. Only the explicit
+    dev flag (``--allow-no-userns-fallback``) permits the
+    ``--user 65534`` (nobody) fallback, and the caller records
+    that fallback on every row (``userns_fallback: true``)."""
     if caps_userns_remap:
         return ["--uidmap", "0:1:65536", "--cap-drop=ALL",
                 "--security-opt=no-new-privileges"]
+    if not allow_no_userns_fallback:
+        raise UsernsUnavailableError(
+            "userns remapping unavailable on this host; the spike "
+            "refuses to build or run without it (explicit dev "
+            "opt-out: --allow-no-userns-fallback)"
+        )
     return ["--user", "65534", "--cap-drop=ALL",
             "--security-opt=no-new-privileges"]
 
@@ -500,8 +551,35 @@ class Podman:
             self.logs.append(err)
         return ProcResult(proc.returncode, proc.stdout, proc.stderr)
 
-    def build(self, tag: str, dockerfile: Path, context: Path) -> ProcResult:
-        return self.run(build_command(self.base, tag, dockerfile, context), BUILD_TIMEOUT_S)
+    def ensure_build_network(self) -> str | None:
+        """Ensure the explicit ``pd-build`` bridge network exists
+        (the native install path's network: same name, created
+        the same way). None on success, else the refusal text for
+        the side's row."""
+        proc = self.run([*self.base, "network", "exists", BUILD_NETWORK], 30)
+        if proc.returncode == 0:
+            return None
+        proc = self.run([*self.base, "network", "create", BUILD_NETWORK], 60)
+        if proc.returncode == 0:
+            return None
+        tail = _last_line(proc.stderr) or _last_line(proc.stdout)
+        return (
+            f"could not create build network {BUILD_NETWORK}"
+            + (f": {tail[:300]}" if tail else "")
+            + "; the spike is refused without its explicit build network"
+        )
+
+    def build(
+        self,
+        tag: str,
+        dockerfile: Path,
+        context: Path,
+        build_user_args: list[str],
+    ) -> ProcResult:
+        return self.run(
+            build_command(self.base, tag, dockerfile, context, build_user_args),
+            BUILD_TIMEOUT_S,
+        )
 
     def image_digests(self, ref: str) -> list[str]:
         """The resolved RepoDigests of an image ref the build
@@ -674,6 +752,7 @@ def _row(
     install_evidence: str | None = None,
     port_source: str | None = None,
     port: int | None = None,
+    userns_fallback: bool = False,
 ) -> dict[str, Any]:
     return {
         "kind": "container-spike",
@@ -689,6 +768,7 @@ def _row(
         "port_source": port_source,
         "port": port,
         "network_mode": "none+socket",
+        "userns_fallback": userns_fallback,
         "attempt": attempt,
     }
 
@@ -705,10 +785,17 @@ def spike_side_from_snapshot(
     prober: Prober = probe_http,
     probe_timeout_s: float = PROBE_TIMEOUT_S,
     socket_wait: Callable[[Path, float, list[str]], str | None] = _wait_for_socket,
+    *,
+    build_user_args: list[str],
+    userns_fallback: bool = False,
 ) -> dict[str, Any]:
     """Spike one side whose snapshot tree is already on disk.
     Never raises for a build/start outcome; outcomes are typed
     into the row."""
+
+    def row(status: str, typed_reason: str | None, **kwargs: Any) -> dict[str, Any]:
+        return _row(unit, side_spec, attempt, status, typed_reason,
+                    userns_fallback=userns_fallback, **kwargs)
     dockerfile_path, compose_path = find_container_file(snapshot)
     compose: ComposeInfo | None = None
     if dockerfile_path is None and compose_path is not None:
@@ -717,29 +804,29 @@ def spike_side_from_snapshot(
             f"compose file: {compose_path.name}; services: {compose.services}"
         )
         if len(compose.services) > 1:
-            return _row(unit, side_spec, attempt, "BUILD_FAILED",
+            return row("BUILD_FAILED",
                         "multi-service not in spike")
         if len(compose.services) == 0:
-            return _row(unit, side_spec, attempt, "BUILD_FAILED",
+            return row("BUILD_FAILED",
                         "compose file declares no services")
         if compose.build_context is None:
-            return _row(unit, side_spec, attempt, "BUILD_FAILED",
+            return row("BUILD_FAILED",
                         "compose service declares no build section; "
                         "image-only services are out of spike scope")
         context = (snapshot / compose.build_context).resolve()
         if not str(context).startswith(str(snapshot.resolve())):
-            return _row(unit, side_spec, attempt, "BUILD_FAILED",
+            return row("BUILD_FAILED",
                         "compose build context escapes the snapshot")
         dockerfile_path = context / (compose.build_dockerfile or "Dockerfile")
         if not dockerfile_path.is_file():
-            return _row(unit, side_spec, attempt, "BUILD_FAILED",
+            return row("BUILD_FAILED",
                         "compose build dockerfile not found in snapshot")
         build_context = context
     elif dockerfile_path is not None:
         build_context = snapshot
         logs.append(f"dockerfile: {dockerfile_path.name}")
     else:
-        return _row(unit, side_spec, attempt, "BUILD_FAILED",
+        return row("BUILD_FAILED",
                     "no root Dockerfile or compose file in snapshot")
 
     info = parse_dockerfile(dockerfile_path.read_text(encoding="utf-8"))
@@ -751,7 +838,11 @@ def spike_side_from_snapshot(
     slug = f"{unit['unit_id']}-{side_spec['role']}-a{attempt}".lower()
     slug = re.sub(r"[^a-z0-9_.-]", "-", slug)
     tag = f"pd-spike-{slug}"
-    built = podman.build(tag, dockerfile_path, build_context)
+    net_error = podman.ensure_build_network()
+    if net_error is not None:
+        return row("BUILD_FAILED", net_error,
+                   install_frozen=frozen, install_evidence=evidence)
+    built = podman.build(tag, dockerfile_path, build_context, build_user_args)
     digests: list[str] = []
     for image in info.from_images:
         for digest in podman.image_digests(image):
@@ -761,7 +852,7 @@ def spike_side_from_snapshot(
     if built.returncode != 0:
         tail = _last_line(built.stderr) or _last_line(built.stdout)
         typed = "container build failed" + (f": {tail[:300]}" if tail else "")
-        return _row(unit, side_spec, attempt, "BUILD_FAILED", typed,
+        return row("BUILD_FAILED", typed,
                     from_digests=digests, install_frozen=frozen,
                     install_evidence=evidence)
 
@@ -775,7 +866,7 @@ def spike_side_from_snapshot(
     port, port_source = determine_port(info, exposed, compose)
     logs.append(f"port: {port} (source: {port_source})")
     if port is None:
-        return _row(unit, side_spec, attempt, "BUILD_FAILED",
+        return row("BUILD_FAILED",
                     "cannot determine container port: no EXPOSE in "
                     "Dockerfile or image config, no compose mapping, "
                     "no declared PORT",
@@ -784,7 +875,7 @@ def spike_side_from_snapshot(
 
     app_argv = list(config.get("Entrypoint") or []) + list(config.get("Cmd") or [])
     if not app_argv:
-        return _row(unit, side_spec, attempt, "START_FAILED",
+        return row("START_FAILED",
                     "image declares no ENTRYPOINT or CMD",
                     from_digests=digests, install_frozen=frozen,
                     install_evidence=evidence, port_source=port_source, port=port)
@@ -796,7 +887,7 @@ def spike_side_from_snapshot(
         bridge_file, bridge_cmd = ".pd-bridge.cjs", "node"
         bridge_text = _NODE_BRIDGE_SCRIPT
     else:
-        return _row(unit, side_spec, attempt, "START_FAILED",
+        return row("START_FAILED",
                     "no bridge runtime (python3 or node) in image",
                     from_digests=digests, install_frozen=frozen,
                     install_evidence=evidence, port_source=port_source, port=port)
@@ -817,13 +908,13 @@ def spike_side_from_snapshot(
         if started.returncode != 0:
             tail = _last_line(started.stderr) or _last_line(started.stdout)
             typed = "container start failed" + (f": {tail[:300]}" if tail else "")
-            return _row(unit, side_spec, attempt, "START_FAILED", typed,
+            return row("START_FAILED", typed,
                         from_digests=digests, install_frozen=frozen,
                         install_evidence=evidence, port_source=port_source, port=port)
         sock_err = socket_wait(sock_path, SOCKET_TIMEOUT_S, logs)
         if sock_err is not None:
             logs.append("container log tail:\n" + podman.container_logs(name))
-            return _row(unit, side_spec, attempt, "START_FAILED",
+            return row("START_FAILED",
                         f"bridge socket never became ready: {sock_err}",
                         from_digests=digests, install_frozen=frozen,
                         install_evidence=evidence, port_source=port_source, port=port)
@@ -834,7 +925,7 @@ def spike_side_from_snapshot(
         )
         if status is not None:
             logs.append(f"readiness: HTTP {status} at {readiness_path}")
-            return _row(unit, side_spec, attempt, "READY", None,
+            return row("READY", None,
                         from_digests=digests, install_frozen=frozen,
                         install_evidence=evidence, port_source=port_source, port=port)
         if not running:
@@ -842,11 +933,11 @@ def spike_side_from_snapshot(
             typed = "container exited before readiness" + (
                 f": {tail[:300]}" if tail else ""
             )
-            return _row(unit, side_spec, attempt, "START_FAILED", typed,
+            return row("START_FAILED", typed,
                         from_digests=digests, install_frozen=frozen,
                         install_evidence=evidence, port_source=port_source, port=port)
         logs.append("container log tail:\n" + podman.container_logs(name))
-        return _row(unit, side_spec, attempt, "START_FAILED", "readiness timeout",
+        return row("START_FAILED", "readiness timeout",
                     from_digests=digests, install_frozen=frozen,
                     install_evidence=evidence, port_source=port_source, port=port)
     finally:
@@ -863,6 +954,8 @@ def spike_side(
     attempt: int,
     workdir: Path,
     user_args: list[str],
+    build_user_args: list[str],
+    userns_fallback: bool = False,
 ) -> dict[str, Any]:
     """Fetch + materialize one side's snapshot, then spike it.
     Exactly one row per side; harness-level surprises are typed
@@ -879,11 +972,12 @@ def spike_side(
         side_podman = Podman(logs, podman.base)
         row = spike_side_from_snapshot(
             side_podman, snapshot, unit, side_spec, readiness_path,
-            attempt, user_args, logs,
+            attempt, user_args, logs, build_user_args=build_user_args,
+            userns_fallback=userns_fallback,
         )
     except Exception as exc:  # one side must not kill the others
         row = _row(unit, side_spec, attempt, "BUILD_FAILED",
-                   f"harness error: {exc}")
+                   f"harness error: {exc}", userns_fallback=userns_fallback)
         logs.append(f"spike raised: {exc}")
     dump_spike_logs(f"spike-{unit['unit_id']}-{tag}-a{attempt}", logs)
     return row
@@ -895,6 +989,7 @@ def spike_repo(
     workdir: Path,
     attempt: int,
     only: list[tuple[str, str]] | None = None,
+    allow_no_userns_fallback: bool = False,
 ) -> dict[str, Any]:
     """Spike every registered side of ``repo`` (or an ``only``
     subset of (unit_id, role) pairs, for reruns)."""
@@ -910,12 +1005,19 @@ def spike_repo(
     ]
     if not caps.podman:
         raise RuntimeError(f"podman not available: {caps.reason}")
-    args_for_user = user_args_for(caps.userns_remap)
+    # Fail closed without userns remapping: user_args_for raises
+    # UsernsUnavailableError, which propagates — no build and no
+    # run happen, and main reports the refusal (exit 2).
+    args_for_user = user_args_for(caps.userns_remap, allow_no_userns_fallback)
+    build_args = build_user_args_for(caps.userns_remap)
+    userns_fallback = not caps.userns_remap
     run_log.append(f"run user args: {args_for_user}")
-    if not caps.userns_remap:
+    run_log.append(f"build user args: {build_args}")
+    if userns_fallback:
         run_log.append(
-            "WARNING: userns remapping unavailable; run uses the "
-            "--user 65534 (nobody) fallback"
+            "WARNING: userns remapping unavailable; the explicit dev "
+            "flag --allow-no-userns-fallback allows the --user 65534 "
+            "(nobody) fallback; every row records userns_fallback: true"
         )
     clone = ensure_clone(workdir, repo)
     readiness_path = load_contract(contract_path(repo)).readiness
@@ -929,7 +1031,8 @@ def spike_repo(
                 continue
             row = spike_side(
                 podman, clone, unit, side_spec, readiness_path,
-                attempt, workdir, args_for_user,
+                attempt, workdir, args_for_user, build_args,
+                userns_fallback=userns_fallback,
             )
             rows.append(row)
             print(json.dumps(row), flush=True)
@@ -964,6 +1067,13 @@ def main(argv: list[str] | None = None) -> int:
         "--rerun-non-ready", type=Path, default=None,
         help="prior rows JSON; re-spike only its non-READY sides",
     )
+    ap.add_argument(
+        "--allow-no-userns-fallback", action="store_true",
+        help="DEV OVERRIDE: when the host cannot do userns "
+        "remapping, proceed as --user 65534 (nobody) instead of "
+        "refusing; every row then records userns_fallback: true. "
+        "Never for measured runs.",
+    )
     args = ap.parse_args(argv)
     manifest = load_manifest(args.manifest)
     only = (
@@ -972,7 +1082,10 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
     try:
-        result = spike_repo(manifest, args.repo, args.workdir, args.attempt, only=only)
+        result = spike_repo(
+            manifest, args.repo, args.workdir, args.attempt, only=only,
+            allow_no_userns_fallback=args.allow_no_userns_fallback,
+        )
     except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"container spike failed: {exc}", file=sys.stderr)
         return 2

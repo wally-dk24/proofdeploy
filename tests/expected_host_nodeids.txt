@@ -12,6 +12,8 @@ tests/test_cli.py::test_measure_provenance_flags
 tests/test_cli.py::test_verify_flags_match_prd
 tests/test_cli.py::test_verify_not_implemented_returns_tool_error
 tests/test_container_spike.py::test_build_command_context_is_snapshot_only
+tests/test_container_spike.py::test_build_command_safety_shape
+tests/test_container_spike.py::test_build_user_args_modes
 tests/test_container_spike.py::test_compose_invalid_yaml_declares_no_services
 tests/test_container_spike.py::test_compose_single_service_dict_build_and_env_port
 tests/test_container_spike.py::test_compose_single_service_forms
@@ -46,9 +48,12 @@ tests/test_container_spike.py::test_side_no_bridge_runtime
 tests/test_container_spike.py::test_side_no_container_file
 tests/test_container_spike.py::test_side_port_undetermined_is_typed_not_guessed
 tests/test_container_spike.py::test_side_readiness_timeout
+tests/test_container_spike.py::test_side_userns_fallback_recorded_on_row
 tests/test_container_spike.py::test_side_vendure_multi_service_typed_and_never_built
+tests/test_container_spike.py::test_spike_repo_refuses_without_userns
 tests/test_container_spike.py::test_spike_side_fetch_failure_is_a_harness_error_row
 tests/test_container_spike.py::test_user_args_both_modes_carry_cap_drop
+tests/test_container_spike.py::test_userns_refused_by_default_without_remap
 tests/test_examples.py::test_invalid_example_fails_loudly
 tests/test_examples.py::test_proofdeploy_yml_examples
 tests/test_examples.py::test_schema_json_is_well_formed_and_current

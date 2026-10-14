@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -69,6 +70,7 @@ services:
 UNIT: dict[str, Any] = {"unit_id": "C3", "repo": "directus/directus"}
 SIDE: dict[str, Any] = {"role": "C", "sha": "dc922b790a15949e8abfce9c1f4523d4e5f89492"}
 USER_ARGS = cs.user_args_for(True)
+BUILD_USER_ARGS = cs.build_user_args_for(True)
 
 
 class FakePodman:
@@ -103,8 +105,13 @@ class FakePodman:
         self.started: list[list[str]] = []
         self.removed: list[str] = []
 
-    def build(self, tag: str, dockerfile: Path, context: Path) -> cs.ProcResult:
-        cmd = cs.build_command(self.base, tag, dockerfile, context)
+    def ensure_build_network(self) -> None:
+        return None
+
+    def build(
+        self, tag: str, dockerfile: Path, context: Path, build_user_args: list[str]
+    ) -> cs.ProcResult:
+        cmd = cs.build_command(self.base, tag, dockerfile, context, build_user_args)
         self.built.append(cmd)
         err = "" if self.build_rc == 0 else "step 9 failed\nerror building image\n"
         return cs.ProcResult(self.build_rc, "", err)
@@ -306,12 +313,41 @@ def test_determine_port_never_guessed() -> None:
 
 def test_build_command_context_is_snapshot_only(tmp_path: Path) -> None:
     dockerfile = tmp_path / "Dockerfile"
-    cmd = cs.build_command(["podman"], "pd-spike-x", dockerfile, tmp_path)
-    assert cmd == ["podman", "build", "-t", "pd-spike-x", "-f", str(dockerfile), str(tmp_path)]
+    cmd = cs.build_command(["podman"], "pd-spike-x", dockerfile, tmp_path, BUILD_USER_ARGS)
+    assert cmd == [
+        "podman", "build",
+        "--userns-uid-map", "0:1:65536", "--userns-gid-map", "0:1:65536",
+        "--cap-drop=ALL", "--network", "pd-build",
+        "-t", "pd-spike-x", "-f", str(dockerfile), str(tmp_path),
+    ]
     assert "-v" not in cmd
     assert "--secret" not in " ".join(cmd)
     assert "--build-arg" not in cmd
-    assert "--network" not in cmd  # build network is podman's default
+
+
+def test_build_command_safety_shape(tmp_path: Path) -> None:
+    # The build executes untrusted Dockerfile RUN steps: remapped
+    # away from host root, capabilities dropped, and on the
+    # explicit pd-build bridge network (the native install path's
+    # network) — never podman's default, never the host's.
+    cmd = cs.build_command(
+        ["podman"], "pd-spike-x", tmp_path / "Dockerfile", tmp_path, BUILD_USER_ARGS
+    )
+    assert "--userns-uid-map" in cmd and "0:1:65536" in cmd
+    assert "--userns-gid-map" in cmd
+    assert "--cap-drop=ALL" in cmd
+    assert cmd[cmd.index("--network") + 1] == "pd-build"
+    assert "--net=host" not in cmd and "host" not in cmd
+    assert "--privileged" not in cmd
+
+
+def test_build_user_args_modes() -> None:
+    remap = cs.build_user_args_for(True)
+    assert "--userns-uid-map" in remap and "--userns-gid-map" in remap
+    assert "0:1:65536" in remap and "--cap-drop=ALL" in remap
+    no_remap = cs.build_user_args_for(False)
+    assert "--userns-uid-map" not in no_remap
+    assert "--cap-drop=ALL" in no_remap  # dropped even in fallback mode
 
 
 def test_run_command_safety_shape(tmp_path: Path) -> None:
@@ -342,10 +378,32 @@ def test_user_args_both_modes_carry_cap_drop() -> None:
     remap = cs.user_args_for(True)
     assert "--uidmap" in remap and "--cap-drop=ALL" in remap
     assert "--security-opt=no-new-privileges" in remap
-    fallback = cs.user_args_for(False)
+    fallback = cs.user_args_for(False, allow_no_userns_fallback=True)
     assert "--user" in fallback and "65534" in fallback
     assert "--cap-drop=ALL" in fallback
     assert "--security-opt=no-new-privileges" in fallback
+
+
+def test_userns_refused_by_default_without_remap() -> None:
+    # Fail closed, like the sandbox: no remap and no explicit dev
+    # flag is a refusal, not a silent fallback.
+    with pytest.raises(cs.UsernsUnavailableError, match="refuses to build or run"):
+        cs.user_args_for(False)
+    with pytest.raises(cs.UsernsUnavailableError):
+        cs.user_args_for(False, allow_no_userns_fallback=False)
+
+
+def test_spike_repo_refuses_without_userns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caps = SimpleNamespace(
+        podman=True, podman_version="test", userns_remap=False,
+        reason="userns probe failed: test double",
+    )
+    monkeypatch.setattr(cs, "check_sandbox_capabilities", lambda: caps)
+    manifest = {"units": [dict(UNIT, sides=[SIDE])]}
+    with pytest.raises(cs.UsernsUnavailableError):
+        cs.spike_repo(manifest, "directus/directus", tmp_path, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +419,7 @@ def test_side_directus_ready(tmp_path: Path) -> None:
         fake, snap, UNIT, SIDE, "/server/ping", 2, USER_ARGS, logs,  # type: ignore[arg-type]
         prober=_ready_prober,
         socket_wait=_socket_ok,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["kind"] == "container-spike"
     assert row["status"] == "READY"
@@ -371,6 +430,7 @@ def test_side_directus_ready(tmp_path: Path) -> None:
     assert row["install_evidence"] == "pnpm install --recursive --offline --frozen-lockfile"
     assert row["from_digests"] == ["docker.io/library/node@sha256:abc123"]
     assert row["network_mode"] == "none+socket"
+    assert row["userns_fallback"] is False
     assert row["attempt"] == 2
     assert len(fake.built) == 1
     started = fake.started[-1]
@@ -382,6 +442,26 @@ def test_side_directus_ready(tmp_path: Path) -> None:
     assert fake.removed == ["pd-spike-c3-c-a2"]
 
 
+def test_side_userns_fallback_recorded_on_row(tmp_path: Path) -> None:
+    # Behind the explicit dev flag the side still runs (as nobody),
+    # and the row says so: userns_fallback is on EVERY row of such
+    # a run, this READY one included.
+    snap = _snapshot(tmp_path, {"Dockerfile": DIRECTUS_DOCKERFILE})
+    fake = FakePodman()
+    row = cs.spike_side_from_snapshot(
+        fake, snap, UNIT, SIDE, "/server/ping", 1,
+        cs.user_args_for(False, allow_no_userns_fallback=True), [],  # type: ignore[arg-type]
+        prober=_ready_prober,
+        socket_wait=_socket_ok,
+        build_user_args=cs.build_user_args_for(False),
+        userns_fallback=True,
+    )
+    assert row["status"] == "READY"
+    assert row["userns_fallback"] is True
+    started = fake.started[-1]
+    assert "--user" in started and "65534" in started
+
+
 def test_side_vendure_multi_service_typed_and_never_built(tmp_path: Path) -> None:
     snap = _snapshot(tmp_path, {"docker-compose.yml": VENDURE_COMPOSE})
     fake = FakePodman()
@@ -390,6 +470,7 @@ def test_side_vendure_multi_service_typed_and_never_built(tmp_path: Path) -> Non
     row = cs.spike_side_from_snapshot(
         fake, snap, unit, side, "/health", 2, USER_ARGS, [],  # type: ignore[arg-type]
         prober=_ready_prober,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "BUILD_FAILED"
     assert row["typed_reason"] == "multi-service not in spike"
@@ -403,6 +484,7 @@ def test_side_no_container_file(tmp_path: Path) -> None:
     row = cs.spike_side_from_snapshot(
         FakePodman(), snap, UNIT, SIDE, "/", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=_ready_prober,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "BUILD_FAILED"
     assert row["typed_reason"] == "no root Dockerfile or compose file in snapshot"
@@ -417,6 +499,7 @@ def test_side_dockerfile_beats_compose_at_root(tmp_path: Path) -> None:
         fake, snap, UNIT, SIDE, "/server/ping", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=_ready_prober,
         socket_wait=_socket_ok,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "READY"
     assert len(fake.built) == 1
@@ -428,6 +511,7 @@ def test_side_build_failure_records_digests_and_tail(tmp_path: Path) -> None:
     row = cs.spike_side_from_snapshot(
         fake, snap, UNIT, SIDE, "/server/ping", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=_ready_prober,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "BUILD_FAILED"
     assert row["typed_reason"] == "container build failed: error building image"
@@ -441,6 +525,7 @@ def test_side_port_undetermined_is_typed_not_guessed(tmp_path: Path) -> None:
     row = cs.spike_side_from_snapshot(
         fake, snap, UNIT, SIDE, "/", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=_ready_prober,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "BUILD_FAILED"
     assert "cannot determine container port" in str(row["typed_reason"])
@@ -460,6 +545,7 @@ def test_side_readiness_timeout(tmp_path: Path) -> None:
         fake, snap, UNIT, SIDE, "/server/ping", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=timeout_prober,
         socket_wait=_socket_ok,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "START_FAILED"
     assert row["typed_reason"] == "readiness timeout"
@@ -476,6 +562,7 @@ def test_side_container_exited_carries_log_tail(tmp_path: Path) -> None:
         fake, snap, UNIT, SIDE, "/server/ping", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=exited_prober,
         socket_wait=_socket_ok,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "START_FAILED"
     assert row["typed_reason"] == "container exited before readiness: kaboom: database gone"
@@ -487,6 +574,7 @@ def test_side_image_without_cmd(tmp_path: Path) -> None:
     row = cs.spike_side_from_snapshot(
         fake, snap, UNIT, SIDE, "/server/ping", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=_ready_prober,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "START_FAILED"
     assert row["typed_reason"] == "image declares no ENTRYPOINT or CMD"
@@ -498,6 +586,7 @@ def test_side_no_bridge_runtime(tmp_path: Path) -> None:
     row = cs.spike_side_from_snapshot(
         fake, snap, UNIT, SIDE, "/server/ping", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=_ready_prober,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "START_FAILED"
     assert row["typed_reason"] == "no bridge runtime (python3 or node) in image"
@@ -522,6 +611,7 @@ def test_side_compose_single_service_uses_compose_port(tmp_path: Path) -> None:
         fake, snap, UNIT, SIDE, "/", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=_ready_prober,
         socket_wait=_socket_ok,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "READY"
     assert row["port"] == 8081
@@ -537,6 +627,7 @@ def test_side_compose_image_only_is_out_of_scope(tmp_path: Path) -> None:
     row = cs.spike_side_from_snapshot(
         FakePodman(), snap, UNIT, SIDE, "/", 1, USER_ARGS, [],  # type: ignore[arg-type]
         prober=_ready_prober,
+        build_user_args=BUILD_USER_ARGS,
     )
     assert row["status"] == "BUILD_FAILED"
     assert "no build section" in str(row["typed_reason"])
@@ -552,7 +643,9 @@ def test_spike_side_fetch_failure_is_a_harness_error_row(
 
     monkeypatch.setattr(cs, "fetch_sha", boom)
     podman = cs.Podman([], ["podman"])
-    row = cs.spike_side(podman, tmp_path, UNIT, SIDE, "/", 1, tmp_path, USER_ARGS)
+    row = cs.spike_side(
+        podman, tmp_path, UNIT, SIDE, "/", 1, tmp_path, USER_ARGS, BUILD_USER_ARGS
+    )
     assert row["status"] == "BUILD_FAILED"
     assert row["typed_reason"] == "harness error: git fetch failed: exit 128"
     assert (tmp_path / "spike-logs" / "spike-C3-clean-a1.log").is_file()

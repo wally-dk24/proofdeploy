@@ -26,12 +26,21 @@ measured kind, and no scoring.
 The same bar as the sandbox, verbatim from the work order:
 
 - **Podman:** rootless and userns-remapped. No privileged mode,
-  no host network, no socket mounts. (When a host cannot do
-  userns remapping, the run falls back to `--user 65534`
-  (nobody), mirroring the sandbox's fallback, and records the
-  fact in its run log; CI runners remap.)
-- **Build:** network is allowed during the build only. The build
-  context is the snapshot only. No secrets, no host mounts.
+  no host network, no socket mounts. Like the sandbox, the spike
+  fails closed when a host cannot do userns remapping: no build
+  and no run happen at all. Only the explicit dev flag
+  `--allow-no-userns-fallback` proceeds without remapping (as
+  `--user 65534`, nobody), and every row of such a run records
+  `userns_fallback: true`; CI runners remap.
+- **Build:** a Dockerfile's RUN steps are untrusted code, held
+  to the same bar as the run: userns-remapped
+  (`--userns-uid-map` / `--userns-gid-map` `0:1:65536`) and
+  `--cap-drop=ALL`, so an escape during the build is not host
+  root. Network is allowed during the build only, and only on
+  the explicit `pd-build` bridge network — the native install
+  path's network — never podman's default and never the
+  host's. The build context is the snapshot only. No secrets,
+  no host mounts.
 - **Run:**
   - `--net=none` with the existing socket bridge (a forwarder
     inside the container on a Unix socket bind-mounted at
@@ -45,14 +54,16 @@ The same bar as the sandbox, verbatim from the work order:
 - A run records how podman was invoked: the run log
   (`spike-logs/spike-<repo>-run-a<attempt>.log`) carries the
   capability line (podman version, userns remapping), the podman
-  base command, and the run user args; every podman invocation
+  base command, and the run and build user args; every podman invocation
   for a side is logged verbatim in that side's log.
 
 Each safety property has a command-construction test in
 `tests/test_container_spike.py`, and each test is plant-proven:
 dropping `--net=none` from the run command, dropping
-`--cap-drop=ALL` from the user args, or adding a host mount to
-the build command makes the matching test fail.
+`--cap-drop=ALL` from the user args, dropping the userns remap
+or the cap-drop from the build command, pointing the build at
+the host network, or adding a host mount to the build command
+makes the matching test fail.
 
 ## Selection (mechanical, decided before any run)
 
@@ -67,7 +78,9 @@ qualifying repo, up to 3, in manifest order:
 | TryGhost/Ghost | — (see below) | — (see below) | no |
 | nestjs/nest, fastify/fastify, honojs/hono, bottlepy/bottle, codeigniter4/CodeIgniter4, django/django, LMCache/LMCache | — | — | no |
 
-Exactly two repos qualify: **vendure** and **directus**.
+Exactly two repos qualify: **vendure** and **directus**. Of
+the two, only Directus can reach a real container start —
+Vendure's sides type out before any build or run (below).
 
 **Ghost near-miss, recorded exactly:** Ghost ships only variant
 names — `Dockerfile.production` and `compose.dev*.yaml` files —
@@ -104,9 +117,10 @@ For the dispatched repo, per registered side
 3. Parse the Dockerfile: FROM stages with build-ARG resolution,
    the install RUN lines (including heredoc bodies), EXPOSE
    ports, ENV.
-4. Build with podman (build network allowed; snapshot-only
-   context; no secrets, no build args, no mounts). Record the
-   resolved digest of every FROM image the build pulled.
+4. Build with podman (userns-remapped, `--cap-drop=ALL`, on
+   the explicit `pd-build` network; snapshot-only context; no
+   secrets, no build args, no mounts). Record the resolved
+   digest of every FROM image the build pulled.
 5. Judge the install from the Dockerfile's own lines:
    `--frozen-lockfile`, `npm ci`, `--immutable`,
    `--require-hashes` are frozen; a bare install line is not.
@@ -128,6 +142,17 @@ For the dispatched repo, per registered side
    `/server/ping`) over the bridge until the app answers HTTP
    (any status) or a bounded timeout passes.
 
+### A note on symlinks in snapshots
+
+Materialization extracts the `git archive` tar with tarfile's
+`data` filter, which refuses absolute paths, `..` escapes and
+links pointing outside the tree — but it keeps in-tree relative
+symlinks. That keep-in-tree rule is the WO-8.4b proposal, which
+is still **awaiting Master's approval**; it is acceptable here
+only because this spike is readiness-only and evidence-only.
+The measured path is unchanged by this spike: it still refuses
+links.
+
 ## What a row records
 
 One row per (unit, role), in `rows-spike-attempt<N>.json`:
@@ -139,7 +164,8 @@ One row per (unit, role), in `rows-spike-attempt<N>.json`:
 `install_frozen` (true / false / null when there is no install
 line to judge), `install_evidence` (the verbatim install line),
 `port_source` (`EXPOSE` / `compose` / `$PORT` / null), `port`,
-`network_mode` (`none+socket`), `attempt`.
+`network_mode` (`none+socket`), `userns_fallback` (true only
+when the run proceeded under the dev no-userns flag), `attempt`.
 
 Per-side build and run logs land in `spike-logs/`, and the
 workflow uploads rows + logs as one artifact. A failure in one
