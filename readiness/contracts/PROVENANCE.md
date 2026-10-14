@@ -343,3 +343,19 @@ not a routed view. Recorded here so the call is visible.
     "Health check endpoint for k8s liveness/readiness probes".
   - why: the repo's own documented readiness route replaces the
     root path.
+
+## 2026-10-14 - nestjs__nest.yml - sample swap REVERTED on review
+
+- **Old value (this branch, briefly):** build/start on `sample/34-hmr-esm`; readiness `/cats`.
+- **New value:** the previous contract, restored unchanged - build/start on `sample/01-cats-app`; readiness `/cats`.
+- **Why (two facts, both recorded at the reviewer's direction):**
+  1. `sample/34-hmr-esm`'s `start:prod` crashes on start at HEAD on Node v24.20.0: it maps its routes and announces it is listening, then its `module.hot` guard (compiled into `dist/main.js` next to a top-level `await`) throws `ReferenceError: ... ERR_AMBIGUOUS_MODULE_SYNTAX` and the process exits. A contract must not ship a known-crashing start.
+  2. Neither sample carries a lockfile (`sample/01-cats-app` and `sample/34-hmr-esm` both lack `package-lock.json`), so `npm --prefix sample/... install` is NOT a frozen install (readiness run rule 9). The restored contract has the same defect; it is recorded here rather than left implicit.
+
+## 2026-10-14 - rule-4 ruling recorded: fastify, hono, nest (framework repos)
+
+- The reviewer ruled: fastify, hono and nest are framework repos, and none has a runnable app at HEAD that both honors `PORT` and installs frozen. Their contracts stay UNCHANGED (no edit accompanies this entry):
+  - fastify: no example at HEAD reads `PORT` (all 19 files under `examples/` checked; `examples/simple.js:28` hardcodes port 3000).
+  - hono: no startable HTTP server exists in the repo at HEAD; the contract's start remains the documented `npm create hono@latest` scaffolder.
+  - nest: per the revert entry above.
+- Two generic items go to WO-8.4 scoping (not this PR): (a) contract-declared port - the harness bridges to the app's own port instead of requiring `$PORT` (the generic-alignment principle); (b) library repos - their measured runs use `harness_app`, so their readiness should prove that path rather than a stand-in example.
