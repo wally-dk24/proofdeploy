@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -360,3 +362,149 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
             assert data.get("auth", {}).get("mode") == "refresh"
         else:
             assert "auth" not in data, path.name
+
+
+# --- the real-git path -------------------------------------------------
+#
+# The run-38575200339 failure (cutoff resolved before any fetch, in a
+# clone that starts empty) was invisible to every test above because
+# they stub the orchestrator or the fetch layer. This test stubs ONLY
+# the sandbox call (Orchestrator._provision_side_sandbox) and the
+# measurement gate, and runs the real provision_repo path — real
+# fetches from a local file:// source, real cutoff resolution, real
+# contract commits — from an empty clone.
+
+
+def _commit_dated(repo: Path, text: str, date: str) -> str:
+    (repo / "app.py").write_text(f'print("{text}")\n', encoding="utf-8")
+    _git(repo, "add", "-A")
+    env = dict(os.environ)
+    env["GIT_AUTHOR_DATE"] = date
+    env["GIT_COMMITTER_DATE"] = date
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", text],
+        capture_output=True, text=True, check=True, timeout=60, env=env,
+    )
+    assert proc.returncode == 0
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _rfc3339_of(repo: Path, sha: str) -> str:
+    epoch = int(_git(repo, "show", "-s", "--format=%ct", sha))
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def test_provision_repo_real_git_from_empty_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Source repository standing in for the GitHub remote: three
+    # commits with distinct committer times, fetchable by SHA the
+    # way GitHub allows.
+    src = tmp_path / "src"
+    src.mkdir()
+    _git(src, "init", "-q")
+    _git(src, "config", "user.name", "readiness-test")
+    _git(src, "config", "user.email", "test@proofdeploy.invalid")
+    _git(src, "config", "uploadpack.allowAnySHA1InWant", "true")
+    fix_parent = _commit_dated(src, "v1", "2026-01-01T00:00:00+00:00")
+    fix = _commit_dated(src, "v2", "2026-01-02T00:00:00+00:00")
+    clean = _commit_dated(src, "v3", "2026-01-03T00:00:00+00:00")
+    # Distinct times, so a cutoff equality below proves WHERE the
+    # cutoff came from, not a coincidence of equal timestamps.
+    assert len({_rfc3339_of(src, s) for s in (fix_parent, fix, clean)}) == 3
+
+    repo = "example/widgets"
+    workdir = tmp_path / "work"
+    # The harness clone, exactly as ensure_clone leaves it before
+    # the run — except its origin is the local source. EMPTY: the
+    # .git directory exists, and it holds no objects at all.
+    clone = workdir / "repos" / rp.repo_slug(repo)
+    clone.mkdir(parents=True)
+    _git(clone, "init", "-q")
+    _git(clone, "remote", "add", "origin", src.as_uri())
+    assert "count: 0" in _git(clone, "count-objects", "-v")
+
+    contract = tmp_path / "widgets.yml"
+    contract.write_text(
+        'build: "true"\nstart: "python app.py"\nreadiness: "/"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rp, "contract_path", lambda r: contract)
+    # The measurement gate is the sandbox capability gate; there is
+    # no capable sandbox in a host test by design (this suite is
+    # podman-free). Everything else in the path is real.
+    monkeypatch.setattr(rp, "assert_measurement_gate", lambda: None)
+
+    seen: list[dict[str, Any]] = []
+
+    def fake_method(
+        self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
+    ) -> SimpleNamespace:
+        seen.append(
+            {"rev": rev, "tag": tag, "cutoff": self._run_lock_cutoff}
+        )
+        return _fake_side()
+
+    monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", fake_method)
+    monkeypatch.chdir(tmp_path)  # pd-logs/ land in tmp
+
+    manifest: dict[str, Any] = {
+        "units": [
+            {
+                "unit_id": "T-REAL",
+                "repo": repo,
+                "class": "train-bug",
+                "sides": [
+                    {"role": "fix^", "sha": fix_parent},
+                    {"role": "fix", "sha": fix},
+                ],
+            },
+            {
+                "unit_id": "C-REAL",
+                "repo": repo,
+                "class": "train-clean",
+                "sides": [{"role": "C", "sha": clean}],
+            },
+        ]
+    }
+    result = rp.provision_repo(manifest, repo, workdir, 1)
+
+    rows = result["rows"]
+    assert [r["status"] for r in rows] == ["READY"] * 3
+    assert [r["registered_sha"] for r in rows] == [fix_parent, fix, clean]
+    assert [r["harness_sha"] for r in rows] == [s["rev"] for s in seen]
+    assert result["network_mode"] in ("isolated", "none+socket")
+
+    # Cutoff arithmetic, from the real git calls: during BOTH bug
+    # sides the run cutoff is the FIX commit's committer time (never
+    # the side's own — the fix^ side proves it); during the clean
+    # side it is the C commit's.
+    assert [s["cutoff"] for s in seen] == [
+        _rfc3339_of(src, fix),
+        _rfc3339_of(src, fix),
+        _rfc3339_of(src, clean),
+    ]
+
+    # The sandbox call received harness commits, each built by the
+    # real commit_contract (read-tree over the depth-1 fetch): the
+    # parent is the registered SHA, the tree delta is exactly
+    # +proofdeploy.yml, and the tree carries that side's own files.
+    for call, registered, text in zip(
+        seen, (fix_parent, fix, clean), ("v1", "v2", "v3"), strict=True
+    ):
+        harness = call["rev"]
+        assert harness != registered
+        assert _git(clone, "rev-parse", f"{harness}^") == registered
+        changed = _git(clone, "diff", "--name-only", registered, harness)
+        assert changed.splitlines() == ["proofdeploy.yml"]
+        assert _git(clone, "show", f"{harness}:app.py") == f'print("{text}")'
+
+    # The fetches were depth-1: the clone is shallow.
+    assert (clone / ".git" / "shallow").is_file()
+    # Fetching the same SHA twice is harmless (the clean unit above
+    # already fetched its C commit twice — once as the cutoff, once
+    # as the side); once more, directly, both times:
+    rp.fetch_sha(clone, clean)
+    rp.fetch_sha(clone, clean)
