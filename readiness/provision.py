@@ -40,6 +40,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -108,8 +109,15 @@ def _git(repo_dir: Path, *args: str, env_extra: dict[str, str] | None = None) ->
         env.update(env_extra)
     proc = subprocess.run(
         ["git", "-C", str(repo_dir), *args],
-        capture_output=True, text=True, check=True, timeout=900, env=env,
+        capture_output=True, text=True, check=False, timeout=900, env=env,
     )
+    if proc.returncode != 0:
+        # Carry git's own stderr: an exit code alone ("returned
+        # non-zero exit status 128") leaves the cause unknowable
+        # from the run's output, as Vendure's failed fetch showed.
+        raise RuntimeError(
+            f"git {' '.join(args)} failed in {repo_dir}: {proc.stderr.strip()}"
+        )
     return proc.stdout.strip()
 
 
@@ -125,14 +133,31 @@ def ensure_clone(workdir: Path, repo: str) -> Path:
     return clone
 
 
+_FETCH_ATTEMPTS = 3
+_FETCH_BACKOFF_SECONDS = (1.0, 2.0)
+
+
 def fetch_sha(clone: Path, sha: str) -> None:
-    """Fetch one commit (with its full tree) if not already present."""
+    """Fetch one commit (with its full tree) if not already present.
+
+    The fetch is retried up to three attempts with backoff: a single
+    transient failure must not decide a unit's record (Vendure's run
+    lost four sides to one exit-128 fetch). The final failure raises
+    the git error with stderr (see _git)."""
     proc = subprocess.run(
         ["git", "-C", str(clone), "cat-file", "-e", f"{sha}^{{commit}}"],
         capture_output=True, text=True, timeout=60,
     )
-    if proc.returncode != 0:
-        _git(clone, "fetch", "-q", "--depth", "1", "origin", sha)
+    if proc.returncode == 0:
+        return
+    for attempt in range(_FETCH_ATTEMPTS):
+        try:
+            _git(clone, "fetch", "-q", "--depth", "1", "origin", sha)
+            return
+        except RuntimeError:
+            if attempt == _FETCH_ATTEMPTS - 1:
+                raise
+            time.sleep(_FETCH_BACKOFF_SECONDS[attempt])
 
 
 def commit_contract(clone: Path, registered_sha: str, contract: Path) -> str:
@@ -217,7 +242,7 @@ def row_from_provision(
         "declared_runtime": plan.get("declared_range"),
         "selected_runtime": prov.runtime,
         "runtime_version": prov.runtime_version or plan.get("selected_version"),
-        "package_manager": plan.get("package_manager") or prov.package_manager,
+        "package_manager": plan.get("package_manager"),
         "status": status,
         "typed_reason": typed,
         "last_error": None if prov.ready else _last_log_line(prov.logs),
@@ -257,6 +282,41 @@ def row_from_exception(
         "package_manager": None,
         "status": "BUILD_FAILED",
         "typed_reason": typed,
+        "last_error": message,
+        "install_plan_sha256": None,
+        "network_mode": network_mode,
+        "attempt": attempt,
+    }
+
+
+def _harness_error_row(
+    unit: dict[str, Any],
+    side_spec: dict[str, Any],
+    attempt: int,
+    network_mode: str | None,
+    exc: Exception,
+) -> dict[str, Any]:
+    """A row for a side the harness itself failed before a
+    provision result existed (the unit's cutoff fetch/read, or the
+    side's own fetch/contract commit): status BUILD_FAILED, typed
+    reason prefixed ``harness error:`` carrying the underlying
+    error with its stderr. No harness commit exists for such a
+    side, so harness_sha is None — the registered SHA stands in
+    its own field and is never duplicated into this one."""
+    message = str(exc)
+    return {
+        "kind": "readiness",
+        "unit": unit["unit_id"],
+        "repo": unit["repo"],
+        "role": side_spec["role"],
+        "registered_sha": side_spec["sha"],
+        "harness_sha": None,
+        "declared_runtime": None,
+        "selected_runtime": None,
+        "runtime_version": None,
+        "package_manager": None,
+        "status": "BUILD_FAILED",
+        "typed_reason": f"harness error: {message}",
         "last_error": message,
         "install_plan_sha256": None,
         "network_mode": network_mode,
@@ -319,6 +379,12 @@ def provision_repo(
     units = units_for_repo(manifest, repo)
     if not units:
         raise ValueError(f"no units for repo {repo!r} in the manifest")
+    # Resolve the workdir before any use: the workflow passes a
+    # relative --workdir, and a relative checkout path handed to
+    # podman is read as a named volume, not a bind mount — Bottle's
+    # install died on exactly that (run 38597070523: the rejected
+    # volume name was the relative unit path verbatim).
+    workdir = workdir.resolve()
     assert_measurement_gate()
     clone = ensure_clone(workdir, repo)
     orch = make_orchestrator(clone, workdir, contract_env_keys(repo))
@@ -326,16 +392,61 @@ def provision_repo(
     network_mode = orch._run_network_mode
     contract = contract_path(repo)
     rows: list[dict[str, Any]] = []
+
+    def record_harness_error(
+        unit: dict[str, Any], side_spec: dict[str, Any], exc: Exception
+    ) -> dict[str, Any]:
+        row = _harness_error_row(unit, side_spec, attempt, network_mode, exc)
+        dump_logs(
+            f"readiness-{unit['unit_id']}-"
+            f"{_TAG_BY_ROLE[str(side_spec['role'])]}-a{attempt}",
+            [f"readiness provision raised: {exc}"],
+        )
+        return row
+
     for unit in units:
-        fetch_sha(clone, cutoff_sha(unit))
-        orch._run_lock_cutoff = orch._commit_cutoff(cutoff_sha(unit))
+        try:
+            fetch_sha(clone, cutoff_sha(unit))
+            orch._run_lock_cutoff = orch._commit_cutoff(cutoff_sha(unit))
+        except Exception as exc:
+            # The unit's cutoff stage failed (its cutoff commit
+            # cannot be fetched, its cutoff cannot be read): the
+            # whole unit gets harness-error rows and the run
+            # continues — one unit's failure must not kill the
+            # repo's run or lose the other units' rows, so the rows
+            # file is always written. (Vendure, run 38597095147:
+            # one failed fetch ended the run and the repo's rows
+            # file was never written.)
+            for side_spec in unit["sides"]:
+                if only is not None and (
+                    unit["unit_id"], side_spec["role"]
+                ) not in only:
+                    continue
+                row = record_harness_error(unit, side_spec, exc)
+                rows.append(row)
+                print(json.dumps(row), flush=True)
+            continue
         for side_spec in unit["sides"]:
-            if only is not None and (unit["unit_id"], side_spec["role"]) not in only:
+            if only is not None and (
+                unit["unit_id"], side_spec["role"]
+            ) not in only:
                 continue
-            row = provision_side(
-                orch, clone, unit, side_spec, contract,
-                attempt, workdir, network_mode,
-            )
+            try:
+                row = provision_side(
+                    orch, clone, unit, side_spec, contract,
+                    attempt, workdir, network_mode,
+                )
+            except Exception as exc:
+                # A failure inside one side (its own fetch, its
+                # contract commit) writes a harness-error row for
+                # THAT side only: exactly one row per attempted
+                # (unit, role), and the unit's other sides keep
+                # their own rows. (The first cut wrapped the whole
+                # side loop in the unit try, so this except
+                # re-wrote error rows for sides that had already
+                # provisioned — one side showed both READY and
+                # BUILD_FAILED.)
+                row = record_harness_error(unit, side_spec, exc)
             rows.append(row)
             print(json.dumps(row), flush=True)
     return {

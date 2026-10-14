@@ -186,8 +186,9 @@ def test_row_from_provision_build_failed_plan_refusal() -> None:
     assert row["status"] == "BUILD_FAILED"
     # The plan's refusal is the typed reason, verbatim.
     assert row["typed_reason"] == "workspaces not yet supported"
-    # No manager on the plan: fall back to the provision's.
-    assert row["package_manager"] == "npm"
+    # No manager on the plan: the row records None — the field
+    # comes from the plan only, never the provision's default.
+    assert row["package_manager"] is None
     assert row["last_error"] == "workspaces not yet supported"
     assert row["network_mode"] == "isolated"
     assert row["attempt"] == 2
@@ -608,3 +609,274 @@ def test_provision_repo_attempt2_uses_attempt_scoped_dirs(
         "readiness-T-REAL2-fix-parent-a1.log",
         "readiness-T-REAL2-fix-parent-a2.log",
     ]
+
+
+def _source_with_commits(tmp_path: Path) -> tuple[Path, str, str]:
+    """A local file:// source repo with two dated commits."""
+    src = tmp_path / "src3"
+    src.mkdir()
+    _git(src, "init", "-q")
+    _git(src, "config", "user.name", "readiness-test")
+    _git(src, "config", "user.email", "test@proofdeploy.invalid")
+    _git(src, "config", "uploadpack.allowAnySHA1InWant", "true")
+    parent = _commit_dated(src, "s1", "2026-03-01T00:00:00+00:00")
+    fix = _commit_dated(src, "s2", "2026-03-02T00:00:00+00:00")
+    return src, parent, fix
+
+
+def _seed_clone(workdir: Path, repo: str, src: Path) -> None:
+    clone = workdir / "repos" / rp.repo_slug(repo)
+    clone.mkdir(parents=True)
+    _git(clone, "init", "-q")
+    _git(clone, "remote", "add", "origin", src.as_uri())
+
+
+def test_fetch_sha_retries_and_error_carries_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A fetch that cannot succeed must be retried (three attempts,
+    # backoff between them) and the raised error must carry git's
+    # own stderr — the Vendure run's exit-128 line carried neither,
+    # so its cause was unknowable from the run's output.
+    src, _parent, _fix = _source_with_commits(tmp_path)
+    workdir = tmp_path / "work"
+    repo = "example/widgets"
+    _seed_clone(workdir, repo, src)
+    clone = workdir / "repos" / rp.repo_slug(repo)
+    sleeps: list[float] = []
+
+    def record_sleep(seconds: float) -> None:
+        # Only the fetch backoff sleeps are >= 1s; subprocess's own
+        # wait-loop polls far below that and is not under test.
+        if seconds >= 1.0:
+            sleeps.append(seconds)
+
+    monkeypatch.setattr("time.sleep", record_sleep)
+    with pytest.raises(RuntimeError) as excinfo:
+        rp.fetch_sha(clone, "e" * 40)
+    assert "fatal" in str(excinfo.value)
+    assert "e" * 40 in str(excinfo.value) or "ref" in str(excinfo.value)
+    assert sleeps == [1.0, 2.0]
+
+
+def test_provision_repo_relative_workdir_yields_absolute_unit_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The workflow passes --workdir readiness-work, a relative path.
+    # Podman reads a relative mount source as a named volume, not a
+    # bind mount (Bottle's install died on exactly that: the volume
+    # name was the relative unit path, slashes and all). The harness
+    # must resolve the workdir so the unit directory handed to the
+    # sandbox call is absolute.
+    src, parent, fix = _source_with_commits(tmp_path)
+    repo = "example/widgets"
+    monkeypatch.chdir(tmp_path)
+    workdir = Path("relwork")
+    _seed_clone(workdir, repo, src)
+    contract = tmp_path / "widgets.yml"
+    contract.write_text(
+        'build: "true"\nstart: "python app.py"\nreadiness: "/"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rp, "contract_path", lambda r: contract)
+    monkeypatch.setattr(rp, "assert_measurement_gate", lambda: None)
+    seen: list[Path] = []
+
+    def fake_method(
+        self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
+    ) -> SimpleNamespace:
+        seen.append(unit_dir)
+        return _fake_side()
+
+    monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", fake_method)
+    manifest: dict[str, Any] = {
+        "units": [
+            {
+                "unit_id": "T-ABS",
+                "repo": repo,
+                "class": "train-bug",
+                "sides": [
+                    {"role": "fix^", "sha": parent},
+                    {"role": "fix", "sha": fix},
+                ],
+            }
+        ]
+    }
+    result = rp.provision_repo(manifest, repo, workdir, 1)
+    assert [r["status"] for r in result["rows"]] == ["READY", "READY"]
+    assert seen and all(p.is_absolute() for p in seen)
+    assert all(str(p).startswith(str(tmp_path)) for p in seen)
+
+
+def test_provision_repo_unit_failure_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One unit's harness-level failure (here: its cutoff commit
+    # cannot be fetched) must not kill the repo's run: the failed
+    # unit gets a typed "harness error:" row per side, the next unit
+    # still provisions, and provision_repo returns the full row set
+    # (so main always writes the rows file). Vendure lost its whole
+    # rows file — and two units — to exactly this.
+    src, parent, fix = _source_with_commits(tmp_path)
+    repo = "example/widgets"
+    workdir = tmp_path / "work"
+    _seed_clone(workdir, repo, src)
+    contract = tmp_path / "widgets.yml"
+    contract.write_text(
+        'build: "true"\nstart: "python app.py"\nreadiness: "/"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rp, "contract_path", lambda r: contract)
+    monkeypatch.setattr(rp, "assert_measurement_gate", lambda: None)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    def fake_method(
+        self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
+    ) -> SimpleNamespace:
+        return _fake_side()
+
+    monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", fake_method)
+    monkeypatch.chdir(tmp_path)
+    manifest: dict[str, Any] = {
+        "units": [
+            {
+                "unit_id": "T-BROKEN",
+                "repo": repo,
+                "class": "checkpoint-bug",
+                "sides": [
+                    {"role": "fix^", "sha": "d" * 40},
+                    {"role": "fix", "sha": "f" * 40},
+                ],
+            },
+            {
+                "unit_id": "T-GOOD",
+                "repo": repo,
+                "class": "train-bug",
+                "sides": [
+                    {"role": "fix^", "sha": parent},
+                    {"role": "fix", "sha": fix},
+                ],
+            },
+        ]
+    }
+    result = rp.provision_repo(manifest, repo, workdir, 1)
+    rows = result["rows"]
+    assert len(rows) == 4
+    broken = [r for r in rows if r["unit"] == "T-BROKEN"]
+    assert [r["status"] for r in broken] == ["BUILD_FAILED", "BUILD_FAILED"]
+    assert all(
+        str(r["typed_reason"]).startswith("harness error:") for r in broken
+    )
+    assert all("fatal" in str(r["typed_reason"]) for r in broken)
+    good = [r for r in rows if r["unit"] == "T-GOOD"]
+    assert [r["status"] for r in good] == ["READY", "READY"]
+
+
+def test_row_package_manager_comes_from_plan_only() -> None:
+    # A refused plan carries no package manager; the row must record
+    # None, not the provision result's default (rows from the real
+    # pass reported "pip" on refused node plans).
+    plan = {"declared_range": None, "refusal": "workspaces not yet supported"}
+    side = _fake_side(
+        status=ProvisionStatus.BUILD_FAILED,
+        reason="workspaces not yet supported",
+        plan=plan,
+    )
+    assert side.provision.package_manager == "npm"  # the provision's default
+    row = rp.row_from_provision(
+        BUG_UNIT, BUG_UNIT["sides"][0], "h" * 40, 1, "isolated", side
+    )
+    assert row["package_manager"] is None
+    plan_with = {"refusal": None, "package_manager": "bun"}
+    side2 = _fake_side(plan=plan_with)
+    row2 = rp.row_from_provision(
+        BUG_UNIT, BUG_UNIT["sides"][0], "h" * 40, 1, "isolated", side2
+    )
+    assert row2["package_manager"] == "bun"
+
+
+def test_provision_repo_mid_unit_failure_one_row_per_side(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A failure INSIDE the side loop (here commit_contract raising
+    # on the second side, after the first side provisioned READY)
+    # must write exactly one row per attempted side: the failed
+    # side gets a harness-error row, the provisioned side keeps its
+    # single READY row, and the next unit still provisions. The
+    # first cut wrapped the whole unit in one try, so the except
+    # re-wrote error rows for every side — one side showed both
+    # READY and BUILD_FAILED (reviewer repro on PR #76).
+    src, parent, fix = _source_with_commits(tmp_path)
+    repo = "example/widgets"
+    workdir = tmp_path / "work"
+    _seed_clone(workdir, repo, src)
+    contract = tmp_path / "widgets.yml"
+    contract.write_text(
+        'build: "true"\nstart: "python app.py"\nreadiness: "/"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rp, "contract_path", lambda r: contract)
+    monkeypatch.setattr(rp, "assert_measurement_gate", lambda: None)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    real_commit_contract = rp.commit_contract
+    fix_calls = {"n": 0}
+
+    def flaky_commit_contract(
+        clone: Path, registered_sha: str, contract_path_arg: Path
+    ) -> str:
+        # Raise only for T-MID's fix side (the first fix call;
+        # T-NEXT shares the SHAs and must provision cleanly).
+        if registered_sha == fix:
+            fix_calls["n"] += 1
+            if fix_calls["n"] == 1:
+                raise RuntimeError("fatal: simulated contract failure")
+        return real_commit_contract(clone, registered_sha, contract_path_arg)
+
+    monkeypatch.setattr(rp, "commit_contract", flaky_commit_contract)
+
+    def fake_method(
+        self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
+    ) -> SimpleNamespace:
+        return _fake_side()
+
+    monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", fake_method)
+    monkeypatch.chdir(tmp_path)
+    unit = {
+        "unit_id": "T-MID",
+        "repo": repo,
+        "class": "train-bug",
+        "sides": [
+            {"role": "fix^", "sha": parent},
+            {"role": "fix", "sha": fix},
+        ],
+    }
+    manifest: dict[str, Any] = {
+        "units": [
+            unit,
+            {
+                "unit_id": "T-NEXT",
+                "repo": repo,
+                "class": "train-bug",
+                "sides": [
+                    {"role": "fix^", "sha": parent},
+                    {"role": "fix", "sha": fix},
+                ],
+            },
+        ]
+    }
+    result = rp.provision_repo(manifest, repo, workdir, 1)
+    rows = result["rows"]
+    mid = [(r["role"], r["status"]) for r in rows if r["unit"] == "T-MID"]
+    assert mid == [("fix^", "READY"), ("fix", "BUILD_FAILED")]
+    fix_row = next(
+        r for r in rows if r["unit"] == "T-MID" and r["role"] == "fix"
+    )
+    assert str(fix_row["typed_reason"]).startswith("harness error:")
+    assert "simulated contract failure" in str(fix_row["typed_reason"])
+    # Ruling: no harness commit exists for such a side, so
+    # harness_sha is None — the registered SHA stands in its own
+    # field and is never duplicated into this one.
+    assert fix_row["harness_sha"] is None
+    nxt = [r["status"] for r in rows if r["unit"] == "T-NEXT"]
+    assert nxt == ["READY", "READY"]
+    assert len(rows) == 4
