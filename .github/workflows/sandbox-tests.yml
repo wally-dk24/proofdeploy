@@ -17,6 +17,19 @@
 # scripts/check_test_manifest.py against
 # tests/expected_sandbox_nodeids.txt (the same 48 nodeids as before;
 # only the assignment moved).
+# WAL-110 (split, structure only): provisions-apps (28m27s job on the
+# last full green run) splits by family into provisions-real-apps
+# (the WO-8.3 Directus/Ghost real-app proofs),
+# provisions-wo83-goldens (the five WO-8.3 golden tests) and
+# provisions-original (the pre-WO-8.3 provisions files: uptime-kuma,
+# forced-compile, node26-corepack, node-headers). The pnpm and flask
+# conformance shards each split 5/5 by case; both halves re-run the
+# module-scoped golden fixture, so each half carries the fixture's
+# measured-run cost plus its own cases' in-call costs (case2/5/6 do
+# their own provisions; the other cases assert on the fixture's
+# records). Same 55 sandbox nodeids, each selected by exactly one
+# shard — proven by scripts/check_test_manifest.py; no test, product
+# code, or per-shard step changed.
 # Lint/typecheck are NOT repeated here: the ci workflow's identical
 # commands are the gate.
 
@@ -96,14 +109,22 @@ jobs:
             files: "tests/test_orchestrator.py"
           - shard: apps-node-express
             nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-express-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-express-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-express-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-express-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-express-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-express-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-express-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-express-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-express-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-express-sqlite]"
-          - shard: apps-node-pnpm
-            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-pnpm-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-pnpm-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-pnpm-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-pnpm-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-pnpm-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-pnpm-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-pnpm-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-pnpm-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-pnpm-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-pnpm-sqlite]"
-          - shard: apps-python-flask
-            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[python-flask-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[python-flask-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[python-flask-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[python-flask-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[python-flask-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[python-flask-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[python-flask-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[python-flask-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[python-flask-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[python-flask-sqlite]"
+          - shard: apps-node-pnpm-a
+            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-pnpm-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-pnpm-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-pnpm-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-pnpm-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-pnpm-sqlite]"
+          - shard: apps-node-pnpm-b
+            nodeids: "tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-pnpm-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-pnpm-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-pnpm-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-pnpm-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-pnpm-sqlite]"
+          - shard: apps-python-flask-a
+            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[python-flask-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[python-flask-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[python-flask-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[python-flask-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[python-flask-sqlite]"
+          - shard: apps-python-flask-b
+            nodeids: "tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[python-flask-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[python-flask-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[python-flask-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[python-flask-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[python-flask-sqlite]"
           - shard: provisions-managers
             files: "tests/test_wo81b_sandbox.py tests/test_wo81_generated_variant.py"
-          - shard: provisions-apps
-            files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py tests/test_wo83_sandbox.py"
+          - shard: provisions-real-apps
+            nodeids: "tests/test_wo83_sandbox.py::test_directus_login_refresh_proof_in_sandbox tests/test_wo83_sandbox.py::test_ghost_ghost_jwt_proof_in_sandbox"
+          - shard: provisions-wo83-goldens
+            nodeids: "tests/test_wo83_sandbox.py::test_golden_bootstrap_values_differ_per_side_in_sandbox tests/test_wo83_sandbox.py::test_golden_ghost_jwt_from_seed_key_file_in_sandbox tests/test_wo83_sandbox.py::test_golden_ghost_missing_key_file_inconclusive_in_sandbox tests/test_wo83_sandbox.py::test_golden_login_mode_in_sandbox tests/test_wo83_sandbox.py::test_golden_refresh_mode_in_sandbox"
+          - shard: provisions-original
+            files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py"
     name: sandbox (${{ matrix.shard }})
     steps:
       - name: Gate (WAL-101)
