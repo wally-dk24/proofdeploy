@@ -477,3 +477,183 @@ def test_tampered_fixture_description_refused(tmp_path):
         check_bundle_answer_key(
             ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
         )
+
+
+# ---------------------------------------------------------------------------
+# WO-8.4b: symlink handling — the author's bundle never follows links.
+# ---------------------------------------------------------------------------
+
+_CANARY = "pdcanary-wo84b-link-target-content"
+
+
+def _eq_repo_with_link(root: Path) -> dict[str, str]:
+    """base (B^) -> bug (B) -> fix, where B adds an in-tree symlink.
+
+    B^ carries canary.txt (content: the canary string) as a regular
+    file; B adds link.txt -> canary.txt and changes app.py. The B^..B
+    diff therefore TOUCHES the link path but not the canary file: if
+    anything reads the link's target content into the author's hands,
+    the canary shows up where it must not be.
+    """
+    repo = root / "eq-link-repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@test")
+    (repo / "app.py").write_text("VALUE = 1\n")
+    (repo / "canary.txt").write_text(_CANARY + "\n")
+    (repo / "proofdeploy.yml").write_text(_YML)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "app.py").write_text("VALUE = 2\n")
+    (repo / "link.txt").symlink_to("canary.txt")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "bug")
+    bug = _git(repo, "rev-parse", "HEAD")
+    (repo / "app.py").write_text("VALUE = 1\n")
+    (repo / "test_fix.py").write_text("def test_fix():\n    assert True\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "Fix app value handling")
+    fix = _git(repo, "rev-parse", "HEAD")
+    return {"repo": str(repo), "base": base, "bug": bug, "fix": fix}
+
+
+def _eq_bundle_with_link(root: Path, info: dict[str, str]) -> dict:
+    """Assemble B's bundle through the real path: create_snapshot
+    (keeps the in-tree link on the provisioning side), then
+    assemble_author_bundle (omits it), prompt built from the BUNDLE
+    snapshot exactly as the orchestrator builds it (WO-8.4b)."""
+    import hashlib
+    import json
+
+    from proofdeploy.fixture import (
+        assemble_author_bundle,
+        create_snapshot,
+        template_filename,
+        template_hash,
+        template_path,
+    )
+    from proofdeploy.model_client import build_author_prompt
+
+    repo = Path(info["repo"])
+    work = root / "eq-link-work"
+    work.mkdir()
+    diff_text = _git(repo, "diff", f"{info['base']}..{info['bug']}", "--")
+    diff_path = work / "diff.patch"
+    diff_path.write_text(diff_text)
+    snap = create_snapshot(
+        repo_dir=repo, commit_rev=info["bug"], output_dir=work / "snap-src"
+    )
+    # The provisioning snapshot keeps the in-tree link (rule 1).
+    assert (snap.dir / "link.txt").is_symlink()
+    skill_path = work / "skill.md"
+    skill_path.write_text("# test skill\n")
+    skill_hash = hashlib.sha256(skill_path.read_bytes()).hexdigest()
+    bundle_dir = work / "bundle"
+    selected_template = template_path(template_filename(False))
+    bundle = assemble_author_bundle(
+        diff_path=diff_path,
+        snapshot_dir=snap.dir,
+        yml_fixture={
+            "repo_name": "ak",
+            "seed_note": "seed",
+            "auth_mechanism": "none",
+            "auth_scope": "none",
+            "flags_note": "none",
+        },
+        output_dir=bundle_dir,
+        expected_template_hash=template_hash(selected_template),
+        template_file=selected_template,
+        source_sha=info["bug"],
+        diff_range=f"{info['base']}..{info['bug']}",
+        skill_path=skill_path,
+        no_skill=True,
+    )
+    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+    prompt, _ = build_author_prompt(
+        skill_text="",
+        fixture_description=(bundle_dir / "fixture-description.txt").read_text(),
+        diff_text=diff_text,
+        snapshot_dir=bundle_dir / "snapshot",
+    )
+    # The same prompt built from the PROVISIONING snapshot (the
+    # pre-WO-8.4b call) reads through the link: the canary appears.
+    # This is the channel rule 3 closes.
+    provisioning_prompt, _ = build_author_prompt(
+        skill_text="",
+        fixture_description=(bundle_dir / "fixture-description.txt").read_text(),
+        diff_text=diff_text,
+        snapshot_dir=snap.dir,
+    )
+    return {
+        "bundle": bundle_dir,
+        "manifest": bundle.manifest,
+        "manifest_data": manifest,
+        "prompt": prompt,
+        "provisioning_prompt": provisioning_prompt,
+        "skill_hash": skill_hash,
+        "info": info,
+        "no_skill": True,
+    }
+
+
+def test_allowlist_bundle_with_in_tree_link_passes(tmp_path):
+    """WO-8.4b: equality holds for a link-carrying tree — B's symlink
+    is excluded from the expected file list and matched against the
+    manifest's omitted_links record instead."""
+    info = _eq_repo_with_link(tmp_path)
+    ctx = _eq_bundle_with_link(tmp_path, info)
+    snap = ctx["bundle"] / "snapshot"
+    # The bundle holds the canary file at its own path, and no link.
+    assert (snap / "canary.txt").is_file()
+    assert not (snap / "link.txt").exists()
+    assert not any(p.is_symlink() for p in snap.rglob("*"))
+    # The link appears only in the manifest, as path + target string.
+    assert ctx["manifest_data"]["omitted_links"] == [
+        {"path": "link.txt", "target": "canary.txt"}
+    ]
+    sha = check_bundle_answer_key(
+        ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+    )
+    assert sha == bundle_manifest_hash(ctx["manifest"])
+
+
+def test_canary_link_target_content_never_reaches_author(tmp_path):
+    """WO-8.4b rule 3 (canary): the diff touches the link path, the
+    link points at the canary file — the canary is absent from the
+    rendered prompt built the orchestrator's way (from the bundle),
+    while the same builder over the provisioning snapshot (links
+    kept) serves it. That contrast is the leak the rule closes."""
+    info = _eq_repo_with_link(tmp_path)
+    ctx = _eq_bundle_with_link(tmp_path, info)
+    assert _CANARY not in ctx["prompt"]
+    assert _CANARY in ctx["provisioning_prompt"]
+
+
+def test_allowlist_refuses_bundle_adding_link_resolved_content(tmp_path):
+    """WO-8.4b: a tampered bundle that materializes the link's
+    resolved content at the link's path is refused (file list)."""
+    info = _eq_repo_with_link(tmp_path)
+    ctx = _eq_bundle_with_link(tmp_path, info)
+    (ctx["bundle"] / "snapshot" / "link.txt").write_text(_CANARY + "\n")
+    with pytest.raises(AnswerKeyLeakError, match="file list"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
+
+
+def test_allowlist_refuses_manifest_missing_omitted_link(tmp_path):
+    """WO-8.4b: a manifest that drops the omitted_links record for
+    B's symlink is refused — the record is recomputed from B."""
+    import json
+
+    info = _eq_repo_with_link(tmp_path)
+    ctx = _eq_bundle_with_link(tmp_path, info)
+    manifest = json.loads(ctx["manifest"].read_text(encoding="utf-8"))
+    manifest["omitted_links"] = []
+    ctx["manifest"].write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(AnswerKeyLeakError, match="omitted_links"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )

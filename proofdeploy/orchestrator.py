@@ -581,7 +581,12 @@ class Orchestrator:
             skill_text=skill_text,
             fixture_description=description,
             diff_text=diff_text,
-            snapshot_dir=snapshot.dir,
+            # WO-8.4b: the prompt is built from the BUNDLE's snapshot,
+            # never the provisioning tree — the bundle omits link
+            # entries entirely, so no link's target content can reach
+            # the author through a link. For a link-free tree the copy
+            # is byte-identical, so the rendered prompt is unchanged.
+            snapshot_dir=bundle.snapshot,
         )
         self._say(f"bundle assembled at {bundle.root}")
         self._leak_check_bundle(bundle, prompt, contract)

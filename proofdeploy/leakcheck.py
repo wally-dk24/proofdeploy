@@ -101,8 +101,10 @@ def check_bundle_answer_key(
     - the bundle root holds exactly the allowed files;
     - ``diff.patch`` is byte-equal to ``git diff B^..B``;
     - the snapshot is byte-equal to ``git archive B`` (file list from
-      ``git ls-tree``, bytes from ``git show``; symlinks and ``.git``
-      refused);
+      ``git ls-tree``, bytes from ``git show``; ``.git`` refused, and
+      symlinks handled by the WO-8.4b rule: none in the bundle, B's
+      symlink entries excluded from the expected file list and matched
+      against the manifest's ``omitted_links`` record);
     - the skill hash equals ``expected_skill_hash``, or the skill is
       absent in the no-skill arm;
     - the fixture description is byte-equal to the approved template
@@ -165,20 +167,35 @@ def check_bundle_answer_key(
     # 3. The snapshot is byte-equal to git archive B. The tree hash is
     #    recomputed from B (never trusted from the manifest); equality
     #    is established file-by-file: names from git ls-tree, bytes from
-    #    git show.
+    #    git show. WO-8.4b: the equality reference applies the same
+    #    omit-links rule as the assembler — symlink entries in B's tree
+    #    (mode 120000) are NOT expected in the bundle snapshot; they are
+    #    expected in the manifest's omitted_links record instead, which
+    #    step 5 cross-verifies against the set derived here from B.
     tree_hash = _git_text(repo_dir, "rev-parse", f"{bug_sha}^{{tree}}").strip()
     if not tree_hash:
         raise AnswerKeyLeakError("answer-key check: could not resolve B^{tree}")
-    expected_files = set(
-        _git_bytes(repo_dir, "ls-tree", "-r", "--name-only", "-z", bug_sha)
-        .decode("utf-8")
+    expected_files: set[str] = set()
+    expected_links: dict[str, str] = {}
+    for entry in (
+        _git_bytes(repo_dir, "ls-tree", "-r", "-z", bug_sha)
+        .decode("utf-8", "surrogateescape")
         .split("\x00")
-    )
-    expected_files.discard("")
+    ):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        mode = meta.split(" ", 1)[0]
+        if mode == "120000":  # symlink: the blob's bytes are the target
+            expected_links[path] = _git_bytes(
+                repo_dir, "show", f"{bug_sha}:{path}"
+            ).decode("utf-8", "surrogateescape")
+        else:
+            expected_files.add(path)
     actual_files = {
         p.relative_to(snapshot_dir).as_posix()
         for p in snapshot_dir.rglob("*")
-        if p.is_file()
+        if p.is_file() and not p.is_symlink()
     }
     if actual_files != expected_files:
         raise AnswerKeyLeakError(
@@ -259,6 +276,22 @@ def check_bundle_answer_key(
         raise AnswerKeyLeakError(
             "answer-key check: manifest fixture_template does not match "
             "the recomputed template selection"
+        )
+    # WO-8.4b: the manifest's omitted_links record must equal B's
+    # symlink set, recomputed in step 3 — path and target string for
+    # every link the assembler omitted, nothing more, nothing less.
+    recorded_links: dict[str, str] = {}
+    raw_omitted = manifest.get("omitted_links", [])
+    if isinstance(raw_omitted, list):
+        for item in raw_omitted:
+            if isinstance(item, dict) and "path" in item and "target" in item:
+                recorded_links[str(item["path"])] = str(item["target"])
+    if recorded_links != expected_links:
+        raise AnswerKeyLeakError(
+            "answer-key check: manifest omitted_links does not match "
+            "B's symlinks: "
+            f"extra={sorted(set(recorded_links) - set(expected_links))[:5]} "
+            f"missing={sorted(set(expected_links) - set(recorded_links))[:5]}"
         )
     template_text = selected_path.read_text(encoding="utf-8")
     try:
