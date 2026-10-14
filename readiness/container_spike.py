@@ -130,7 +130,7 @@ SOCKET_TIMEOUT_S = 15
 # unchanged. There is no named network to create and no
 # fallback: if this mode is unavailable the build itself fails
 # and the side is typed BUILD_FAILED with the build's error.
-BUILD_NETWORK_MODE = "slirp4netns:allow_host_loopback=true"
+BUILD_NETWORK_MODE = "slirp4netns:allow_host_loopback=false"
 
 # The address a build RUN step would use to reach the host's
 # loopback under BUILD_NETWORK_MODE (the slirp gateway address).
