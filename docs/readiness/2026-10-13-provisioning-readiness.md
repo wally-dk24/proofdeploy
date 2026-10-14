@@ -122,9 +122,20 @@ One row per (unit, side), attempt 1. Attempt 2 is identical on (status, typed_re
 
 ```
 $ podman --storage-driver vfs --cgroup-manager=cgroupfs run -d --name pd-fix-a859256a --net=none --uidmap 0:1:65536 --cap-drop=ALL --security-opt=no-new-privileges -v /home/runner/work/proofdeploy/proofdeploy/readiness-work/units/T6/a1/snapshot-fix:/checkout -w /checkout -v /tmp/pd-87dqp0c1:/pd-sock -e HOME=/checkout/.sandbox-home -e PORT=55185 docker.io/library/python:3.14.8-bookworm@sha256:7ee7e4d4fb42c3ad45b8fdc473b64ec69c3cf6e80ae5d52f6fa55f77fac29027 bash -c (python3 /checkout/.pd-bridge.py /pd-sock/app.sock 55185 &); /checkout/.venv/bin/python -c "from bottle import route, run, template; index = route('/hello/<name>')(lambda name: template('<b>Hello {{name}}</b>!', name=name)); run(host='localhost', port=8080)"
+8c61edea7d4107eb3774803d2901c35bae82eb32df9d4d00cf42b4645cc3430b
+
+bridge socket ready: /tmp/pd-87dqp0c1/app.sock
+sandbox app: --net=none, Unix socket bridge, executor proxy at 127.0.0.1:34811
+app container log tail:
+Bottle v0.14-dev server starting up (using WSGIRefServer())...
 Listening on http://localhost:8080/
+Hit Ctrl-C to quit.
+
+
 sandbox app not ready
 ```
+
+(Lines 64–75 of the log, quoted whole; nothing omitted.)
 
   Both sides record `START_FAILED`, typed reason `readiness timeout`, last error `sandbox app not ready`. The failure is our contract's, not the app's: the app started and listened, on the wrong port by our instruction.
 - **Bottle runtime finding.** The plan selected Python 3.14.8 from the tree's declared `>=3.9`, while the registered baseline note for this fix says it needs Python 3.9–3.11. The selected runtime is outside the range the registration records for the fix; carried here as a finding, separate from the port defect above.
