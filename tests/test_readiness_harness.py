@@ -255,7 +255,7 @@ def test_provision_side_routes_through_orchestrator_method(
     # A READY side's live container is stopped, never leaked.
     assert proc.stopped
     # The side's logs are dumped for the artifact.
-    assert (tmp_path / "pd-logs" / "readiness-T2-fix-parent.log").is_file()
+    assert (tmp_path / "pd-logs" / "readiness-T2-fix-parent-a1.log").is_file()
 
 
 def test_provision_side_types_a_raising_path(
@@ -508,3 +508,103 @@ def test_provision_repo_real_git_from_empty_clone(
     # as the side); once more, directly, both times:
     rp.fetch_sha(clone, clean)
     rp.fetch_sha(clone, clean)
+
+
+def test_provision_repo_attempt2_uses_attempt_scoped_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression test for the Directus attempt-2 collision (run
+    # 38587020785): the workflow's attempt-2 invocation shares the
+    # workdir with attempt 1, so unit directories and pd-logs names
+    # must be attempt-scoped, or the rerun dies on attempt 1's
+    # snapshot directories and overwrites its logs. Runs the real
+    # provision_repo twice against the same workdir — attempt 1,
+    # then attempt 2 fed from attempt 1's rows exactly as the
+    # workflow feeds it — with a non-READY side, so the rerun has
+    # targets. Only the sandbox call and the gate are stubbed.
+    src = tmp_path / "src"
+    src.mkdir()
+    _git(src, "init", "-q")
+    _git(src, "config", "user.name", "readiness-test")
+    _git(src, "config", "user.email", "test@proofdeploy.invalid")
+    _git(src, "config", "uploadpack.allowAnySHA1InWant", "true")
+    fix_parent = _commit_dated(src, "w1", "2026-02-01T00:00:00+00:00")
+    fix = _commit_dated(src, "w2", "2026-02-02T00:00:00+00:00")
+
+    repo = "example/widgets"
+    workdir = tmp_path / "work"
+    clone = workdir / "repos" / rp.repo_slug(repo)
+    clone.mkdir(parents=True)
+    _git(clone, "init", "-q")
+    _git(clone, "remote", "add", "origin", src.as_uri())
+
+    contract = tmp_path / "widgets.yml"
+    contract.write_text(
+        'build: "true"\nstart: "python app.py"\nreadiness: "/"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rp, "contract_path", lambda r: contract)
+    monkeypatch.setattr(rp, "assert_measurement_gate", lambda: None)
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_method(
+        self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
+    ) -> SimpleNamespace:
+        calls.append({"rev": rev, "unit_dir": unit_dir, "tag": tag})
+        return _fake_side(
+            status=ProvisionStatus.BUILD_FAILED,
+            reason="archive member is a link, refused: readme.md",
+            plan={"refusal": "archive member is a link, refused: readme.md"},
+            logs=["archive member is a link, refused: readme.md"],
+        )
+
+    monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", fake_method)
+    monkeypatch.chdir(tmp_path)  # pd-logs/ land in tmp
+
+    manifest: dict[str, Any] = {
+        "units": [
+            {
+                "unit_id": "T-REAL2",
+                "repo": repo,
+                "class": "train-bug",
+                "sides": [
+                    {"role": "fix^", "sha": fix_parent},
+                    {"role": "fix", "sha": fix},
+                ],
+            }
+        ]
+    }
+    result1 = rp.provision_repo(manifest, repo, workdir, 1)
+    assert [r["status"] for r in result1["rows"]] == ["BUILD_FAILED"] * 2
+
+    rows1_path = tmp_path / "rows-attempt1.json"
+    rows1_path.write_text(json.dumps(result1), encoding="utf-8")
+    targets = rp._rerun_targets(rows1_path)
+    assert targets == [("T-REAL2", "fix^"), ("T-REAL2", "fix")]
+    result2 = rp.provision_repo(manifest, repo, workdir, 2, only=targets)
+    assert [r["attempt"] for r in result2["rows"]] == [2, 2]
+    assert len(calls) == 4
+
+    # The unit directory handed to the sandbox call is scoped by
+    # attempt: attempt 1's two calls share .../a1, attempt 2's share
+    # .../a2, and the two are different directories under the same
+    # unit. A shared directory (the pre-fix shape) fails here — in
+    # production it is what killed the rerun.
+    dirs = [c["unit_dir"] for c in calls]
+    assert dirs[0] == dirs[1] and dirs[2] == dirs[3]
+    assert dirs[0] != dirs[2]
+    assert dirs[0].name == "a1" and dirs[2].name == "a2"
+    assert dirs[0].parent.name == "T-REAL2"
+    assert dirs[0].parent == dirs[2].parent
+    assert dirs[0].is_dir() and dirs[2].is_dir()
+
+    # The pd-logs names are attempt-scoped too: both attempts' logs
+    # survive side by side instead of the rerun overwriting them.
+    names = sorted(p.name for p in (tmp_path / "pd-logs").glob("*.log"))
+    assert names == [
+        "readiness-T-REAL2-fix-a1.log",
+        "readiness-T-REAL2-fix-a2.log",
+        "readiness-T-REAL2-fix-parent-a1.log",
+        "readiness-T-REAL2-fix-parent-a2.log",
+    ]
