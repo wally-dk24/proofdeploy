@@ -1,0 +1,2 @@
+# pd-golden-auth uses only the Python standard library: no
+# third-party dependencies to install or pin.

@@ -103,7 +103,7 @@ jobs:
           - shard: provisions-managers
             files: "tests/test_wo81b_sandbox.py tests/test_wo81_generated_variant.py"
           - shard: provisions-apps
-            files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py"
+            files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py tests/test_wo83_sandbox.py"
     name: sandbox (${{ matrix.shard }})
     steps:
       - name: Gate (WAL-101)

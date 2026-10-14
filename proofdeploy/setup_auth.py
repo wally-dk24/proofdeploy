@@ -24,10 +24,18 @@ Credential provider (proactive, never reactive):
   status, and it never re-sends a request. A 401 from the target is the
   probe's data (the assertions evaluate it); it is never a refresh signal.
 - `ghost_jwt` mode mints a short-lived Ghost Admin API JWT per request
-  from the fixture's admin key (Ghost has no refresh endpoint).
+  from the instance's admin key (Ghost has no refresh endpoint). The
+  key comes from a fixture binding or, declared in the contract
+  (WO-8.3), from a checkout file the instance's own seed wrote.
+- `login` mode (WO-8.3) POSTs the contract's declared login path with
+  a body template whose placeholders resolve from the run's bindings —
+  the channel through which the per-run bootstrap credentials
+  (`auth.bootstrap_env`, generated fresh per side and per run) feed
+  login and refresh.
 - `refresh` mode calls a refresh endpoint, but only when there is no
   token or a provider-issued token nears expiry. Fixture tokens have no
-  known expiry and are never refreshed proactively.
+  known expiry and are never refreshed proactively. With a login path
+  declared, the first acquisition is a login; later ones refresh.
 - `register` mode registers a disposable user on the target (declared in
   the contract, never a default): POSTs to a declared endpoint with
   generated credentials and extracts the token from the response. A
@@ -47,9 +55,43 @@ import hashlib
 import hmac
 import json
 import re
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+
+def generate_bootstrap_env(names: list[str]) -> dict[str, str]:
+    """Generate fresh random values for declared bootstrap env NAMES.
+
+    WO-8.3 (Addenda 43/44): the contract's `auth.bootstrap_env`
+    declares NAMES only; ProofDeploy generates the values. Every call
+    returns new values — fresh per side and per run, random, never
+    reused, never derived from a customer value. The values are
+    credentials for the disposable instance only: they are injected
+    into that side's install and app containers, feed the side's
+    login/refresh provider, and join the record's redaction set.
+    They are never written to proofdeploy.yml or any committed file;
+    the record names them only as "generated", with their env names.
+    The prompt and the bundle are assembled and leak-checked before
+    any value is generated (authoring precedes provisioning), so a
+    generated value cannot appear in either — and the leak check
+    refuses these values wherever they are supplied to it as extra
+    secrets (the forbidden-values set).
+
+    A name containing "EMAIL" gets an email-shaped value at
+    example.com (the IANA documentation domain: syntactically a real
+    address format — strict login validators accept it — but no
+    mailbox exists there and nothing is ever sent to it); every other
+    name gets 32 hex characters.
+    """
+    out: dict[str, str] = {}
+    for name in names:
+        if "EMAIL" in name.upper():
+            out[name] = f"pd-{secrets.token_hex(6)}@example.com"
+        else:
+            out[name] = secrets.token_hex(16)
+    return out
 
 # `${NAME}` placeholders in strings.
 _BINDING_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -199,6 +241,11 @@ class SetupContext:
     # them must reach the record's redaction (Addendum 23 R1).
     run_captures_all: dict[str, list[Any]] = field(default_factory=dict, repr=False)
     run_minted: list[str] = field(default_factory=list, repr=False)
+    # Per-run bootstrap credential values in effect for this context
+    # (WO-8.3), set by the executor from its `bootstrap_env`. Copied to
+    # the ProbeResult at assembly so the values join the record's
+    # redaction set (the record names them only as "generated").
+    run_bootstrap: list[str] = field(default_factory=list, repr=False)
     # Set by a harness_app setup step (WO-5): subsequent setup steps and
     # the probe's act target the harness app instead of the provisioned
     # target. None when no harness_app step ran.
@@ -314,13 +361,31 @@ class CredentialProvider:
 
     Modes (from the `credential_config` mapping):
     - `ghost_jwt`: mint a short-lived Ghost Admin API JWT per request from
-      the fixture's admin key. Config: {"mode": "ghost_jwt",
-      "key": "${ADMIN_KEY}", "ttl_seconds": 300}.
+      the instance's admin key. Config: {"mode": "ghost_jwt",
+      "key": "${ADMIN_KEY}", "ttl_seconds": 300} resolves the key from a
+      binding; the WO-8.3 contract form declares `key_file` instead —
+      the key is created by the instance during its own seed, written
+      to a declared checkout file, and the orchestrator reads it after
+      READY and passes it as `key_value` (a missing file arrives as
+      `key_error` and fails INCONCLUSIVE `auth`, never a crash).
+    - `login` (WO-8.3): POST the declared login path with the declared
+      body template — its `${NAME}` placeholders resolve from the
+      run's bindings, which is how the per-run bootstrap values feed
+      it — and extract the token at `token_json_path`. Config:
+      {"mode": "login", "path": "/auth/login", "method": "POST",
+      "body": {"email": "${ADMIN_EMAIL}", "password": "${ADMIN_PASSWORD}"},
+      "token_json_path": "data.access_token",
+      "expires_in_json_path": "data.expires"}.
     - `refresh` (default): call a refresh endpoint, but only when there is
       no token or a provider-issued token nears expiry. Config:
       {"mode": "refresh", "path": "/auth/refresh", "method": "POST",
       "headers": {...}, "body": {...}, "token_json_path": "access_token",
-      "expires_in_json_path": "expires_in"}.
+      "expires_in_json_path": "expires_in"}. With `login_path`/
+      `login_body` declared (WO-8.3), the first acquisition is a login
+      (as `login` mode, at the login path); the response's refresh
+      token is read at `refresh_token_json_path` and bound as
+      `${REFRESH_TOKEN}` for the refresh body, and later acquisitions
+      refresh near expiry.
     - `register`: register a disposable user on the target. The endpoint,
       body fields, and token field are declared in the contract (never a
       default). Config: {"mode": "register", "path": "/register",
