@@ -318,14 +318,64 @@ def test_assemble_rejects_nonempty_output_dir(tmp_path):
         _assemble(tmp_path)
 
 
-def test_assemble_rejects_symlink_in_snapshot(tmp_path):
-    """Finding 2: symlinks are refused outright (copytree would follow them)."""
+def test_assemble_rejects_absolute_symlink_in_snapshot(tmp_path):
+    """WO-8.4b rule 2: an absolute-target link is refused, typed, named.
+
+    (Finding 2's original case: the link pointed outside the snapshot
+    via an absolute target — still refused, now with a typed reason.)
+    """
     snap = _snapshot(tmp_path)
     (tmp_path / "secret").mkdir()
     (tmp_path / "secret" / "fix.patch").write_text("ANSWER\n", encoding="utf-8")
     (snap / "link").symlink_to(tmp_path / "secret", target_is_directory=True)
-    with pytest.raises(ValueError, match="symlink"):
+    with pytest.raises(fixture.SnapshotLinkError) as excinfo:
         _assemble(tmp_path, snap=snap)
+    assert excinfo.value.reason == fixture.LINK_TARGET_ABSOLUTE
+    assert excinfo.value.path == "link"
+
+
+def test_assemble_omits_in_tree_links_and_records_them(tmp_path):
+    """WO-8.4b rule 3: in-tree links are omitted from the bundle copy —
+    no entry, no content through the link — and recorded in the
+    manifest as path + target string."""
+    snap = _snapshot(tmp_path)
+    (snap / "alias.js").symlink_to("src/app.js")
+    (snap / "srclink").symlink_to("src", target_is_directory=True)
+    bundle = _assemble(tmp_path, snap=snap)
+    # The real file is in the bundle at its own path only.
+    assert (bundle.snapshot / "src" / "app.js").read_text(encoding="utf-8") == (
+        "console.log(1);\n"
+    )
+    assert not (bundle.snapshot / "alias.js").exists()
+    assert not (bundle.snapshot / "srclink").exists()
+    assert not any(p.is_symlink() for p in bundle.snapshot.rglob("*"))
+    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+    assert manifest["omitted_links"] == [
+        {"path": "alias.js", "target": "src/app.js"},
+        {"path": "srclink", "target": "src"},
+    ]
+
+
+def test_assemble_refuses_escaping_symlink_in_snapshot(tmp_path):
+    """WO-8.4b rule 2: a `../` escape is refused with the path named."""
+    snap = _snapshot(tmp_path)
+    (snap / "bad").symlink_to("../outside.txt")
+    with pytest.raises(fixture.SnapshotLinkError) as excinfo:
+        _assemble(tmp_path, snap=snap)
+    assert excinfo.value.reason == fixture.LINK_TARGET_ESCAPES
+    assert excinfo.value.path == "bad"
+
+
+def test_assemble_refuses_chained_escaping_symlink_in_snapshot(tmp_path):
+    """WO-8.4b rule 2: a chain whose final hop escapes is refused; the
+    typed reason names the link being validated."""
+    snap = _snapshot(tmp_path)
+    (snap / "a").symlink_to("b")
+    (snap / "b").symlink_to("../../outside.txt")
+    with pytest.raises(fixture.SnapshotLinkError) as excinfo:
+        _assemble(tmp_path, snap=snap)
+    assert excinfo.value.reason == fixture.LINK_TARGET_ESCAPES
+    assert excinfo.value.path == "a"
 
 
 def test_assemble_rejects_nested_git(tmp_path):
@@ -487,9 +537,100 @@ def _git_repo_with_symlink(tmp_path):
     return repo, sha
 
 
-def test_create_snapshot_refuses_symlink_members(tmp_path):
-    """pr-agent: tar symlinks are refused at extraction, never written."""
+def _git_repo_with_links(tmp_path, files, links):
+    """A real git repo with the given files and committed symlinks.
+
+    files: {relpath: content}; links: {relpath: target string}.
+    Returns (repo_dir, sha)."""
+    repo = tmp_path / "linkrepo2"
+    repo.mkdir()
+    for rel, content in files.items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    for rel, target in links.items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.symlink_to(target)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "one"], cwd=repo, check=True, env=env)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return repo, sha
+
+
+def test_create_snapshot_keeps_in_tree_symlink_members(tmp_path):
+    """WO-8.4b rule 1 (was: all tar symlinks refused): a relative
+    in-tree link is kept as a symlink in the materialized snapshot."""
     repo, sha = _git_repo_with_symlink(tmp_path)
-    with pytest.raises(ValueError, match="is a link, refused"):
+    snap = fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
+    link = snap.dir / "link.txt"
+    assert link.is_symlink()
+    assert os.readlink(link) == "real.txt"
+    assert link.read_text(encoding="utf-8") == "data\n"
+
+
+def test_create_snapshot_keeps_dir_and_chained_in_tree_links(tmp_path):
+    """WO-8.4b rule 1: in-tree links to a directory and chained in-tree
+    links are kept, and content reads through them — the build proceeds."""
+    repo, sha = _git_repo_with_links(
+        tmp_path,
+        files={"real.txt": "data\n", "realdir/f.txt": "nested\n"},
+        links={
+            "dirlink": "realdir",
+            "chain1": "chain2",
+            "chain2": "real.txt",
+        },
+    )
+    snap = fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
+    assert (snap.dir / "dirlink").is_symlink()
+    assert (snap.dir / "dirlink" / "f.txt").read_text(encoding="utf-8") == "nested\n"
+    assert (snap.dir / "chain1").is_symlink()
+    assert (snap.dir / "chain1").read_text(encoding="utf-8") == "data\n"
+
+
+def test_create_snapshot_refuses_absolute_symlink(tmp_path):
+    """WO-8.4b rule 2 (real git): an absolute target is refused with a
+    typed reason naming the path."""
+    repo, sha = _git_repo_with_links(
+        tmp_path, files={"real.txt": "data\n"}, links={"abs.txt": "/etc/passwd"}
+    )
+    with pytest.raises(fixture.SnapshotLinkError) as excinfo:
         fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
-    assert not (tmp_path / "snap" / "link.txt").exists()
+    assert excinfo.value.reason == fixture.LINK_TARGET_ABSOLUTE
+    assert excinfo.value.path == "abs.txt"
+    assert "abs.txt" in str(excinfo.value)
+
+
+def test_create_snapshot_refuses_parent_escaping_symlink(tmp_path):
+    """WO-8.4b rule 2 (real git): a `../` escape is refused, path named."""
+    repo, sha = _git_repo_with_links(
+        tmp_path, files={"real.txt": "data\n"}, links={"esc.txt": "../outside.txt"}
+    )
+    with pytest.raises(fixture.SnapshotLinkError) as excinfo:
+        fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
+    assert excinfo.value.reason == fixture.LINK_TARGET_ESCAPES
+    assert excinfo.value.path == "esc.txt"
+
+
+def test_create_snapshot_refuses_chained_escaping_symlink(tmp_path):
+    """WO-8.4b rule 2 (real git): a chain landing outside the tree is
+    refused; the typed reason names the link being validated."""
+    repo, sha = _git_repo_with_links(
+        tmp_path,
+        files={"real.txt": "data\n"},
+        links={"c1": "c2", "c2": "../../outside.txt"},
+    )
+    with pytest.raises(fixture.SnapshotLinkError) as excinfo:
+        fixture.create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=tmp_path / "snap")
+    assert excinfo.value.reason == fixture.LINK_TARGET_ESCAPES
+    assert excinfo.value.path == "c1"
