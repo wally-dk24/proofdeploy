@@ -10,9 +10,13 @@ Every contract below was validated with the repo's own loader
 
 HEADs at authoring time: TryGhost/Ghost `d507bc2741fa`,
 directus/directus `8e140f942508`, vendure-ecommerce/vendure
-`983ae280ace8`, nestjs/nest `fa152aff7ecd`, django/django
+`983ae280ace8`, nestjs/nest `fa152aff7ecd`, fastify/fastify
+`e222f53aa267`, honojs/hono `588ec13fa68e`, django/django
 `adeef108afa7`, LMCache/LMCache `96e69e09ea34`, bottlepy/bottle
-`8ec5fe29420d`, codeigniter4/CodeIgniter4 `8e2db880c621`.
+`b73bd1db5b7a` (author's bare-clone FETCH_HEAD; a parallel
+checkout showed `8ec5fe29420d` — the README example the
+contract quotes is identical in both), codeigniter4/
+CodeIgniter4 `8e2db880c621`.
 
 Per-field sources are quoted verbatim from the HEAD files named.
 "Judgment call" flags are the authors' own, kept deliberately: the
@@ -36,8 +40,10 @@ data, not a defect to hide.
   (author-flagged): `pnpm dev` is the monorepo's dev orchestration
   for the repo itself; production start is not a root script at
   HEAD (`"start"` is `None` in root `package.json`).
-- `readiness`: `"/"` — the site's root answers unauthenticated;
-  the loader-proven path class the WO-8.3 Ghost work used.
+- `readiness`: `"/"` — HEAD's own dev healthcheck,
+  `compose.dev.yaml`: a fetch of `http://localhost:2368`
+  treated as healthy on any status <500 — an unauthenticated
+  root fetch, matching the runner's any-non-error rule.
 - No `env:`: the contract's earlier draft's env keys were not
   HEAD-documented; the port/host ride on the `start` prefix.
 
@@ -63,48 +69,53 @@ package at HEAD is a monorepo whose npm entry the proof pinned.
 ## vendure-ecommerce/vendure — approved fixture (registered hash `6e739fca…`)
 
 Condition honored: each commit uses its own `dev-config.ts`,
-unmodified — the contract declares no DB env and no config
-override. Authored from HEAD README + `packages/dev-server`
-config; the registered stage evidence names the same entry files
-(`populate-dev-server.ts`, `packages/create`'s `copy-assets` build
-step feeding the root build).
+unmodified — the contract sets only the `DB` switch that
+`dev-config.ts` itself reads (below); the file is never
+overridden. Authored from HEAD `CONTRIBUTING.md` + README +
+`packages/dev-server` config; the registered stage evidence
+names the same seed file (`populate-dev-server.ts`,
+`packages/create`'s `copy-assets` build step feeding the root
+build).
 
-- `build`: root `package.json` — `"packageManager"` is unset and
-  the tree carries `bun.lock`; scripts: `"build": "lerna run
-  build"`. README.md documents the Bun-based monorepo flow.
-  KNOWN CONSEQUENCE, deliberate: the sandbox refuses bun plans
-  (`supported node managers: npm, pnpm, yarn — bun stays
-  refused`), so HEAD-shaped Vendure trees type out at plan time;
-  older registered trees plan by their own lockfiles. The
-  readiness rows report this as-is; the contract is not bent
-  toward a manager HEAD does not document.
-- `migrate`: `packages/dev-server/package.json` scripts contain
-  `"codegen"` (GraphQL schema codegen the dev-server imports at
-  startup). Judgment call (author-flagged): the dev-server's own
-  DB migrations run inside the app boot (`src/` migration runner),
-  so no standalone DB-migration command exists at HEAD; codegen
-  is the documented pre-start step placed in the migrate slot.
-- `seed`: `packages/dev-server/populate-dev-server.ts` exists at
-  HEAD; README.md: "the `populate-dev-server.ts` script in the
-  `packages/dev-server` directory" populates "an initial set of
-  products, customers and orders". Invoked with `bunx tsx`, the
-  README's own runner for the dev-server entry files. (An earlier
-  draft's `bun run populate` / `bun run start` named scripts that
-  do NOT exist in `packages/dev-server/package.json` — caught in
-  authoring review and corrected to the files themselves.)
-- `start`: `packages/dev-server/index.ts` is the dev-server entry;
-  README.md ("Start the server": `bunx tsx index.ts` run from the
-  dev-server directory after building all packages).
-- `readiness`: `"/"` — COORDINATOR AMENDMENT to the author's
-  `/admin-api` draft, on the author's own evidence:
-  `packages/dev-server/index.ts` mounts the landing page at the
-  root ("Serve the Vendure logo & landing page from the root"),
-  while a bare GET on the GraphQL `/admin-api` returns 400, and
-  the runner's readiness check treats an HTTP error as not-ready.
-  `/` proves the same process is serving HTTP, with a 200.
-- No `env:`: HEAD's `packages/dev-server/dev-config.ts` reads
-  `DB_*` variables with SQLite defaults; nothing needs declaring,
-  and the approved condition forbids overriding the config.
+- `build`: `CONTRIBUTING.md` (HEAD root): "[Bun](https://bun.sh/)
+  — the canonical package manager for this repo", "Always use
+  `bun install` inside this repo", steps 1–2: "`bun install`",
+  "`bun run build`"; root `package.json`: `"build": "lerna run
+  build"`, tree carries `bun.lock`. KNOWN CONSEQUENCE,
+  deliberate: the sandbox refuses bun plans (supported node
+  managers: npm, pnpm, yarn — bun stays refused), so HEAD-shaped
+  Vendure trees type out at plan time; older registered trees
+  plan by their own lockfiles. The readiness rows report this
+  as-is; the contract is not bent toward a manager HEAD does
+  not document.
+- `seed`: `CONTRIBUTING.md` step 4 ("Populate test data"):
+  "cd packages/dev-server" / "bun run populate";
+  `packages/dev-server/package.json`: `"populate": "node -r
+  ts-node/register -r dotenv/config populate-dev-server.ts"`;
+  `packages/dev-server/README.md`: "Test data can be populated
+  by running the `populate` script."
+- `start`: `packages/dev-server/package.json`: `"start": "node
+  ../cli/dist/cli.js start all"`, invoked from the dev-server
+  directory per `CONTRIBUTING.md` step 5. Judgment call
+  (author-flagged): the documented `bun run dev` runs a
+  Portless/watcher supervisor unsuited to a fixed-port sandbox
+  readiness check; the package's verbatim `start` script is
+  used instead.
+- `readiness`: `"/health"` — `packages/dev-server/scripts/
+  dev-workflow.mjs` polls `` `${apiOrigin}/health` `` as the
+  "API health endpoint", unauthenticated, accepting 2xx–3xx:
+  Vendure's own readiness check at HEAD.
+- `env`: `DB: sqlite` — `packages/dev-server/dev-config.ts`:
+  `const dbType = process.env.DB || 'mysql';` — HEAD's default
+  is MySQL (an external server), so one documented switch is
+  required; the sqlite branch is a self-contained file database
+  needing no credentials (`AGENTS.md`: "Switch DB with env
+  var: `DB=postgres` or `DB=sqlite`"). Non-secret config only;
+  the MySQL branch's hardcoded dev values were not copied.
+- No `migrate`: no migrate script exists in
+  `packages/dev-server/package.json`; migration is part of the
+  start entry itself (`index.ts`: `runMigrations(devConfig)`,
+  and `dev-config.ts` returns `synchronize: true`).
 
 ## nestjs/nest — generic (HEAD README + config)
 
@@ -112,20 +123,27 @@ The framework repo ships no runnable root app (root
 `package.json` has no `start` script); the contract targets the
 repo's own canonical sample application.
 
-- `build`: root `package.json` — `"build": "tsc -p
-  tsconfig.json"` with the root `package-lock.json` (`npm ci`);
+- `build`: root `package.json` — `"build": "tsc -b -v
+  packages"` with the root `package-lock.json` (`npm ci`);
   then `sample/01-cats-app` installed and built via `--prefix`.
-  `--legacy-peer-deps` is the repo's documented sample-install
-  mode: root README.md's sample instructions use `npm install
-  --legacy-peer-deps`, and the sample's own `postinstall` echoes
-  that flag. Sample `package.json` — `"build": "nest build"`.
+  `--legacy-peer-deps` is the repo's own sample-install mode:
+  `tools/gulp/tasks/samples.ts` (the repo's `install:samples`
+  runner) uses `'npm install --legacy-peer-deps'` per sample
+  and itself invokes via `--prefix`. Sample `package.json` —
+  `"build": "nest build"`.
 - `start`: `sample/01-cats-app/package.json` — `"start:prod":
-  "node dist/main"`, run via `npm --prefix`.
+  "node dist/main"`, run via `npm --prefix` (chosen over
+  `"start": "nest start"`: the build already compiles the
+  sample to `dist/`). No root `app.controller.ts` exists in
+  the sample; its only controller is the cats controller.
 - `readiness`: `"/cats"` — `sample/01-cats-app/src/cats/
-  cats.controller.ts` (`@Controller('cats')`) serves the route
-  unauthenticated; the sample's root controller also answers
-  `/`. (The sample binds no port itself: its `main.ts` listens
-  on `process.env.PORT ?? 3000`, and the runner assigns PORT.)
+  cats.controller.ts` (`@Controller('cats')`, `@Get()`)
+  serves it unauthenticated, proven by the sample's own HEAD
+  e2e spec (`cats.e2e-spec.ts` expects 200 on `GET /cats`
+  with no auth headers). Recorded tension: the sample's
+  `main.ts` is `await app.listen(3000)` — a hardcoded port,
+  not the runner-assigned one; the rows will show what that
+  does, and no `env` was invented to hide it.
 
 ## django/django — generic (HEAD README + config)
 
@@ -206,20 +224,23 @@ repo's own canonical sample application.
 
 - `build`: root `package.json` — `"build": "pnpm run
   remove-dist && vp pack && pnpm run copy:package.cjs.json &&
-  publint"`; the tree carries `pnpm-lock.yaml`. Expected plan
-  outcome, recorded in advance: HEAD also carries
-  `pnpm-workspace.yaml`, and the Node adapter refuses workspace
-  trees, so Hono sides are expected to type out at plan time
-  with that refusal — the contract is faithful anyway.
-- `start`: `"node --experimental-strip-types
-  examples/with-static.ts"` — hono is a runtime-agnostic
-  framework core with no server binary and no `start` script;
-  `examples/with-static.ts` at HEAD is a complete Hono app
-  served through the repo's own `@hono/node-server` adapter,
-  answering `/` with 200, and the examples import the framework
-  from source, matching Node's type-stripping execution the
-  repo's own tooling assumes. Judgment call (author-flagged):
-  an earlier draft's `npm create hono@latest` was rejected in
-  authoring review — it is an interactive scaffolder for a NEW
-  project and never runs this repo.
-- `readiness`: `"/"`.
+  publint"`, `"packageManager": "pnpm@12.6.0"`; the tree
+  carries `pnpm-lock.yaml`. Expected plan outcome, recorded in
+  advance: HEAD also carries `pnpm-workspace.yaml`, and the
+  Node adapter refuses workspace trees, so Hono sides are
+  expected to type out at plan time with that refusal — the
+  contract is faithful anyway.
+- `start`: `"npm create hono@latest"` — JUDGMENT CALL
+  (author-flagged, verified at HEAD): no runnable app exists
+  in this repo. The README snippet is a library export
+  (`export default app`), `package.json` has no
+  start/dev/serve script, and the full HEAD tree contains no
+  `examples/` directory (verified by recursive `ls-tree`);
+  the benchmarks tool is a Bun+bombardier harness, not an app.
+  The start is therefore the README Quick Start's own command
+  (`README.md`: `npm create hono@latest`). It scaffolds a NEW
+  project rather than serving this repo, so a typed
+  start/readiness failure is the expected, legitimate outcome;
+  no server file was invented to disguise that.
+- `readiness`: `"/"` — `README.md`'s only route:
+  `app.get('/', (c) => c.text('Hono!'))`.

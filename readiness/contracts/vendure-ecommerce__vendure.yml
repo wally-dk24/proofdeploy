@@ -1,5 +1,6 @@
 build: "bun install && bun run build"
-migrate: "cd packages/dev-server && bun run codegen"
-seed: "cd packages/dev-server && bunx tsx populate-dev-server.ts"
-start: "cd packages/dev-server && bunx tsx index.ts"
-readiness: "/"
+seed: "cd packages/dev-server && bun run populate"
+start: "cd packages/dev-server && bun run start"
+readiness: "/health"
+env:
+  DB: sqlite
