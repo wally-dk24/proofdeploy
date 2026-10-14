@@ -15,8 +15,8 @@ name: ci
 # checked by scripts/check_test_manifest.py in the lint job
 # (WAL-109: the hardcoded per-shard counts and embedded file lists
 # that used to sit in these matrices were replaced by the manifest;
-# a test added without regenerating it fails the lint job in ~a
-# minute with the nodeids named). Each host shard
+# a test added without regenerating it fails the lint job with
+# the nodeids named). Each host shard
 # also writes a JUnit report, and a verify step asserts from it that
 # every collected test ran and none skipped (Addendum 55): the host
 # selection has no PD_REQUIRE_SANDBOX net, so without this a
@@ -175,8 +175,12 @@ jobs:
         # suite must equal tests/expected_*_nodeids.txt and
         # every test must be selected by exactly one shard.
         # Adding/removing/renaming a test without regenerating
-        # the manifest fails HERE, in ~a minute, with the
-        # nodeids named — not ten minutes into a shard run.
+        # the manifest fails HERE, with the nodeids named — not
+        # ten minutes into a shard run. The check collects ONCE
+        # (gate-speed item 0): importing the suite runs a real
+        # podman capability probe at import time in several test
+        # modules, so one collection is ~2 minutes on a runner —
+        # the old 17-collection version of this step took ~11.
         if: steps.gate.outputs.proceed == 'true'
         run: python scripts/check_test_manifest.py
 
@@ -190,7 +194,7 @@ jobs:
       matrix:
         include:
           - shard: goldens
-            files: "tests/test_executor_addendum20.py tests/test_leakcheck.py tests/test_orchestrator_addendum25.py tests/test_probe.py tests/test_provisioning_sandbox.py tests/test_readiness_harness.py tests/test_replay.py tests/test_runner.py tests/test_runpair_addendum21.py tests/test_runpair_addendum24.py tests/test_runpair_addendum25.py tests/test_wo7_pr2.py"
+            files: "tests/test_executor_addendum20.py tests/test_leakcheck.py tests/test_orchestrator_addendum25.py tests/test_probe.py tests/test_provisioning_sandbox.py tests/test_container_spike.py tests/test_readiness_harness.py tests/test_replay.py tests/test_runner.py tests/test_runpair_addendum21.py tests/test_runpair_addendum24.py tests/test_runpair_addendum25.py tests/test_wo7_pr2.py"
             nodeids: "tests/test_orchestrator.py::test_check_sandbox_runtime_mismatch_fails_closed tests/test_orchestrator.py::test_clean_no_valid_probe_is_false_alarm tests/test_orchestrator.py::test_measure_bug_end_to_end tests/test_orchestrator.py::test_measure_bug_leak_check_fails_closed tests/test_orchestrator.py::test_measure_bug_model_transport_retry_succeeds tests/test_orchestrator.py::test_measure_bug_model_transport_retry_twice tests/test_orchestrator.py::test_measure_bug_refuses_fix_sha_in_snapshot tests/test_orchestrator.py::test_measure_bug_uses_fix_parent_not_b tests/test_orchestrator.py::test_measure_clean_model_transport_retry_succeeds tests/test_orchestrator.py::test_measure_clean_model_transport_retry_twice tests/test_orchestrator.py::test_sandboxed_clean_run_records_measured tests/test_orchestrator.py::test_unsandboxed_clean_run_records_not_measured tests/test_orchestrator.py::test_unsandboxed_normal_run_records_not_measured tests/test_wo81b.py::test_host_provisions_committed_lock_ready[poetry]"
           - shard: contracts
             files: "tests/test_change_model.py tests/test_examples.py tests/test_fixture.py tests/test_orchestrator_addendum23.py tests/test_orchestrator_addendum24.py tests/test_provisioning.py tests/test_runpair.py tests/test_runpair_addendum23.py tests/test_sandbox.py tests/test_setup_auth.py tests/test_wo73.py tests/test_wo81.py"
@@ -235,25 +239,26 @@ jobs:
         id: counts
         if: steps.gate.outputs.proceed == 'true'
         run: |
-          count() { python -m pytest --collect-only -q -o addopts="" -p no:cacheprovider "$@" 2>/dev/null | grep -c "::" || true; }
-          full=$(count)
-          host=$(count -m "not sandbox")
-          sand=$(count -m "sandbox")
-          shard_count=$(count ${{ matrix.files }} ${{ matrix.nodeids }} -m "not sandbox")
-          echo "collection: full=$full host=$host sandbox=$sand shard(${{ matrix.shard }})=$shard_count"
-          echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
-          if [ "$((host + sand))" -ne "$full" ]; then
-            echo "::error::partition broken: host($host) + sandbox($sand) != full($full)"
-            exit 1
-          fi
+          set -o pipefail
+          python scripts/check_test_manifest.py --counts "not sandbox" -- ${{ matrix.files }} ${{ matrix.nodeids }} | tee /tmp/counts-${{ matrix.shard }}.txt
+          grep '^shard_count=' /tmp/counts-${{ matrix.shard }}.txt >> "$GITHUB_OUTPUT"
           # WAL-109: no hardcoded per-shard counts or file lists
           # live here anymore. The exact-set proof — every
           # collected test named in tests/expected_*_nodeids.txt
           # and selected by exactly one shard — is owned by
           # scripts/check_test_manifest.py, run in the lint job
-          # (and locally before pushing). This step keeps the
-          # runtime partition equality and hands the shard's own
-          # collected count to the JUnit verify step below.
+          # (and locally before pushing).
+          # Gate-speed item 0: this step used to run four fresh
+          # pytest collections (full/host/sandbox/shard); importing
+          # the suite runs a real podman capability probe at
+          # import time in several test modules (~110s per
+          # collection), so the counts now come from the
+          # generated manifests via the script's --counts mode.
+          # That is exactly as strong: the lint job proves the
+          # manifests equal real collection on this same commit,
+          # --counts asserts the two manifests are disjoint (the
+          # partition), and the JUnit verify below still compares
+          # this shard's REAL run against the derived count.
       - name: tests (this shard)
         if: steps.gate.outputs.proceed == 'true'
         env:

@@ -172,11 +172,9 @@ jobs:
         id: counts
         if: steps.gate.outputs.proceed == 'true'
         run: |
-          count() { python -m pytest --collect-only -q -o addopts="" -p no:cacheprovider "$@" 2>/dev/null | grep -c "::" || true; }
-          sand=$(count -m "sandbox")
-          shard_count=$(count ${{ matrix.files }} ${{ matrix.nodeids }} -m "sandbox")
-          echo "collection: sandbox(full)=$sand shard(${{ matrix.shard }})=$shard_count"
-          echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
+          set -o pipefail
+          python scripts/check_test_manifest.py --counts "sandbox" -- ${{ matrix.files }} ${{ matrix.nodeids }} | tee /tmp/counts-${{ matrix.shard }}.txt
+          grep '^shard_count=' /tmp/counts-${{ matrix.shard }}.txt >> "$GITHUB_OUTPUT"
           # WAL-109: the file-set partition guard that used to be
           # embedded here (a hardcoded list of the files holding
           # sandbox tests) is owned by scripts/check_test_manifest.py
@@ -184,6 +182,15 @@ jobs:
           # selection must equal tests/expected_sandbox_nodeids.txt
           # and every test must be selected by exactly one shard of
           # this matrix.
+          # Gate-speed item 0: this step used to run two fresh
+          # pytest collections per shard; importing the suite runs
+          # a real podman capability probe at import time in
+          # several test modules (~110s per collection), so the
+          # counts now come from the generated manifests via the
+          # script's --counts mode. The Verify step below still
+          # compares this shard's REAL run against the derived
+          # count, and the ci lint job proves the manifests equal
+          # real collection on the same commit.
 
       - name: Run sandbox selection (this shard)
         # B3 (Addendum 16): PD_REQUIRE_SANDBOX=1 turns any sandbox
