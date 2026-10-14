@@ -125,6 +125,12 @@ jobs:
             nodeids: "tests/test_wo83_sandbox.py::test_golden_bootstrap_values_differ_per_side_in_sandbox tests/test_wo83_sandbox.py::test_golden_ghost_jwt_from_seed_key_file_in_sandbox tests/test_wo83_sandbox.py::test_golden_ghost_missing_key_file_inconclusive_in_sandbox tests/test_wo83_sandbox.py::test_golden_login_mode_in_sandbox tests/test_wo83_sandbox.py::test_golden_refresh_mode_in_sandbox"
           - shard: provisions-original
             files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py"
+          # WAL-118: the container spike's build-network property
+          # test — a real rootless build proving a RUN step cannot
+          # reach a service on the host's loopback. Every other
+          # container-spike test is host-side (ci workflow).
+          - shard: spike-build-network
+            nodeids: "tests/test_container_spike.py::test_build_network_blocks_host_loopback"
     name: sandbox (${{ matrix.shard }})
     steps:
       - name: Gate (WAL-101)

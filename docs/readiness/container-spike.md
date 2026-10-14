@@ -37,8 +37,10 @@ The same bar as the sandbox, verbatim from the work order:
   (`--userns-uid-map` / `--userns-gid-map` `0:1:65536`) and
   `--cap-drop=ALL`, so an escape during the build is not host
   root. Network is allowed during the build only, and only on
-  the explicit `pd-build` bridge network — the native install
-  path's network — never podman's default and never the
+  the explicit rootless build network
+  `slirp4netns:allow_host_loopback=false` — outbound NAT for
+  package registries, no route back to services bound on the
+  host's loopback — never podman's default and never the
   host's. The build context is the snapshot only. No secrets,
   no host mounts.
 - **Run:**
@@ -54,7 +56,8 @@ The same bar as the sandbox, verbatim from the work order:
 - A run records how podman was invoked: the run log
   (`spike-logs/spike-<repo>-run-a<attempt>.log`) carries the
   capability line (podman version, userns remapping), the podman
-  base command, and the run and build user args; every podman invocation
+  base command, the run and build user args, and the build
+  network mode; every podman invocation
   for a side is logged verbatim in that side's log.
 
 Each safety property has a command-construction test in
@@ -63,7 +66,36 @@ dropping `--net=none` from the run command, dropping
 `--cap-drop=ALL` from the user args, dropping the userns remap
 or the cap-drop from the build command, pointing the build at
 the host network, or adding a host mount to the build command
-makes the matching test fail.
+makes the matching test fail. The build network's loopback
+block is proven as a property, not just a flag: a sandbox test
+(`test_build_network_blocks_host_loopback`, sandbox-tests CI)
+runs a real rootless build whose RUN step tries to reach a
+service bound on the host's loopback and must fail to reach it
+while a control fetch succeeds; flipping the mode to
+`allow_host_loopback=true` is the plant that makes it fail.
+
+### Why the build network changed (WAL-118)
+
+The build originally ran on the native install path's named
+`pd-build` netavark bridge. The first real runs from main
+(2026-10-14, runs `38647384356` / `38647391627`) showed a
+userns-mapped `podman build` cannot join a named netavark
+network on podman 4.9.3: every Directus side — all four, both
+attempts — died at the Dockerfile's first RUN step with the
+same typed reason, verbatim:
+
+```
+Error: building at STEP "RUN apk --no-cache add python3 py3-setuptools build-base": setup network: cannot use networks as rootless
+```
+
+The failure was the harness's, not the app's (the native path
+avoids it because it builds via `podman run`, which can join
+the bridge). The fix changed only the build's network: the
+userns maps and `--cap-drop=ALL` are unchanged, and there is no
+fallback — if the slirp mode is unavailable the build itself
+fails and the side is typed `BUILD_FAILED` with the build's
+error. The mode is recorded on every row (`build_network`) and
+in the run header log.
 
 ## Selection (mechanical, decided before any run)
 
@@ -118,9 +150,10 @@ For the dispatched repo, per registered side
    the install RUN lines (including heredoc bodies), EXPOSE
    ports, ENV.
 4. Build with podman (userns-remapped, `--cap-drop=ALL`, on
-   the explicit `pd-build` network; snapshot-only context; no
-   secrets, no build args, no mounts). Record the resolved
-   digest of every FROM image the build pulled.
+   the explicit rootless build network
+   `slirp4netns:allow_host_loopback=false`; snapshot-only
+   context; no secrets, no build args, no mounts). Record the
+   resolved digest of every FROM image the build pulled.
 5. Judge the install from the Dockerfile's own lines:
    `--frozen-lockfile`, `npm ci`, `--immutable`,
    `--require-hashes` are frozen; a bare install line is not.
@@ -165,7 +198,9 @@ One row per (unit, role), in `rows-spike-attempt<N>.json`:
 `install_frozen` (true / false / null when there is no install
 line to judge), `install_evidence` (the verbatim install line),
 `port_source` (`EXPOSE` / `compose` / `$PORT` / null), `port`,
-`network_mode` (`none+socket`), `userns_fallback` (true only
+`network_mode` (`none+socket`), `build_network`
+(`slirp4netns:allow_host_loopback=false`), `userns_fallback`
+(true only
 when the run proceeded under the dev no-userns flag), `attempt`.
 
 Per-side build and run logs land in `spike-logs/`, and the
