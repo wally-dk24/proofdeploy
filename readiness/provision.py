@@ -327,6 +327,7 @@ def provision_repo(
     contract = contract_path(repo)
     rows: list[dict[str, Any]] = []
     for unit in units:
+        fetch_sha(clone, cutoff_sha(unit))
         orch._run_lock_cutoff = orch._commit_cutoff(cutoff_sha(unit))
         for side_spec in unit["sides"]:
             if only is not None and (unit["unit_id"], side_spec["role"]) not in only:
