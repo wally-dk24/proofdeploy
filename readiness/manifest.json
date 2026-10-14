@@ -1,0 +1,462 @@
+{
+ "pass": "Addendum 64 provisioning readiness pass (WAL-112) \u2014 unit inventory",
+ "kind": "run manifest \u2014 SHAs resolved mechanically (commit-graph metadata only)",
+ "rules_applied": [
+  "fix = registered SHA (full as registered, or short expanded uniquely in a bare blobless clone of the upstream repo)",
+  "fix^ = first parent of the fix commit (git rev-parse <fix>^1)",
+  "no fix commit content, diffs, or working trees were read at any point",
+  "checkpoint bug SHAs supplied by Addendum 65 (orchestrator record); fix^ re-derived from the commit graph and matched, per unit note"
+ ],
+ "counts": {
+  "units": 27,
+  "sides": 42,
+  "by_class": {
+   "checkpoint-bug": 4,
+   "checkpoint-control": 5,
+   "heldout-bug": 4,
+   "heldout-clean": 4,
+   "train-bug": 7,
+   "train-clean": 3
+  }
+ },
+ "units": [
+  {
+   "unit_id": "C1",
+   "repo": "vendure-ecommerce/vendure",
+   "class": "checkpoint-control",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "4cbbc790118786a17721954c3a4d739810bd2632",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "C2",
+   "repo": "vendure-ecommerce/vendure",
+   "class": "checkpoint-control",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "b19ab4dc76e4f8521e02258b8afa26f615142595",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "C3",
+   "repo": "directus/directus",
+   "class": "checkpoint-control",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "dc922b790a15949e8abfce9c1f4523d4e5f89492",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "C4",
+   "repo": "directus/directus",
+   "class": "checkpoint-control",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "a5da59da94bb33c8d644df93a21403eca4c1a4e7",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "C5",
+   "repo": "TryGhost/Ghost",
+   "class": "checkpoint-control",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "5d482965b7f5ed05ffef956d0eaed8b8a51af0ef",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "checkpoint-bug-ghost-1",
+   "repo": "TryGhost/Ghost",
+   "class": "checkpoint-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "93e0084723cdaf22d656bcd4811b87433e6b3875",
+     "source": "parent-of-fix (derived by Wally from the commit graph; matches Addendum 65)"
+    },
+    {
+     "role": "fix",
+     "sha": "f67640b2c18c76abd9cd3f6d19d6ae93327b42fa",
+     "source": "orchestrator-record-addendum-65"
+    }
+   ],
+   "note": "SHAs from the orchestrator's Master-approved record (Addendum 65); no registered repo file holds them. fix^ re-derived by Wally from the commit graph 2026-10-13: match. B verified an ancestor of fix."
+  },
+  {
+   "unit_id": "checkpoint-bug-directus-1",
+   "repo": "directus/directus",
+   "class": "checkpoint-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "7e9b03504c6094bac8dace713c11a6f909016057",
+     "source": "parent-of-fix (derived by Wally from the commit graph; matches Addendum 65)"
+    },
+    {
+     "role": "fix",
+     "sha": "93a3f39342e171d3ae3017c2aa9a744b5e1c3f8a",
+     "source": "orchestrator-record-addendum-65"
+    }
+   ],
+   "note": "SHAs from the orchestrator's Master-approved record (Addendum 65); no registered repo file holds them. fix^ re-derived by Wally from the commit graph 2026-10-13: match. B verified an ancestor of fix."
+  },
+  {
+   "unit_id": "checkpoint-bug-vendure-1",
+   "repo": "vendure-ecommerce/vendure",
+   "class": "checkpoint-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "859619c4c289f7773619704f9cd1e5c1256dcfce",
+     "source": "parent-of-fix (derived by Wally from the commit graph; matches Addendum 65)"
+    },
+    {
+     "role": "fix",
+     "sha": "4393199c077e5cd9399696d25b69c620b36c5cc2",
+     "source": "orchestrator-record-addendum-65"
+    }
+   ],
+   "note": "SHAs from the orchestrator's Master-approved record (Addendum 65); no registered repo file holds them. fix^ re-derived by Wally from the commit graph 2026-10-13: match. B verified an ancestor of fix."
+  },
+  {
+   "unit_id": "checkpoint-bug-vendure-2",
+   "repo": "vendure-ecommerce/vendure",
+   "class": "checkpoint-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "8fb22a8d882bb8b8cb2828c19f91e7c7d58f8aff",
+     "source": "parent-of-fix (derived by Wally from the commit graph; matches Addendum 65)"
+    },
+    {
+     "role": "fix",
+     "sha": "02c9d81e83bebebe8b3384b2f789800b14ed0146",
+     "source": "orchestrator-record-addendum-65"
+    }
+   ],
+   "note": "SHAs from the orchestrator's Master-approved record (Addendum 65); no registered repo file holds them. fix^ re-derived by Wally from the commit graph 2026-10-13: match. B verified an ancestor of fix."
+  },
+  {
+   "unit_id": "H1",
+   "repo": "nestjs/nest",
+   "class": "heldout-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "1c4d9c42dd0815a4c0b30c149b1f88d440fda237",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "02ee6d444cfe2a9b214228b940b7bc3d65f9b035",
+     "source": "short-expansion"
+    }
+   ]
+  },
+  {
+   "unit_id": "H2",
+   "repo": "nestjs/nest",
+   "class": "heldout-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "a0b14b583009d5387ac2bcadeeb2e7c80a4dbdf6",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "1d1dbf7bd5d59f1a1035aab10636ba422047d115",
+     "source": "short-expansion"
+    }
+   ]
+  },
+  {
+   "unit_id": "H3",
+   "repo": "nestjs/nest",
+   "class": "heldout-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "40d07dc62ccb41686859b804f8523ae0e2dd1984",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "21648746d9ce499eeca21b86a503749be9172ae3",
+     "source": "short-expansion"
+    }
+   ]
+  },
+  {
+   "unit_id": "H4",
+   "repo": "nestjs/nest",
+   "class": "heldout-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "697ff89e0ecad2210b68ef8e0020730182a79e52",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "1685a435b16dfc685dfa92defa03a9d1f3a8e42b",
+     "source": "short-expansion"
+    }
+   ]
+  },
+  {
+   "unit_id": "heldout-clean-1",
+   "repo": "nestjs/nest",
+   "class": "heldout-clean",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "a9bf20b6936f53a136bf845c480f19ae534a2d8b",
+     "source": "short-expansion",
+     "registered_short_sha": "a9bf20b",
+     "note": "Registered in short form only; expansion was scoped to bug-unit Fix SHAs in this task and was not attempted."
+    }
+   ]
+  },
+  {
+   "unit_id": "heldout-clean-2",
+   "repo": "nestjs/nest",
+   "class": "heldout-clean",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "abce26ecc997b7021bbdf9bb78e10af598885121",
+     "source": "short-expansion",
+     "registered_short_sha": "abce26ec",
+     "note": "Registered in short form only; expansion was scoped to bug-unit Fix SHAs in this task and was not attempted."
+    }
+   ]
+  },
+  {
+   "unit_id": "heldout-clean-3",
+   "repo": "nestjs/nest",
+   "class": "heldout-clean",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "45485b54210e06a517c1ebf86b42b1ea99fc3fe2",
+     "source": "short-expansion",
+     "registered_short_sha": "45485b54",
+     "note": "Registered in short form only; expansion was scoped to bug-unit Fix SHAs in this task and was not attempted."
+    }
+   ]
+  },
+  {
+   "unit_id": "heldout-clean-4",
+   "repo": "nestjs/nest",
+   "class": "heldout-clean",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "c921a60ea114c0e1a6e048c0bd52d6c9d92f8cb6",
+     "source": "short-expansion",
+     "registered_short_sha": "c921a60e",
+     "note": "Registered in short form only; expansion was scoped to bug-unit Fix SHAs in this task and was not attempted."
+    }
+   ]
+  },
+  {
+   "unit_id": "T1",
+   "repo": "codeigniter4/CodeIgniter4",
+   "class": "train-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "ecbf044666bed41d23f07518096d9843fe6c08b0",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "f5e463b9a3e986389ce285963e51a7f1fab6559f",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "T2",
+   "repo": "fastify/fastify",
+   "class": "train-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "dd2ba36fb0f762a5135e423ca810fed99da81b6f",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "179619c8e99d54924309b9933402151ef9af37e0",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "T3",
+   "repo": "fastify/fastify",
+   "class": "train-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "7de6e81697778f9f41bd327a3b1c5c9a0d9637b4",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "93c239a380f3f2778bb7565fcdf777e91cfe1fbc",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "T4",
+   "repo": "django/django",
+   "class": "train-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "7ff7fcc0508864a4bc39693128ace38b1e95a890",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "ebcb13b327301f28cbc6cd5e4988a719f00575aa",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "T5",
+   "repo": "LMCache/LMCache",
+   "class": "train-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "3884c7f1f61ea49c776bf42e276fc968bb2a6ac6",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "449b94c17f66973081308f6e050027ced3f0ab0f",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "T6",
+   "repo": "bottlepy/bottle",
+   "class": "train-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "2a743a302a71460bfe4c0b8b7cb99a306b0328c6",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "b73bd1db5b7a915cf6a78656955c4059f58195ae",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "T7",
+   "repo": "honojs/hono",
+   "class": "train-bug",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "fix^",
+     "sha": "f5a53463ad2ff791fc02418b645750ce75a260ad",
+     "source": "parent-of-fix"
+    },
+    {
+     "role": "fix",
+     "sha": "00ee875728e2369b98a9ab7dda0690b77afedcff",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "train-C1",
+   "repo": "django/django",
+   "class": "train-clean",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "da6567da7ea0e844c9a880e02c7b34e1a184edf8",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "train-C2",
+   "repo": "honojs/hono",
+   "class": "train-clean",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "1f707c56378a4497bc0a6a44fef5f5a8517fdf6b",
+     "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "train-C3",
+   "repo": "fastify/fastify",
+   "class": "train-clean",
+   "status": "resolved",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "f376f6082b5ddfe5ea96fdd3d98a66377b6bb4c2",
+     "source": "registered"
+    }
+   ]
+  }
+ ]
+}
