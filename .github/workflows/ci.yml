@@ -166,10 +166,10 @@ jobs:
         if: steps.gate.outputs.proceed == 'true'
       - name: lint
         if: steps.gate.outputs.proceed == 'true'
-        run: ruff check proofdeploy tests conformance
+        run: ruff check proofdeploy tests conformance readiness
       - name: typecheck
         if: steps.gate.outputs.proceed == 'true'
-        run: mypy proofdeploy conformance
+        run: mypy proofdeploy conformance readiness
       - name: Test manifest (WAL-109)
         # The exact-set partition proof, fast: the collected
         # suite must equal tests/expected_*_nodeids.txt and
