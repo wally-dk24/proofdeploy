@@ -147,8 +147,9 @@ For the dispatched repo, per registered side
 Materialization extracts the `git archive` tar with tarfile's
 `data` filter, which refuses absolute paths, `..` escapes and
 links pointing outside the tree — but it keeps in-tree relative
-symlinks. That keep-in-tree rule is the WO-8.4b proposal, which
-is still **awaiting Master's approval**; it is acceptable here
+symlinks. That keep-in-tree rule is the WO-8.4b rule,
+**approved by Master 2026-10-14 (WO-8.4b); the measured path adopts
+it only when WO-8.4b merges**. It is acceptable here
 only because this spike is readiness-only and evidence-only.
 The measured path is unchanged by this spike: it still refuses
 links.
