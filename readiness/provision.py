@@ -279,7 +279,7 @@ def provision_side(
     outcome; the raising paths are typed into the row."""
     fetch_sha(clone, str(side_spec["sha"]))
     harness_sha = commit_contract(clone, str(side_spec["sha"]), contract)
-    unit_dir = workdir / "units" / str(unit["unit_id"])
+    unit_dir = workdir / "units" / str(unit["unit_id"]) / f"a{attempt}"
     unit_dir.mkdir(parents=True, exist_ok=True)
     tag = _TAG_BY_ROLE[str(side_spec["role"])]
     side: Any = None
@@ -301,7 +301,7 @@ def provision_side(
             proc = side.provision.proc
             if proc is not None:
                 proc.stop()
-    dump_logs(f"readiness-{unit['unit_id']}-{tag}", logs)
+    dump_logs(f"readiness-{unit['unit_id']}-{tag}-a{attempt}", logs)
     return row
 
 
