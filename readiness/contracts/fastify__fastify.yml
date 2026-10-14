@@ -1,0 +1,3 @@
+build: "npm run build:validation"
+start: "node examples/simple.js"
+readiness: "/"

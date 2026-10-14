@@ -1,0 +1,3 @@
+build: "python -m pip install ."
+start: "django-admin"
+readiness: "/"
