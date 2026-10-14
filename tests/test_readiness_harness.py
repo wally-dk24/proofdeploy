@@ -34,6 +34,7 @@ import yaml
 import readiness.provision as rp
 from proofdeploy import orchestrator as orch_mod
 from proofdeploy.orchestrator import MeasureConfig, Orchestrator
+from proofdeploy.provisioning import NodeAdapter
 from proofdeploy.runner import ProvisionResult, ProvisionStatus
 from proofdeploy.yml import load_contract
 
@@ -192,6 +193,120 @@ def test_row_from_provision_build_failed_plan_refusal() -> None:
     assert row["last_error"] == "workspaces not yet supported"
     assert row["network_mode"] == "isolated"
     assert row["attempt"] == 2
+
+
+def test_row_from_provision_records_the_refusal_that_fired(
+    tmp_path: Path,
+) -> None:
+    # Directus shape (ten-repo re-run on c867b4b, WAL-119): a
+    # workspaces repo whose declared Node range is the bare "22",
+    # which no pinned image satisfies. The real Node plan for such
+    # a snapshot carries BOTH refusals — `refusal` ("workspaces not
+    # yet supported") and the sandbox-only `image_refusal` (the
+    # range refusal) — and the sandbox executor checks
+    # `image_refusal` before `plan.refusal` is ever consulted, so
+    # the side stops on the range refusal: that is its provision
+    # reason and the last line of its log. The row's typed reason
+    # must be the refusal that fired, not the plan field that
+    # never did (the re-run's Directus rows said "workspaces"
+    # while every log — and the rows' own last_error — ended with
+    # the range refusal).
+    snap = tmp_path / "snapshot"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "directus-shaped",
+                "engines": {"node": "22"},
+                "workspaces": ["packages/*"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snap / "pnpm-workspace.yaml").write_text(
+        "packages:\n  - 'packages/*'\n", encoding="utf-8"
+    )
+    (snap / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\n", encoding="utf-8"
+    )
+    plan = NodeAdapter().plan(snap, contract=None)
+    # The premise, from the real planner: both refusals on one plan.
+    assert plan.refusal == "workspaces not yet supported"
+    assert plan.image_refusal == (
+        "declared range 22 not satisfiable by pinned images"
+    )
+    assert plan.lockfile_name is None
+    side = _fake_side(
+        status=ProvisionStatus.BUILD_FAILED,
+        reason=plan.image_refusal,
+        plan=plan.to_dict(),
+        logs=[
+            "install plan: sha256 ... (adapter: node)",
+            str(plan.image_refusal),
+        ],
+    )
+    side.provision.runtime_version = None
+    side.sandbox_evidence = {}
+    row = rp.row_from_provision(
+        BUG_UNIT, BUG_UNIT["sides"][0], "h" * 40, 1, "none+socket", side
+    )
+    assert row["status"] == "BUILD_FAILED"
+    assert row["typed_reason"] == plan.image_refusal
+    assert row["last_error"] == plan.image_refusal
+
+
+def test_provision_side_row_agrees_with_its_log_on_both_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same Directus shape driven through the harness's per-side
+    # function: the row's typed reason must equal the last line of
+    # the side's own dumped pd-log (the refusal that fired), even
+    # though the attached plan also carries a `refusal` that never
+    # fired in the sandbox.
+    range_refusal = "declared range 22 not satisfiable by pinned images"
+    plan = {
+        "declared_range": "22",
+        "refusal": "workspaces not yet supported",
+        "image_refusal": range_refusal,
+    }
+
+    def fake_method(
+        self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
+    ) -> SimpleNamespace:
+        return _fake_side(
+            status=ProvisionStatus.BUILD_FAILED,
+            reason=range_refusal,
+            plan=plan,
+            logs=[
+                "install plan: sha256 ... (adapter: node)",
+                range_refusal,
+            ],
+            proc=_FakeProc(),
+        )
+
+    monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", fake_method)
+    monkeypatch.setattr(rp, "fetch_sha", lambda clone, sha: None)
+    monkeypatch.setattr(rp, "commit_contract", lambda clone, sha, c: "h" * 40)
+    monkeypatch.chdir(tmp_path)
+
+    cfg = MeasureConfig(
+        repo_dir=tmp_path,
+        output_dir=tmp_path / "records",
+        workdir=tmp_path / "work",
+        no_skill=True,
+        sandbox=True,
+    )
+    orch = Orchestrator(cfg)
+    row = rp.provision_side(
+        orch, tmp_path, BUG_UNIT, BUG_UNIT["sides"][0],
+        Path("contract.yml"), 1, tmp_path / "work", "none+socket",
+    )
+    assert row["status"] == "BUILD_FAILED"
+    assert row["typed_reason"] == range_refusal
+    log_text = (
+        tmp_path / "pd-logs" / "readiness-T2-fix-parent-a1.log"
+    ).read_text(encoding="utf-8")
+    assert log_text.splitlines()[-1] == row["typed_reason"]
 
 
 def test_row_from_exception_types_runtime_detection() -> None:
