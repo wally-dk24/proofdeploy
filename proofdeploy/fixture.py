@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import posixpath
 import shutil
 import subprocess
 import tarfile
@@ -132,18 +134,119 @@ def _sha256_file(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-def _check_snapshot_tree(snap: Path) -> None:
-    """Fail closed on anything that could smuggle history or outside content.
+# ---------------------------------------------------------------------------
+# Symlink handling (WO-8.4b; Master's decision, docs/adr/0012).
+#
+# 1. A symlink in a snapshot is kept only if its target is relative and
+#    resolves inside the snapshot tree.
+# 2. Anything else is refused, with a typed reason naming the path. That
+#    covers absolute targets and targets that escape the tree through
+#    `..` or chained links.
+# 3. The probe author's bundle never follows links: link entries are
+#    omitted from the bundle entirely and recorded in the manifest.
+# ---------------------------------------------------------------------------
 
-    Refuses `.git` at any depth (a submodule or vendored checkout can carry
-    history in a nested `.git`) and refuses symlinks altogether (`copytree`
-    would otherwise follow a link pointing outside the snapshot).
+# Typed refusal reasons for snapshot symlinks (WO-8.4b rule 2).
+LINK_TARGET_ABSOLUTE = "symlink-target-absolute"
+LINK_TARGET_ESCAPES = "symlink-target-escapes-tree"
+LINK_RESOLUTION_LOOP = "symlink-resolution-loop"
+
+_MAX_LINK_HOPS = 40
+
+
+class SnapshotLinkError(ValueError):
+    """A snapshot symlink fails the WO-8.4b rule: typed reason + the path."""
+
+    def __init__(self, path: str, target: str, reason: str) -> None:
+        self.path = path
+        self.target = target
+        self.reason = reason
+        super().__init__(f"snapshot symlink refused ({reason}): {path} -> {target}")
+
+
+def _resolve_link_target(
+    links: dict[str, str], link_rel: str, target: str
+) -> tuple[list[str] | None, str | None]:
+    """Resolve ``target`` component-wise over the tree's symlink map.
+
+    ``links`` maps posix relative paths to their target strings. Returns
+    ``(parts, None)`` with the final path's components — every component
+    real, symlink components substituted eagerly exactly as the kernel
+    resolves them, so the result is inside the tree by construction —
+    or ``(None, reason)`` when the target is absolute, escapes the
+    tree, or chains past the hop cap. The decision never touches the
+    filesystem, so it is identical for a tar stream mid-extraction and
+    for a materialized tree.
     """
-    for p in snap.rglob("*"):
-        if p.name == ".git":
-            raise ValueError(f"snapshot must not contain .git history: {p}")
-        if p.is_symlink():
-            raise ValueError(f"snapshot must not contain symlinks: {p}")
+    if posixpath.isabs(target):
+        return None, LINK_TARGET_ABSOLUTE
+    parts: list[str] = link_rel.split("/")[:-1]  # the link's own directory
+    todo: list[str] = target.split("/")
+    hops = 0
+    while todo:
+        comp = todo.pop(0)
+        if comp in ("", "."):
+            continue
+        if comp == "..":
+            if not parts:
+                return None, LINK_TARGET_ESCAPES
+            parts.pop()
+            continue
+        parts.append(comp)
+        cur = "/".join(parts)
+        if cur in links:
+            hops += 1
+            if hops > _MAX_LINK_HOPS:
+                return None, LINK_RESOLUTION_LOOP
+            hop_target = links[cur]
+            if posixpath.isabs(hop_target):
+                return None, LINK_TARGET_ABSOLUTE
+            parts.pop()  # substitute the link component with its target
+            todo = hop_target.split("/") + todo
+    return parts, None
+
+
+def _validate_snapshot_link(links: dict[str, str], link_rel: str) -> None:
+    """Raise SnapshotLinkError unless the link obeys WO-8.4b rule 1."""
+    _parts, reason = _resolve_link_target(links, link_rel, links[link_rel])
+    if reason is not None:
+        raise SnapshotLinkError(link_rel, links[link_rel], reason)
+
+
+def _scan_snapshot_tree(snap: Path) -> tuple[list[Path], list[Path], dict[str, str]]:
+    """Enumerate a snapshot tree without ever following a link.
+
+    Returns ``(dirs, files, links)``: real directories and regular
+    files as paths, and the symlink map ``{posix rel path: target}``.
+    Refuses `.git` at any depth (a submodule or vendored checkout can
+    carry history in a nested `.git`) and any symlink failing the
+    WO-8.4b rule (SnapshotLinkError naming the path).
+    """
+    dirs: list[Path] = []
+    files: list[Path] = []
+    links: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(snap, followlinks=False):
+        base = Path(dirpath)
+        for name in list(dirnames):
+            p = base / name
+            if name == ".git":
+                raise ValueError(f"snapshot must not contain .git history: {p}")
+            if p.is_symlink():
+                links[p.relative_to(snap).as_posix()] = os.readlink(p)
+                dirnames.remove(name)  # never descend through a link
+            else:
+                dirs.append(p)
+        for name in filenames:
+            p = base / name
+            if name == ".git":
+                raise ValueError(f"snapshot must not contain .git history: {p}")
+            if p.is_symlink():
+                links[p.relative_to(snap).as_posix()] = os.readlink(p)
+            else:
+                files.append(p)
+    for rel in sorted(links):
+        _validate_snapshot_link(links, rel)
+    return dirs, files, links
 
 
 def _tree_hash(root: Path) -> str:
@@ -206,17 +309,21 @@ def create_snapshot(
     to smuggle by construction.
 
     The archive streams through a pipe (never fully buffered in memory) and
-    each member is validated before extraction: symlinks, hardlinks, and
+    each member is validated before extraction: hardlinks and
     non-file/non-dir members are refused outright, and any member whose
-    path would escape output_dir raises.
+    path would escape output_dir raises. Symlink members are DEFERRED
+    until every file is extracted, then validated against the WO-8.4b
+    rule (target relative and resolving inside the tree, chains
+    included) and created as symlinks; a symlink failing the rule
+    raises SnapshotLinkError with a typed reason naming the path.
 
     Returns the snapshot directory and the resolved full SHA. Pass the SHA
     as `source_sha` to `assemble_author_bundle` so the manifest records
     exactly which commit the snapshot came from.
 
     Fail-closed: unknown rev, non-empty output dir, `git archive` failure,
-    or an archive member that is a link or would extract outside output_dir
-    all raise.
+    a hardlink or escaping archive member, or a symlink member failing
+    the WO-8.4b rule all raise.
     """
     repo = Path(repo_dir)
     out = Path(output_dir)
@@ -238,17 +345,24 @@ def create_snapshot(
         stderr=subprocess.PIPE,
     )
     stderr = b""
+    links: dict[str, str] = {}
     try:
         assert proc.stdout is not None  # for mypy: Popen with PIPE sets it
         with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
             for member in tf:
-                if member.issym() or member.islnk():
-                    raise ValueError(f"archive member is a link, refused: {member.name}")
-                if not (member.isfile() or member.isdir()):
+                if member.islnk():
+                    raise ValueError(f"archive member is a hardlink, refused: {member.name}")
+                if not (member.isfile() or member.isdir() or member.issym()):
                     raise ValueError(f"archive member is not a file or dir, refused: {member.name}")
                 target = (out / member.name).resolve()
                 if not str(target).startswith(str(out_resolved) + "/"):
                     raise ValueError(f"archive member escapes snapshot dir: {member.name}")
+                if member.issym():
+                    # Deferred: no link exists on disk during extraction,
+                    # so the resolve() above stays purely lexical, and the
+                    # chain check sees the archive's complete link map.
+                    links[posixpath.normpath(member.name)] = member.linkname
+                    continue
                 tf.extract(member, out)
     except Exception:
         # Validation failed mid-stream: the producer may be blocked writing
@@ -267,6 +381,14 @@ def create_snapshot(
         _, stderr = proc.communicate()
     if proc.returncode != 0:
         raise ValueError(f"git archive {sha} failed in {repo}: {stderr.decode().strip()}")
+    # Every file is extracted and the producer reaped clean: validate
+    # the deferred symlinks against the WO-8.4b rule (all-or-nothing —
+    # validate the whole map before creating any link), then create
+    # them with their target strings verbatim.
+    for rel in sorted(links):
+        _validate_snapshot_link(links, rel)
+    for rel in sorted(links):
+        os.symlink(links[rel], out / rel)
     return Snapshot(dir=out, sha=sha)
 
 
@@ -311,10 +433,18 @@ def assemble_author_bundle(
     fixture_template {file, sha256} so the answer-key check can recompute
     it from the contract and refuse a mismatch.
 
+    WO-8.4b rule 3: the bundle never follows links. Link entries in the
+    snapshot are omitted from the bundle copy entirely — no content
+    reaches the author through a link — and each omitted link is
+    recorded in the manifest as its path and target string
+    (`omitted_links`). A snapshot symlink failing rule 1/2 (absolute,
+    escaping, or looping target) refuses assembly outright
+    (SnapshotLinkError naming the path).
+
     Fail-closed throughout: template hash mismatch, skill hash mismatch,
-    non-empty output dir, `.git` at any depth in the snapshot, symlinks in
-    the snapshot, or a final bundle whose contents differ from the allowlist
-    all raise.
+    non-empty output dir, `.git` at any depth in the snapshot, a symlink
+    failing the WO-8.4b rule, or a final bundle whose contents differ
+    from the allowlist all raise.
     """
     tpath = Path(template_file) if template_file else template_path()
     actual_hash = hashlib.sha256(tpath.read_bytes()).hexdigest()
@@ -330,7 +460,7 @@ def assemble_author_bundle(
         raise ValueError(f"diff not found: {diff_p}")
     if not snap_p.is_dir():
         raise ValueError(f"snapshot dir not found: {snap_p}")
-    _check_snapshot_tree(snap_p)
+    snap_dirs, snap_files, snap_links = _scan_snapshot_tree(snap_p)
     _check_output_dir(out)
 
     description = render_description(tpath.read_text(encoding="utf-8"), yml_fixture)
@@ -341,10 +471,19 @@ def assemble_author_bundle(
     out_desc = out / "fixture-description.txt"
     out_skill = out / "skill-author.md"
     shutil.copyfile(diff_p, out_diff)
-    # copytree without symlinks=True never creates symlinks, but the source
-    # tree was already checked above; re-check the copy belt and braces.
-    shutil.copytree(snap_p, out_snap)
-    _check_snapshot_tree(out_snap)
+    # Copy the snapshot file-by-file from the scan: directories and
+    # regular files only. Link entries are omitted entirely (WO-8.4b
+    # rule 3) — copytree is not used because it would follow links and
+    # copy target content into the bundle. Re-scan the copy belt and
+    # braces: it must hold exactly the scanned files and no links.
+    out_snap.mkdir(parents=True, exist_ok=True)
+    for d in snap_dirs:
+        (out_snap / d.relative_to(snap_p)).mkdir(parents=True, exist_ok=True)
+    for f in snap_files:
+        shutil.copy2(f, out_snap / f.relative_to(snap_p))
+    _copy_dirs, copy_files, copy_links = _scan_snapshot_tree(out_snap)
+    if copy_links or len(copy_files) != len(snap_files):
+        raise ValueError("bundle snapshot copy does not match the scanned source tree")
     out_desc.write_text(description, encoding="utf-8")
 
     # The generated author copy goes in the bundle; its hash is verified
@@ -381,6 +520,12 @@ def assemble_author_bundle(
         "fixture_template": {"file": tpath.name, "sha256": actual_hash},
         "allowlist": list(allowlist),
         "snapshot_tree_sha256": _tree_hash(out_snap),
+        # WO-8.4b rule 3: every link omitted from the bundle, recorded
+        # as its path and its target string. The manifest sits next to
+        # the bundle, never inside it, so this reaches no author.
+        "omitted_links": [
+            {"path": rel, "target": snap_links[rel]} for rel in sorted(snap_links)
+        ],
         "files": {
             "diff.patch": _sha256_file(out_diff),
             "fixture-description.txt": _sha256_file(out_desc),
