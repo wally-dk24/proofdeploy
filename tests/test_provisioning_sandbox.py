@@ -240,25 +240,45 @@ def test_sandbox_executor_uses_pinned_image_from_plan(monkeypatch, tmp_path):
     assert row.pinned_ref in seen_images
 
 
-def test_sandbox_executor_refuses_bun_plan(monkeypatch, tmp_path):
-    """WO-7 PR 2: Node plans now run in the sandbox (npm/pnpm/yarn);
-    a plan whose manager the sandbox cannot run (bun) still fails
-    closed, with the plan recorded and no install attempted.
+def test_sandbox_executor_runs_bun_plan(monkeypatch, tmp_path):
+    """Plan 1.2e (D22): a bun plan runs in the sandbox (before
+    1.2e this asserted the fail-closed refusal "not yet supported
+    in the sandbox" with no install attempted — the behavior the
+    plan line replaces). The install phase the executor issues is
+    the plan's digest-pinned bun bootstrap followed by the frozen
+    install through the persisted bun binary.
     """
     from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.sandbox import Sandbox, SandboxError
 
     snap = tmp_path / "snap"
     snap.mkdir()
-    (snap / "package.json").write_text('{"name": "t"}\n')
-    (snap / "bun.lock").write_bytes(b"\x00bun")
+    (snap / "package.json").write_text(
+        '{"name": "t", "packageManager": "bun@1.4.3"}\n'
+    )
+    (snap / "bun.lock").write_text('{"lockfileVersion": 1}\n')
     cap = _CaptureInstall()
     orch, _ = _stub_sandbox_side(monkeypatch, snap, cap)
+
+    def _stop_after_install(self, *a, **k):
+        raise SandboxError("test stops after install")
+
+    monkeypatch.setattr(Sandbox, "start", _stop_after_install)
     side = orch._provision_side_sandbox("fakerev", 18092, snap / "unit", "t")
-    assert side.provision.status == ProvisionStatus.BUILD_FAILED
-    assert side.provision.reason == "not yet supported in the sandbox"
+    # Reached the start phase (stubbed to fail there): NOT refused.
+    assert side.provision.status == ProvisionStatus.START_FAILED
+    assert side.provision.package_manager == "bun"
     assert side.provision.install_plan is not None
     assert side.provision.install_plan["adapter"] == "node"
-    assert cap.commands == [], "no install may run for a refused plan"
+    assert side.provision.install_plan["bun_version"] == "1.4.3"
+    installs = [d for d in cap.descriptors if d["phase"] == "install"]
+    assert len(installs) == 2
+    bootstrap, frozen = installs
+    assert bootstrap["argv_rendered"][:2] == ["bash", "-c"]
+    assert "sha256sum -c" in bootstrap["argv_rendered"][2]
+    assert frozen["argv_rendered"] == [
+        "/checkout/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,20 @@ do userns remapping (this sandbox: newuidmap EPERM), it falls back to
 ``no-new-privileges``, and records the limitation. Set
 ``require_userns=True`` to fail closed instead.
 
+Checkout ownership (plan 1.2(g)): under ``--uidmap 0:1:65536`` the
+container's root is NOT the owner of the checkout's files — the files
+belong to the invoking host user, whose uid is shifted out of the
+owner position by the mapping — and ``--cap-drop=ALL`` leaves no
+CAP_FOWNER, so a bare ``chmod`` on a committed file is EPERM inside
+the install (pnpm's linkBin chmods workspace members' bin files in
+place; Directus's frozen install died there). Creating files works
+regardless (the tree is made world-writable), which is why installs
+ran deep before failing. The fix is in :meth:`Sandbox._prepare_checkout`:
+before provisioning, the disposable snapshot's ownership is
+transferred to the mapped runtime uid (``podman unshare chown``), so
+the install process owns the files it provisions. The mapping, the
+capability sets, the mounts and the networks are unchanged.
+
 Customer secrets never enter the container environment. The contract
 env passed to the sandbox must already be secret-free (the
 orchestrator passes only declared-public config); auth tokens travel
@@ -721,6 +735,13 @@ class Sandbox:
     # reason's first-error scan reads that step only — never an
     # earlier step's or another phase's error lines.
     failed_step_output: str | None = field(default=None, repr=False)
+    # Checkouts whose ownership was already transferred to the
+    # sandbox's mapped runtime uid (plan 1.2(g)); _prepare_checkout
+    # runs once per phase, and the transfer must happen only once
+    # per checkout for a given Sandbox.
+    _ownership_transferred: set[str] = field(
+        default_factory=set, repr=False
+    )
 
     def __post_init__(self) -> None:
         scrubbed = _ScrubLog(self.secret_values)
@@ -915,6 +936,70 @@ class Sandbox:
             )
         except (OSError, subprocess.TimeoutExpired) as e:
             self.log.append(f"chmod checkout failed: {e}")
+        self._own_checkout_for_sandbox(checkout)
+
+    def _own_checkout_for_sandbox(self, checkout: Path) -> None:
+        """Transfer the checkout's ownership to the sandbox runtime uid.
+
+        Plan 1.2(g). Under ``--uidmap 0:1:65536`` (rootless), container
+        uid 0 is the invoking user's FIRST SUBORDINATE uid, and the
+        invoking user — who owns every file in the materialized
+        snapshot — is not in the map at all; under rootful podman the
+        same args map container root to host uid 1, again not the
+        owner. The install process therefore owns none of the
+        pre-existing checkout files, and chmod(2) — which requires
+        euid == file owner or CAP_FOWNER over the inode's user
+        namespace, both absent under ``--cap-drop=ALL`` — fails with
+        EPERM on any committed file (pnpm's linkBin chmodding a
+        workspace member's own bin file is where Directus's frozen
+        install died). Files the install CREATES are owned by the
+        mapped uid, which is why installs ran deep before failing.
+
+        ``podman unshare`` runs a command in the rootless user
+        namespace whose coordinates are defined by the same relative
+        mapping the run uses: in-namespace uid/gid 1 IS the first
+        subordinate id — the real host id container root runs as.
+        Chowning the disposable snapshot to 1:1 there makes the
+        install process the owner of every file it provisions, with
+        no change to the uidmap, the capability sets, the mounts or
+        the networks. The snapshot is a copy; the source repository
+        is never touched. Best-effort and logged, in the house style
+        of the chmod above: a failed transfer surfaces later as the
+        install's own error, never as a new exception here.
+        """
+        key = str(checkout)
+        if key in self._ownership_transferred:
+            return
+        if not self._capabilities().userns_remap:
+            # Nobody-fallback mode runs as --user 65534 with no
+            # mapping to transfer ownership into; nothing to do.
+            return
+        try:
+            if checkout.stat().st_uid != os.getuid():
+                # No longer owned by the invoking user: a previous
+                # Sandbox already transferred this checkout.
+                self._ownership_transferred.add(key)
+                return
+        except OSError:
+            return
+        ok, reason = _run(
+            _podman_base()
+            + ["unshare", "chown", "-R", "1:1", str(checkout)],
+            300,
+            self.log,
+        )
+        if ok:
+            self._ownership_transferred.add(key)
+            self.log.append(
+                "checkout ownership: transferred to the sandbox "
+                "runtime uid (podman unshare chown 1:1; plan 1.2(g))"
+            )
+        else:
+            self.log.append(
+                "checkout ownership transfer failed "
+                f"({reason}); installs that chmod committed files "
+                "will fail with EPERM (plan 1.2(g))"
+            )
 
     def install(
         self,

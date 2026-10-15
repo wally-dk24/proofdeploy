@@ -177,6 +177,43 @@ login/refresh provider, collected into the record's redaction set,
 and named in the evidence record's `auth_bootstrap` field as
 "generated" with their env names — never their values).
 
+#### Checkout ownership in the sandbox (plan 1.2(g), 2026-10-15)
+
+The 2026-10-15 readiness re-run showed Directus's frozen pnpm
+install running deep, then failing: `EPERM: operation not
+permitted, chmod '/checkout/packages/extensions-sdk/cli.js'` in
+pnpm's linkBin, which chmods a workspace member's own bin file in
+place. Root cause: sandbox containers run with
+`--uidmap 0:1:65536`, under which container root is NOT the owner
+of the checkout's files — with rootless podman it is the invoking
+user's first subordinate uid (and the invoking user, who owns the
+materialized snapshot, is not in the map at all); with rootful
+podman it is host uid 1. chmod(2) requires the caller's euid to
+equal the file's owner or hold CAP_FOWNER over the inode's user
+namespace; `--cap-drop=ALL` removes the capabilities, so chmod on
+any pre-existing (committed) file is EPERM. Creating files
+succeeded all along — the tree is made world-writable — and files
+the install creates are owned by the mapped uid, which is why
+installs ran deep before failing at the first chmod of a
+committed file.
+
+Decision (posture change, recorded here): before provisioning,
+the sandbox transfers ownership of the disposable snapshot copy
+to the mapped runtime uid (`podman unshare chown -R 1:1`, in
+`Sandbox._prepare_checkout`; in-namespace 1:1 is the first
+subordinate id — the real host id container root runs as under
+the same relative mapping). The install process now OWNS the
+files it provisions. What does NOT change: the uidmap itself
+(`0:1:65536`; container root still never maps to the invoking
+user or to host root), every capability set (install keeps
+`--cap-drop=ALL` plus the D15 build-only set where it applies;
+the app run stays `--cap-drop=ALL`), the mounts (only the
+checkout), and the network modes. The transfer applies to the
+snapshot copy only — snapshots are `git archive` extracts created
+for the run; the source repository is never touched. The nobody
+fallback (`--user 65534`, dev-only opt-out) has no mapping to
+transfer into and is unchanged.
+
 ### Schema version
 
 Every record (evidence, score, judgment) and every per-probe result

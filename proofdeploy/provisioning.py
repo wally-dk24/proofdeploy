@@ -106,6 +106,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import platform
 import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -348,6 +349,15 @@ class InstallPlan:
     # evidence, not plan data: the readiness harness records it
     # (readiness/provision.py, REG-D D4).
     regd: dict[str, Any] | None = None
+    # Plan 1.2e (D22): set on bun plans — the selected bun version
+    # (the app's packageManager pin when declared, else the pin
+    # table's default) and the sha256 of the pinned release
+    # artifact the bootstrap step verifies before unpacking
+    # (BUN_RELEASE_SHA256). The version is recorded even when the
+    # app declared none: the plan/record always names the exact
+    # bun that will run the frozen install.
+    bun_version: str | None = None
+    bun_sha256: str | None = None
     # Workspace facts (plan 1.2b; both None on a non-workspace plan).
     # workspace_root is the directory the frozen install runs in,
     # relative to the checkout root ("." — installs always run at
@@ -1664,6 +1674,102 @@ COREPACK_BIN = "{checkout}/.pd-tools/node_modules/.bin/corepack"
 # honor npm_config_nodedir; it is plan data, so it is recorded.
 NODE_INSTALL_ENV = {"npm_config_nodedir": "/usr/local"}
 
+# Plan 1.2e (D22): bun is pinned BY DIGEST. Bun ships as a single
+# binary in a zip on the oven-sh/bun GitHub releases page; this
+# table is the committed pin — bun version -> machine architecture
+# -> (release artifact, sha256 of that artifact) — resolved from
+# the release's own SHASUMS256.txt and verified against the
+# downloaded artifacts when the rows were added (ADR-0014). The
+# bootstrap step downloads the artifact into the checkout's
+# .pd-tools, verifies the sha256 before unpacking, and installs
+# the binary at BUN_BIN: the Addendum 35 persisted-tools pattern,
+# like the corepack bootstrap above and the Python managers'
+# hash-pinned bootstrap requirements files. A bun version with no
+# row here is REFUSED at plan time (typed) — there is no unpinned
+# bun install, and no fallback to another manager.
+BUN_RELEASE_SHA256: dict[str, dict[str, tuple[str, str]]] = {
+    "1.4.3": {
+        "x86_64": (
+            "bun-linux-x64.zip",
+            "3e730528d89775f03f87f05c06787c4df4099d0a37f3f252e7b829cb23816e18",
+        ),
+        "aarch64": (
+            "bun-linux-aarch64.zip",
+            "efa9813da5ed72423bf847f916e8d2c47c0d776add972354026a75e10da9aa21",
+        ),
+    },
+    "1.3.14": {
+        "x86_64": (
+            "bun-linux-x64.zip",
+            "951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f",
+        ),
+        "aarch64": (
+            "bun-linux-aarch64.zip",
+            "a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b",
+        ),
+    },
+    "1.2.19": {
+        "x86_64": (
+            "bun-linux-x64.zip",
+            "c3d3c14e9a5ec83ff67d0acfe76e4315ad06da9f34f59fc7b13813782caf1f66",
+        ),
+        "aarch64": (
+            "bun-linux-aarch64.zip",
+            "fcfd471cdbd5a78fd4a390e29cccd2bb7004a49d352ba037af3b61d4fd5d0b83",
+        ),
+    },
+}
+
+# The bun version a bun.lock repo gets when its packageManager
+# field does not pin one: the newest row of the pin table. The
+# selected version is recorded on the plan either way (D22).
+BUN_DEFAULT_VERSION = "1.4.3"
+BUN_BIN = "{checkout}/.pd-tools/bin/bun"
+_BUN_RELEASE_URL = (
+    "https://github.com/oven-sh/bun/releases/download/"
+    "bun-v{version}/{artifact}"
+)
+
+
+def _bun_bootstrap_step(
+    version: str, artifact: str, sha256: str
+) -> PlanStep:
+    """The persisted bun bootstrap (plan 1.2e): one ``bash -c``
+    argv step (the shape of the Python managers' ``-c`` code
+    steps) that downloads the pinned release zip into the
+    checkout's .pd-tools, verifies its sha256 against the
+    committed pin, and unpacks the binary to BUN_BIN. Any failure
+    (download, digest mismatch, unpack) fails the step: the
+    frozen install never runs against an unverified bun.
+    Non-interactive throughout (curl -f, unzip -o). When the
+    sandbox's intercepting proxy is in play the plan's CA
+    (SSL_CERT_FILE, set by the executor's install env) is handed
+    to curl explicitly; on a plain network it rides the image's
+    own trust store.
+    """
+    url = _BUN_RELEASE_URL.format(version=version, artifact=artifact)
+    bindir = artifact.removesuffix(".zip")
+    script = (
+        "set -e; "
+        "d={checkout}/.pd-tools; "
+        "mkdir -p $d/bin $d/.bun-dist; "
+        'cacert=""; '
+        'if [ -n "${SSL_CERT_FILE:-}" ] && [ -f "$SSL_CERT_FILE" ]; '
+        'then cacert="--cacert $SSL_CERT_FILE"; fi; '
+        f"curl -fsSL $cacert {url} -o $d/bun.zip; "
+        f'echo "{sha256}  $d/bun.zip" | sha256sum -c -; '
+        "unzip -o -q $d/bun.zip -d $d/.bun-dist; "
+        f"cp $d/.bun-dist/{bindir}/bun $d/bin/bun; "
+        "chmod +x $d/bin/bun; "
+        "rm -rf $d/bun.zip $d/.bun-dist; "
+        "$d/bin/bun --version"
+    )
+    return PlanStep(
+        phase="install",
+        argv=["bash", "-c", script],
+        env=dict(NODE_INSTALL_ENV),
+    )
+
 
 class NodeAdapter:
     """Node: frozen installs planned from the lockfile.
@@ -1674,6 +1780,15 @@ class NodeAdapter:
       ``pnpm install --frozen-lockfile``; ``yarn.lock`` -> ``yarn
       install --frozen-lockfile`` (classic) or ``--immutable``
       (berry), via runner.select_package_manager.
+    - ``bun.lock`` -> ``bun install --frozen-lockfile`` (plan
+      1.2e, D22), run by a bun binary the plan itself bootstraps
+      into the checkout's .pd-tools, pinned BY DIGEST
+      (BUN_RELEASE_SHA256): the version comes from the app's
+      ``packageManager`` pin when declared, else the pin table's
+      default, and the selected version + artifact digest are
+      recorded on the plan. A bun version with no digest pin is a
+      typed refusal. ``bun.lockb`` (the legacy binary lockfile)
+      is a typed refusal: only the text ``bun.lock`` is planned.
     - A ``packageManager`` pin renders the install through corepack
       at the exact pinned version (deterministically, as plan data —
       never dependent on the planning host's own corepack), with
@@ -1766,9 +1881,10 @@ class NodeAdapter:
         ``packageManager`` pin select the manager exactly as for
         a single-package repo, the frozen install runs at the
         root, and the contract steps are scoped to the member.
-        Managers without workspace support here (yarn, bun) are a
-        typed refusal naming the manager — bun joins the
-        supported set under plan 1.2e without an interface change.
+        Managers without workspace support here (yarn) are a
+        typed refusal naming the manager; bun joined the
+        supported set under plan 1.2e, through this same method
+        and with no interface change.
         """
         # The cutoff is threaded for REG-D only, exactly as in
         # plan(): evaluated solely when a contract step declares
@@ -1854,14 +1970,30 @@ class NodeAdapter:
                 ),
             )
         lockfile_name, lockfile_sha = found
+        if lockfile_name == "bun.lockb":
+            # Plan 1.2e (D22): the legacy BINARY bun lockfile is
+            # refused, typed. Equivalence with the text bun.lock
+            # cannot be proven from the plan's side (the format is
+            # opaque and version-stamped by the bun that wrote it),
+            # so there is no frozen install from it — never a
+            # silent fall-back and never a generated lockfile.
+            return InstallPlan(
+                **base,
+                refusal=(
+                    "bun.lockb (the legacy binary bun lockfile) is "
+                    "not supported: bun installs are planned from "
+                    "bun.lock only — regenerate the lockfile with "
+                    "a current bun and commit bun.lock"
+                ),
+            )
         manager, argv = select_package_manager(
             snapshot_dir, "node", lockfile_name
         )
-        if app_path is not None and manager not in ("pnpm", "npm"):
+        if app_path is not None and manager not in ("pnpm", "npm", "bun"):
             # Workspace support is implemented for pnpm and npm
-            # (plan 1.2b); another manager's workspace is a typed
-            # refusal naming it — never a silent fall-back. (bun
-            # joins this set under plan 1.2e.)
+            # (plan 1.2b) and bun (plan 1.2e); another manager's
+            # workspace is a typed refusal naming it — never a
+            # silent fall-back.
             return InstallPlan(
                 **base,
                 refusal=(
@@ -1894,6 +2026,47 @@ class NodeAdapter:
         # Addendum 37: EVERY Node install step carries the nodedir
         # env (compile fallback against the image's own headers).
         step_env: dict[str, str] = dict(NODE_INSTALL_ENV)
+        bun_version: str | None = None
+        bun_sha256: str | None = None
+        bun_bootstrap: PlanStep | None = None
+        if manager == "bun":
+            # Plan 1.2e (D22): bun is not on the pinned Node image
+            # and is not corepack-distributed, so the plan
+            # bootstraps it into the checkout's .pd-tools, pinned
+            # by digest. The version aligns to the app: its own
+            # packageManager pin when declared, else the pin
+            # table's default. No digest pin for the selected
+            # version is a typed refusal — bun is never installed
+            # unpinned, and the frozen install never falls back
+            # to another manager.
+            bun_version = (
+                pm_version if pm_name == "bun" else None
+            ) or BUN_DEFAULT_VERSION
+            row = BUN_RELEASE_SHA256.get(bun_version)
+            if row is None:
+                return InstallPlan(
+                    **base,
+                    refusal=(
+                        f"no pinned digest for bun@{bun_version}: "
+                        "bun is pinned by digest (BUN_RELEASE_SHA256) "
+                        "and this version has no pin; refusing to "
+                        "install an unpinned bun"
+                    ),
+                )
+            release = row.get(platform.machine())
+            if release is None:
+                return InstallPlan(
+                    **base,
+                    refusal=(
+                        f"no pinned bun build for architecture "
+                        f"{platform.machine()!r} (bun@{bun_version})"
+                    ),
+                )
+            artifact, bun_sha256 = release
+            bun_bootstrap = _bun_bootstrap_step(
+                bun_version, artifact, bun_sha256
+            )
+            argv = [BUN_BIN, "install", "--frozen-lockfile"]
         pinned = bool(
             pm_name == manager
             and pm_version
@@ -1937,6 +2110,11 @@ class NodeAdapter:
                     env=dict(NODE_INSTALL_ENV),
                 )
             )
+        if bun_bootstrap is not None:
+            # Plan 1.2e: the digest-pinned bun bootstrap precedes
+            # the frozen install, in persisted (.pd-tools) form,
+            # exactly like the corepack bootstrap above.
+            steps.append(bun_bootstrap)
         steps.append(PlanStep(phase="install", argv=argv, env=step_env))
         # Plan 1.2b: a workspace plan scopes the contract steps to
         # the app member (cwd relative to the root; "." and None
@@ -1958,7 +2136,7 @@ class NodeAdapter:
             # member's dependencies there) persists alongside the
             # root's.
             persisted.append(f"{step_cwd}/node_modules")
-        if corepack_version:
+        if corepack_version or bun_bootstrap is not None:
             persisted.append(".pd-tools")
         return InstallPlan(
             **base,
@@ -1971,6 +2149,8 @@ class NodeAdapter:
             corepack_version=corepack_version,
             npm_flags=npm_flags,
             regd=regd,
+            bun_version=bun_version,
+            bun_sha256=bun_sha256,
             workspace_root="." if app_path is not None else None,
             app_path=app_path,
             steps=steps,

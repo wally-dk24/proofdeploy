@@ -69,6 +69,10 @@ FROZEN_INSTALL = {
     # same corepack-pinned pnpm as node-pnpm-sqlite.
     "node-pnpm-monorepo": ["/checkout/.pd-tools/node_modules/.bin/corepack",
                            "pnpm@9.15.0", "install", "--frozen-lockfile"],
+    # Plan 1.2e: bun runs from the plan's digest-pinned bootstrap
+    # in the persisted .pd-tools, never a floating system bun.
+    "node-bun-sqlite": ["/checkout/.pd-tools/bin/bun",
+                        "install", "--frozen-lockfile"],
 }
 
 # The concrete install error each ecosystem prints when the lockfile
@@ -78,6 +82,10 @@ MISMATCH_MARKERS = {
     "node-pnpm-sqlite": "OUTDATED_LOCKFILE",
     "python-flask-sqlite": "DO NOT MATCH",
     "node-pnpm-monorepo": "OUTDATED_LOCKFILE",
+    # bun's frozen-install mismatch error, verified against the
+    # pinned bun 1.4.3: "error: lockfile had changes, but
+    # lockfile is frozen".
+    "node-bun-sqlite": "lockfile had changes",
 }
 
 
