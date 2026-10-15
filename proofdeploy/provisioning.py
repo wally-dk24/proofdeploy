@@ -1487,7 +1487,7 @@ class PythonAdapter:
                 declared_range=det.declared_range,
                 **image,
                 refusal=(
-                    "no frozen lockfile found in snapshot "
+                    "not supported: no frozen lockfile found in snapshot "
                     "for runtime 'python'"
                 ),
             )
@@ -1990,7 +1990,7 @@ class NodeAdapter:
             return InstallPlan(
                 **base,
                 refusal=(
-                    "no frozen lockfile found in snapshot "
+                    "not supported: no frozen lockfile found in snapshot "
                     "for runtime 'node'"
                 ),
             )
