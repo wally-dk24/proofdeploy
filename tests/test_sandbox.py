@@ -823,6 +823,64 @@ def test_install_home_is_pd_home_with_sibling_mount(monkeypatch, tmp_path):
     assert not [a for a in app_args if ".sandbox-home" in a]
 
 
+def test_install_pins_pnpm_store_into_pd_home(monkeypatch, tmp_path):
+    """Plan 1.2(k): pnpm's cross-device store fallback would put
+    its store at /checkout/.pnpm-store (the checkout mount's
+    root); with no app-declared store location, install
+    containers carry a store pin into /pd-home through pnpm's
+    env config channel."""
+    _patch_sandbox_caps(
+        monkeypatch, userns_remap=True, build_network=True
+    )
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    (checkout / "package.json").write_text("{}")
+    assert sb.install(
+        checkout, ["echo hi"], env={}, proxy_env={}, timeout=60
+    )
+    args = _install_run_args(fake)
+    assert (
+        f"npm_config_store_dir={PD_HOME_CONTAINER}/.pnpm-store" in args
+    )
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        (".npmrc", "store-dir=/the/apps/own/store\n"),
+        ("pnpm-workspace.yaml", "storeDir: /the/apps/own/store\n"),
+    ],
+)
+def test_install_respects_app_declared_pnpm_store(
+    monkeypatch, tmp_path, declaration
+):
+    """Plan 1.2(k), generic alignment: an app that declares its
+    own store location (``store-dir`` in .npmrc, ``storeDir`` in
+    pnpm-workspace.yaml) keeps its choice — no sandbox store
+    env is injected over it."""
+    _patch_sandbox_caps(
+        monkeypatch, userns_remap=True, build_network=True
+    )
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    (checkout / "package.json").write_text("{}")
+    name, content = declaration
+    (checkout / name).write_text(content)
+    assert sb.install(
+        checkout, ["echo hi"], env={}, proxy_env={}, timeout=60
+    )
+    args = _install_run_args(fake)
+    assert not [
+        a for a in args if a.startswith("npm_config_store_dir=")
+    ]
+
+
 def test_ownership_transfer_covers_home_dir(monkeypatch, tmp_path):
     """Plan 1.2(k): the 1.2(g) ownership transfer covers the
     per-side HOME dir in the same single unshare chown call — the

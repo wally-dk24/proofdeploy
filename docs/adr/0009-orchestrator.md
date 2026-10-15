@@ -256,6 +256,15 @@ config; no app files, no secrets (the environment is stripped
 as before, and generated bootstrap values never persist to
 it intentionally — they arrive as step env, as before).
 
+One manager needed a word beyond HOME: pnpm anchors its store
+on the project's filesystem when the HOME-based store would be
+cross-device, which — /checkout being its own mount — put the
+store back in the tree at /checkout/.pnpm-store. The sandbox
+therefore pins the store into /pd-home through pnpm's own env
+config channel (npm_config_store_dir), unless the app declares
+a store location in its own config (.npmrc `store-dir`,
+pnpm-workspace.yaml `storeDir`) — the app's choice stands.
+
 What does NOT change: the uidmap (`0:1:65536`), every capability
 set (D15; the app run stays `--cap-drop=ALL`), and the network
 modes. The mounts gain exactly one entry — `/pd-home` —

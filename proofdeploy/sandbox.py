@@ -58,6 +58,12 @@ ownership transferred by the same mechanism as the checkout's.
 ProofDeploy's tool state no longer lives in the tree it measures.
 The capability sets, the uidmap and the networks are unchanged;
 the mount itself is recorded in ADR-0009 as a dated posture note.
+One manager needs a word beyond HOME: pnpm anchors its store on
+the project's filesystem when the HOME-based store would be
+cross-device, which would put it at ``/checkout/.pnpm-store`` —
+install steps therefore pin the store into /pd-home through pnpm's
+env config channel, unless the app declares its own store location
+(install_steps, _pnpm_store_dir_declared).
 
 Customer secrets never enter the container environment. The contract
 env passed to the sandbox must already be secret-free (the
@@ -142,6 +148,37 @@ def sandbox_home_dir(checkout: Path) -> Path:
 # model client on the host; the container has no use for it and must
 # never see it.
 _SECRET_ENV_BLOCKLIST = frozenset({"GROQ_API_KEY"})
+
+
+def _pnpm_store_dir_declared(checkout: Path) -> bool:
+    """True when the app itself declares pnpm's store location.
+
+    pnpm reads ``store-dir`` from the workspace root's ``.npmrc``
+    (every pnpm in the field) and ``storeDir`` from
+    ``pnpm-workspace.yaml`` (pnpm 10+). When the app declares
+    either, its choice stands — the sandbox's /pd-home store
+    default (install_steps) is only for apps that declare
+    neither (generic alignment: the app's own configuration
+    wins). A file that cannot be read counts as undeclared;
+    the default then applies, which matches the effective
+    behavior such an app already had.
+    """
+    try:
+        npmrc = (checkout / ".npmrc").read_text(encoding="utf-8")
+    except OSError:
+        npmrc = ""
+    for line in npmrc.splitlines():
+        if line.split("=", 1)[0].strip().lower() == "store-dir":
+            return True
+    try:
+        workspace = (checkout / "pnpm-workspace.yaml").read_text(
+            encoding="utf-8"
+        )
+    except OSError:
+        workspace = ""
+    return any(
+        line.startswith("storeDir:") for line in workspace.splitlines()
+    )
 
 
 def _strip_secret_env(env: dict[str, str]) -> dict[str, str]:
@@ -1123,6 +1160,29 @@ class Sandbox:
         # tool caches that ride on HOME must never land in the
         # app's tree, where a workspace scanner can discover them.
         full_env["HOME"] = PD_HOME_CONTAINER
+        # pnpm's store (plan 1.2(k)): left to HOME alone, pnpm
+        # anchors its content-addressable store on the PROJECT's
+        # filesystem whenever the HOME-based store would be
+        # cross-device (@pnpm/store-path's fallback: a
+        # .pnpm-store at the project filesystem's root) — and
+        # /checkout is its own mount, so the store would land at
+        # /checkout/.pnpm-store, back inside the tree this plan
+        # line exists to keep clean. (Observed with pnpm 9.15.0:
+        # home on another device -> store path resolves to
+        # <fs root>/.pnpm-store; with the pin below it resolves
+        # under HOME and the install leaves nothing in the tree.)
+        # Pin the store into /pd-home through pnpm's own env
+        # config channel, unless the caller already set it or the
+        # app declares a store location in its own config (the
+        # app's choice wins; _pnpm_store_dir_declared). npm, bun
+        # and python steps simply ignore the key.
+        if (checkout / "package.json").is_file() and (
+            not _pnpm_store_dir_declared(checkout)
+        ):
+            full_env.setdefault(
+                "npm_config_store_dir",
+                f"{PD_HOME_CONTAINER}/.pnpm-store",
+            )
         results: list[dict] = []
         self.failed_step_output = None
         for i, step in enumerate(steps):
