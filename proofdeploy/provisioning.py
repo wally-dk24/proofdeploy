@@ -1604,6 +1604,16 @@ BUN_RELEASE_SHA256: dict[str, dict[str, tuple[str, str]]] = {
             "a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b",
         ),
     },
+    "1.2.20": {
+        "x86_64": (
+            "bun-linux-x64.zip",
+            "4e9edc4cba0c7c1623a288be01e53bbde11a4d073f2cf339cab026627858b548",
+        ),
+        "aarch64": (
+            "bun-linux-aarch64.zip",
+            "98d2e0b2c09421569172b4d46b6f81378c2dbdd77480ebb27f3989dd4e72e18b",
+        ),
+    },
     "1.2.19": {
         "x86_64": (
             "bun-linux-x64.zip",
