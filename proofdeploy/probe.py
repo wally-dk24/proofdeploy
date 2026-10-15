@@ -26,7 +26,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 # Harness version, recorded in every run manifest. Bump on any schema change.
 HARNESS_VERSION = "1.0.0"
@@ -231,6 +231,44 @@ def _validate_capture(capture: Any, where: str) -> None:
             continue
         if unknown:
             _reject(f"{where}.{name} has unknown fields: {sorted(unknown)}")
+
+
+class ProbeSchema(Protocol):
+    """The probe-type surface: strict schema validation and parsing.
+
+    Plan 1.4(b): the plug-in seam for probe types. ADR-0004 makes the
+    probe schema (probe types, fields, expected-result encoding) a
+    public, versioned contract, validated on ingest; ADR-007 fixes the
+    shape — a probe is `{setup, act, assert}` over the allowed methods,
+    assertion types, and setup types above, with code probes rejected
+    fail-closed. This module's functions are the built-in
+    implementation of the surface: `validate_probe` (one probe,
+    strict), `parse_probes` (author output, strict — any failure
+    rejects the whole set), and `parse_probes_lenient` (per-block, so
+    invalid blocks are kept for the record and never sent). The
+    surface is module-level functions, not a dispatch object, so —
+    unlike `AuthProvider` — there are no call sites to re-annotate;
+    conformance of the built-in implementation is exercised by
+    tests/test_probe.py's schema-surface test.
+    """
+
+    def validate_probe(
+        self, probe: Any, allow_harness_app: bool = False
+    ) -> dict[str, Any]:
+        """Validate one probe against the strict schema (fail-closed)."""
+        ...
+
+    def parse_probes(
+        self, text: str, allow_harness_app: bool = False
+    ) -> list[dict]:
+        """Extract and validate every probe in author output, strictly."""
+        ...
+
+    def parse_probes_lenient(
+        self, text: str, allow_harness_app: bool = False
+    ) -> tuple[list[dict], list[dict]]:
+        """Extract probes per block: (valid probes, invalid blocks)."""
+        ...
 
 
 def validate_probe(probe: Any, allow_harness_app: bool = False) -> dict[str, Any]:

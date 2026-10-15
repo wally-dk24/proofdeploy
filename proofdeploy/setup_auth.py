@@ -58,7 +58,7 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 
 def generate_bootstrap_env(names: list[str]) -> dict[str, str]:
@@ -350,9 +350,32 @@ def mint_ghost_jwt(admin_key: str, ttl_seconds: int = 300) -> str:
     return f"{header}.{payload}.{sig}"
 
 
+class AuthProvider(Protocol):
+    """The auth-provider surface the executor dispatches on (plan 1.4(b)).
+
+    The plug-in seam for credential providers (ADR-0010): a provider is
+    anything with a `config` mapping, a `mode`, and `token_needed` —
+    exactly the members the executor's `_ensure_credential` and
+    `_provide_*` methods use. `CredentialProvider` below is the built-in
+    implementation; conformance is structural, as with
+    `ProvisioningAdapter` in provisioning.py.
+    """
+
+    config: dict[str, Any]
+
+    @property
+    def mode(self) -> str:
+        """The provider mode: `register`, `login`, `refresh`, or `ghost_jwt`."""
+        ...
+
+    def token_needed(self, ctx: SetupContext) -> bool:
+        """Whether to (re)acquire a credential before the next request."""
+        ...
+
+
 @dataclass
 class CredentialProvider:
-    """Proactive credential provider.
+    """Proactive credential provider (the built-in `AuthProvider`).
 
     Mints or refreshes the auth token BEFORE requests are sent — never in
     reaction to a response. A 401 from the target is the probe's data (the
