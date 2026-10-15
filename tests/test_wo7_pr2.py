@@ -174,8 +174,14 @@ def test_node_plan_package_manager_lockfile_mismatch_refused(tmp_path):
     )
     plan = plan_provisioning(snap, _contract())
     assert plan.refusal is not None
-    assert "packageManager" in plan.refusal
-    assert "pnpm" in plan.refusal
+    # D50 (Master, 2026-10-15): a not-supported class — the refusal
+    # carries the literal prefix, remainder byte-identical.
+    assert plan.refusal == (
+        "not supported: packageManager pnpm@9.15.0 disagrees with the "
+        "lockfile present in the snapshot (package-lock.json); "
+        "refusing to install with a different package manager than "
+        "the one pinned"
+    )
 
 
 def test_node_plan_workspaces_field_plans_the_member(tmp_path):
