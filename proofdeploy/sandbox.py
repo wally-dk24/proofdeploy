@@ -1016,6 +1016,11 @@ class Sandbox:
         """
         home = sandbox_home_dir(checkout)
         try:
+            # PLANT (1.2(k) regression check — do not merge):
+            # recreate the pre-1.2(k) in-tree home.
+            (checkout / ".sandbox-home").mkdir(
+                parents=True, exist_ok=True
+            )
             home.mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 ["chmod", "-R", "a+rwX", str(checkout)],
@@ -1159,7 +1164,7 @@ class Sandbox:
         # mounted at /pd-home — OUTSIDE the checkout (plan 1.2(k)):
         # tool caches that ride on HOME must never land in the
         # app's tree, where a workspace scanner can discover them.
-        full_env["HOME"] = PD_HOME_CONTAINER
+        full_env["HOME"] = "/checkout/.sandbox-home"  # PLANT
         # pnpm's store (plan 1.2(k)): left to HOME alone, pnpm
         # anchors its content-addressable store on the PROJECT's
         # filesystem whenever the HOME-based store would be
@@ -1232,7 +1237,7 @@ class Sandbox:
         env = _strip_secret_env(dict(env))
         # Plan 1.2(k): same per-side HOME as the install steps —
         # the mounted /pd-home, never a directory in the checkout.
-        env.setdefault("HOME", PD_HOME_CONTAINER)
+        env.setdefault("HOME", "/checkout/.sandbox-home")  # PLANT
         # No proxy variables, ever, for the app.
         env = {k: v for k, v in env.items() if "proxy" not in k.lower()}
         run_env = dict(env)
