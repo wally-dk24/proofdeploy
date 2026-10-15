@@ -110,6 +110,7 @@ from proofdeploy.sandbox import (
     resolve_network_mode,
 )
 from proofdeploy.setup_auth import generate_bootstrap_env
+from proofdeploy.submodules import materialize_snapshot_submodules
 from proofdeploy.yml import RepoContract, load_contract
 
 # Fixture keys rendered into the author-facing description by design.
@@ -1148,6 +1149,33 @@ class Orchestrator:
         sha = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
         snap_dir = unit_dir / f"snapshot-{tag}"
         snapshot = create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=snap_dir)
+        # Plan 1.2(l) (D46): fill the snapshot's listed gitlinks at
+        # their recorded commits before anything reads the tree. A
+        # typed refusal raises here, exactly as a snapshot failure
+        # does; the records ride on the provision into the evidence.
+        submodules = materialize_snapshot_submodules(
+            repo_dir=repo,
+            sha=sha,
+            snapshot_dir=snapshot.dir,
+            scratch_dir=unit_dir / f"submodule-scratch-{tag}",
+        )
+        side = self._provision_side_impl(
+            runner, rev, port, unit_dir, tag, sha=sha, snapshot=snapshot
+        )
+        side.provision.submodules = submodules
+        return side
+
+    def _provision_side_impl(
+        self,
+        runner: Provisioner,
+        rev: str,
+        port: int,
+        unit_dir: Path,
+        tag: str,
+        *,
+        sha: str,
+        snapshot: Any,
+    ) -> _Side:
         contract = load_contract(snapshot.dir / "proofdeploy.yml")
         # WO-8.3: fresh bootstrap credentials for THIS side and run,
         # generated before any step runs (the seed consumes them).
@@ -1185,13 +1213,47 @@ class Orchestrator:
         container with no external network, only the checkout mounted,
         and no secrets in the container environment (WO-5 brief).
         """
-        import os
-
-        cfg = self.cfg
-        repo = cfg.repo_dir
+        repo = self.cfg.repo_dir
         sha = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
         snap_dir = unit_dir / f"snapshot-{tag}"
         snapshot = create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=snap_dir)
+        # Plan 1.2(l) (D46): fill the snapshot's listed gitlinks at
+        # their recorded commits before anything reads the tree. A
+        # typed refusal raises here, exactly as a snapshot failure
+        # does; the records ride on the provision into the evidence
+        # record and the readiness row.
+        submodules = materialize_snapshot_submodules(
+            repo_dir=repo,
+            sha=sha,
+            snapshot_dir=snapshot.dir,
+            scratch_dir=unit_dir / f"submodule-scratch-{tag}",
+        )
+        if submodules:
+            self._say(
+                f"snapshot submodules ({tag}): "
+                + ", ".join(
+                    f"{r['path']}@{str(r['commit'])[:8]}" for r in submodules
+                )
+            )
+        side = self._provision_side_sandbox_impl(
+            rev, port, unit_dir, tag, sha=sha, snapshot=snapshot
+        )
+        side.provision.submodules = submodules
+        return side
+
+    def _provision_side_sandbox_impl(
+        self,
+        rev: str,
+        port: int,
+        unit_dir: Path,
+        tag: str,
+        *,
+        sha: str,
+        snapshot: Any,
+    ) -> _Side:
+        import os
+
+        cfg = self.cfg
         contract = load_contract(snapshot.dir / "proofdeploy.yml")
         logs: list[str] = [f"sandbox provision {tag} ({sha[:12]})"]
 

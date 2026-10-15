@@ -88,6 +88,13 @@ class ProvisionResult:
     # when the install never built the root project (the pip
     # paths) or nothing could be determined.
     build_backend: dict | None = None
+    # Plan 1.2(l) (D46): the git submodules materialized into the
+    # snapshot at their recorded commits, as
+    # [{path, url, commit, tree_sha}] (empty when the tree lists
+    # none). Set by the orchestrator after provisioning — the
+    # materialization happens at snapshot time, before the executor
+    # runs — and recorded here so it lands in the evidence record.
+    submodules: list[dict] = field(default_factory=list)
     # Live process handle on READY. Caller-owned: the caller must terminate
     # it when done and call cleanup_run(run_id). Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
@@ -113,6 +120,7 @@ class ProvisionResult:
             "executed_steps": self.executed_steps,
             "generated_lock": self.generated_lock,
             "build_backend": self.build_backend,
+            "submodules": self.submodules,
             "logs": self.logs,
         }
 
