@@ -4,6 +4,8 @@ The run: `.github/workflows/readiness.yml` on `main` at `833fa3baf2cf59b2a680696
 
 This pass is complete: **all 42 registered sides have a row in attempt 1 and in attempt 2, and attempt 2 mirrors attempt 1 on (status, typed_reason) for every side.** Every run concluded `success`, and there are no harness-error rows. (Two earlier batches inform the harness's history — the first Directus dispatches that validated attempt isolation, and a nine-repo batch in which Vendure's run died mid-loop before its bug-side rows were written; the harness defects those exposed were fixed in PR #76. This report rests only on the batch below.)
 
+The body below is this pass's record as written. Later status — gaps that have since closed, one erratum, and the plan 1.2a follow-through — is recorded in "Follow-up — 2026-10-14 (evening)" at the end of this report.
+
 ## Cause classes
 
 Verdict classes were settled when this report's form was fixed (Addendum 66). Their causes, and the mapping used below:
@@ -139,6 +141,7 @@ sandbox app not ready
 
   Both sides record `START_FAILED`, typed reason `readiness timeout`, last error `sandbox app not ready`. The failure is our contract's, not the app's: the app started and listened, on the wrong port by our instruction.
 - **Bottle runtime finding.** The plan selected Python 3.14.8 from the tree's declared `>=3.9`, while the registered baseline note for this fix says it needs Python 3.9–3.11. The selected runtime is outside the range the registration records for the fix; carried here as a finding, separate from the port defect above.
+- **Fastify (T2, T3, train-C3) — the no-lockfile refusal is settled behavior (D18).** A Node repo with no lockfile stays typed "not supported: no frozen lockfile" — no generated Node lockfile in Stage 1 (decision D18, 2026-10-14). The five `no frozen lockfile` rows are the intended outcome for these repos, not a gap awaiting a generated lockfile.
 - **Hono's plan selects bun** for its units, which the sandbox does not support — its rows are the package-manager sub-cause of the coverage gap, not the workspaces refusal its pnpm sibling repos hit.
 - **Django's train controls** were expected to record the `django-admin` no-runnable-app line; in this run all three Django sides refused earlier, at the snapshot (symlinks under `docs/_theme/`), so the no-runnable-app class has no rows in this pass.
 - **Checkpoint-bug sides** (Ghost, Directus, Vendure units) are provisioned from the bug-fix commits in the orchestrator's record, as registered in Addendum 65; the registered files hold no checkpoint SHAs.
@@ -146,7 +149,7 @@ sandbox app not ready
 
 ## Latent contract defects
 
-Not observed in this run; contract-fix PR in progress. These defects sit in the registered contracts themselves and would surface only on a run that gets each repo past its earlier refusal:
+Not observed in this run. These defects sit in the registered contracts themselves and would surface only on a run that gets each repo past its earlier refusal. (Status update, 2026-10-14: the contract-fix PR referred to here has merged — PR #77 updated the bottle, nest, django and LMCache contracts to serve HTTP on `$PORT`. The items below are retained as recorded at the time of this pass.)
 
 - **fastify** — the contract's example listens on port 3000; the harness assigns `PORT`, so the listener and the probe would miss each other exactly as Bottle's did.
 - **nest** — the contract's sample listens on port 3000 (same defect).
@@ -156,4 +159,24 @@ Not observed in this run; contract-fix PR in progress. These defects sit in the 
 
 ## Registered-set note
 
-The manifest registers 27 units / 42 sides. Its train-control list names three clean-diff controls (django C1, hono C2, fastify C3); a registered file's claim of five is a known shortfall, left as-is for a separate ruling — nothing was substituted in this run.
+The manifest registers 27 units / 42 sides. Its train-control list names three clean-diff controls (django C1, hono C2, fastify C3); a registered file's claim of five is a known shortfall — nothing was substituted in this run. (The ruling has since been made, 2026-10-14, D19: the control set widens by a registered mechanical rule — the floor is never lowered — and plan 1.6 owns building the added controls.)
+
+## Follow-up — 2026-10-14 (evening)
+
+### Erratum (WAL-119)
+
+In the 2026-10-14 re-run data, the four Directus sides' rows (both attempts) should read `declared range 22 not satisfiable by pinned images`, not `workspaces not yet supported` — the row had recorded a plan refusal that never fired (WAL-119, PR #83).
+
+### Plan 1.2a closed — the range fix proven on Directus
+
+The Directus-only readiness re-run on main `6a5c6e8` (runs [38663645824](https://github.com/wally-dk24/proofdeploy/actions/runs/38663645824) and [38664245371](https://github.com/wally-dk24/proofdeploy/actions/runs/38664245371), attempts 1 and 2) shows all 8 side-attempts selecting runtime **22.23.3** from the declared `"22"`, with zero range refusals anywhere; every row, log and `last_error` reads `workspaces not yet supported`. The bare-partial range defect behind the erratum above is fixed (PR #84) and plan 1.2a is closed. The remaining Directus blocker is monorepo/workspace support (plan 1.2b).
+
+### Bottle is READY
+
+After the contract fix in PR #77, a readiness run ([38624583663](https://github.com/wally-dk24/proofdeploy/actions/runs/38624583663)) recorded both Bottle sides **READY 2/2** — the first READY sides in the program. The tables above remain this pass's results, in which Bottle was 0/2.
+
+### Status of the gaps this report recorded
+
+- **Symlinks** (18 sides above, the largest class): narrowed by PR #81 — in-tree relative links are kept; links that escape the tree or are absolute are refused with a typed reason.
+- **Record integrity**: fixed by PR #83 — a row now records the refusal that actually fires (see the erratum).
+- **Version-range parsing**: fixed by PR #84 — a bare partial such as `"22"` expands over its unspecified components instead of reading as an exact pin (see plan 1.2a above).

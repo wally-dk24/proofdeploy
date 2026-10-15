@@ -35,8 +35,9 @@ Unknown versions raise.
 
 Records:
 - Every record (evidence, score, judgment) and every per-probe result
-  carries ``schema_version`` (currently ``"1.3.0"``). Bump it when the
-  record format changes; readers must refuse unknown versions. Records
+  carries ``schema_version`` (the ``SCHEMA_VERSION`` constant, defined
+  in ``proofdeploy/probe.py``). Bump it when the record format
+  changes; readers must refuse unknown versions. Records
   written at 1.0.0 (scalar ``captured_values``, no harness provenance)
   still load and re-score.
 - Every run writes an evidence record BEFORE any scoring. The evidence

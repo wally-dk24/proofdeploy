@@ -184,6 +184,11 @@ carries `schema_version` (`"1.0.0"`, defined in `proofdeploy/probe.py`
 as `SCHEMA_VERSION`). It is documented next to the record format in
 `proofdeploy/runpair.py`. Bump it when the record format changes.
 
+Update (2026-10-14): `SCHEMA_VERSION` has since been bumped as the
+record format changed; its current value is `"1.5.0"` (the versioned
+contract is `docs/contract/result-contract.md`). The `"1.0.0"` above
+is the value in force when this ADR was written.
+
 ## Consequences
 
 - `proofdeploy measure --repo ... --bug-id ... --base ... --bug ... --fix ...`
