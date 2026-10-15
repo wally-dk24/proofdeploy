@@ -11,6 +11,7 @@ tests/test_cli.py::test_measure_no_sandbox_is_explicit_dev_flag
 tests/test_cli.py::test_measure_provenance_flags
 tests/test_cli.py::test_verify_flags_match_prd
 tests/test_cli.py::test_verify_not_implemented_returns_tool_error
+tests/test_container_spike.py::test_build_caps_are_build_only
 tests/test_container_spike.py::test_build_command_context_is_snapshot_only
 tests/test_container_spike.py::test_build_command_safety_shape
 tests/test_container_spike.py::test_build_user_args_modes
