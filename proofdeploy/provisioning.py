@@ -2119,9 +2119,10 @@ class NodeAdapter:
             # rendering on EVERY row, in persisted form — corepack
             # is installed into the checkout's .pd-tools (which
             # persists across the per-step --rm containers), never
-            # -g. COREPACK_HOME rides on HOME (inside the checkout
-            # in the sandbox), so the downloaded manager survives
-            # to later steps with the network cut.
+            # -g. COREPACK_HOME rides on HOME (the sandbox's
+            # per-side /pd-home since plan 1.2(k); the host's own
+            # HOME on the host executor), so the downloaded manager
+            # survives to later steps with the network cut.
             corepack_version = COREPACK_BOOTSTRAP_VERSION
             steps.append(
                 PlanStep(
