@@ -19,13 +19,22 @@ Per registered side of a repo (``readiness/manifest.json``):
   with more than one service is typed ``multi-service not in
   spike`` and never built; a single-service compose must declare a
   ``build`` section (an image-only service is out of spike scope);
-* the image is built with podman: the build runs on the native
-  install path's explicit ``pd-build`` bridge network (network
-  during the build only), userns-remapped and with
-  ``--cap-drop=ALL`` -- a Dockerfile's RUN steps are untrusted
-  code and must not execute as host root any more than the run
-  may. The build context is the snapshot directory and nothing
-  else, no secrets and no build args are passed;
+* the image is built with podman: the build runs on the spike's
+  explicit rootless build network,
+  ``slirp4netns:allow_host_loopback=false`` (network during the
+  build only: outbound NAT for package registries, no route back
+  to services bound on the host's loopback), userns-remapped and
+  with ``--cap-drop=ALL`` -- a Dockerfile's RUN steps are
+  untrusted code and must not execute as host root any more than
+  the run may. The build originally ran on the native install
+  path's named ``pd-build`` netavark bridge; the first real runs
+  on main (2026-10-14) proved a userns-mapped ``podman build``
+  cannot join a named netavark network on podman 4.9.3 (every
+  Directus side died at its first RUN step with "setup network:
+  cannot use networks as rootless"), so the build network is the
+  rootless user-mode one instead. The build context is the
+  snapshot directory and nothing else, no secrets and no build
+  args are passed;
 * every ``FROM`` image's resolved digest is recorded from
   ``podman image inspect`` after the build pulled it;
 * the install verdict is judged from the Dockerfile's own install
@@ -106,9 +115,31 @@ BUILD_TIMEOUT_S = 7200
 PROBE_TIMEOUT_S = 180
 SOCKET_TIMEOUT_S = 15
 
-# The explicit bridge network for builds: the native install
-# path's network (proofdeploy.sandbox._ensure_build_network).
-BUILD_NETWORK = "pd-build"
+# The build network (WAL-118). The build originally ran on the
+# native install path's explicit ``pd-build`` netavark bridge —
+# the first real runs on main proved a userns-mapped
+# ``podman build`` cannot join a named netavark network on
+# podman 4.9.3: every Directus side died at its Dockerfile's
+# first RUN step with "setup network: cannot use networks as
+# rootless" (the native path avoids this because it builds via
+# ``podman run``, which can join the bridge). The build
+# therefore uses slirp4netns, the rootless user-mode network:
+# outbound NAT for package registries, and with
+# allow_host_loopback=false no route back to services bound on
+# the host's loopback. The userns maps and --cap-drop=ALL are
+# unchanged. There is no named network to create and no
+# fallback: if this mode is unavailable the build itself fails
+# and the side is typed BUILD_FAILED with the build's error.
+BUILD_NETWORK_MODE = "slirp4netns:allow_host_loopback=false"
+
+# The address a build RUN step would use to reach the host's
+# loopback under BUILD_NETWORK_MODE (the slirp gateway address).
+# The property test in tests/test_container_spike.py binds a
+# service on the host's loopback and proves a RUN step cannot
+# reach it at this address; flipping the mode's
+# allow_host_loopback to true is the plant that must make that
+# test fail.
+BUILD_NETWORK_HOST_ADDR = "10.0.2.2"
 
 
 class UsernsUnavailableError(RuntimeError):
@@ -449,13 +480,13 @@ def build_command(
 ) -> list[str]:
     """The build invocation. The context is the snapshot dir and
     nothing else is mounted or passed: no -v, no --secret, no
-    --build-arg. The build runs on the explicit ``pd-build``
-    bridge network -- the native install path's network -- never
-    on podman's default and never on the host network: RUN steps
-    are untrusted code and must not land in the host namespace
-    or on an unnamed default."""
+    --build-arg. The build runs on the explicit rootless build
+    network (BUILD_NETWORK_MODE: slirp4netns with host loopback
+    blocked) -- never on podman's default and never on the host
+    network: RUN steps are untrusted code and must not land in
+    the host namespace or on an unnamed default."""
     return [
-        *base, "build", *build_user_args, "--network", BUILD_NETWORK,
+        *base, "build", *build_user_args, "--network", BUILD_NETWORK_MODE,
         "-t", tag, "-f", str(dockerfile), str(context),
     ]
 
@@ -550,24 +581,6 @@ class Podman:
         if err:
             self.logs.append(err)
         return ProcResult(proc.returncode, proc.stdout, proc.stderr)
-
-    def ensure_build_network(self) -> str | None:
-        """Ensure the explicit ``pd-build`` bridge network exists
-        (the native install path's network: same name, created
-        the same way). None on success, else the refusal text for
-        the side's row."""
-        proc = self.run([*self.base, "network", "exists", BUILD_NETWORK], 30)
-        if proc.returncode == 0:
-            return None
-        proc = self.run([*self.base, "network", "create", BUILD_NETWORK], 60)
-        if proc.returncode == 0:
-            return None
-        tail = _last_line(proc.stderr) or _last_line(proc.stdout)
-        return (
-            f"could not create build network {BUILD_NETWORK}"
-            + (f": {tail[:300]}" if tail else "")
-            + "; the spike is refused without its explicit build network"
-        )
 
     def build(
         self,
@@ -768,6 +781,7 @@ def _row(
         "port_source": port_source,
         "port": port,
         "network_mode": "none+socket",
+        "build_network": BUILD_NETWORK_MODE,
         "userns_fallback": userns_fallback,
         "attempt": attempt,
     }
@@ -838,10 +852,6 @@ def spike_side_from_snapshot(
     slug = f"{unit['unit_id']}-{side_spec['role']}-a{attempt}".lower()
     slug = re.sub(r"[^a-z0-9_.-]", "-", slug)
     tag = f"pd-spike-{slug}"
-    net_error = podman.ensure_build_network()
-    if net_error is not None:
-        return row("BUILD_FAILED", net_error,
-                   install_frozen=frozen, install_evidence=evidence)
     built = podman.build(tag, dockerfile_path, build_context, build_user_args)
     digests: list[str] = []
     for image in info.from_images:
@@ -1013,6 +1023,7 @@ def spike_repo(
     userns_fallback = not caps.userns_remap
     run_log.append(f"run user args: {args_for_user}")
     run_log.append(f"build user args: {build_args}")
+    run_log.append(f"build network: {BUILD_NETWORK_MODE}")
     if userns_fallback:
         run_log.append(
             "WARNING: userns remapping unavailable; the explicit dev "

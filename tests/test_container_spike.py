@@ -1,4 +1,4 @@
-"""Container-spike tests: podman-free.
+"""Container-spike tests: podman-free, plus one sandbox test.
 
 The parsing core (Dockerfile FROM/ARG/EXPOSE/install lines,
 compose services, port determination) is pure and tested
@@ -9,12 +9,20 @@ context, no secret env) are assertions on those lists. The
 per-side flow is driven through a FakePodman that records every
 command it is handed, so a flow test can also assert the safety
 shape of the commands the flow actually built.
+
+The one exception is the build-network property test at the
+bottom: it runs a real rootless ``podman build`` and proves a
+RUN step cannot reach a service bound on the host's loopback.
+It is sandbox-gated (the skipif below) and runs only in the
+sandbox-tests CI job, where podman is rootless.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +30,7 @@ from typing import Any
 import pytest
 
 import readiness.container_spike as cs
+from proofdeploy.sandbox import _podman_base
 
 DIRECTUS_DOCKERFILE = """\
 # syntax=docker/dockerfile:1.4
@@ -104,9 +113,6 @@ class FakePodman:
         self.built: list[list[str]] = []
         self.started: list[list[str]] = []
         self.removed: list[str] = []
-
-    def ensure_build_network(self) -> None:
-        return None
 
     def build(
         self, tag: str, dockerfile: Path, context: Path, build_user_args: list[str]
@@ -317,7 +323,7 @@ def test_build_command_context_is_snapshot_only(tmp_path: Path) -> None:
     assert cmd == [
         "podman", "build",
         "--userns-uid-map", "0:1:65536", "--userns-gid-map", "0:1:65536",
-        "--cap-drop=ALL", "--network", "pd-build",
+        "--cap-drop=ALL", "--network", "slirp4netns:allow_host_loopback=false",
         "-t", "pd-spike-x", "-f", str(dockerfile), str(tmp_path),
     ]
     assert "-v" not in cmd
@@ -328,15 +334,18 @@ def test_build_command_context_is_snapshot_only(tmp_path: Path) -> None:
 def test_build_command_safety_shape(tmp_path: Path) -> None:
     # The build executes untrusted Dockerfile RUN steps: remapped
     # away from host root, capabilities dropped, and on the
-    # explicit pd-build bridge network (the native install path's
-    # network) — never podman's default, never the host's.
+    # explicit rootless build network — slirp4netns with host
+    # loopback blocked (WAL-118: a userns-mapped build cannot
+    # join a named netavark network on podman 4.9.3) — never
+    # podman's default, never the host's.
     cmd = cs.build_command(
         ["podman"], "pd-spike-x", tmp_path / "Dockerfile", tmp_path, BUILD_USER_ARGS
     )
     assert "--userns-uid-map" in cmd and "0:1:65536" in cmd
     assert "--userns-gid-map" in cmd
     assert "--cap-drop=ALL" in cmd
-    assert cmd[cmd.index("--network") + 1] == "pd-build"
+    assert cmd[cmd.index("--network") + 1] == cs.BUILD_NETWORK_MODE
+    assert cmd[cmd.index("--network") + 1] == "slirp4netns:allow_host_loopback=false"
     assert "--net=host" not in cmd and "host" not in cmd
     assert "--privileged" not in cmd
 
@@ -430,6 +439,7 @@ def test_side_directus_ready(tmp_path: Path) -> None:
     assert row["install_evidence"] == "pnpm install --recursive --offline --frozen-lockfile"
     assert row["from_digests"] == ["docker.io/library/node@sha256:abc123"]
     assert row["network_mode"] == "none+socket"
+    assert row["build_network"] == "slirp4netns:allow_host_loopback=false"
     assert row["userns_fallback"] is False
     assert row["attempt"] == 2
     assert len(fake.built) == 1
@@ -692,3 +702,131 @@ def test_main_unknown_repo_exits_2(tmp_path: Path) -> None:
         "--workdir", str(tmp_path / "work"), "--manifest", str(manifest),
     ])
     assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# Build network property (sandbox selection: real rootless podman)
+# ---------------------------------------------------------------------------
+
+
+def _rootless_podman() -> bool:
+    """True when podman here runs rootless — the only mode the
+    build network exists in. Deliberately a cheap ``podman info``
+    rather than the full sandbox capability probe: this module's
+    other tests are podman-free and must stay fast to collect."""
+    try:
+        proc = subprocess.run(
+            [*_podman_base(), "info", "--format", "{{.Host.Security.Rootless}}"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+requires_rootless_podman = pytest.mark.skipif(
+    not _rootless_podman(),
+    reason="rootless podman unavailable: the container build-network "
+    "property test needs rootless podman (runs in the sandbox-tests CI job)",
+)
+
+_LOOPBACK_TOKEN = "pd-loopback-canary-7f3a"
+
+_PROBE_PY = """\
+import sys
+import urllib.request
+
+TOKEN = "__TOKEN__"
+TARGET = "__TARGET__"
+
+
+def fetch(url, timeout):
+    req = urllib.request.Request(url, headers={"User-Agent": "pd-spike-probe"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+try:
+    fetch("http://example.com/", 20)
+    print("CONTROL_OK", flush=True)
+except Exception as exc:
+    print("CONTROL_FAILED: %s" % exc, flush=True)
+    sys.exit(4)
+
+try:
+    body = fetch(TARGET, 20)
+except Exception as exc:
+    print("LOOPBACK_BLOCKED: %s" % exc, flush=True)
+    sys.exit(3)
+if TOKEN in body:
+    print("LOOPBACK_REACHED", flush=True)
+    sys.exit(0)
+print("LOOPBACK_UNEXPECTED_BODY", flush=True)
+sys.exit(5)
+"""
+
+
+class _LoopbackHandler(BaseHTTPRequestHandler):
+    """Serves the canary token on the host's loopback only."""
+
+    def do_GET(self) -> None:
+        if self.path == "/token":
+            body = _LOOPBACK_TOKEN.encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+@requires_rootless_podman
+def test_build_network_blocks_host_loopback(tmp_path: Path) -> None:
+    # The security property of BUILD_NETWORK_MODE, proven against
+    # a real rootless build — not just the flag's presence in the
+    # command list: a service bound on the host's loopback must be
+    # unreachable from a build RUN step, while ordinary outbound
+    # traffic works (the control fetch distinguishes "loopback
+    # blocked" from "no network at all": if the build network
+    # were broken entirely, CONTROL_OK never prints and this test
+    # fails rather than passing vacuously). The plant: set
+    # allow_host_loopback=true in BUILD_NETWORK_MODE and the RUN
+    # step reaches the service — LOOPBACK_REACHED, the probe exits
+    # 0, the build succeeds — and this test fails.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackHandler)
+    port = int(server.server_address[1])
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    context = tmp_path / "ctx"
+    context.mkdir()
+    dockerfile = context / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.12-alpine\n"
+        "COPY probe.py /probe.py\n"
+        "RUN python3 /probe.py\n",
+        encoding="utf-8",
+    )
+    (context / "probe.py").write_text(
+        _PROBE_PY.replace("__TOKEN__", _LOOPBACK_TOKEN).replace(
+            "__TARGET__", f"http://{cs.BUILD_NETWORK_HOST_ADDR}:{port}/token"
+        ),
+        encoding="utf-8",
+    )
+    logs: list[str] = []
+    podman = cs.Podman(logs)
+    tag = "pd-spike-loopback-property"
+    try:
+        result = podman.build(
+            tag, dockerfile, context, cs.build_user_args_for(True)
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    podman.run([*podman.base, "image", "rm", "-f", tag], 60)
+    joined = "\n".join(logs)
+    assert "CONTROL_OK" in joined, joined
+    assert "LOOPBACK_REACHED" not in joined, joined
+    assert "LOOPBACK_BLOCKED" in joined, joined
+    assert result.returncode != 0
