@@ -1263,6 +1263,74 @@ def test_regd_unit_summaries_differing_trees_list_the_diff(
     assert summary["removed"] == ["a@1.0.0", "c@3.0.0"]
 
 
+def _regd_errored_row(unit: str, role: str, error: str) -> dict:
+    return {
+        "unit": unit,
+        "role": role,
+        "regd": {
+            "applied": True,
+            "tree_sha256": None,
+            "tree_artifact": None,
+            "tree_error": error,
+        },
+    }
+
+
+def test_regd_unit_summaries_unreadable_trees_emit_null_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REG-D D4 two-side report: a unit where REG-D applied on
+    both sides but a tree cannot be read back is emitted with
+    regd_trees_identical null and the per-side tree_errors —
+    never dropped silently. Covers all three unreadable shapes:
+    the capture itself failed (tree_error on the row), the
+    artifact is missing at read-back, and the artifact is
+    unparseable. A unit where REG-D applied on one side only
+    still gets no summary."""
+    monkeypatch.chdir(tmp_path)
+    tree = {"dependencies": {"a": {"version": "1.0.0"}}}
+    good = _write_tree(tmp_path, "good.json", tree)
+    broken = tmp_path / "pd-logs" / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    rows = [
+        # U1: the fix side's capture failed; its row carries the
+        # error and no artifact.
+        _regd_captured_row("U1", "fix^", good),
+        _regd_errored_row(
+            "U1", "fix", "RuntimeError: npm ls exited 1 with no tree"
+        ),
+        # U2: the fix side's artifact was recorded at capture
+        # time but is gone when the summary reads it back.
+        _regd_captured_row("U2", "fix^", good),
+        _regd_captured_row("U2", "fix", "pd-logs/missing.json"),
+        # U3: the fix side's artifact is unparseable.
+        _regd_captured_row("U3", "fix^", good),
+        _regd_captured_row("U3", "fix", "pd-logs/broken.json"),
+        # U4: REG-D applied on one side only -> no summary.
+        _regd_captured_row("U4", "C", good),
+    ]
+    summaries = rp.regd_unit_summaries(rows)
+    by_unit = {s["unit"]: s for s in summaries}
+    assert set(by_unit) == {"U1", "U2", "U3"}
+    assert by_unit["U1"] == {
+        "unit": "U1",
+        "regd_trees_identical": None,
+        "tree_errors": {
+            "fix": "RuntimeError: npm ls exited 1 with no tree"
+        },
+    }
+    assert by_unit["U2"]["regd_trees_identical"] is None
+    assert set(by_unit["U2"]["tree_errors"]) == {"fix"}
+    assert by_unit["U2"]["tree_errors"]["fix"].startswith(
+        "FileNotFoundError"
+    )
+    assert by_unit["U3"]["regd_trees_identical"] is None
+    assert set(by_unit["U3"]["tree_errors"]) == {"fix"}
+    assert by_unit["U3"]["tree_errors"]["fix"].startswith(
+        "JSONDecodeError"
+    )
+
+
 def test_capture_regd_tree_failure_is_recorded_not_silent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
