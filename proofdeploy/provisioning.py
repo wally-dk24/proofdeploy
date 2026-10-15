@@ -1976,10 +1976,11 @@ class NodeAdapter:
                 return InstallPlan(
                     **base,
                     refusal=(
-                        f"packageManager {pm_name}@{pm_version} disagrees "
-                        f"with the lockfile present in the snapshot "
-                        f"({present[0]}); refusing to install with a "
-                        "different package manager than the one pinned"
+                        f"not supported: packageManager {pm_name}@"
+                        f"{pm_version} disagrees with the lockfile present "
+                        f"in the snapshot ({present[0]}); refusing to "
+                        "install with a different package manager than "
+                        "the one pinned"
                     ),
                 )
         preferred: list[str] | None = None
@@ -2005,10 +2006,10 @@ class NodeAdapter:
             return InstallPlan(
                 **base,
                 refusal=(
-                    "bun.lockb (the legacy binary bun lockfile) is "
-                    "not supported: bun installs are planned from "
-                    "bun.lock only — regenerate the lockfile with "
-                    "a current bun and commit bun.lock"
+                    "bun.lockb (legacy binary lockfile): ProofDeploy "
+                    "plans bun installs from bun.lock only (our gap) "
+                    "— regenerate the lockfile with a current bun "
+                    "and commit bun.lock"
                 ),
             )
         manager, argv = select_package_manager(

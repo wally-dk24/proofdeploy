@@ -48,9 +48,9 @@ the readiness row.
 | 5 | `python lock generation requires the unit's resolution cutoff (the fix commit's committer time for a bug pair, C's for a clean diff); none was provided` | provisioning.py:1404 | **harness or environment** — the run failed to supply the unit's cutoff; nothing about the repo. |
 | 6 | `workspaces not yet supported for runtime 'python'` | provisioning.py:1548 | **our gap** — Python workspace planning is unbuilt (plan 1.2b interface answer). |
 | 7 | `workspaces not yet supported` | provisioning.py:1798 | **our gap** — a Node workspace declaration our detector could not resolve into a layout. |
-| 8 | `packageManager {pm}@{version} disagrees with the lockfile present in the snapshot ({name}); refusing to install with a different package manager than the one pinned` | provisioning.py:1843 | **not supported** ⚠ — the repo's own declarations conflict; as committed it cannot be installed frozen. No prefix today. |
+| 8 | `not supported: packageManager {pm}@{version} disagrees with the lockfile present in the snapshot ({name}); refusing to install with a different package manager than the one pinned` | provisioning.py:1979 | **not supported** — the repo's own declarations conflict; as committed it cannot be installed frozen. Prefix added by the part-2 PR per the ruling (Master, D50); remainder byte-identical. |
 | 9 | `not supported: no frozen lockfile found in snapshot for runtime 'node'` (D18) | provisioning.py:1857 | **not supported** — prefix added by this PR. This is D18's canonical case (fastify class). |
-| 10 | `bun.lockb (the legacy binary bun lockfile) is not supported: bun installs are planned from bun.lock only — regenerate the lockfile with a current bun and commit bun.lock` | provisioning.py:1872 | **not supported** ⚠ — the words "is not supported:" sit mid-string, so `startswith("not supported:")` does **not** match it today: the side is retried and is not mechanically terminal. |
+| 10 | `bun.lockb (legacy binary lockfile): ProofDeploy plans bun installs from bun.lock only (our gap) — regenerate the lockfile with a current bun and commit bun.lock` | provisioning.py:2009 | **our gap** — ruled our gap (bun itself installs frozen from `bun.lockb`; the limit is our planner's) and reworded by the part-2 PR so the text no longer contains "is not supported"; the regenerate-and-commit advice is preserved. |
 | 11 | `workspaces not yet supported for package manager {manager!r}` | provisioning.py:1889 | **our gap** — workspace support exists for pnpm/npm/bun; another manager's workspace is unbuilt. |
 | 12 | `no pinned digest for bun@{version}: bun is pinned by digest (BUN_RELEASE_SHA256) and this version has no pin; refusing to install an unpinned bun` | provisioning.py:1917 | **our gap** — our pin table lacks the version (the work order's own example); fixed by adding the row, as PR #105 did for bun 1.2.20. |
 | 13 | `no pinned bun build for architecture {arch!r} (bun@{version})` | provisioning.py:1928 | **our gap** — our pin table lacks the architecture row for a pinned version. |
@@ -122,9 +122,21 @@ reasons. All are host/run conditions by construction.
 
 | # | String | Site | Proposed class |
 |---|---|---|---|
-| 56 | `runtime not supported` — `row_from_exception`'s mapping of runner.py:330's `cannot detect runtime in {dir}: no package.json or pyproject.toml` | readiness/provision.py:283 | **not supported** ⚠ — a repo with no detectable runtime manifest is a repo property, but the string does not carry the `not supported:` prefix, so the mechanical test does not recognize it today: the side is re-provisioned on attempt 2 (and fails identically). |
+| 56 | `runtime not supported` — `row_from_exception`'s mapping of runner.py:330's `cannot detect runtime in {dir}: no package.json, pyproject.toml or requirements.txt` | readiness/provision.py:283 | **our gap** — ruled our gap: detection is root-only (package.json → pyproject.toml → requirements.txt), so an app under `app.path` or a non-Node/Python repo lands here; that is our coverage. The underlying message was fixed by the part-2 PR to name `requirements.txt`, which detection also checks. The harness string itself carries no prefix and the side is re-provisioned on attempt 2. |
 | 57 | (mechanism) `row_from_exception` passes any other exception's message through verbatim as `typed_reason`. Named instance: `proofdeploy.yml missing required keys: {keys}` | readiness/provision.py:285; proofdeploy/yml.py:101 | **our gap** — for the named instance: contract files are authored in this repo. (The passthrough itself is unclassifiable in general; each exception text rules on its own.) |
 | 58 | `harness error: {message}` — fetch/contract-commit failures before a provision result exists | readiness/provision.py:333 | **harness or environment** — by construction; retried. |
+
+## 6. REG-D dated sample resolution — `proofdeploy/provisioning.py` (PR #102)
+
+Rows added by the part-2 PR, per the ruling: PR #102's REG-D
+strings needed rows in this inventory once #102 landed. These
+were classed directly by the ruling (no separate proposal).
+
+| # | String (verbatim; `{…}` = interpolated) | Site | Ruled class |
+|---|---|---|---|
+| 59 | `REG-D: sample {path} has a lockfile ({name}); REG-D does not apply — the sample must install frozen` | provisioning.py:2171 | **our gap** — the correct behavior there is to install the sample frozen. Not urgent: no registered nest unit's sample has a lockfile. |
+| 60 | `REG-D: the contract declares dated sample resolution ({token}) but no ISO 8601 UTC lock cutoff is available for this unit; refusing to run an undated sample install (REG-D D6)` | provisioning.py:557 | **harness or environment** — the analogue of #5: the run failed to supply the unit's cutoff. |
+| 61 | `REG-D: the contract declares dated sample resolution ({token}) but the unit's lock cutoff could not be read ({error}); refusing to run an undated sample install (REG-D D6)` | provisioning.py:549 | **harness or environment** — same D6 family as #60. |
 
 ## Scope notes
 
@@ -132,9 +144,134 @@ reasons. All are host/run conditions by construction.
   own `typed_reason` strings (`multi-service not in spike`,
   `no root Dockerfile or compose file in snapshot`, …) in a
   separate harness whose rows do not feed H5/J1. Excluded here.
-- PR #102's REG-D refusal strings (`REG-D: …`) are not on this
-  main yet; they need rows in this inventory when #102 lands.
-- This PR changes **only** the D18 strings (#4, #9, #15, #19,
-  #37): each gained the `not supported: ` prefix, remainder
-  byte-identical. No other string above was edited; the ⚠ rows
-  are surfaced for the reviewer's ruling, not silently fixed.
+- PR #102's REG-D refusal strings (`REG-D: …`) landed with
+  #102; their rows are §6 (#59–#61), added by the part-2 PR.
+- Part 1 of the follow-up (PR #107) changed **only** the D18
+  strings (#4, #9, #15, #19, #37): each gained the
+  `not supported: ` prefix, remainder byte-identical. The ⚠
+  rows were surfaced for the reviewer's ruling, not silently
+  fixed; the ruling is recorded at the end of this document.
+- Part 2 (this PR) applies that ruling: the Ruling section
+  below, the §6 REG-D rows, the #8 prefix (D50), the #10
+  rewording, and the #56 message fix. Site line numbers are
+  this PR's tree for the rows it changed (#8, #10, #56,
+  #59–#61) and the part-1 tree elsewhere.
+
+## Ruling (reviewer, 2026-10-15)
+
+Recorded by the part-2 PR from the reviewer's ruling (relay
+2026-10-15T2050Z §3). This section governs: where a row's
+proposed class above and its ruled class here differ, the
+ruled class is the one in force.
+
+**Governing rules:**
+
+- **R1.** The mechanical test stays
+  `typed_reason.startswith("not supported:")`. The prefix
+  goes **only** on strings in a not-supported class Master has
+  approved: D18, D33, and anything he approves now (D50 for
+  #8).
+- **R2.** Any string not ruled here, including future
+  passthroughs (#57), defaults to **harness or environment**:
+  retried, never skipped. Nothing becomes not-supported by
+  sounding like it.
+- **R3.** An **our gap** row never removes a unit. Under H5
+  the unit stays pending until we fix the gap, then it's
+  re-provisioned.
+
+**Agreed as proposed:** 1, 4–7, 9, 11–26, 28–55, 58.
+
+- On #1, an impossible range (no release could ever satisfy
+  it) is the only exception. If one occurs, the reviewer
+  reclassifies that row with evidence.
+- On #21 and #24 to #26, agreed: these are retried.
+
+**Changed by the ruling:** #2 → our gap (the contract is
+ours); #3 → our gap (we declare `app.path` in our contracts;
+REG-C selection's own "ambiguous app" exclusion is a
+separate, registered mechanism and is unaffected); #10 → our
+gap (bun itself installs frozen from `bun.lockb`; reworded by
+this PR, see §1); #27 → our gap (agreed); #56 → our gap
+(detection is root-only, so this is our coverage; the message
+fix is in §5); #57 → R2 (the passthrough defaults to harness
+or environment; the named `proofdeploy.yml missing required
+keys` instance is our gap).
+
+**Brought to Master and approved:** #8 → not supported
+(Master, D50) — the repo's own toolchain refuses on the same
+principle as D33. The prefix is applied by this PR, remainder
+byte-identical.
+
+**REG-D strings (PR #102, §6):** #59 → our gap; #60 and #61
+→ harness or environment (#60 is the analogue of #5).
+
+| # | Ruled class |
+|---|---|
+| 1 | our gap |
+| 2 | our gap |
+| 3 | our gap |
+| 4 | not supported |
+| 5 | harness or environment |
+| 6 | our gap |
+| 7 | our gap |
+| 8 | not supported (Master, D50) |
+| 9 | not supported |
+| 10 | our gap |
+| 11 | our gap |
+| 12 | our gap |
+| 13 | our gap |
+| 14 | not supported |
+| 15 | not supported |
+| 16 | harness or environment |
+| 17 | our gap |
+| 18 | harness or environment |
+| 19 | not supported |
+| 20 | harness or environment |
+| 21 | harness or environment |
+| 22 | harness or environment |
+| 23 | harness or environment |
+| 24 | harness or environment |
+| 25 | harness or environment |
+| 26 | harness or environment |
+| 27 | our gap |
+| 28 | harness or environment |
+| 29 | harness or environment |
+| 30 | harness or environment |
+| 31 | harness or environment |
+| 32 | our gap |
+| 33 | our gap |
+| 34 | harness or environment |
+| 35 | our gap |
+| 36 | our gap |
+| 37 | not supported |
+| 38 | our gap |
+| 39 | harness or environment |
+| 40 | harness or environment |
+| 41 | harness or environment |
+| 42 | harness or environment |
+| 43 | harness or environment |
+| 44 | harness or environment |
+| 45 | harness or environment |
+| 46 | harness or environment |
+| 47 | harness or environment |
+| 48 | harness or environment |
+| 49 | harness or environment |
+| 50 | harness or environment |
+| 51 | harness or environment |
+| 52 | harness or environment |
+| 53 | harness or environment |
+| 54 | harness or environment |
+| 55 | harness or environment |
+| 56 | our gap |
+| 57 | our gap |
+| 58 | harness or environment |
+| 59 | our gap |
+| 60 | harness or environment |
+| 61 | harness or environment |
+
+The prefix-coverage test
+(`tests/test_lockfile_drift.py::test_typed_refusal_prefix_coverage`)
+reads this table: every row ruled **not supported** must
+correspond to an emitted string starting with
+`not supported: `, and no other ruled row's string may start
+with it.

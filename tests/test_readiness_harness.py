@@ -323,7 +323,8 @@ def test_provision_side_row_agrees_with_its_log_on_both_refusals(
 
 def test_row_from_exception_types_runtime_detection() -> None:
     exc = ValueError(
-        "cannot detect runtime in /snap: no package.json or pyproject.toml"
+        "cannot detect runtime in /snap: no package.json, "
+        "pyproject.toml or requirements.txt"
     )
     row = rp.row_from_exception(
         BUG_UNIT, BUG_UNIT["sides"][0], "h" * 40, 1, "isolated", exc
@@ -393,7 +394,8 @@ def test_provision_side_types_a_raising_path(
         self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
     ) -> SimpleNamespace:
         raise ValueError(
-            "cannot detect runtime in /snap: no package.json or pyproject.toml"
+            "cannot detect runtime in /snap: no package.json, "
+            "pyproject.toml or requirements.txt"
         )
 
     monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", raising_method)
