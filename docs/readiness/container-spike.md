@@ -36,7 +36,15 @@ The same bar as the sandbox, verbatim from the work order:
   to the same bar as the run: userns-remapped
   (`--userns-uid-map` / `--userns-gid-map` `0:1:65536`) and
   `--cap-drop=ALL`, so an escape during the build is not host
-  root. Network is allowed during the build only, and only on
+  root. On top of the drop-all, the build — and only the
+  build — adds back the minimal capability set `BUILD_CAPS`
+  (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETUID`,
+  `SETGID`): the file-ownership and identity operations
+  ordinary Dockerfiles perform, which a bare drop-all makes
+  impossible (see "Why the build capabilities changed"
+  below). Nothing beyond that set: no `MKNOD`, no
+  `NET_ADMIN`, no `SYS_ADMIN`. The run gets no add-back.
+  Network is allowed during the build only, and only on
   the explicit rootless build network
   `slirp4netns:allow_host_loopback=false` — outbound NAT for
   package registries, no route back to services bound on the
@@ -56,8 +64,8 @@ The same bar as the sandbox, verbatim from the work order:
 - A run records how podman was invoked: the run log
   (`spike-logs/spike-<repo>-run-a<attempt>.log`) carries the
   capability line (podman version, userns remapping), the podman
-  base command, the run and build user args, and the build
-  network mode; every podman invocation
+  base command, the run and build user args, the build
+  network mode and the build caps; every podman invocation
   for a side is logged verbatim in that side's log.
 
 Each safety property has a command-construction test in
@@ -73,6 +81,14 @@ runs a real rootless build whose RUN step tries to reach a
 service bound on the host's loopback and must fail to reach it
 while a control fetch succeeds; flipping the mode to
 `allow_host_loopback=true` is the plant that makes it fail.
+The build caps are likewise proven as a property: a sandbox
+test (`test_build_caps_allow_chown_but_not_net_admin`,
+sandbox-tests CI) runs two real rootless builds — one whose
+RUN step chowns a file to another uid (must build, under
+`BUILD_CAPS`) and one whose step needs `CAP_NET_ADMIN`, a
+capability outside the set (must still fail). Removing
+`CHOWN` from the set, or adding `NET_ADMIN` to it, is the
+plant that makes it fail.
 
 ### Why the build network changed (WAL-118)
 
@@ -96,6 +112,34 @@ fallback — if the slirp mode is unavailable the build itself
 fails and the side is typed `BUILD_FAILED` with the build's
 error. The mode is recorded on every row (`build_network`) and
 in the run header log.
+
+### Why the build capabilities changed (WAL-120)
+
+The Directus re-run on the fixed build network (run
+`38657936035`, from main `d1826b7`) got past the `apk add`
+step and died at STEP 6/23 on all four sides, both attempts,
+with the same typed reason, verbatim:
+
+```
+Error: building at STEP "RUN chown node:node .": while running runtime: exit status 1
+```
+
+(the step's own output line was `chown: .: Operation not
+permitted`). The cause was the harness's again, not the app's:
+the build ran with `--cap-drop=ALL`, which removes
+CAP_CHOWN, and changing a copied tree's ownership is
+something ordinary Dockerfiles — Directus's included — do as
+a matter of course. These rows said nothing about whether
+Directus installs: the frozen install never ran.
+
+The fix changes only the build's capabilities: every
+capability is still dropped, and the minimal set
+`BUILD_CAPS` — `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`,
+`SETUID`, `SETGID`, the file-ownership and identity
+operations — is added back for the build only. The set is
+recorded on every row (`build_caps`) and in the run header
+log. The run is unchanged: `--cap-drop=ALL`, no add-back,
+`no-new-privileges`.
 
 ## Selection (mechanical, decided before any run)
 
@@ -149,7 +193,8 @@ For the dispatched repo, per registered side
 3. Parse the Dockerfile: FROM stages with build-ARG resolution,
    the install RUN lines (including heredoc bodies), EXPOSE
    ports, ENV.
-4. Build with podman (userns-remapped, `--cap-drop=ALL`, on
+4. Build with podman (userns-remapped, `--cap-drop=ALL`
+   plus the build-only `BUILD_CAPS` add-back, on
    the explicit rootless build network
    `slirp4netns:allow_host_loopback=false`; snapshot-only
    context; no secrets, no build args, no mounts). Record the
@@ -191,7 +236,8 @@ links.
 
 One row per (unit, role), in `rows-spike-attempt<N>.json`:
 
-`kind` (`"container-spike"`), `repo`, `unit`, `role`,
+`kind` (`"container-spike"`), `repo`, `unit`, `unit_id` (the
+unit's manifest id, the same value as `unit`), `role`,
 `registered_sha`, `status` (`READY` / `BUILD_FAILED` /
 `START_FAILED`), `typed_reason` (verbatim-style reason or null),
 `from_digests` (every FROM image's resolved digest),
@@ -199,8 +245,9 @@ One row per (unit, role), in `rows-spike-attempt<N>.json`:
 line to judge), `install_evidence` (the verbatim install line),
 `port_source` (`EXPOSE` / `compose` / `$PORT` / null), `port`,
 `network_mode` (`none+socket`), `build_network`
-(`slirp4netns:allow_host_loopback=false`), `userns_fallback`
-(true only
+(`slirp4netns:allow_host_loopback=false`), `build_caps` (the
+build's added-back capability set, `BUILD_CAPS`),
+`userns_fallback` (true only
 when the run proceeded under the dev no-userns flag), `attempt`.
 
 Per-side build and run logs land in `spike-logs/`, and the

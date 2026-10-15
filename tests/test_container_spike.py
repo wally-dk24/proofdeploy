@@ -10,11 +10,14 @@ per-side flow is driven through a FakePodman that records every
 command it is handed, so a flow test can also assert the safety
 shape of the commands the flow actually built.
 
-The one exception is the build-network property test at the
-bottom: it runs a real rootless ``podman build`` and proves a
-RUN step cannot reach a service bound on the host's loopback.
-It is sandbox-gated (the skipif below) and runs only in the
-sandbox-tests CI job, where podman is rootless.
+The exceptions are the property tests at the bottom: they run
+real rootless ``podman build``s and prove the build-network
+property (a RUN step cannot reach a service bound on the
+host's loopback) and the build-caps property (a RUN ``chown``
+succeeds under BUILD_CAPS while a step needing a capability
+outside the set still fails). They are sandbox-gated (the
+skipif below) and run only in the sandbox-tests CI job, where
+podman is rootless.
 """
 
 from __future__ import annotations
@@ -323,7 +326,8 @@ def test_build_command_context_is_snapshot_only(tmp_path: Path) -> None:
     assert cmd == [
         "podman", "build",
         "--userns-uid-map", "0:1:65536", "--userns-gid-map", "0:1:65536",
-        "--cap-drop=ALL", "--network", "slirp4netns:allow_host_loopback=false",
+        "--cap-drop=ALL", "--cap-add=CHOWN,DAC_OVERRIDE,FOWNER,FSETID,SETUID,SETGID",
+        "--network", "slirp4netns:allow_host_loopback=false",
         "-t", "pd-spike-x", "-f", str(dockerfile), str(tmp_path),
     ]
     assert "-v" not in cmd
@@ -357,6 +361,41 @@ def test_build_user_args_modes() -> None:
     no_remap = cs.build_user_args_for(False)
     assert "--userns-uid-map" not in no_remap
     assert "--cap-drop=ALL" in no_remap  # dropped even in fallback mode
+    # The BUILD_CAPS add-back is part of the build's posture in
+    # both modes (WAL-120).
+    cap_add = "--cap-add=" + ",".join(cs.BUILD_CAPS)
+    assert cap_add in remap and cap_add in no_remap
+
+
+def test_build_caps_are_build_only(tmp_path: Path) -> None:
+    # WAL-120: the build drops every capability and adds back
+    # exactly BUILD_CAPS — the file-ownership/identity set an
+    # ordinary Dockerfile needs (Directus's `RUN chown
+    # node:node .` above all). The set itself is pinned here:
+    # adding or removing a capability is a deliberate change to
+    # this test, never a silent drift. The RUN gets no add-back
+    # at all: drop-all and no-new-privileges, exactly as before.
+    assert cs.BUILD_CAPS == (
+        "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETUID", "SETGID"
+    )
+    cap_add = "--cap-add=CHOWN,DAC_OVERRIDE,FOWNER,FSETID,SETUID,SETGID"
+    build = cs.build_command(
+        ["podman"], "pd-spike-x", tmp_path / "Dockerfile", tmp_path,
+        cs.build_user_args_for(True),
+    )
+    assert "--cap-drop=ALL" in build
+    assert cap_add in build
+    assert build.count(cap_add) == 1
+    run = cs.run_command(
+        ["podman"], "pd-spike-x", "img", cs.user_args_for(True),
+        tmp_path, {}, "exec app",
+    )
+    assert "--cap-drop=ALL" in run
+    assert "--security-opt=no-new-privileges" in run
+    assert not any(arg.startswith("--cap-add") for arg in run)
+    assert not any(arg.startswith("--cap-add") for arg in cs.user_args_for(True))
+    fallback = cs.user_args_for(False, allow_no_userns_fallback=True)
+    assert not any(arg.startswith("--cap-add") for arg in fallback)
 
 
 def test_run_command_safety_shape(tmp_path: Path) -> None:
@@ -440,6 +479,8 @@ def test_side_directus_ready(tmp_path: Path) -> None:
     assert row["from_digests"] == ["docker.io/library/node@sha256:abc123"]
     assert row["network_mode"] == "none+socket"
     assert row["build_network"] == "slirp4netns:allow_host_loopback=false"
+    assert row["build_caps"] == list(cs.BUILD_CAPS)
+    assert row["unit_id"] == "C3"
     assert row["userns_fallback"] is False
     assert row["attempt"] == 2
     assert len(fake.built) == 1
@@ -830,3 +871,98 @@ def test_build_network_blocks_host_loopback(tmp_path: Path) -> None:
     assert "LOOPBACK_REACHED" not in joined, joined
     assert "LOOPBACK_BLOCKED" in joined, joined
     assert result.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# Build caps property (sandbox selection: real rootless podman)
+# ---------------------------------------------------------------------------
+
+_CAPS_PROBE_PY = """\
+import fcntl
+import os
+import socket
+import struct
+import sys
+
+MODE = "__MODE__"
+
+if MODE == "chown":
+    target = "/pd-caps-chown-target"
+    with open(target, "w") as fh:
+        fh.write("x")
+    os.chown(target, 1000, 1000)
+    print("CHOWN_OK", flush=True)
+    sys.exit(0)
+
+# MODE == "netadmin": SIOCSIFFLAGS on lo with flags 0 (bring the
+# interface down) needs CAP_NET_ADMIN over the build's network
+# namespace -- a capability BUILD_CAPS deliberately leaves out.
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ifreq = b"lo" + bytes(14) + struct.pack("h", 0) + bytes(22)
+try:
+    fcntl.ioctl(sock, 0x8914, ifreq)
+except PermissionError as exc:
+    print("NETADMIN_BLOCKED: %s" % exc, flush=True)
+    sys.exit(3)
+print("NETADMIN_OK", flush=True)
+sys.exit(0)
+"""
+
+
+def _caps_probe_build(tmp_path: Path, mode: str) -> tuple[int, str]:
+    """One real rootless build of the caps probe in ``mode``;
+    returns (build returncode, the build's whole log)."""
+    context = tmp_path / f"ctx-{mode}"
+    context.mkdir()
+    dockerfile = context / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.12-alpine\n"
+        "COPY probe.py /probe.py\n"
+        "RUN python3 /probe.py\n",
+        encoding="utf-8",
+    )
+    (context / "probe.py").write_text(
+        _CAPS_PROBE_PY.replace("__MODE__", mode), encoding="utf-8"
+    )
+    logs: list[str] = []
+    podman = cs.Podman(logs)
+    tag = f"pd-spike-caps-property-{mode}"
+    try:
+        result = podman.build(tag, dockerfile, context, cs.build_user_args_for(True))
+    finally:
+        podman.run([*podman.base, "image", "rm", "-f", tag], 60)
+    return result.returncode, "\n".join(logs)
+
+
+@requires_rootless_podman
+def test_build_caps_allow_chown_but_not_net_admin(tmp_path: Path) -> None:
+    # The WAL-120 property of BUILD_CAPS, proven against real
+    # rootless builds — not just the flags in the command list.
+    # Half 1: a RUN step that chowns a file to another uid
+    # builds. That is the exact operation Directus's Dockerfile
+    # died on (`RUN chown node:node .` — "Operation not
+    # permitted") under the old drop-all-only build. Half 2: a
+    # step needing CAP_NET_ADMIN — a capability the set
+    # deliberately leaves out — still fails, so the add-back is
+    # a minimal set, not a quiet return to a privileged build.
+    #
+    # Why NET_ADMIN is the probe capability and not mknod:
+    # device-node creation inside a user namespace is refused
+    # regardless of the capability set (the kernel checks it
+    # against the initial user namespace), so an mknod step
+    # fails under both the old and the new set and can prove
+    # nothing about the set. CAP_NET_ADMIN over the build's own
+    # network namespace is granted or withheld by the set
+    # itself, which is what this test measures.
+    #
+    # Plants: remove CHOWN from BUILD_CAPS and half 1's build
+    # fails (the chown raises PermissionError); add NET_ADMIN
+    # to BUILD_CAPS and half 2's step succeeds (NETADMIN_OK,
+    # the build passes) — either plant makes this test fail.
+    chown_rc, chown_log = _caps_probe_build(tmp_path, "chown")
+    assert "CHOWN_OK" in chown_log, chown_log
+    assert chown_rc == 0, chown_log
+    netadmin_rc, netadmin_log = _caps_probe_build(tmp_path, "netadmin")
+    assert "NETADMIN_OK" not in netadmin_log, netadmin_log
+    assert "NETADMIN_BLOCKED" in netadmin_log, netadmin_log
+    assert netadmin_rc != 0, netadmin_log
