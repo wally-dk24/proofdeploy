@@ -675,6 +675,7 @@ tests/test_wo6_regc_add2.py::test_node_root_app_passes
 tests/test_wo6_regc_add2.py::test_node_root_app_without_start_excluded
 tests/test_wo6_regc_add2.py::test_node_single_workspace_app_passes
 tests/test_wo6_regc_add2.py::test_node_two_root_lockfiles_excluded
+tests/test_wo6_regc_add2.py::test_node_workspace_glob_skips_node_modules
 tests/test_wo6_regc_add2.py::test_node_workspace_two_start_packages_ambiguous
 tests/test_wo6_regc_add2.py::test_node_workspace_zero_start_packages_excluded
 tests/test_wo6_regc_add2.py::test_notfound_is_a_typed_harness_error

@@ -365,7 +365,9 @@ class TreeIndex:
         """Directories matched by workspace patterns (F1).
 
         Positive patterns union; `!` patterns subtract. `*` matches
-        one path segment, `**` any number (including zero).
+        one path segment, `**` any number (including zero). Expansion
+        never descends into or matches a `node_modules` directory
+        (G1), mirroring npm/pnpm workspace-glob resolution.
         """
         matched: set[str] = set()
         for pat in patterns:
@@ -375,6 +377,18 @@ class TreeIndex:
             if pat.startswith("!"):
                 matched -= self._expand_pattern(pat[1:])
         return sorted(matched)
+
+    def _glob_children(self, dir_path: str) -> set[str]:
+        """Children visible to workspace-glob expansion (G1).
+
+        npm and pnpm ignore `node_modules` when resolving workspace
+        globs, so expansion never descends into or matches a
+        `node_modules` directory, at any depth, in `*` or `**`.
+        """
+        return {
+            d for d in self.child_dirs(dir_path)
+            if d.rsplit("/", 1)[-1] != "node_modules"
+        }
 
     def _expand_pattern(self, pattern: str) -> set[str]:
         pat = pattern.strip()
@@ -389,14 +403,14 @@ class TreeIndex:
                 frontier = list(current)
                 while frontier:
                     d = frontier.pop()
-                    for child in self.child_dirs(d):
+                    for child in self._glob_children(d):
                         if child not in seen:
                             seen.add(child)
                             frontier.append(child)
                 nxt = seen
             else:
                 for d in current:
-                    for child in self.child_dirs(d):
+                    for child in self._glob_children(d):
                         if fnmatch.fnmatchcase(child.rsplit("/", 1)[-1], seg):
                             nxt.add(child)
             current = nxt

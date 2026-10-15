@@ -418,6 +418,30 @@ def test_node_lerna_default_packages() -> None:
     assert node["workspace_members"] == ["packages/api"]
 
 
+def test_node_workspace_glob_skips_node_modules() -> None:
+    # G1: npm/pnpm ignore node_modules when resolving workspace globs.
+    # A committed packages/app/node_modules/dep/package.json (with
+    # scripts.start) must not become a spurious member under
+    # `packages/**` — it would read as a wrong "ambiguous app".
+    repos = {"acme/mono": {"files": {
+        "package.json": json.dumps({"workspaces": ["packages/**"]}),
+        "package-lock.json": "{}",
+        "packages/app/package.json": json.dumps({
+            "scripts": {"start": "node app.js"},
+            "dependencies": {"sqlite3": "^5.1.0"},
+        }),
+        "packages/app/node_modules/dep/package.json": json.dumps({
+            "scripts": {"start": "node dep.js"}, "dependencies": {},
+        }),
+    }}}
+    entry = check(FakeFetcher(repos), "acme/mono", 2000, ["JavaScript"])
+    assert entry["survivor"] is True
+    node = entry["stacks"]["node"]
+    assert node["app_path"] == "packages/app"
+    assert node["workspace_patterns"] == ["packages/**"]
+    assert node["workspace_members"] == ["packages/app"]
+
+
 def test_node_nx_only_marker_no_declared_members() -> None:
     # nx.json declares no members; with no patterns anywhere the nested
     # app is not a workspace package (F1).
