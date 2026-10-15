@@ -1,3 +1,6 @@
+# PROVENANCE 2026-10-15: app.path declared "." under the reviewer's app-identification ruling (plan 1.2b follow-up) — the app is named in the contract; the tool never guesses. This contract's commands already run from the repo root, so "." preserves them exactly.
+app:
+  path: "."
 build: "pnpm run bootstrap && pnpm run build"
 migrate: "pnpm run migrate:db"
 start: "server__host=0.0.0.0 server__port=$PORT pnpm dev"
