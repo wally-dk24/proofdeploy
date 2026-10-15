@@ -133,10 +133,13 @@ jobs:
             files: "tests/test_uptime_kuma.py tests/test_node26_corepack.py tests/test_forced_compile.py tests/test_node_headers.py"
           # WAL-118: the container spike's build-network property
           # test — a real rootless build proving a RUN step cannot
-          # reach a service on the host's loopback. Every other
-          # container-spike test is host-side (ci workflow).
+          # reach a service on the host's loopback. WAL-120 adds
+          # the build-caps property test (a RUN chown builds under
+          # BUILD_CAPS; a step needing NET_ADMIN still fails).
+          # Every other container-spike test is host-side (ci
+          # workflow).
           - shard: spike-build-network
-            nodeids: "tests/test_container_spike.py::test_build_network_blocks_host_loopback"
+            nodeids: "tests/test_container_spike.py::test_build_caps_allow_chown_but_not_net_admin tests/test_container_spike.py::test_build_network_blocks_host_loopback"
     name: sandbox (${{ matrix.shard }})
     steps:
       - name: Gate (WAL-101)
