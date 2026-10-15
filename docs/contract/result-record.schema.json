@@ -1,0 +1,690 @@
+{
+  "$defs": {
+    "evidence_record": {
+      "additionalProperties": false,
+      "description": "Built by build_evidence_record() and written BEFORE any scoring. All 55 keys are always present; fields that do not apply to the run are null or empty, never absent.",
+      "properties": {
+        "auth_bootstrap": {
+          "additionalProperties": {
+            "type": "object"
+          },
+          "description": "Per-side auth bootstrap summary, e.g. {\"fix\": {\"generated\": [\"ADMIN_EMAIL\", \"ADMIN_PASSWORD\"]}}: env NAMES recorded as \"generated\", never their values.",
+          "type": "object"
+        },
+        "author_prompt_builder_sha256": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "SHA-256 of the prompt builder module."
+        },
+        "author_prompt_sha256": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "SHA-256 of the frozen author-prompt template that built the prompt."
+        },
+        "b_parent_sha": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "B^: the parent of B."
+        },
+        "b_sha": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "The bug-introducing commit B, resolved separately from fix^; recorded for provenance."
+        },
+        "bug_id": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "bundle_manifest": {
+          "type": "object"
+        },
+        "bundle_manifest_sha256": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "c_provision": {
+          "description": "Provisioning result for the C side (provisioning contract, not this contract).",
+          "type": "object"
+        },
+        "c_results": {
+          "items": {
+            "$ref": "#/$defs/probe_result"
+          },
+          "type": "array"
+        },
+        "c_sha": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "The clean-diff commit C; only clean runs use the c_* fields."
+        },
+        "captured_values": {
+          "description": "Values captured during the run. Stored REDACTED (see the contract doc): the written record holds redaction markers, not the values. A name bound more than once maps to a list of its distinct values.",
+          "type": "object"
+        },
+        "clean_id": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "contract_env": {
+          "description": "Contract env values used by the run; same redaction rule as fixture, via public_contract_env_keys.",
+          "type": "object"
+        },
+        "crash_probe_results": {
+          "description": "Crash records only: whatever per-probe results were gathered before the crash. The builder types this Any; no single shape is guaranteed."
+        },
+        "crash_provisioning": {
+          "type": "object"
+        },
+        "fix_parent_provision": {
+          "type": "object"
+        },
+        "fix_parent_results": {
+          "items": {
+            "$ref": "#/$defs/probe_result"
+          },
+          "type": "array"
+        },
+        "fix_parent_sha": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "fix^: the parent of the fix commit; the side the probes run against first."
+        },
+        "fix_provision": {
+          "type": "object"
+        },
+        "fix_results": {
+          "items": {
+            "$ref": "#/$defs/probe_result"
+          },
+          "type": "array"
+        },
+        "fix_sha": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "The fix commit in the target repo."
+        },
+        "fixture": {
+          "description": "Fixture values used by the run; every value is a redaction secret unless its key is in public_fixture_keys.",
+          "type": "object"
+        },
+        "harness_version": {
+          "description": "HARNESS_VERSION (the probe-schema harness version), distinct from schema_version.",
+          "type": "string"
+        },
+        "inconclusive_cause": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "Crash records only: the typed cause of an orchestrator-crash INCONCLUSIVE."
+        },
+        "inconclusive_error": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "invalid_probe_blocks": {
+          "description": "Author blocks that failed validation, recorded verbatim with their rejection reason ({block_index, raw_text, rejection_reason}).",
+          "items": {
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "measured_result": {
+          "description": "False marks a non-measured (e.g. unsandboxed dev) run; such a record must never be treated as a measured result.",
+          "type": "boolean"
+        },
+        "minted_tokens": {
+          "description": "Tokens minted by the credential provider. Stored REDACTED, like captured_values.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model_attempts": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model_call_attempts": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "model_id": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "model_request": {
+          "description": "The exact model request as sent (model, temperature, per-message hashes, seed/tools as sent).",
+          "type": "object"
+        },
+        "model_temperature": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "parsed_probes": {
+          "description": "The parsed probes, stored VERBATIM and never redacted; parsed_probes_sha256 must still match them.",
+          "items": {
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "parsed_probes_sha256": {
+          "$ref": "#/$defs/sha256_hex",
+          "description": "SHA-256 of the canonical JSON of parsed_probes."
+        },
+        "prompt": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "prompt_sha256": {
+          "$ref": "#/$defs/sha256_hex"
+        },
+        "provenance": {
+          "description": "Caller provenance (Actions run URL/ID, runner image, capability probe) merged with the computed harness object, which is always present.",
+          "properties": {
+            "harness": {
+              "$ref": "#/$defs/harness_provenance"
+            }
+          },
+          "required": [
+            "harness"
+          ],
+          "type": "object"
+        },
+        "public_contract_env_keys": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "public_fixture_keys": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "raw_model_response": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "record_id": {
+          "$ref": "#/$defs/record_id"
+        },
+        "record_type": {
+          "const": "evidence"
+        },
+        "run_kind": {
+          "enum": [
+            "bug",
+            "clean"
+          ]
+        },
+        "runner_log": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sandbox_evidence": {
+          "description": "Isolation actually in effect per side (network mode, userns mode, uid); empty when the sandbox was not used.",
+          "type": "object"
+        },
+        "sandboxed": {
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": "1.5.0"
+        },
+        "scoring_version": {
+          "description": "The scoring rule version; the only value the code produces is v2-per-probe.",
+          "type": "string"
+        },
+        "skill_sha256": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "Null for no-skill baseline runs."
+        },
+        "timestamp": {
+          "description": "UTC ISO-8601 (datetime.now(timezone.utc).isoformat()).",
+          "format": "date-time",
+          "type": "string"
+        },
+        "truncation_flags": {
+          "type": "object"
+        },
+        "verdict": {
+          "description": "Always null on an evidence record: the verdict lives on the score (and judgment) records, never on the evidence.",
+          "type": "null"
+        },
+        "write_grants": {
+          "description": "Per side: {provisioned, target_url, network_mode} \u2014 writes were allowed on a side iff its executor was provisioned.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "record_id",
+        "timestamp",
+        "record_type",
+        "schema_version",
+        "run_kind",
+        "bug_id",
+        "clean_id",
+        "fix_sha",
+        "fix_parent_sha",
+        "b_sha",
+        "b_parent_sha",
+        "c_sha",
+        "c_provision",
+        "c_results",
+        "prompt",
+        "prompt_sha256",
+        "raw_model_response",
+        "parsed_probes",
+        "parsed_probes_sha256",
+        "invalid_probe_blocks",
+        "bundle_manifest",
+        "bundle_manifest_sha256",
+        "skill_sha256",
+        "model_id",
+        "model_temperature",
+        "model_attempts",
+        "model_call_attempts",
+        "model_request",
+        "author_prompt_sha256",
+        "author_prompt_builder_sha256",
+        "truncation_flags",
+        "sandbox_evidence",
+        "write_grants",
+        "sandboxed",
+        "measured_result",
+        "provenance",
+        "harness_version",
+        "scoring_version",
+        "fix_parent_provision",
+        "fix_provision",
+        "fix_parent_results",
+        "fix_results",
+        "runner_log",
+        "fixture",
+        "contract_env",
+        "public_fixture_keys",
+        "public_contract_env_keys",
+        "captured_values",
+        "minted_tokens",
+        "auth_bootstrap",
+        "inconclusive_cause",
+        "inconclusive_error",
+        "crash_provisioning",
+        "crash_probe_results",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "harness_provenance": {
+      "additionalProperties": false,
+      "description": "provenance.harness, computed by harness_provenance() (proofdeploy/runpair.py): the ProofDeploy code that produced the record.",
+      "properties": {
+        "commit": {
+          "description": "git rev-parse HEAD of the ProofDeploy checkout; null when the package does not sit at that repo's toplevel. Never sourced from an environment variable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "source": {
+          "enum": [
+            "git",
+            null
+          ]
+        },
+        "workflow_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "commit",
+        "source",
+        "dirty",
+        "workflow_ref"
+      ],
+      "type": "object"
+    },
+    "judgment_record": {
+      "additionalProperties": false,
+      "description": "Built by build_judgment_record(): the reviewer's condition-3 decision. Append-only; cites the evidence and score records and the evidence commit.",
+      "properties": {
+        "bug_id": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "clean_id": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "condition3_met": {
+          "type": "boolean"
+        },
+        "evidence_commit_sha": {
+          "type": "string"
+        },
+        "evidence_record_id": {
+          "$ref": "#/$defs/record_id"
+        },
+        "judge": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "Must be non-empty on bug runs (enforced at write time)."
+        },
+        "judge_role": {
+          "description": "On measured (bug) runs only \"reviewer\" may judge (enforced at write time).",
+          "enum": [
+            "reviewer",
+            "implementer",
+            "auditor"
+          ]
+        },
+        "note": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "probe_index": {
+          "description": "Must be in the cited score's candidate_catch (enforced at write time).",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "record_id": {
+          "$ref": "#/$defs/record_id"
+        },
+        "record_type": {
+          "const": "judgment"
+        },
+        "run_kind": {
+          "enum": [
+            "bug",
+            "clean"
+          ]
+        },
+        "schema_version": {
+          "const": "1.5.0"
+        },
+        "score_record_id": {
+          "$ref": "#/$defs/record_id"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "\"catch\" only when condition3_met is true for the cited probe.",
+          "enum": [
+            "catch",
+            "no_catch"
+          ]
+        }
+      },
+      "required": [
+        "record_id",
+        "timestamp",
+        "record_type",
+        "schema_version",
+        "run_kind",
+        "bug_id",
+        "clean_id",
+        "evidence_record_id",
+        "score_record_id",
+        "evidence_commit_sha",
+        "probe_index",
+        "judge",
+        "judge_role",
+        "condition3_met",
+        "verdict",
+        "note"
+      ],
+      "type": "object"
+    },
+    "probe_result": {
+      "additionalProperties": false,
+      "description": "One per-probe result, as serialized by ProbeResult.to_dict() (proofdeploy/executor.py). Embedded in evidence records under fix_parent_results / fix_results / c_results.",
+      "properties": {
+        "assertions_evaluated": {
+          "description": "Whether assertion evaluation actually ran; when false, replay must carry the recorded verdict instead of re-deciding.",
+          "type": "boolean"
+        },
+        "details": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "http_body": {
+          "description": "Response body, capped at 2000 characters by ProbeResult.to_dict().",
+          "type": "string"
+        },
+        "http_body_truncated": {
+          "description": "True when http_body was truncated at the 2000-character cap; a truncated body is not replayable.",
+          "type": "boolean"
+        },
+        "http_headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "http_status": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "probe_index": {
+          "type": "integer"
+        },
+        "reason": {
+          "description": "Typed INCONCLUSIVE reason (InconclusiveReason); null unless verdict is inconclusive.",
+          "enum": [
+            "environment",
+            "auth",
+            "drift",
+            "probe",
+            null
+          ]
+        },
+        "request": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/recorded_request"
+            }
+          ],
+          "description": "The act request actually sent; null when no request was sent."
+        },
+        "schema_version": {
+          "const": "1.5.0"
+        },
+        "sent": {
+          "description": "Whether the probe was actually sent to the target.",
+          "type": "boolean"
+        },
+        "setup_requests": {
+          "description": "Every setup-step request actually sent, in order; null when the executor left it unset.",
+          "items": {
+            "$ref": "#/$defs/recorded_request"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "verdict": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive"
+          ]
+        },
+        "writes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "probe_index",
+        "verdict",
+        "reason",
+        "request",
+        "setup_requests",
+        "http_status",
+        "http_headers",
+        "http_body",
+        "http_body_truncated",
+        "writes",
+        "details",
+        "sent",
+        "assertions_evaluated"
+      ],
+      "type": "object"
+    },
+    "record_id": {
+      "description": "uuid.uuid4().hex, minted by the record builder.",
+      "pattern": "^[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "recorded_request": {
+      "additionalProperties": false,
+      "description": "An HTTP request exactly as sent, recorded by the executor for replay: {method, url, headers, body}.",
+      "properties": {
+        "body": {
+          "description": "Request body as sent; any JSON value or null."
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "method": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "url",
+        "headers",
+        "body"
+      ],
+      "type": "object"
+    },
+    "score_record": {
+      "additionalProperties": false,
+      "description": "Built by build_score_record() from the COMMITTED evidence record; caller-passed verdicts that disagree with the evidence are refused. Written in a later commit than the evidence it cites.",
+      "properties": {
+        "bug_id": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "candidate_catch": {
+          "description": "Indices of EVERY probe that went FAIL on fix^ and PASS on fix.",
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "clean_id": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "evidence_commit_sha": {
+          "description": "The git commit that carries the cited evidence record.",
+          "type": "string"
+        },
+        "evidence_record_id": {
+          "$ref": "#/$defs/record_id"
+        },
+        "false_alarm": {
+          "description": "Clean runs only; null on bug runs.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "note": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "record_id": {
+          "$ref": "#/$defs/record_id"
+        },
+        "record_type": {
+          "const": "score"
+        },
+        "run_kind": {
+          "enum": [
+            "bug",
+            "clean"
+          ]
+        },
+        "schema_version": {
+          "const": "1.5.0"
+        },
+        "scoring_version": {
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "Bug runs: candidate_catch (never \"catch\" \u2014 only a judgment makes a catch), no_catch, or inconclusive. Clean runs: null; they score false_alarm instead.",
+          "enum": [
+            "candidate_catch",
+            "no_catch",
+            "inconclusive",
+            null
+          ]
+        }
+      },
+      "required": [
+        "record_id",
+        "timestamp",
+        "record_type",
+        "schema_version",
+        "run_kind",
+        "bug_id",
+        "clean_id",
+        "evidence_record_id",
+        "evidence_commit_sha",
+        "verdict",
+        "candidate_catch",
+        "false_alarm",
+        "scoring_version",
+        "note"
+      ],
+      "type": "object"
+    },
+    "sha256_hex": {
+      "description": "Lowercase hex SHA-256 digest as produced by hashlib.sha256(...).hexdigest().",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "string_or_null": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "$id": "proofdeploy/docs/contract/result-record.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The record format written to runs.jsonl by proofdeploy/runpair.py at SCHEMA_VERSION 1.5.0 (proofdeploy/probe.py). One JSON object per line; exactly three record types: evidence, score, judgment. This schema uses only the keyword subset enforced by the stdlib validator in tests/test_runpair.py (type, enum, const, required, properties, additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref); every other keyword is annotation only. See docs/contract/result-contract.md for the prose contract.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/evidence_record"
+    },
+    {
+      "$ref": "#/$defs/score_record"
+    },
+    {
+      "$ref": "#/$defs/judgment_record"
+    }
+  ],
+  "title": "ProofDeploy result record, schema_version 1.5.0"
+}
