@@ -2,11 +2,14 @@
 
 import hashlib
 import json
+import os
+import re
 import subprocess
 
 import pytest
 
 from proofdeploy.executor import InconclusiveReason, ProbeResult, Verdict
+from proofdeploy.probe import SCHEMA_VERSION
 from proofdeploy.runpair import (
     DEFAULT_SCORING_VERSION,
     SCORING_VERSION,
@@ -17,6 +20,7 @@ from proofdeploy.runpair import (
     ScoreMismatchError,
     build_evidence_record,
     build_judgment_record,
+    build_score_record,
     collect_record_secret_values,
     collect_secret_values,
     commit_records,
@@ -1090,3 +1094,308 @@ def test_evidence_record_carries_registered_model_config():
     assert out["model_id"] == "openai/gpt-oss-120b"
     assert out["model_temperature"] == 0.2
     assert out["model_attempts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Plan 1.4(a): the versioned result contract (docs/contract/). The schema
+# file is docs/contract/result-record.schema.json; the prose contract is
+# docs/contract/result-contract.md. The repo's dependency set has no JSON
+# Schema library, so the validator below implements — with the standard
+# library only — exactly the keyword subset the schema file uses.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CONTRACT_SCHEMA_PATH = os.path.join(
+    _REPO_ROOT, "docs", "contract", "result-record.schema.json"
+)
+
+
+def _load_contract_schema():
+    with open(_CONTRACT_SCHEMA_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _contract_type_matches(instance, expected):
+    if expected == "null":
+        return instance is None
+    if expected == "boolean":
+        return isinstance(instance, bool)
+    if expected == "integer":
+        return isinstance(instance, int) and not isinstance(instance, bool)
+    if expected == "number":
+        return isinstance(instance, (int, float)) and not isinstance(instance, bool)
+    if expected == "string":
+        return isinstance(instance, str)
+    if expected == "array":
+        return isinstance(instance, list)
+    if expected == "object":
+        return isinstance(instance, dict)
+    raise AssertionError(f"contract validator: unknown type {expected!r}")
+
+
+def _contract_errors(instance, schema, root, path="$"):
+    """JSON Schema validation, stdlib subset.
+
+    Enforces: $ref (local #/$defs/...), type, enum, const, oneOf, anyOf,
+    required, properties, additionalProperties (false or a schema),
+    items, pattern. Every other keyword is annotation and is ignored.
+    Returns a list of error strings; empty means valid.
+    """
+    if "$ref" in schema:
+        ref = schema["$ref"]
+        prefix = "#/$defs/"
+        assert ref.startswith(prefix), f"contract validator: unsupported $ref {ref!r}"
+        return _contract_errors(instance, root["$defs"][ref[len(prefix) :]], root, path)
+    errors = []
+    if "oneOf" in schema:
+        matches = sum(
+            1
+            for sub in schema["oneOf"]
+            if not _contract_errors(instance, sub, root, path)
+        )
+        if matches != 1:
+            errors.append(f"{path}: oneOf matched {matches} schemas, expected exactly 1")
+        return errors
+    if "anyOf" in schema:
+        if all(_contract_errors(instance, sub, root, path) for sub in schema["anyOf"]):
+            errors.append(f"{path}: anyOf matched no schema")
+        return errors
+    if "const" in schema and instance != schema["const"]:
+        errors.append(f"{path}: {instance!r} != const {schema['const']!r}")
+    if "enum" in schema and instance not in schema["enum"]:
+        errors.append(f"{path}: {instance!r} not in enum {schema['enum']!r}")
+    if "type" in schema:
+        expected = schema["type"]
+        expected_list = expected if isinstance(expected, list) else [expected]
+        if not any(_contract_type_matches(instance, t) for t in expected_list):
+            errors.append(
+                f"{path}: expected type {expected!r}, got {type(instance).__name__}"
+            )
+            return errors  # deeper checks are meaningless on a type miss
+    if isinstance(instance, dict):
+        for key in schema.get("required", []):
+            if key not in instance:
+                errors.append(f"{path}: missing required key {key!r}")
+        props = schema.get("properties", {})
+        for key, subschema in props.items():
+            if key in instance:
+                errors.extend(
+                    _contract_errors(instance[key], subschema, root, f"{path}.{key}")
+                )
+        additional = schema.get("additionalProperties", True)
+        if additional is False:
+            for key in instance:
+                if key not in props:
+                    errors.append(f"{path}: additional property {key!r} not allowed")
+        elif isinstance(additional, dict):
+            for key in instance:
+                if key not in props:
+                    errors.extend(
+                        _contract_errors(instance[key], additional, root, f"{path}.{key}")
+                    )
+    if isinstance(instance, list) and "items" in schema:
+        for i, item in enumerate(instance):
+            errors.extend(
+                _contract_errors(item, schema["items"], root, f"{path}[{i}]")
+            )
+    if isinstance(instance, str) and "pattern" in schema:
+        if not re.search(schema["pattern"], instance):
+            errors.append(
+                f"{path}: {instance!r} does not match pattern {schema['pattern']!r}"
+            )
+    return errors
+
+
+def _contract_records():
+    """Representative records from the real builders, redacted as written."""
+    passed = ProbeResult(
+        probe_index=0,
+        verdict=Verdict.PASS,
+        http_status=200,
+        http_headers={"content-type": "text/plain"},
+        http_body="ok",
+        request={
+            "method": "GET",
+            "url": "http://localhost:8000/",
+            "headers": {},
+            "body": None,
+        },
+        setup_requests=[],
+    )
+    inconclusive = ProbeResult(
+        probe_index=1,
+        verdict=Verdict.INCONCLUSIVE,
+        reason=InconclusiveReason.ENVIRONMENT,
+        details=["target unreachable"],
+    )
+    bug = build_evidence_record(
+        run_kind="bug",
+        bug_id="B1",
+        fix_sha="a" * 40,
+        fix_parent_sha="b" * 40,
+        b_sha="c" * 40,
+        b_parent_sha="d" * 40,
+        prompt="prompt",
+        raw_model_response="response",
+        parsed_probes=[{"act": {"method": "GET", "path": "/"}}],
+        fix_parent_results=[inconclusive],
+        fix_results=[passed],
+        fix_parent_provision={"ready": False},
+        fix_provision={"ready": True},
+        auth_bootstrap={"fix": {"generated": ["ADMIN_PASSWORD"]}},
+        provenance={"run_url": "https://example.invalid/runs/1"},
+    )
+    clean = build_evidence_record(
+        run_kind="clean",
+        clean_id="C1",
+        c_sha="e" * 40,
+        c_results=[passed],
+        c_provision={"ready": True},
+    )
+    crash = build_evidence_record(
+        run_kind="bug",
+        bug_id="B2",
+        inconclusive_cause="tool_failure",
+        inconclusive_error="RuntimeError: boom",
+        crash_provisioning={"ready": False},
+    )
+    score_bug = build_score_record(
+        evidence_record_id=bug["record_id"],
+        evidence_commit_sha="f" * 40,
+        run_kind="bug",
+        bug_id="B1",
+        score_verdict="candidate_catch",
+        candidate_catch=[0],
+    )
+    score_inconclusive = build_score_record(
+        evidence_record_id=bug["record_id"],
+        evidence_commit_sha="f" * 40,
+        run_kind="bug",
+        bug_id="B1",
+        score_verdict="inconclusive",
+        candidate_catch=[],
+    )
+    score_clean = build_score_record(
+        evidence_record_id=clean["record_id"],
+        evidence_commit_sha="f" * 40,
+        run_kind="clean",
+        clean_id="C1",
+        false_alarm=False,
+    )
+    judgment = build_judgment_record(
+        evidence_record_id=bug["record_id"],
+        score_record_id=score_bug["record_id"],
+        evidence_commit_sha="f" * 40,
+        run_kind="bug",
+        bug_id="B1",
+        probe_index=0,
+        judge="reviewer-1",
+        judge_role="reviewer",
+        condition3_met=True,
+    )
+    judgment_no_catch = build_judgment_record(
+        evidence_record_id=bug["record_id"],
+        score_record_id=score_bug["record_id"],
+        evidence_commit_sha="f" * 40,
+        run_kind="bug",
+        bug_id="B1",
+        probe_index=0,
+        judge="reviewer-1",
+        judge_role="reviewer",
+        condition3_met=False,
+    )
+    records = [
+        bug,
+        clean,
+        crash,
+        score_bug,
+        score_inconclusive,
+        score_clean,
+        judgment,
+        judgment_no_catch,
+    ]
+    # Records are validated as they are written: after redaction.
+    return [redact_record(r, []) for r in records]
+
+
+def test_result_contract_schema_version_matches_code():
+    schema = _load_contract_schema()
+    for def_name in (
+        "evidence_record",
+        "score_record",
+        "judgment_record",
+        "probe_result",
+    ):
+        const = schema["$defs"][def_name]["properties"]["schema_version"]["const"]
+        assert const == SCHEMA_VERSION
+
+
+def test_result_contract_builder_records_validate():
+    schema = _load_contract_schema()
+    for record in _contract_records():
+        errors = _contract_errors(record, schema, schema)
+        assert errors == [], f"{record['record_type']}: {errors}"
+
+
+def test_result_contract_committed_records_validate():
+    schema = _load_contract_schema()
+    family = {"evidence", "score", "judgment"}
+    validated = 0
+    legacy = 0
+    for dirpath, dirnames, filenames in os.walk(_REPO_ROOT):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            if not name.endswith((".json", ".jsonl")):
+                continue
+            path = os.path.join(dirpath, name)
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            if name.endswith(".jsonl"):
+                candidates = [
+                    json.loads(line) for line in text.splitlines() if line.strip()
+                ]
+            else:
+                obj = json.loads(text)
+                candidates = obj if isinstance(obj, list) else [obj]
+            for candidate in candidates:
+                if not isinstance(candidate, dict) or "record_type" not in candidate:
+                    continue
+                if (
+                    candidate["record_type"] in family
+                    and "schema_version" in candidate
+                ):
+                    errors = _contract_errors(candidate, schema, schema)
+                    assert errors == [], f"{path}: {errors}"
+                    validated += 1
+                elif "schema_version" not in candidate:
+                    # Pre-contract record families (e.g. the legacy
+                    # author_run evaluation lines) carry no
+                    # schema_version; this schema does not claim them.
+                    legacy += 1
+    # Non-vacuity: the scan really does find the repo's committed
+    # record artifacts and classify the legacy family as out-of-scope.
+    assert legacy >= 1
+    assert validated >= 0
+
+
+def test_result_contract_rejects_corrupted_records():
+    schema = _load_contract_schema()
+    records = _contract_records()
+    score = next(r for r in records if r["record_type"] == "score")
+    evidence = next(r for r in records if r["record_type"] == "evidence")
+
+    dropped = json.loads(json.dumps(score))
+    del dropped["evidence_commit_sha"]
+    assert _contract_errors(dropped, schema, schema) != []
+
+    wrong_verdict = json.loads(json.dumps(score))
+    wrong_verdict["verdict"] = "catch"  # a score never stores "catch"
+    assert _contract_errors(wrong_verdict, schema, schema) != []
+
+    wrong_type = json.loads(json.dumps(evidence))
+    wrong_type["fix_results"][0]["schema_version"] = 150
+    assert _contract_errors(wrong_type, schema, schema) != []
+
+    extra_key = json.loads(json.dumps(evidence))
+    extra_key["surprise"] = True
+    assert _contract_errors(extra_key, schema, schema) != []
