@@ -1472,6 +1472,18 @@ class Provisioner:
                 if first_on_path
                 else manager_bin
             )
+        if package_manager == "bun":
+            # Plan 1.2e: the plan's bootstrapped bun lives in the
+            # checkout's .pd-tools/bin; an app's own contract steps
+            # may call `bun` (its build/start), so that dir goes
+            # first on PATH for every step — the host rendering of
+            # the sandbox's bun PATH treatment.
+            bun_bin = str(snap / ".pd-tools" / "bin")
+            first_on_path = (
+                bun_bin + os.pathsep + first_on_path
+                if first_on_path
+                else bun_bin
+            )
         step_env = build_env(contract_env, prepend_path=first_on_path)
 
         # 6b. Re-probe the runtime version through the final step PATH.

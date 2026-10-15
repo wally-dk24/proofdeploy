@@ -265,11 +265,22 @@ def _sandbox_step_command(
     `yarn` runs the plan's pinned version — never a PATH fallback.
     That bin dir therefore goes first on PATH, ahead of
     node_modules/.bin, for a corepack-pinned pnpm/yarn plan's steps.
+
+    Bun plans (plan 1.2e): the plan's bootstrapped bun lives in the
+    checkout's .pd-tools/bin (persisted), and an app's own contract
+    steps may call `bun` (its build/start), so that dir goes first
+    on PATH for a bun plan's steps — the same treatment, from the
+    plan's own fact.
     """
     if runtime == "node":
         if corepack_version is not None and manager in ("pnpm", "yarn"):
             return (
                 "env PATH=/checkout/.pd-tools/node_modules/.bin:"
+                f"/checkout/node_modules/.bin:$PATH {cmd}"
+            )
+        if manager == "bun":
+            return (
+                "env PATH=/checkout/.pd-tools/bin:"
                 f"/checkout/node_modules/.bin:$PATH {cmd}"
             )
         return f"env PATH=/checkout/node_modules/.bin:$PATH {cmd}"
@@ -1339,12 +1350,13 @@ class Orchestrator:
         # Fail closed for managers the sandbox executor cannot run:
         # pip and the committed-lock managers for Python (WO-8.1b:
         # uv/poetry/pdm plans carry their own hash-pinned bootstrap
-        # and frozen install, so they run), npm/pnpm/yarn for Node
-        # (bun stays refused).
+        # and frozen install, so they run), npm/pnpm/yarn/bun for
+        # Node (bun since plan 1.2e: its plan carries the
+        # digest-pinned bootstrap, so it runs the same way).
         supported_managers = (
             {"pip", "uv", "poetry", "pdm"}
             if runtime_name == "python"
-            else {"npm", "pnpm", "yarn"}
+            else {"npm", "pnpm", "yarn", "bun"}
         )
         if plan.package_manager not in supported_managers:
             logs.append(f"sandbox: lockfile {lockfile_name} not yet supported")
