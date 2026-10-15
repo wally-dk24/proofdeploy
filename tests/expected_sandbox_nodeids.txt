@@ -31,6 +31,7 @@ tests/test_conformance.py::test_case8_clean_commit_no_fail[python-flask-sqlite]
 tests/test_conformance.py::test_case9_no_canary_in_records[node-express-sqlite]
 tests/test_conformance.py::test_case9_no_canary_in_records[node-pnpm-sqlite]
 tests/test_conformance.py::test_case9_no_canary_in_records[python-flask-sqlite]
+tests/test_container_spike.py::test_build_network_blocks_host_loopback
 tests/test_forced_compile.py::test_forced_compile_variant_ready_on_node24
 tests/test_node26_corepack.py::test_pnpm_golden_variant_provisions_on_node26
 tests/test_node_headers.py::test_pinned_node_image_ships_its_headers[24.21.0-24]
