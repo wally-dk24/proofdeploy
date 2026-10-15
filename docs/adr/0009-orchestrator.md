@@ -214,6 +214,59 @@ for the run; the source repository is never touched. The nobody
 fallback (`--user 65534`, dev-only opt-out) has no mapping to
 transfer into and is unchanged.
 
+#### Sandbox HOME outside the app's tree (plan 1.2(k), 2026-10-15)
+
+The 2026-10-15 bun readiness re-run showed all six Vendure sides
+failing at the contract build step: bun's frozen install
+completed (2,902 packages), then `lerna run build` died with
+nx's `WorkspaceValidityError: The following implicitDependencies
+point to non-existent project(s): nx → graph-client`. Root cause
+(reproduced by the reviewer outside the sandbox): the sandbox set
+`HOME=/checkout/.sandbox-home` — INSIDE the app's tree — so bun's
+install cache (`$HOME/.bun/install/cache`) held extracted
+packages inside Vendure's workspace, including `nx@22.3.3`,
+whose package ships a top-level `project.json` naming
+`implicitDependencies: ["graph-client"]`. nx discovers
+`project.json` files across the workspace (it prunes
+`node_modules`; the cache is not under `node_modules`), loaded
+the cached file as a project named `nx`, and refused.
+`graph-client` exists nowhere in Vendure's tree; upstream is
+fine. The defect is ours, and it is a class, not an instance:
+any app whose tools scan their workspace can trip over tool
+state we leave in the tree.
+
+Decision (posture change, recorded here): the sandbox user's
+HOME moves OUT of the checkout. Each side gets a per-side
+scratch directory on the host, created NEXT TO the snapshot
+(`<checkout>.pd-home`, `proofdeploy.sandbox.sandbox_home_dir`),
+mounted read-write at `/pd-home` in every step container of
+that side (install, build, seed and start alike), with
+`HOME=/pd-home`. It persists across that side's step containers
+exactly as `/checkout` does, so everything that relied on HOME
+keeps working: the corepack cache (COREPACK_HOME rides on
+HOME), the pnpm store, the npm cache, the bun cache, and the
+pip/uv caches. It is never the host's real home and never shared
+across sides or runs. Its ownership is transferred with the
+checkout's, in the same `podman unshare chown -R 1:1` call
+(plan 1.2(g)'s mechanism), and it is removed at cleanup through
+the same path as the checkout — it is a sibling inside the
+side's run directory, so the workdir cleanup that takes the
+snapshot takes it too. It holds only tool caches and tool
+config; no app files, no secrets (the environment is stripped
+as before, and generated bootstrap values never persist to
+it intentionally — they arrive as step env, as before).
+
+What does NOT change: the uidmap (`0:1:65536`), every capability
+set (D15; the app run stays `--cap-drop=ALL`), and the network
+modes. The mounts gain exactly one entry — `/pd-home` —
+superseding the 1.2(g) note's "only the checkout" for mounts.
+The plan's declared in-checkout persisted dirs (`.pd-tools`,
+`.venv`, `node_modules`) are unchanged by this note; whether
+`.pd-tools` also moves is a separate question, ruled on
+separately. The nobody fallback (`--user 65534`, dev-only
+opt-out) is unchanged: no mapping to transfer into, and the
+home directory is made world-writable like the checkout.
+
 ### Schema version
 
 Every record (evidence, score, judgment) and every per-probe result

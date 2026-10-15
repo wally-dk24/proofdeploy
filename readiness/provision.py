@@ -257,6 +257,14 @@ def row_from_provision(
         "selected_runtime": prov.runtime,
         "runtime_version": prov.runtime_version or plan.get("selected_version"),
         "package_manager": plan.get("package_manager"),
+        # Plan 1.2(k) trace fix: the plan's workspace facts ride on
+        # the row, from the plan only. Until now the row carried no
+        # app_path at all, so a reader extracting one saw None for
+        # every repo — including workspace plans like Vendure's,
+        # whose plan resolves app_path "." (provisioning.py's
+        # plan_workspace) and scopes its steps by it.
+        "app_path": plan.get("app_path"),
+        "workspace_root": plan.get("workspace_root"),
         "status": status,
         "typed_reason": typed,
         "last_error": None if prov.ready else _last_log_line(prov.logs),
@@ -294,6 +302,8 @@ def row_from_exception(
         "selected_runtime": None,
         "runtime_version": None,
         "package_manager": None,
+        "app_path": None,
+        "workspace_root": None,
         "status": "BUILD_FAILED",
         "typed_reason": typed,
         "last_error": message,
@@ -329,6 +339,8 @@ def _harness_error_row(
         "selected_runtime": None,
         "runtime_version": None,
         "package_manager": None,
+        "app_path": None,
+        "workspace_root": None,
         "status": "BUILD_FAILED",
         "typed_reason": f"harness error: {message}",
         "last_error": message,

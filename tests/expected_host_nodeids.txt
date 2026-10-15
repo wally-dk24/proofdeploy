@@ -342,6 +342,7 @@ tests/test_readiness_harness.py::test_rerun_targets_take_only_non_ready
 tests/test_readiness_harness.py::test_row_from_exception_keeps_other_messages
 tests/test_readiness_harness.py::test_row_from_exception_types_runtime_detection
 tests/test_readiness_harness.py::test_row_from_provision_build_failed_plan_refusal
+tests/test_readiness_harness.py::test_row_from_provision_carries_plan_workspace_facts
 tests/test_readiness_harness.py::test_row_from_provision_ready
 tests/test_readiness_harness.py::test_row_from_provision_records_the_refusal_that_fired
 tests/test_readiness_harness.py::test_row_package_manager_comes_from_plan_only
@@ -553,6 +554,7 @@ tests/test_sandbox.py::test_explicit_opt_out_runs_and_records
 tests/test_sandbox.py::test_groq_key_stripped_from_app_env
 tests/test_sandbox.py::test_groq_key_stripped_from_install_env
 tests/test_sandbox.py::test_install_command_failure_returns_false
+tests/test_sandbox.py::test_install_home_is_pd_home_with_sibling_mount
 tests/test_sandbox.py::test_install_refuses_without_bridge
 tests/test_sandbox.py::test_install_transfers_checkout_ownership_when_remapped
 tests/test_sandbox.py::test_install_uses_bridge_never_host
@@ -565,6 +567,7 @@ tests/test_sandbox.py::test_measurement_gate_refuses_no_podman
 tests/test_sandbox.py::test_measurement_gate_refuses_no_userns
 tests/test_sandbox.py::test_measurement_gate_returns_caps_dict
 tests/test_sandbox.py::test_no_ownership_transfer_without_userns_remap
+tests/test_sandbox.py::test_ownership_transfer_covers_home_dir
 tests/test_sandbox.py::test_prepare_checkout_chmod_failure_logs
 tests/test_sandbox.py::test_resolve_network_mode_auto_isolated
 tests/test_sandbox.py::test_resolve_network_mode_auto_none_socket
