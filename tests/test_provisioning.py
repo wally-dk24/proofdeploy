@@ -788,7 +788,7 @@ def test_workspace_without_lockfile_refuses_at_root(tmp_path):
     snap = _workspace_snapshot(tmp_path, lockfile=False)
     plan = NodeAdapter().plan(snap, _ws_contract(app_path="packages/app"))
     assert plan.refusal == (
-        "no frozen lockfile found in snapshot for runtime 'node'"
+        "not supported: no frozen lockfile found in snapshot for runtime 'node'"
     )
 
 
@@ -833,3 +833,229 @@ def test_non_workspace_plan_carries_no_workspace_fields(tmp_path):
     assert plan.workspace_root is None
     assert plan.app_path is None
     assert all(s.cwd is None for s in plan.steps)
+
+
+# ---------------------------------------------------------------------------
+# install.npm_flags (plan 1.2h): the contract's allowlisted flags
+# render into the frozen npm ci argv and are recorded on the plan.
+# ---------------------------------------------------------------------------
+
+
+def test_node_plan_npm_flags_render_into_ci_argv(tmp_path):
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    plan = plan_provisioning(
+        snap,
+        _contract(start="node server.js", npm_flags=["--legacy-peer-deps"]),
+    )
+    assert plan.refusal is None
+    assert plan.package_manager == "npm"
+    assert plan.npm_flags == ["--legacy-peer-deps"]
+    install = next(s for s in plan.steps if s.phase == "install")
+    assert install.argv == [
+        "npm", "ci", "--legacy-peer-deps", "--no-audit", "--no-fund",
+    ]
+
+
+def test_node_plan_no_npm_flags_by_default(tmp_path):
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    plan = plan_provisioning(snap, _contract(start="node server.js"))
+    assert plan.npm_flags == []
+    install = next(s for s in plan.steps if s.phase == "install")
+    assert install.argv is not None
+    assert "--legacy-peer-deps" not in install.argv
+
+
+def test_node_plan_npm_flags_refused_for_pnpm(tmp_path):
+    # Declared npm flags on a pnpm plan are a typed refusal, never
+    # a silent no-op.
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "packageManager": "pnpm@9.1.0"},
+        lockfile="pnpm-lock.yaml",
+    )
+    plan = plan_provisioning(
+        snap,
+        _contract(start="node server.js", npm_flags=["--legacy-peer-deps"]),
+    )
+    assert plan.refusal is not None
+    assert "install.npm_flags applies to npm plans only" in plan.refusal
+    assert plan.steps == []
+
+
+# ---------------------------------------------------------------------------
+# REG-D (plan 1.2i): the {regd_cutoff} placeholder in a contract
+# step renders at plan time with the unit's REG-A lock cutoff.
+# ---------------------------------------------------------------------------
+
+REGD_BUILD = (
+    "npm --prefix sample/01-cats-app install "
+    "--legacy-peer-deps --before={regd_cutoff}"
+)
+REGD_CUTOFF = "2025-06-07T08:09:10Z"
+
+
+def _regd_contract(**kw):
+    return _contract(build=REGD_BUILD, start="node server.js", **kw)
+
+
+def test_regd_plan_renders_cutoff_and_records_facts(tmp_path):
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    plan = plan_provisioning(
+        snap, _regd_contract(), lock_cutoff=REGD_CUTOFF
+    )
+    assert plan.refusal is None
+    build = next(s for s in plan.steps if s.phase == "build")
+    assert build.shell == (
+        "npm --prefix sample/01-cats-app install "
+        f"--legacy-peer-deps --before={REGD_CUTOFF}"
+    )
+    assert plan.regd == {
+        "sample_path": "sample/01-cats-app",
+        "cutoff": REGD_CUTOFF,
+        "command": (
+            "npm --prefix sample/01-cats-app install "
+            f"--legacy-peer-deps --before={REGD_CUTOFF}"
+        ),
+    }
+
+
+def test_regd_both_sides_render_the_same_cutoff(tmp_path):
+    # REG-D D3: both sides of a unit share the run's one cutoff,
+    # so their rendered sample commands are identical. The cutoff
+    # reaches the plan as the lazy callable the orchestrator
+    # supplies for a measured unit.
+    shells = []
+    for name in ("parent", "fix"):
+        side_dir = tmp_path / name
+        side_dir.mkdir()
+        snap = _node_snapshot(
+            side_dir,
+            package_json={"name": "t", "engines": {"node": ">=20"}},
+        )
+        plan = plan_provisioning(
+            snap,
+            _regd_contract(),
+            lock_cutoff=lambda: REGD_CUTOFF,
+        )
+        assert plan.refusal is None
+        assert plan.regd is not None
+        assert plan.regd["cutoff"] == REGD_CUTOFF
+        shells.append(
+            next(s for s in plan.steps if s.phase == "build").shell
+        )
+    assert shells[0] == shells[1]
+    assert "{regd_cutoff}" not in shells[0]
+
+
+def test_regd_no_cutoff_is_a_typed_refusal(tmp_path):
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    plan = plan_provisioning(snap, _regd_contract())
+    assert plan.refusal is not None
+    assert plan.refusal.startswith("REG-D:")
+    assert "undated sample install" in plan.refusal
+    assert plan.steps == []
+    assert plan.regd is None
+
+
+def test_regd_non_iso_cutoff_is_a_typed_refusal(tmp_path):
+    # The cutoff lands in a shell string: anything that is not an
+    # ISO 8601 timestamp is refused, never rendered.
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    plan = plan_provisioning(
+        snap, _regd_contract(), lock_cutoff="2025-06-07; rm -rf /"
+    )
+    assert plan.refusal is not None
+    assert plan.refusal.startswith("REG-D:")
+    assert plan.steps == []
+
+
+def test_regd_offset_cutoff_is_a_typed_refusal(tmp_path):
+    # The registered text says ISO 8601 UTC: an offset form is a
+    # well-formed timestamp but NOT UTC, so it is refused, never
+    # converted or rendered.
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    plan = plan_provisioning(
+        snap,
+        _regd_contract(),
+        lock_cutoff="2025-06-07T08:09:10+02:00",
+    )
+    assert plan.refusal is not None
+    assert plan.refusal.startswith("REG-D:")
+    assert plan.steps == []
+    assert plan.regd is None
+
+
+def test_regd_sample_with_lockfile_is_refused_exactly(tmp_path):
+    # REG-D D1(b): a sample carrying its own lockfile must
+    # install frozen — REG-D refuses with the registered wording.
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    sample = snap / "sample" / "01-cats-app"
+    sample.mkdir(parents=True)
+    (sample / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    plan = plan_provisioning(
+        snap, _regd_contract(), lock_cutoff=REGD_CUTOFF
+    )
+    assert plan.refusal == (
+        "REG-D: sample sample/01-cats-app has a lockfile "
+        "(package-lock.json); REG-D does not apply — the sample "
+        "must install frozen"
+    )
+    assert plan.steps == []
+    assert plan.regd is None
+
+
+def test_regd_sample_lockfile_names_are_all_refused(tmp_path):
+    # Every lockfile name in the D1(b) set refuses, named in the
+    # refusal; the ROOT lockfile (the app's own frozen install)
+    # never triggers it — only the sample's does.
+    for name in (
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
+    ):
+        side_dir = tmp_path / name
+        side_dir.mkdir()
+        snap = _node_snapshot(
+            side_dir,
+            package_json={"name": "t", "engines": {"node": ">=20"}},
+        )
+        sample = snap / "sample" / "01-cats-app"
+        sample.mkdir(parents=True)
+        (sample / name).write_text("{}\n", encoding="utf-8")
+        plan = plan_provisioning(
+            snap, _regd_contract(), lock_cutoff=REGD_CUTOFF
+        )
+        assert plan.refusal is not None
+        assert f"({name})" in plan.refusal
+
+
+def test_regd_absent_leaves_plan_untouched(tmp_path):
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    plan = plan_provisioning(snap, _contract(start="node server.js"))
+    assert plan.regd is None

@@ -677,7 +677,8 @@ def verify_lockfile(snapshot_dir: Path, runtime: str) -> str:
     found = find_lockfile(snapshot_dir, runtime)
     if found is None:
         raise ValueError(
-            f"no frozen lockfile found in {snapshot_dir} for runtime {runtime!r}"
+            f"not supported: no frozen lockfile found in {snapshot_dir} "
+            f"for runtime {runtime!r}"
         )
     return found[1]
 
@@ -1419,7 +1420,8 @@ class Provisioner:
         if plan.lockfile_name is None:
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
-                f"no frozen lockfile found in {snap} for runtime {runtime!r}",
+                f"not supported: no frozen lockfile found in {snap} "
+                f"for runtime {runtime!r}",
                 plan,
                 runtime=runtime,
                 runtime_version=actual_version,

@@ -476,3 +476,64 @@ def test_readiness_row_carries_typed_reason_and_is_never_retried(
     assert rp._rerun_targets(prior) == [("T-generic", "fix")]
     assert rp._is_not_supported_row(row)
     assert not rp._is_not_supported_row(generic)
+
+
+# ---------------------------------------------------------------------------
+# Plan 1.2(j) follow-up: D18's own refusal strings carry the
+# registered ``not supported: `` prefix (D18's registered reason is
+# literally "not supported: no frozen lockfile"), so H5/J1 judging
+# and the harness's non-retry rule treat a no-lockfile side as the
+# not-supported class it is — before this follow-up the emitted
+# strings ("no frozen lockfile found ...") carried no prefix and
+# the side was re-provisioned on attempt 2 like a transient
+# failure.
+# ---------------------------------------------------------------------------
+
+
+def test_d18_no_lockfile_refusal_is_prefixed_and_never_retried(
+    tmp_path: Path,
+) -> None:
+    from proofdeploy.provisioning import NodeAdapter
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        '{"name": "t"}\n', encoding="utf-8"
+    )
+    contract = SimpleNamespace(
+        build=None, migrate=None, seed=None, start="node .", env={}
+    )
+    plan = NodeAdapter().plan(snap, contract)
+    assert plan.refusal == (
+        "not supported: no frozen lockfile found in snapshot "
+        "for runtime 'node'"
+    )
+
+    side = _fake_side(plan.refusal, ProvisionStatus.BUILD_FAILED)
+    row = rp.row_from_provision(
+        _UNIT, _UNIT["sides"][0], "h" * 40, 1, "isolated", side
+    )
+    assert row["status"] == "BUILD_FAILED"
+    assert row["typed_reason"] == plan.refusal
+    assert rp._is_not_supported_row(row)
+
+    generic_unit = {**_UNIT, "unit_id": "T-generic"}
+    generic = rp.row_from_provision(
+        generic_unit,
+        _UNIT["sides"][0],
+        "h" * 40,
+        1,
+        "isolated",
+        _fake_side(
+            "install failed: npm error code ECONNREFUSED",
+            ProvisionStatus.BUILD_FAILED,
+        ),
+    )
+    prior = tmp_path / "rows-attempt-1.json"
+    prior.write_text(
+        json.dumps({"rows": [row, generic]}), encoding="utf-8"
+    )
+    # The D18 side is terminal (never a rerun target); the generic
+    # failure still is.
+    assert rp._rerun_targets(prior) == [("T-generic", "fix")]
+    assert not rp._is_not_supported_row(generic)
