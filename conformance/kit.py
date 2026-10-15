@@ -58,6 +58,10 @@ APPS = (
     # the app package (packages/notes-app) the contract's app.path
     # names; the planted bug lives in the library.
     "node-pnpm-monorepo",
+    # Plan 1.2e: the bun golden — the node-pnpm-sqlite app shape
+    # under bun (bun.lock, packageManager bun pin, digest-pinned
+    # bun bootstrap).
+    "node-bun-sqlite",
 )
 
 # The app's own history, in commit order. The kit maps these onto the

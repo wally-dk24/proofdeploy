@@ -1,0 +1,16 @@
+{
+  "name": "pd-golden-bun",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "bun@1.4.3",
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "dependencies": {
+    "express": "^5.0.0",
+    "better-sqlite3": "^12.11.1"
+  },
+  "trustedDependencies": [
+    "better-sqlite3"
+  ]
+}
