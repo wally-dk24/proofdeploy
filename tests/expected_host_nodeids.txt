@@ -555,7 +555,10 @@ tests/test_sandbox.py::test_groq_key_stripped_from_app_env
 tests/test_sandbox.py::test_groq_key_stripped_from_install_env
 tests/test_sandbox.py::test_install_command_failure_returns_false
 tests/test_sandbox.py::test_install_home_is_pd_home_with_sibling_mount
+tests/test_sandbox.py::test_install_pins_pnpm_store_into_pd_home
 tests/test_sandbox.py::test_install_refuses_without_bridge
+tests/test_sandbox.py::test_install_respects_app_declared_pnpm_store[declaration0]
+tests/test_sandbox.py::test_install_respects_app_declared_pnpm_store[declaration1]
 tests/test_sandbox.py::test_install_transfers_checkout_ownership_when_remapped
 tests/test_sandbox.py::test_install_uses_bridge_never_host
 tests/test_sandbox.py::test_isolation_evidence_fields
