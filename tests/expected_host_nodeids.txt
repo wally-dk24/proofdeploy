@@ -411,6 +411,7 @@ tests/test_runner.py::test_exec_timeout
 tests/test_runner.py::test_failed_provision_cleans_up_scratch_dirs
 tests/test_runner.py::test_find_lockfile_prefers_first_match
 tests/test_runner.py::test_find_lockfile_prefers_package_manager
+tests/test_runner.py::test_provision_corepack_pinned_pnpm_manager_bin_first_on_path
 tests/test_runner.py::test_provision_lockfile_match_not_required
 tests/test_runner.py::test_provision_lockfile_mismatch
 tests/test_runner.py::test_provision_missing_binary_in_install
@@ -575,6 +576,7 @@ tests/test_sandbox.py::test_groq_key_stripped_from_app_env
 tests/test_sandbox.py::test_groq_key_stripped_from_install_env
 tests/test_sandbox.py::test_install_command_failure_returns_false
 tests/test_sandbox.py::test_install_refuses_without_bridge
+tests/test_sandbox.py::test_install_transfers_checkout_ownership_when_remapped
 tests/test_sandbox.py::test_install_uses_bridge_never_host
 tests/test_sandbox.py::test_isolation_evidence_fields
 tests/test_sandbox.py::test_isolation_evidence_uid_zero_when_remapped
@@ -584,6 +586,7 @@ tests/test_sandbox.py::test_measurement_gate_refuses_no_build_network
 tests/test_sandbox.py::test_measurement_gate_refuses_no_podman
 tests/test_sandbox.py::test_measurement_gate_refuses_no_userns
 tests/test_sandbox.py::test_measurement_gate_returns_caps_dict
+tests/test_sandbox.py::test_no_ownership_transfer_without_userns_remap
 tests/test_sandbox.py::test_prepare_checkout_chmod_failure_logs
 tests/test_sandbox.py::test_resolve_network_mode_auto_isolated
 tests/test_sandbox.py::test_resolve_network_mode_auto_none_socket
@@ -679,7 +682,9 @@ tests/test_wo7_pr2.py::test_sandbox_executed_steps_carry_the_real_failure_code
 tests/test_wo7_pr2.py::test_sandbox_executor_quotes_workspace_member_path
 tests/test_wo7_pr2.py::test_sandbox_executor_refuses_ambiguous_workspace_plan
 tests/test_wo7_pr2.py::test_sandbox_executor_runs_bun_plan
+tests/test_wo7_pr2.py::test_sandbox_executor_runs_corepack_pinned_pnpm_plan
 tests/test_wo7_pr2.py::test_sandbox_executor_runs_node_plan_through_adapter
+tests/test_wo7_pr2.py::test_sandbox_executor_unpinned_pnpm_plan_gets_no_manager_bin
 tests/test_wo7_pr2.py::test_sandbox_install_failure_reason_falls_back_to_last_line
 tests/test_wo7_pr2.py::test_sandbox_install_failure_reason_names_first_error_line
 tests/test_wo7_pr2.py::test_sandbox_install_failure_reason_without_step_output_names_the_step
