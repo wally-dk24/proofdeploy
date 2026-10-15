@@ -553,7 +553,13 @@ def test_node_plan_bun_lockb_refused(tmp_path):
     )
     plan = plan_provisioning(snap, _contract(start="node server.js"))
     assert plan.refusal is not None
-    assert plan.refusal.startswith("bun.lockb")
+    # Reviewer's ruling (2026-10-15, inventory #10): our gap, reworded
+    # so the text no longer contains "is not supported".
+    assert plan.refusal == (
+        "bun.lockb (legacy binary lockfile): ProofDeploy plans bun "
+        "installs from bun.lock only (our gap) — regenerate the "
+        "lockfile with a current bun and commit bun.lock"
+    )
     assert plan.steps == []
 
 
