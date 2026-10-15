@@ -229,7 +229,21 @@ def row_from_provision(
     prov = side.provision
     plan: dict[str, Any] = prov.install_plan or {}
     status = "READY" if prov.ready else prov.status.value.upper()
-    typed = plan.get("refusal") or prov.reason
+    # The typed reason is the refusal that actually stopped THIS
+    # side: the provision's own reason, set by the sandbox executor
+    # at the gate where it stopped. The plan's `refusal` field is
+    # only a fallback — a plan can carry BOTH `refusal` and the
+    # sandbox-only `image_refusal` (a Node plan for a workspaces
+    # repo whose declared range no pinned image satisfies carries
+    # both), and the sandbox executor checks `image_refusal` before
+    # `plan.refusal` is ever consulted, so preferring the plan field
+    # recorded a refusal that never fired (Directus, re-run on
+    # c867b4b: rows said "workspaces not yet supported" while every
+    # log — and the rows' own last_error — ended with the range
+    # refusal). When the plan refusal IS the stopper, the executor
+    # copies it into the provision's reason verbatim, so this order
+    # changes nothing for those rows.
+    typed = prov.reason or plan.get("refusal")
     evidence = side.sandbox_evidence or {}
     network_mode = evidence.get("app_network_mode") or fallback_network_mode
     return {
