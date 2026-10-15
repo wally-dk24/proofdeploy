@@ -18,6 +18,7 @@ does not exist there) and passes on the branch.
 """
 import hashlib
 import json
+import platform
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -409,6 +410,141 @@ def test_plan_provisioning_unknown_snapshot_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Bun (plan 1.2e, D22): the frozen install runs through a bun the
+# plan itself bootstraps into .pd-tools, pinned BY DIGEST — the
+# version from the app's packageManager when declared, else the
+# pin table's default, recorded on the plan either way. bun.lockb
+# and unpinned bun versions are typed refusals.
+# ---------------------------------------------------------------------------
+
+
+def test_node_plan_bun_digest_pinned_from_package_manager(tmp_path):
+    from proofdeploy.provisioning import BUN_RELEASE_SHA256
+
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={
+            "name": "t",
+            "packageManager": "bun@1.3.14",
+            "engines": {"node": ">=20"},
+        },
+        lockfile="bun.lock",
+    )
+    plan = plan_provisioning(snap, _contract(start="node server.js"))
+    assert plan.refusal is None
+    assert plan.package_manager == "bun"
+    assert plan.package_manager_version == "1.3.14"
+    assert plan.bun_version == "1.3.14"
+    artifact, digest = BUN_RELEASE_SHA256["1.3.14"][platform.machine()]
+    assert plan.bun_sha256 == digest
+    install = [s for s in plan.steps if s.phase == "install"]
+    assert len(install) == 2
+    bootstrap, frozen = install
+    # The bootstrap is one bash -c step (selected BY CONTENT): it
+    # downloads the pinned release artifact and verifies the
+    # committed digest before the binary is used.
+    assert bootstrap.argv is not None
+    assert bootstrap.argv[:2] == ["bash", "-c"]
+    script = bootstrap.argv[2]
+    assert "bun-v1.3.14" in script and artifact in script
+    assert digest in script and "sha256sum -c" in script
+    assert "{checkout}/.pd-tools" in script
+    # Plant 2's guard: the frozen install's argv is EXACTLY the
+    # persisted bun + install + --frozen-lockfile — drop the flag
+    # in the adapter and this fails.
+    assert frozen.argv == [
+        "{checkout}/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+    ]
+    assert plan.persisted_dirs == ["node_modules", ".pd-tools"]
+
+
+def test_node_plan_bun_without_pin_uses_recorded_default(tmp_path):
+    """No packageManager pin: the pin table's default bun is
+    selected, digest-pinned exactly like a declared pin, and the
+    selected version is still recorded on the plan (D22) — never
+    a floating system bun."""
+    from proofdeploy.provisioning import (
+        BUN_DEFAULT_VERSION,
+        BUN_RELEASE_SHA256,
+    )
+
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+        lockfile="bun.lock",
+    )
+    plan = plan_provisioning(snap, _contract(start="node server.js"))
+    assert plan.refusal is None
+    assert plan.package_manager == "bun"
+    assert plan.package_manager_version is None
+    assert plan.bun_version == BUN_DEFAULT_VERSION
+    _, digest = BUN_RELEASE_SHA256[BUN_DEFAULT_VERSION][
+        platform.machine()
+    ]
+    assert plan.bun_sha256 == digest
+    install = [s for s in plan.steps if s.phase == "install"]
+    assert install[-1].argv == [
+        "{checkout}/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+    ]
+
+
+def test_node_plan_bun_lockb_refused(tmp_path):
+    """D22: bun.lockb (the legacy binary lockfile) is a typed
+    refusal — no frozen install is planned from it, and no other
+    manager is substituted."""
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t"},
+        lockfile="bun.lockb",
+    )
+    plan = plan_provisioning(snap, _contract(start="node server.js"))
+    assert plan.refusal is not None
+    assert plan.refusal.startswith("bun.lockb")
+    assert plan.steps == []
+
+
+def test_node_plan_bun_unpinned_version_refused(tmp_path):
+    """Plant 3's standing guard: a packageManager bun version with
+    no digest pin in the table is a typed refusal naming the
+    version — bun is never installed unpinned."""
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "packageManager": "bun@9.9.9"},
+        lockfile="bun.lock",
+    )
+    plan = plan_provisioning(snap, _contract(start="node server.js"))
+    assert plan.refusal is not None
+    assert "no pinned digest for bun@9.9.9" in plan.refusal
+    assert plan.steps == []
+
+
+def test_bun_workspace_plan_scopes_contract_steps(tmp_path):
+    """Plan 1.2e: bun joins plan 1.2b's workspace set — the frozen
+    install (bootstrap first) runs at the root, the contract
+    steps scope to the member, exactly like pnpm/npm."""
+    snap = _workspace_snapshot(tmp_path, manager="bun")
+    plan = NodeAdapter().plan(snap, _ws_contract())
+    assert plan.refusal is None
+    assert plan.workspace_root == "."
+    assert plan.app_path == "packages/app"
+    assert plan.package_manager == "bun"
+    assert plan.bun_version == "1.4.3"
+    assert plan.lockfile_name == "bun.lock"
+    installs = [s for s in plan.steps if s.phase == "install"]
+    assert installs and all(s.cwd is None for s in installs)
+    frozen = [
+        s for s in installs if s.argv and "--frozen-lockfile" in s.argv
+    ]
+    assert len(frozen) == 1
+    assert frozen[0].argv is not None
+    assert frozen[0].argv[0] == "{checkout}/.pd-tools/bin/bun"
+    scoped = {s.phase: s.cwd for s in plan.steps if s.shell}
+    assert scoped == {"build": "packages/app", "start": "packages/app"}
+    assert "packages/app/node_modules" in plan.persisted_dirs
+    assert ".pd-tools" in plan.persisted_dirs
+
+
+# ---------------------------------------------------------------------------
 # Workspaces / monorepos (plan 1.2b): the frozen install runs at the
 # workspace root; the contract steps are scoped to the resolved app
 # member; ambiguity and unsupported managers are typed refusals.
@@ -449,6 +585,11 @@ def _workspace_snapshot(
         if lockfile:
             (snap / "yarn.lock").write_text("# yarn lockfile v1\n",
                                             encoding="utf-8")
+    elif manager == "bun":
+        root_pkg["workspaces"] = ["packages/*"]
+        root_pkg["packageManager"] = "bun@1.4.3"
+        if lockfile:
+            (snap / "bun.lock").write_text("{}\n", encoding="utf-8")
     if root_extra:
         root_pkg.update(root_extra)
     (snap / "package.json").write_text(json.dumps(root_pkg), encoding="utf-8")
