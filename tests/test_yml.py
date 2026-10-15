@@ -157,3 +157,55 @@ def test_app_path_must_stay_inside_checkout(tmp_path):
         load_contract(write(tmp_path, VALID + 'app:\n  path: "/abs/web"\n'))
     with pytest.raises(ValueError, match="'app.path' must resolve inside"):
         load_contract(write(tmp_path, VALID + 'app:\n  path: "../outside"\n'))
+
+
+# install.npm_flags (plan 1.2h): allowlisted flags for the frozen
+# npm ci. Anything off the allowlist is refused at load.
+
+def test_install_npm_flags_allowlisted_loads(tmp_path):
+    text = VALID + 'install:\n  npm_flags: ["--legacy-peer-deps"]\n'
+    c = load_contract(write(tmp_path, text))
+    assert c.npm_flags == ["--legacy-peer-deps"]
+
+
+def test_install_absent_defaults_to_no_flags(tmp_path):
+    c = load_contract(write(tmp_path, VALID))
+    assert c.npm_flags == []
+
+
+def test_install_npm_flags_unknown_flag_rejected(tmp_path):
+    bad = VALID + 'install:\n  npm_flags: ["--force"]\n'
+    with pytest.raises(ValueError, match="unsupported flag '--force'"):
+        load_contract(write(tmp_path, bad))
+
+
+def test_install_npm_flags_unreviewed_flag_rejected(tmp_path):
+    # Even a plausible npm flag is refused: the allowlist is the
+    # contract, not npm's own flag set.
+    bad = VALID + 'install:\n  npm_flags: ["--ignore-scripts"]\n'
+    with pytest.raises(ValueError, match="unsupported flag"):
+        load_contract(write(tmp_path, bad))
+
+
+def test_install_must_be_a_mapping(tmp_path):
+    with pytest.raises(ValueError, match="'install' must be a mapping"):
+        load_contract(write(tmp_path, VALID + 'install: "--legacy-peer-deps"\n'))
+
+
+def test_install_unknown_keys_rejected(tmp_path):
+    bad = VALID + 'install:\n  npm_flags: ["--legacy-peer-deps"]\n  pnpm_flags: []\n'
+    with pytest.raises(ValueError, match="'install' has unknown keys"):
+        load_contract(write(tmp_path, bad))
+
+
+def test_install_npm_flags_must_be_a_nonempty_list(tmp_path):
+    with pytest.raises(ValueError, match="'install.npm_flags' must be a non-empty"):
+        load_contract(write(tmp_path, VALID + 'install:\n  npm_flags: "--legacy-peer-deps"\n'))
+    with pytest.raises(ValueError, match="'install.npm_flags' must be a non-empty"):
+        load_contract(write(tmp_path, VALID + 'install:\n  npm_flags: []\n'))
+
+
+def test_install_npm_flags_duplicates_rejected(tmp_path):
+    bad = VALID + 'install:\n  npm_flags: ["--legacy-peer-deps", "--legacy-peer-deps"]\n'
+    with pytest.raises(ValueError, match="repeats '--legacy-peer-deps'"):
+        load_contract(write(tmp_path, bad))
