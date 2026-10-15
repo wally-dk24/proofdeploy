@@ -237,7 +237,12 @@ def check_sandbox_runtime(
 # provision reason, so the helper has one home there.
 
 
-def _sandbox_step_command(cmd: str, runtime: str = "python") -> str:
+def _sandbox_step_command(
+    cmd: str,
+    runtime: str = "python",
+    manager: str | None = None,
+    corepack_version: str | None = None,
+) -> str:
     """Render a contract step for the sandbox (WO-7 plan executor).
 
     Python: the app runs with the venv's python: a step beginning with
@@ -250,8 +255,23 @@ def _sandbox_step_command(cmd: str, runtime: str = "python") -> str:
     Node (WO-7 PR 2): node_modules lives inside the checkout, so its
     .bin goes first on PATH for that command only — the Node analog
     of the venv rendering. The command itself is untouched.
+
+    Corepack-pinned Node plans (plan 1.2f): the plan bootstraps
+    corepack into the checkout's .pd-tools (persisted), and the
+    corepack package's own bin dir carries the manager shims
+    (pnpm/pnpx/yarn/yarnpkg). A shim resolves the snapshot's
+    packageManager pin from the checkout (walking up from the
+    step's directory), so a contract step calling bare `pnpm` or
+    `yarn` runs the plan's pinned version — never a PATH fallback.
+    That bin dir therefore goes first on PATH, ahead of
+    node_modules/.bin, for a corepack-pinned pnpm/yarn plan's steps.
     """
     if runtime == "node":
+        if corepack_version is not None and manager in ("pnpm", "yarn"):
+            return (
+                "env PATH=/checkout/.pd-tools/node_modules/.bin:"
+                f"/checkout/node_modules/.bin:$PATH {cmd}"
+            )
         return f"env PATH=/checkout/node_modules/.bin:$PATH {cmd}"
     parts = cmd.split(maxsplit=1)
     if parts and parts[0] in ("python", "python3") and len(parts) == 2:
@@ -1395,7 +1415,12 @@ class Orchestrator:
                 spec["command"] = shlex.join(argv)
                 spec["argv_rendered"] = argv
             elif step.shell is not None:
-                rendered = _sandbox_step_command(step.shell, runtime_name)
+                rendered = _sandbox_step_command(
+                    step.shell,
+                    runtime_name,
+                    plan.package_manager,
+                    corepack_version=plan.corepack_version,
+                )
                 spec["command"] = rendered
                 spec["shell"] = rendered
             else:
@@ -1529,7 +1554,9 @@ class Orchestrator:
         # (S3): the plan's start step, rendered by
         # _sandbox_step_command for the plan's runtime — a Python
         # start beginning with `python` uses the venv binary directly;
-        # a Node start gets node_modules/.bin first on PATH.
+        # a Node start gets node_modules/.bin first on PATH (a
+        # corepack-pinned pnpm/yarn plan's start gets the persisted
+        # corepack's manager bin ahead of it — plan 1.2f).
         start_step = next(
             (s for s in plan.steps if s.phase == "start"), None
         )
@@ -1538,6 +1565,8 @@ class Orchestrator:
             if start_step is not None and start_step.shell
             else contract.start,
             runtime_name,
+            plan.package_manager,
+            corepack_version=plan.corepack_version,
         )
         # Plan 1.2b: a workspace start runs in the app member's
         # directory (same scoping as the install-phase steps,

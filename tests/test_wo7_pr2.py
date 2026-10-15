@@ -357,6 +357,114 @@ def test_sandbox_executor_runs_node_plan_through_adapter(
     assert rec["exit_code"] == 0
 
 
+def test_sandbox_executor_runs_corepack_pinned_pnpm_plan(
+    monkeypatch, tmp_path
+):
+    """Plan 1.2(f): a corepack-pinned pnpm plan's contract steps
+    render with the persisted corepack's manager bin first on PATH,
+    so a step calling bare `pnpm` runs the plan's pinned version
+    (the corepack package's shim resolves the snapshot's
+    packageManager pin) instead of dying with
+    "env: 'pnpm': No such file or directory" — the Ghost failure
+    this plan line fixes. The install phase is the plan's .pd-tools
+    corepack bootstrap plus the frozen install through the
+    persisted corepack binary, exactly as planned."""
+    from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.sandbox import Sandbox
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps({
+            "name": "t",
+            "packageManager": "pnpm@9.15.0",
+            "engines": {"node": ">=20"},
+        }) + "\n"
+    )
+    (snap / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    (snap / "server.js").write_text("// app\n")
+    contract = RepoContract(
+        build="pnpm --version",
+        start="pnpm run start",
+        readiness="/health",
+        env={},
+    )
+    fake = _FakeInstallSteps()
+    orch = _stub_sandbox(monkeypatch, snap, contract, fake)
+    monkeypatch.setattr(Sandbox, "start", _stop_after_install)
+    side = orch._provision_side_sandbox("fakerev", 18097, snap / "unit", "t")
+
+    # Reached the start phase (stubbed to fail there): NOT refused.
+    assert side.provision.status == ProvisionStatus.START_FAILED
+    assert side.provision.package_manager == "pnpm"
+    assert side.provision.install_plan is not None
+    assert side.provision.install_plan["package_manager_version"] == "9.15.0"
+    assert side.provision.install_plan["corepack_version"] == "0.36.0"
+    installs = [d for d in fake.descriptors if d["phase"] == "install"]
+    assert len(installs) == 2
+    bootstrap, frozen = installs
+    assert bootstrap["argv_rendered"] == [
+        "npm", "install", "--prefix", "/checkout/.pd-tools",
+        "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
+    ]
+    assert frozen["argv_rendered"] == [
+        "/checkout/.pd-tools/node_modules/.bin/corepack",
+        "pnpm@9.15.0", "install", "--frozen-lockfile",
+    ]
+    build = next(d for d in fake.descriptors if d["phase"] == "build")
+    assert build["shell"] == (
+        "env PATH=/checkout/.pd-tools/node_modules/.bin:"
+        "/checkout/node_modules/.bin:$PATH pnpm --version"
+    )
+    start = next(
+        e for e in side.provision.executed_steps if e["phase"] == "start"
+    )
+    assert start["shell"] == (
+        "env PATH=/checkout/.pd-tools/node_modules/.bin:"
+        "/checkout/node_modules/.bin:$PATH pnpm run start"
+    )
+
+
+def test_sandbox_executor_unpinned_pnpm_plan_gets_no_manager_bin(
+    monkeypatch, tmp_path
+):
+    """Plan 1.2(f) scope guard: an UNPINNED pnpm plan never
+    bootstraps corepack, so there is no persisted manager bin to
+    put on PATH — its contract steps keep the plain
+    node_modules/.bin rendering."""
+    from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.sandbox import Sandbox
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps({"name": "t", "engines": {"node": ">=20"}}) + "\n"
+    )
+    (snap / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    (snap / "server.js").write_text("// app\n")
+    contract = RepoContract(
+        build="pnpm --version",
+        start="node server.js",
+        readiness="/health",
+        env={},
+    )
+    fake = _FakeInstallSteps()
+    orch = _stub_sandbox(monkeypatch, snap, contract, fake)
+    monkeypatch.setattr(Sandbox, "start", _stop_after_install)
+    side = orch._provision_side_sandbox("fakerev", 18098, snap / "unit", "t")
+
+    assert side.provision.status == ProvisionStatus.START_FAILED
+    assert side.provision.package_manager == "pnpm"
+    assert side.provision.install_plan is not None
+    assert side.provision.install_plan["corepack_version"] is None
+    build = next(d for d in fake.descriptors if d["phase"] == "build")
+    assert build["shell"] == (
+        "env PATH=/checkout/node_modules/.bin:$PATH pnpm --version"
+    )
+
+
 def test_sandbox_executor_refuses_bun_plan(monkeypatch, tmp_path):
     """bun is not one of the sandbox's Node managers: fail closed,
     no install runs."""
