@@ -420,6 +420,68 @@ def test_sandbox_executor_refuses_ambiguous_workspace_plan(
     assert fake.descriptors == []
 
 
+def test_sandbox_executor_quotes_workspace_member_path(
+    monkeypatch, tmp_path
+):
+    """Plan 1.2b (reviewer fix): a workspace member's directory
+    name is repo-controlled text, and the sandbox scopes its
+    commands with a `cd` prefix built from it. An odd-but-legal
+    name — a space and a $(...) fragment — still plans (quoting
+    is the answer, not a name refusal); every issued sandbox
+    command carries the path shlex-quoted as a single cd
+    argument, while the executed records keep cwd as the raw
+    relative path."""
+    import shlex
+
+    from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.sandbox import Sandbox
+    from proofdeploy.yml import RepoContract
+
+    member_rel = "apps/we ird;$(id)"
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps({"name": "t", "workspaces": ["apps/*"]}) + "\n"
+    )
+    (snap / "package-lock.json").write_text("{}\n")
+    member = snap / "apps" / "we ird;$(id)"
+    member.mkdir(parents=True)
+    (member / "package.json").write_text(
+        json.dumps({"name": "weird"}) + "\n", encoding="utf-8"
+    )
+    (member / "server.js").write_text("// app\n")
+    contract = RepoContract(
+        build="node --check server.js",
+        start="node server.js",
+        readiness="/health",
+        env={},
+    )
+    fake = _FakeInstallSteps()
+    orch = _stub_sandbox(monkeypatch, snap, contract, fake)
+    monkeypatch.setattr(Sandbox, "start", _stop_after_install)
+    side = orch._provision_side_sandbox("fakerev", 18096, snap / "unit", "t")
+
+    # The plan accepted the odd name and scoped to that member.
+    assert side.provision.status == ProvisionStatus.START_FAILED
+    assert side.provision.install_plan is not None
+    assert side.provision.install_plan["app_path"] == member_rel
+    quoted = shlex.quote(f"/checkout/{member_rel}")
+    # The scoped install-phase (build) command handed to the
+    # sandbox carries the quoted path.
+    build = next(d for d in fake.descriptors if d["phase"] == "build")
+    assert build["command"].startswith(f"cd {quoted} && ")
+    assert build["cwd"] == member_rel
+    # The executed records: the start step's shell is the command
+    # as issued (quoted cd prefix); every recorded cwd is the
+    # raw relative path.
+    executed = side.provision.executed_steps
+    start_rec = next(e for e in executed if e["phase"] == "start")
+    assert start_rec["shell"].startswith(f"cd {quoted} && ")
+    assert start_rec["cwd"] == member_rel
+    build_rec = next(e for e in executed if e["phase"] == "build")
+    assert build_rec["cwd"] == member_rel
+
+
 # ---------------------------------------------------------------------------
 # Addendum 31: executed steps recorded by BOTH executors.
 # ---------------------------------------------------------------------------

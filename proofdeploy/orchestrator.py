@@ -1405,10 +1405,12 @@ class Orchestrator:
                 # member — run it in that directory inside the
                 # checkout (the container's workdir stays the
                 # checkout root; the cd is part of the recorded
-                # command, as issued).
-                spec["command"] = (
-                    f"cd /checkout/{step.cwd} && {spec['command']}"
-                )
+                # command, as issued). The member path comes from
+                # the untrusted repo, so it is shell-quoted: an
+                # odd-but-legal directory name stays a single cd
+                # argument instead of breaking out into the shell.
+                quoted = shlex.quote(f"/checkout/{step.cwd}")
+                spec["command"] = f"cd {quoted} && {spec['command']}"
                 spec["cwd"] = step.cwd
             step_specs.append(spec)
         # PIP_NO_CACHE_DIR=1: pip warns the cache dir isn't writable as
@@ -1538,12 +1540,14 @@ class Orchestrator:
             runtime_name,
         )
         # Plan 1.2b: a workspace start runs in the app member's
-        # directory (same scoping as the install-phase steps).
+        # directory (same scoping as the install-phase steps,
+        # including the shell-quoting of the repo-controlled path).
         start_cwd = (
             start_step.cwd if start_step is not None else None
         )
         if start_cwd:
-            start_cmd = f"cd /checkout/{start_cwd} && {start_cmd}"
+            quoted = shlex.quote(f"/checkout/{start_cwd}")
+            start_cmd = f"cd {quoted} && {start_cmd}"
         # Addendum 31: the start step is recorded as it is issued; its
         # exit_code stays None (the app container's exit is not a
         # completed step exit the executor observes).
