@@ -237,7 +237,9 @@ def check_sandbox_runtime(
 # provision reason, so the helper has one home there.
 
 
-def _sandbox_step_command(cmd: str, runtime: str = "python") -> str:
+def _sandbox_step_command(
+    cmd: str, runtime: str = "python", manager: str | None = None
+) -> str:
     """Render a contract step for the sandbox (WO-7 plan executor).
 
     Python: the app runs with the venv's python: a step beginning with
@@ -250,8 +252,19 @@ def _sandbox_step_command(cmd: str, runtime: str = "python") -> str:
     Node (WO-7 PR 2): node_modules lives inside the checkout, so its
     .bin goes first on PATH for that command only — the Node analog
     of the venv rendering. The command itself is untouched.
+
+    Bun plans (plan 1.2e): the plan's bootstrapped bun lives in the
+    checkout's .pd-tools/bin (persisted), and an app's own contract
+    steps may call `bun` (its build/start), so that dir goes first
+    on PATH for a bun plan's steps — the same treatment, from the
+    plan's own fact.
     """
     if runtime == "node":
+        if manager == "bun":
+            return (
+                "env PATH=/checkout/.pd-tools/bin:"
+                f"/checkout/node_modules/.bin:$PATH {cmd}"
+            )
         return f"env PATH=/checkout/node_modules/.bin:$PATH {cmd}"
     parts = cmd.split(maxsplit=1)
     if parts and parts[0] in ("python", "python3") and len(parts) == 2:
@@ -1319,12 +1332,13 @@ class Orchestrator:
         # Fail closed for managers the sandbox executor cannot run:
         # pip and the committed-lock managers for Python (WO-8.1b:
         # uv/poetry/pdm plans carry their own hash-pinned bootstrap
-        # and frozen install, so they run), npm/pnpm/yarn for Node
-        # (bun stays refused).
+        # and frozen install, so they run), npm/pnpm/yarn/bun for
+        # Node (bun since plan 1.2e: its plan carries the
+        # digest-pinned bootstrap, so it runs the same way).
         supported_managers = (
             {"pip", "uv", "poetry", "pdm"}
             if runtime_name == "python"
-            else {"npm", "pnpm", "yarn"}
+            else {"npm", "pnpm", "yarn", "bun"}
         )
         if plan.package_manager not in supported_managers:
             logs.append(f"sandbox: lockfile {lockfile_name} not yet supported")
@@ -1395,7 +1409,9 @@ class Orchestrator:
                 spec["command"] = shlex.join(argv)
                 spec["argv_rendered"] = argv
             elif step.shell is not None:
-                rendered = _sandbox_step_command(step.shell, runtime_name)
+                rendered = _sandbox_step_command(
+                    step.shell, runtime_name, plan.package_manager
+                )
                 spec["command"] = rendered
                 spec["shell"] = rendered
             else:
@@ -1538,6 +1554,7 @@ class Orchestrator:
             if start_step is not None and start_step.shell
             else contract.start,
             runtime_name,
+            plan.package_manager,
         )
         # Plan 1.2b: a workspace start runs in the app member's
         # directory (same scoping as the install-phase steps,

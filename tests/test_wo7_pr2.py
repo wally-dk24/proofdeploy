@@ -11,7 +11,9 @@ Three groups:
   and monorepo workspaces refused with the registered wording.
 - The sandbox executor running a Node plan through the adapter
   (podman-free stubs, the Addendum 18 pattern): a Node plan is no
-  longer refused wholesale; a bun plan still fails closed.
+  longer refused wholesale; a bun plan runs too (plan 1.2e: its
+  digest-pinned bootstrap + frozen install, with .pd-tools/bin
+  first on the contract steps' PATH).
 - Addendum 31: each provision result records, per executed step,
   {phase, executor, argv_rendered | shell, exit_code} — for BOTH
   executors rendering the same plan, and the sandbox's install argv
@@ -357,16 +359,28 @@ def test_sandbox_executor_runs_node_plan_through_adapter(
     assert rec["exit_code"] == 0
 
 
-def test_sandbox_executor_refuses_bun_plan(monkeypatch, tmp_path):
-    """bun is not one of the sandbox's Node managers: fail closed,
-    no install runs."""
+def test_sandbox_executor_runs_bun_plan(monkeypatch, tmp_path):
+    """Plan 1.2e (D22): a bun plan runs in the sandbox (before
+    1.2e this asserted the fail-closed refusal "not yet supported
+    in the sandbox" — the behavior the plan line replaces). The
+    install phase carries the plan's digest-pinned bootstrap and
+    the frozen install through the persisted bun, and the
+    contract steps render with .pd-tools/bin first on PATH."""
     from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.sandbox import Sandbox
     from proofdeploy.yml import RepoContract
 
     snap = tmp_path / "snap"
     snap.mkdir()
-    (snap / "package.json").write_text(json.dumps({"name": "t"}) + "\n")
-    (snap / "bun.lock").write_bytes(b"\x00bun")
+    (snap / "package.json").write_text(
+        json.dumps({
+            "name": "t",
+            "packageManager": "bun@1.4.3",
+            "engines": {"node": ">=20"},
+        }) + "\n"
+    )
+    (snap / "bun.lock").write_text('{"lockfileVersion": 1}\n')
+    (snap / "server.js").write_text("// app\n")
     contract = RepoContract(
         build="node --check server.js",
         start="node server.js",
@@ -375,10 +389,30 @@ def test_sandbox_executor_refuses_bun_plan(monkeypatch, tmp_path):
     )
     fake = _FakeInstallSteps()
     orch = _stub_sandbox(monkeypatch, snap, contract, fake)
+    monkeypatch.setattr(Sandbox, "start", _stop_after_install)
     side = orch._provision_side_sandbox("fakerev", 18094, snap / "unit", "t")
-    assert side.provision.status == ProvisionStatus.BUILD_FAILED
-    assert side.provision.reason == "not yet supported in the sandbox"
-    assert fake.descriptors == []
+
+    # Reached the start phase (stubbed to fail there): the plan
+    # was NOT refused.
+    assert side.provision.status == ProvisionStatus.START_FAILED
+    assert side.provision.package_manager == "bun"
+    assert side.provision.install_plan is not None
+    assert side.provision.install_plan["adapter"] == "node"
+    assert side.provision.install_plan["bun_version"] == "1.4.3"
+    installs = [d for d in fake.descriptors if d["phase"] == "install"]
+    assert len(installs) == 2
+    bootstrap, frozen = installs
+    assert bootstrap["argv_rendered"][:2] == ["bash", "-c"]
+    assert "bun-v1.4.3" in bootstrap["argv_rendered"][2]
+    assert "sha256sum -c" in bootstrap["argv_rendered"][2]
+    assert frozen["argv_rendered"] == [
+        "/checkout/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+    ]
+    build = next(d for d in fake.descriptors if d["phase"] == "build")
+    assert build["shell"] == (
+        "env PATH=/checkout/.pd-tools/bin:"
+        "/checkout/node_modules/.bin:$PATH node --check server.js"
+    )
 
 
 def test_sandbox_executor_refuses_ambiguous_workspace_plan(
