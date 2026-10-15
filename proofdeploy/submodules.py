@@ -27,10 +27,15 @@ nothing from the submodule.
 
 Safety (the URLs in ``.gitmodules`` are untrusted repo input):
 
-* https only, enforced by git itself:
-  ``-c protocol.allow=never -c protocol.https.allow=always``, which
-  refuses ``file://``, ``ssh``, ``git://`` and ``ext::`` before any
-  transport is spawned;
+* https only, enforced twice: the resolved URL and the recorded
+  SHA are validated before any git process runs (R1 — a URL such
+  as ``--upload-pack=…`` or ``-c…`` must never reach git's argv,
+  where it would be parsed as an option; the fetch argv also ends
+  its options with ``--end-of-options``), and git itself is
+  restricted with
+  ``-c protocol.allow=never -c protocol.https.allow=always``,
+  which refuses ``file://``, ``ssh``, ``git://`` and ``ext::``
+  before any transport is spawned;
 * no credentials: ``GIT_TERMINAL_PROMPT=0``, an empty credential
   helper, and a hermetic config (system/global config files are not
   read, so a stray ``url.insteadOf`` rewrite cannot redirect the
@@ -41,32 +46,49 @@ Safety (the URLs in ``.gitmodules`` are untrusted repo input):
   (ADR 0012);
 * per-fetch limits, stated here: one fetch may take at most
   ``FETCH_TIMEOUT_SECONDS`` (300s), and one submodule's extracted
-  tree may total at most ``MAX_TREE_BYTES`` (512 MiB). Nested
-  submodules are followed to ``MAX_DEPTH`` (5) levels below the
-  side's own tree.
+  tree may total at most ``MAX_TREE_BYTES`` (512 MiB). The size
+  cap is summed from the tree listing and enforced BEFORE
+  anything is written, and blobs are streamed to disk from one
+  ``cat-file --batch`` process — never loaded whole into memory.
+  Nested submodules are followed to ``MAX_DEPTH`` (5) levels
+  below the side's own tree.
 
-Failure typing:
+Failure typing (classes per the reviewer's R4 ruling, D48/D50):
 
-* a URL refused by the scheme rules, a path refused by the path
-  rules, or a commit the remote does not serve raises
-  :class:`SubmoduleUnavailableError` — a typed
+* the recorded commit is unavailable — a URL refused by the R1
+  validation or the protocol rules, a repository not found or
+  private, or a commit the remote does not serve — raises
+  :class:`SubmoduleUnavailableError`: a typed
   ``not supported: submodule <path> at <sha> unavailable from
   <url>: <detail>`` reason, where the detail is git's first error
   line for a fetch refusal (the H5 class: the readiness harness
   judges the side skipped with its reason published and never
   retries it);
-* a network or other transient failure raises
-  :class:`SubmoduleFetchError` instead — the harness's existing
+* a submodule path refused by the path rules (absolute, ``..``,
+  a symlinked parent) and a symlink escaping a fetched tree get
+  the class ``create_snapshot`` already gives an ADR 0012
+  refusal: a plain ``ValueError`` (fixture.py:359) or the
+  ``SnapshotLinkError`` itself (fixture.py:157) — NEITHER
+  carries the ``not supported:`` prefix;
+* a tree over the size cap is OUR gap — the cap is our limit —
+  and raises a plain ``ValueError`` whose message says so
+  (``(our gap)``), never ``not supported:``;
+* a relative URL whose superproject origin is missing or not an
+  https URL (scp-style, a local path) is harness or environment
+  — the origin is this checkout's configuration, not the
+  repo's — and, like a network or other transient failure,
+  raises :class:`SubmoduleFetchError`, the harness's existing
   retry class, never typed not-supported;
-* there is never a silent fallback to an empty directory: a listed
-  gitlink either materializes at its recorded commit or the side
-  fails with one of the two typings above.
+* there is never a silent fallback to an empty directory: a
+  listed gitlink either materializes at its recorded commit or
+  the side fails with one of the typings above.
 """
 
 from __future__ import annotations
 
 import os
 import posixpath
+import re
 import subprocess
 import urllib.parse
 from pathlib import Path
@@ -182,7 +204,13 @@ def _git_fetch(
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_CONFIG_GLOBAL"] = os.devnull
-    argv += ["-C", str(repo), "fetch", "-q", "--depth", "1", "--no-tags", url, sha]
+    # --end-of-options (R1): the URL and SHA are untrusted repo
+    # input; nothing after this marker can be parsed as an option,
+    # whatever the URL string looks like.
+    argv += [
+        "-C", str(repo), "fetch", "-q", "--depth", "1", "--no-tags",
+        "--end-of-options", url, sha,
+    ]
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True,
@@ -229,11 +257,48 @@ def _git_fetch(
     return repo, tree.stdout.strip()
 
 
+_SHA40_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _validate_fetch_target(url: str, sha: str) -> None:
+    """R1: refuse a hostile URL or SHA before any git process runs.
+
+    The URL and SHA come straight from the repo under test
+    (``.gitmodules`` and the tree's gitlink), so they are untrusted
+    input to git's argv: a URL such as ``--upload-pack=…`` or
+    ``-c…`` would otherwise be parsed as an option. After
+    resolution the URL must be a plain ``https://`` URL — that
+    anchor alone excludes a leading ``-`` — with no whitespace or
+    control characters, and the SHA must be exactly 40 lowercase
+    hex. Refusals are typed (the D46 class: non-https by the
+    protocol rules means the recorded commit is unavailable) and
+    carry ``detail`` so the materialize layer can re-raise with
+    the submodule's path, exactly as for a fetch refusal.
+    """
+    if not url.startswith("https://") or any(
+        ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url
+    ):
+        raise SubmoduleUnavailableError(
+            f"not supported: submodule URL refused before fetch: {url!r}",
+            detail=f"submodule URL is not a clean https URL: {url!r}",
+        )
+    if _SHA40_RE.fullmatch(sha) is None:
+        raise SubmoduleUnavailableError(
+            f"not supported: submodule commit refused before fetch: {sha!r}",
+            detail=(
+                "recorded commit is not a 40-character lowercase "
+                f"hex SHA: {sha!r}"
+            ),
+        )
+
+
 class HttpsSubmoduleTransport:
     """Production transport: https only, no credentials, hermetic
-    git config (see the module docstring)."""
+    git config (see the module docstring). The fetch target is
+    validated (R1) before any git process runs."""
 
     def fetch(self, url: str, sha: str, scratch_dir: Path) -> tuple[Path, str]:
+        _validate_fetch_target(url, sha)
         return _git_fetch(scratch_dir / "repo", url, sha, restrict_protocols=True)
 
 
@@ -301,17 +366,25 @@ def _read_gitmodules(tree_root: Path) -> list[dict[str, str]]:
     ]
 
 
-def _resolve_url(raw_url: str, base_url: str | None, path: str, sha: str) -> str:
+def _resolve_url(raw_url: str, base_url: str | None, path: str) -> str:
     """Resolve a .gitmodules URL. Relative URLs (``./`` / ``../``)
     resolve against the superproject's own origin URL, exactly as
     git resolves them (Ghost's ``../../TryGhost/Source.git`` against
-    ``https://github.com/TryGhost/Ghost.git``)."""
+    ``https://github.com/TryGhost/Ghost.git``).
+
+    A missing origin, or one that is not an https URL (scp-style
+    ``git@host:path``, a local path), makes resolution impossible
+    for a reason that lives in THIS checkout's configuration, not
+    in the repo: harness or environment (the reviewer's R4 ruling),
+    raised as SubmoduleFetchError — the harness retry class."""
     if raw_url.startswith(("./", "../")):
-        if base_url is None:
-            raise _typed(
-                path, sha, raw_url,
-                "relative submodule URL with no superproject origin "
-                "to resolve it against",
+        if base_url is None or "://" not in base_url:
+            raise SubmoduleFetchError(
+                f"harness or environment: relative submodule URL "
+                f"{raw_url!r} for submodule {path} cannot be resolved: "
+                f"the superproject origin is missing or not an https "
+                f"URL ({base_url!r}); the origin is this checkout's "
+                f"configuration, not the repo's"
             )
         return urllib.parse.urljoin(base_url, raw_url)
     return raw_url
@@ -320,39 +393,37 @@ def _resolve_url(raw_url: str, base_url: str | None, path: str, sha: str) -> str
 def _check_path_syntax(full_rel: str, raw_url: str) -> None:
     """Refuse an absolute or ``..``-carrying .gitmodules path,
     whether or not it pairs with a gitlink (see the caller). The
-    commit is not known for an unpaired path; the typed message
-    says so instead of inventing one."""
+    refusal is a plain ValueError — the class create_snapshot
+    gives an ADR 0012 refusal (fixture.py:359) — with NO
+    ``not supported:`` prefix (the reviewer's R4 ruling)."""
     if posixpath.isabs(full_rel) or any(
         part == ".." for part in full_rel.split("/")
     ):
-        raise _typed(
-            full_rel, "unrecorded", raw_url,
+        raise ValueError(
             f"submodule path does not normalize inside the checkout: "
-            f"{full_rel!r}",
+            f"{full_rel!r}"
         )
 
 
-def _validate_path(
-    snapshot_dir: Path, full_rel: str, sha: str, url: str
-) -> str:
+def _validate_path(snapshot_dir: Path, full_rel: str) -> str:
     """Validate one submodule path (posix, relative to the snapshot
-    root) against ADR 0012 and return its normalized form. Refusals
-    are typed: ``..`` components or an absolute path, and any
-    symlinked component on the way down (a link could carry the
-    extraction outside the checkout)."""
+    root) against ADR 0012 and return its normalized form: ``..``
+    components or an absolute path, and any symlinked component on
+    the way down (a link could carry the extraction outside the
+    checkout). Refusals are plain ValueErrors — the class
+    create_snapshot gives an ADR 0012 refusal (fixture.py:359) —
+    with NO ``not supported:`` prefix (the reviewer's R4 ruling)."""
     if posixpath.isabs(full_rel) or any(
         part == ".." for part in full_rel.split("/")
     ):
-        raise _typed(
-            full_rel, sha, url,
+        raise ValueError(
             f"submodule path does not normalize inside the checkout: "
-            f"{full_rel!r}",
+            f"{full_rel!r}"
         )
     normalized = posixpath.normpath(full_rel)
     if normalized in ("", "."):
-        raise _typed(
-            full_rel, sha, url,
-            f"submodule path does not name a directory: {full_rel!r}",
+        raise ValueError(
+            f"submodule path does not name a directory: {full_rel!r}"
         )
     parts = normalized.split("/")
     cursor = snapshot_dir
@@ -361,38 +432,25 @@ def _validate_path(
         cursor = cursor / part
         walked.append(part)
         if cursor.is_symlink():
-            raise _typed(
-                full_rel, sha, url,
-                f"submodule path has a symlinked parent: {'/'.join(walked)}",
+            raise ValueError(
+                f"submodule path has a symlinked parent: {'/'.join(walked)}"
             )
         if cursor.exists() and not cursor.is_dir():
-            raise _typed(
-                full_rel, sha, url,
+            raise ValueError(
                 f"submodule path's parent is not a directory: "
-                f"{'/'.join(walked)}",
+                f"{'/'.join(walked)}"
             )
     dest = snapshot_dir / normalized
     if dest.is_symlink():
-        raise _typed(
-            full_rel, sha, url,
-            "submodule path is a symlink in the snapshot",
+        raise ValueError(
+            f"submodule path is a symlink in the snapshot: {full_rel!r}"
         )
     if dest.exists() and not dest.is_dir():
-        raise _typed(
-            full_rel, sha, url,
-            "submodule path exists in the snapshot and is not a directory",
+        raise ValueError(
+            "submodule path exists in the snapshot and is not a "
+            f"directory: {full_rel!r}"
         )
     return normalized
-
-
-def _tree_bytes(root: Path) -> int:
-    total = 0
-    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
-        for name in filenames:
-            p = Path(dirpath) / name
-            if not p.is_symlink():
-                total += p.stat().st_size
-    return total
 
 
 def _extract_tree(
@@ -404,9 +462,17 @@ def _extract_tree(
     listed ones), symlinks deferred, validated against the WO-8.4b
     rule as one map, then created verbatim. Nothing is executed and
     no attribute filter is applied — the tree's bytes are the
-    commit's bytes."""
+    commit's bytes.
+
+    The size cap is enforced BEFORE anything is written (R3): the
+    blob sizes come from the ``ls-tree -l`` listing itself and are
+    summed first; an over-cap tree is refused with nothing on
+    disk. Blobs are then streamed to disk from ONE
+    ``cat-file --batch`` process — each blob's bytes go from the
+    pipe to the file in chunks, never held whole in memory.
+    """
     proc = subprocess.run(
-        ["git", "-C", str(repo), "ls-tree", "-r", "-z", sha],
+        ["git", "-C", str(repo), "ls-tree", "-r", "-l", "-z", sha],
         capture_output=True, timeout=120,
     )
     if proc.returncode != 0:
@@ -414,14 +480,15 @@ def _extract_tree(
             f"git ls-tree {sha} failed in {repo}: "
             f"{proc.stderr.decode(errors='replace').strip()}"
         )
-    dest.mkdir(parents=True, exist_ok=True)
-    links: dict[str, str] = {}
+    # (mode, oid, size, rel) per entry; gitlinks carry no blob.
+    entries: list[tuple[str, str, int, str]] = []
+    total = 0
     for entry in proc.stdout.split(b"\0"):
         if not entry:
             continue
         meta, _, raw_path = entry.partition(b"\t")
-        parts = meta.split(b" ")
-        if len(parts) != 3:
+        parts = meta.split()
+        if len(parts) != 4:
             raise SubmoduleFetchError(
                 f"unparseable ls-tree entry for {sha}: {entry!r}"
             )
@@ -430,41 +497,105 @@ def _extract_tree(
         rel = raw_path.decode("utf-8", errors="surrogateescape")
         # Tree paths are normalized by construction (git forbids
         # `..` components); refuse defensively rather than ever
-        # writing outside dest.
+        # writing outside dest. Plain ValueError: the ADR 0012
+        # refusal class of create_snapshot (fixture.py:359).
         if posixpath.isabs(rel) or any(p == ".." for p in rel.split("/")):
-            raise _typed(
-                full_path, sha, url,
-                f"tree entry escapes the submodule directory: {rel!r}",
+            raise ValueError(
+                f"submodule tree entry escapes the submodule "
+                f"directory: {rel!r}"
             )
-        target = dest / rel
         if mode == "160000":
-            target.mkdir(parents=True, exist_ok=True)
+            entries.append((mode, oid, 0, rel))
             continue
-        blob = subprocess.run(
-            ["git", "-C", str(repo), "cat-file", "blob", oid],
-            capture_output=True, timeout=120,
-        )
-        if blob.returncode != 0:
+        try:
+            size = int(parts[3])
+        except ValueError:
             raise SubmoduleFetchError(
-                f"git cat-file {oid} failed in {repo}: "
-                f"{blob.stderr.decode(errors='replace').strip()}"
-            )
-        if mode == "120000":
-            links[rel] = blob.stdout.decode("utf-8", errors="surrogateescape")
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(blob.stdout)
-        if mode == "100755":
-            target.chmod(0o755)
+                f"unparseable ls-tree size for {sha}: {entry!r}"
+            ) from None
+        total += size
+        entries.append((mode, oid, size, rel))
+    if total > MAX_TREE_BYTES:
+        # The cap is OUR limit, so this is our gap (D48 R1/R3):
+        # a plain ValueError whose message says so — it must NOT
+        # start with "not supported:".
+        raise ValueError(
+            f"submodule {full_path}: its tree is {total} bytes, over "
+            f"the {MAX_TREE_BYTES}-byte limit ProofDeploy sets for "
+            f"one submodule (our gap)"
+        )
+    dest.mkdir(parents=True, exist_ok=True)
+    links: dict[str, str] = {}
+    batch = subprocess.Popen(
+        ["git", "-C", str(repo), "cat-file", "--batch"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    )
+    done = False
+    try:
+        assert batch.stdin is not None and batch.stdout is not None
+        for mode, oid, size, rel in entries:
+            target = dest / rel
+            if mode == "160000":
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            # Request-response, one blob at a time: write the oid,
+            # then drain exactly its response before asking for
+            # the next, so neither pipe can fill and stall.
+            batch.stdin.write(f"{oid}\n".encode())
+            batch.stdin.flush()
+            header = batch.stdout.readline().decode(errors="replace").split()
+            if len(header) != 3 or header[1] != "blob" or int(header[2]) != size:
+                raise SubmoduleFetchError(
+                    f"git cat-file --batch cannot serve {oid} in "
+                    f"{repo}: {' '.join(header)}"
+                )
+            if mode == "120000":
+                # A link target is a path string by construction;
+                # it is the one blob read whole.
+                data = batch.stdout.read(size)
+                batch.stdout.read(1)  # the response's trailing LF
+                links[rel] = data.decode("utf-8", errors="surrogateescape")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            remaining = size
+            with target.open("wb") as fh:
+                while remaining > 0:
+                    chunk = batch.stdout.read(min(65536, remaining))
+                    if not chunk:
+                        raise SubmoduleFetchError(
+                            f"git cat-file --batch stream ended "
+                            f"early for {oid} in {repo}"
+                        )
+                    fh.write(chunk)
+                    remaining -= len(chunk)
+            batch.stdout.read(1)  # the response's trailing LF
+            if mode == "100755":
+                target.chmod(0o755)
+        done = True
+    finally:
+        if batch.poll() is None:
+            if done:
+                assert batch.stdin is not None
+                batch.stdin.close()
+                batch.wait(timeout=60)
+            else:
+                batch.kill()
+                batch.wait(timeout=60)
+    if batch.returncode != 0:
+        raise SubmoduleFetchError(
+            f"git cat-file --batch exited {batch.returncode} in {repo}"
+        )
     # All-or-nothing, exactly as in create_snapshot: validate the
-    # whole symlink map before creating any link.
+    # whole symlink map before creating any link. A refusal is the
+    # SnapshotLinkError itself — the class create_snapshot gives
+    # an ADR 0012 refusal (fixture.py:157) — re-based to name the
+    # path from the snapshot root.
     for rel in sorted(links):
         try:
             _validate_snapshot_link(links, rel)
         except SnapshotLinkError as exc:
-            raise _typed(
-                full_path, sha, url,
-                f"symlink refused ({exc.reason}): {exc.path} -> {exc.target}",
+            raise SnapshotLinkError(
+                f"{full_path}/{exc.path}", exc.target, exc.reason
             ) from None
     for rel in sorted(links):
         link_dest = dest / rel
@@ -574,10 +705,10 @@ def materialize_snapshot_submodules(
                 )
             if raw_url.startswith(("./", "../")):
                 base = level_base_url if level_base_url is not None else origin_url()
-                url = _resolve_url(raw_url, base, full_path, commit)
+                url = _resolve_url(raw_url, base, full_path)
             else:
                 url = raw_url
-            normalized = _validate_path(snap, full_path, commit, url)
+            normalized = _validate_path(snap, full_path)
             dest = snap / normalized
             counter[0] += 1
             fetch_dir = scratch / f"fetch-{counter[0]}"
@@ -587,14 +718,9 @@ def materialize_snapshot_submodules(
                 if exc.detail is not None:
                     raise _typed(full_path, commit, url, exc.detail) from None
                 raise
+            # _extract_tree enforces MAX_TREE_BYTES from the tree
+            # listing before writing anything (R3).
             _extract_tree(bare_repo, commit, dest, full_path=full_path, url=url)
-            size = _tree_bytes(dest)
-            if size > MAX_TREE_BYTES:
-                raise _typed(
-                    full_path, commit, url,
-                    f"extracted submodule content is {size} bytes, over "
-                    f"the {MAX_TREE_BYTES}-byte limit",
-                )
             records.append(
                 {
                     "path": full_path,
