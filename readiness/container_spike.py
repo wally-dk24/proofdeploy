@@ -165,7 +165,7 @@ BUILD_NETWORK_HOST_ADDR = "10.0.2.2"
 # tests/test_container_spike.py. BUILD ONLY: the app run keeps
 # --cap-drop=ALL with no --cap-add, unchanged. The set is
 # recorded on every row (build_caps) and in the run header.
-BUILD_CAPS = ("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETUID", "SETGID")
+BUILD_CAPS = ("DAC_OVERRIDE", "FOWNER", "FSETID", "SETUID", "SETGID")
 
 
 class UsernsUnavailableError(RuntimeError):
