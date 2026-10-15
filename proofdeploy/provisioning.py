@@ -92,12 +92,18 @@ in the wheel's ``Generator``. The Node adapter
 plans frozen installs from the lockfile for both executors: npm ci /
 pnpm install --frozen-lockfile / yarn classic --frozen-lockfile or
 berry --immutable, a packageManager pin rendered through corepack,
-node_modules persisted inside the checkout; workspaces and
-packageManager/lockfile mismatches are typed refusals (WO-7 PR 2).
+node_modules persisted inside the checkout. Monorepo workspaces
+are planned (plan 1.2b, via ``plan_workspace``): the frozen
+install runs at the workspace root and the contract steps are
+scoped to the resolved app member; an ambiguous workspace
+(several members, no contract ``app.path``), a workspace manager
+without support, and packageManager/lockfile mismatches are
+typed refusals (WO-7 PR 2).
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -105,6 +111,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+
+import yaml
 
 from proofdeploy.runner import (
     _PM_LOCKFILES,
@@ -233,6 +241,12 @@ class PlanStep:
     shell: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     executor: str | None = None
+    # Working directory RELATIVE to the checkout root (plan 1.2b):
+    # None means the checkout root itself, where every step ran
+    # before workspace support. Workspace plans scope the contract
+    # steps (build/migrate/seed/start) to the app member's directory
+    # this way; install steps always run at the workspace root.
+    cwd: str | None = None
 
 
 @dataclass
@@ -317,6 +331,13 @@ class InstallPlan:
     package_manager: str | None = None
     package_manager_version: str | None = None
     corepack_version: str | None = None
+    # Workspace facts (plan 1.2b; both None on a non-workspace plan).
+    # workspace_root is the directory the frozen install runs in,
+    # relative to the checkout root ("." — installs always run at
+    # the root); app_path is the workspace member the contract steps
+    # are scoped to ("." when the app is the root package itself).
+    workspace_root: str | None = None
+    app_path: str | None = None
     pip_require_hashes: bool = False
     steps: list[PlanStep] = field(default_factory=list)
     persisted_dirs: list[str] = field(default_factory=list)
@@ -364,6 +385,30 @@ class ProvisioningAdapter(Protocol):
         """
         ...
 
+    def plan_workspace(
+        self,
+        snapshot_dir: Path,
+        contract: Any,
+        lock_cutoff: LockCutoff = None,
+    ) -> InstallPlan:
+        """Build the install plan (or refusal) for a workspace /
+        monorepo snapshot (plan 1.2b).
+
+        The shape is ecosystem-shaped, never manager-shaped: the
+        frozen install runs at the workspace root with the manager
+        the adapter selects from the workspace root's own lockfile (a plan
+        fact, recorded on the plan), and the contract's
+        build/migrate/seed/start steps are scoped to the resolved
+        app member — the contract's ``app.path`` when declared,
+        else the single member, else the root; several members
+        with no declaration is the typed refusal
+        ``ambiguous app: <n> candidates``. A later manager plugs
+        into this same method by joining the adapter's supported
+        set (plan 1.2e does exactly that for bun) — the interface
+        does not change.
+        """
+        ...
+
 
 def _image_fields(
     runtime: str, declared_range: str | None
@@ -391,17 +436,182 @@ def _image_fields(
     }
 
 
-def _contract_steps(contract: Any) -> list[PlanStep]:
-    """The contract's own steps, in order: build, migrate, seed, start."""
+def _contract_steps(
+    contract: Any, cwd: str | None = None
+) -> list[PlanStep]:
+    """The contract's own steps, in order: build, migrate, seed, start.
+
+    ``cwd`` (plan 1.2b) scopes every step to a directory relative
+    to the checkout root — the workspace member being built; None
+    keeps the historical behavior (steps run at the root).
+    """
     steps: list[PlanStep] = []
     for phase in ("build", "migrate", "seed"):
         cmd = getattr(contract, phase, None)
         if cmd:
-            steps.append(PlanStep(phase=phase, shell=str(cmd)))
+            steps.append(PlanStep(phase=phase, shell=str(cmd), cwd=cwd))
     start = getattr(contract, "start", None)
     if start:
-        steps.append(PlanStep(phase="start", shell=str(start)))
+        steps.append(PlanStep(phase="start", shell=str(start), cwd=cwd))
     return steps
+
+
+# ---------------------------------------------------------------------------
+# Workspace layout (plan 1.2b)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorkspaceLayout:
+    """A detected monorepo workspace declaration in a snapshot.
+
+    ``source`` names where the declaration was found
+    (``pnpm-workspace.yaml`` or ``package.json``); ``members`` are
+    the member package directories (relative to the root, sorted)
+    that contain a package.json. The root package itself is never
+    a member: it is the app only when no member is, or when the
+    contract names ``"."`` explicitly.
+    """
+
+    source: str
+    members: list[str]
+
+
+def _workspace_globs(snapshot_dir: Path) -> tuple[str, list[str]] | None:
+    """The declared workspace member globs, or None when undeclared.
+
+    ``pnpm-workspace.yaml``'s ``packages:`` wins when the file
+    exists (it is pnpm's own workspace file); otherwise
+    package.json's ``workspaces`` (a list, or a mapping with a
+    ``packages`` list). An unparseable declaration yields an empty
+    glob list: the workspace is still declared (the caller's
+    detection said so), it just names no members.
+    """
+    ws_file = snapshot_dir / "pnpm-workspace.yaml"
+    if ws_file.is_file():
+        globs: list[str] = []
+        try:
+            data = yaml.safe_load(ws_file.read_text(encoding="utf-8"))
+        except (yaml.YAMLError, OSError):
+            data = None
+        if isinstance(data, dict):
+            pkgs = data.get("packages")
+            if isinstance(pkgs, list):
+                globs = [g for g in pkgs if isinstance(g, str)]
+        return "pnpm-workspace.yaml", globs
+    pkg = snapshot_dir / "package.json"
+    try:
+        data = json.loads(pkg.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict) or "workspaces" not in data:
+        return None
+    ws = data.get("workspaces")
+    globs = []
+    if isinstance(ws, list):
+        globs = [g for g in ws if isinstance(g, str)]
+    elif isinstance(ws, dict):
+        pkgs = ws.get("packages")
+        if isinstance(pkgs, list):
+            globs = [g for g in pkgs if isinstance(g, str)]
+    return "package.json", globs
+
+
+def _glob_member_dirs(root: Path, pattern: str) -> set[str]:
+    """Directories under ``root`` matched by one workspace glob.
+
+    Segments match with fnmatch; ``**`` spans any depth (including
+    zero). Hidden directories and node_modules are never entered
+    by ``**``: they cannot be workspace members, and node_modules
+    may be a huge installed tree.
+    """
+    parts = [p for p in pattern.split("/") if p not in ("", ".")]
+    if not parts:
+        return set()
+    found: set[str] = set()
+
+    def walk(cur: Path, rest: list[str]) -> None:
+        if not rest:
+            rel = cur.relative_to(root).as_posix()
+            if rel != ".":
+                found.add(rel)
+            return
+        head, tail = rest[0], rest[1:]
+        if head == "**":
+            walk(cur, tail)  # zero segments
+            for child in sorted(cur.iterdir()):
+                if (
+                    child.is_dir()
+                    and not child.name.startswith(".")
+                    and child.name != "node_modules"
+                ):
+                    walk(child, rest)  # one or more segments
+            return
+        if not cur.is_dir():
+            return
+        for child in sorted(cur.iterdir()):
+            if child.is_dir() and fnmatch.fnmatchcase(child.name, head):
+                walk(child, tail)
+
+    if root.is_dir():
+        walk(root, parts)
+    return found
+
+
+def detect_workspace(snapshot_dir: Path) -> WorkspaceLayout | None:
+    """Detect a monorepo workspace declaration in a snapshot.
+
+    Returns the layout (declaration source + member package
+    dirs), or None when no workspace is declared. Members are
+    the glob matches (with ``!`` exclusions applied) that
+    contain a package.json, sorted.
+    """
+    found = _workspace_globs(snapshot_dir)
+    if found is None:
+        return None
+    source, globs = found
+    members: set[str] = set()
+    exclusions: list[str] = []
+    for glob in globs:
+        if glob.startswith("!"):
+            exclusions.append(glob[1:])
+        else:
+            members |= _glob_member_dirs(snapshot_dir, glob)
+    for glob in exclusions:
+        members -= _glob_member_dirs(snapshot_dir, glob)
+    return WorkspaceLayout(
+        source=source,
+        members=sorted(
+            m for m in members if (snapshot_dir / m / "package.json").is_file()
+        ),
+    )
+
+
+def _resolve_workspace_app(
+    layout: WorkspaceLayout, declared: str | None
+) -> tuple[str | None, str | None]:
+    """Resolve which workspace member is the app: (app_path, refusal).
+
+    The contract's ``app.path`` wins when declared; it must name
+    the root (``"."``) or a detected member — anything else is a
+    typed refusal, never a guess. Undeclared: a single member is
+    the app, no members means the root package itself is the app,
+    and several members is the typed ambiguity refusal.
+    """
+    if declared is not None:
+        app_path = str(Path(declared))
+        if app_path == "." or app_path in layout.members:
+            return app_path, None
+        return None, (
+            f"app.path {declared!r} is not a workspace package "
+            "in this snapshot (workspace members: "
+            f"{', '.join(layout.members) or 'none'})"
+        )
+    if len(layout.members) > 1:
+        return None, f"ambiguous app: {len(layout.members)} candidates"
+    if layout.members:
+        return layout.members[0], None
+    return ".", None
 
 
 # REG-A (docs/registration/python-lock-rule.md): the registered
@@ -1302,6 +1512,32 @@ class PythonAdapter:
             persisted_dirs=[".venv", ".pd-tools"],
         )
 
+    def plan_workspace(
+        self,
+        snapshot_dir: Path,
+        contract: Any,
+        lock_cutoff: LockCutoff = None,
+    ) -> InstallPlan:
+        """Python workspaces: a typed refusal, for now (plan 1.2b).
+
+        No Python workspace declaration is detected yet — the
+        interface's workspace routing keys off declarations only
+        the Node adapter's ecosystems make — so this is the
+        interface's answer when a Python workspace plan is
+        requested explicitly: refuse typed, never guess a member
+        or a root to install.
+        """
+        del contract, lock_cutoff
+        det = self.detect(snapshot_dir)
+        declared = det.declared_range if det is not None else None
+        return InstallPlan(
+            adapter=self.name,
+            runtime="python",
+            declared_range=declared,
+            **_image_fields("python", declared),
+            refusal="workspaces not yet supported for runtime 'python'",
+        )
+
 
 # The pinned corepack a packageManager-pinned Node plan bootstraps
 # into the checkout's .pd-tools (Addendum 35). Persisted form on
@@ -1343,8 +1579,12 @@ class NodeAdapter:
       (it pins pnpm, only package-lock.json exists) is a typed
       refusal — never a silent fall-back to the other manager.
     - Monorepo workspaces (a ``workspaces`` field in package.json,
-      or a ``pnpm-workspace.yaml``) are refused with the registered
-      wording: "workspaces not yet supported".
+      or a ``pnpm-workspace.yaml``) are planned by
+      :meth:`plan_workspace` (plan 1.2b): the frozen install runs
+      at the workspace root and the contract steps are scoped to
+      the resolved app member. Ambiguity (several members, no
+      contract ``app.path``) and unsupported workspace managers
+      are typed refusals.
     - ``node_modules`` lives in the checkout (persisted_dirs), so it
       survives from the install container to the app container.
     - Every install step's env carries
@@ -1385,9 +1625,80 @@ class NodeAdapter:
             "declared_range": det.declared_range,
             **image,
         }
-        # Monorepo workspaces: refused, with the registered wording.
+        # Monorepo workspaces (plan 1.2b): planned by the
+        # workspace-aware method — frozen install at the root,
+        # contract steps scoped to the resolved app member.
         if self._declares_workspaces(snapshot_dir):
+            return self.plan_workspace(snapshot_dir, contract)
+        return self._install_plan(snapshot_dir, base, contract, app_path=None)
+
+    def plan_workspace(
+        self,
+        snapshot_dir: Path,
+        contract: Any,
+        lock_cutoff: LockCutoff = None,
+    ) -> InstallPlan:
+        """Plan a Node workspace (monorepo) snapshot (plan 1.2b).
+
+        The app member is resolved first (contract ``app.path``,
+        else the single member, else the root; several members
+        with no declaration is the typed ambiguity refusal), then
+        the plan is the root plan: the root's lockfile and
+        ``packageManager`` pin select the manager exactly as for
+        a single-package repo, the frozen install runs at the
+        root, and the contract steps are scoped to the member.
+        Managers without workspace support here (yarn, bun) are a
+        typed refusal naming the manager — bun joins the
+        supported set under plan 1.2e without an interface change.
+        """
+        # Node never generates a lock; the cutoff is ignored (and
+        # never evaluated), exactly as in plan().
+        del lock_cutoff
+        det = self.detect(snapshot_dir)
+        assert det is not None, (
+            "plan_workspace() called without a node detection"
+        )
+        image = _image_fields("node", det.declared_range)
+        base: dict[str, Any] = {
+            "adapter": self.name,
+            "runtime": "node",
+            "declared_range": det.declared_range,
+            **image,
+        }
+        layout = detect_workspace(snapshot_dir)
+        if layout is None:
+            # Routed here on a declaration this module could not
+            # resolve into a layout: refuse typed, never guess.
             return InstallPlan(**base, refusal="workspaces not yet supported")
+        app_path, refusal = _resolve_workspace_app(
+            layout, getattr(contract, "app_path", None)
+        )
+        if refusal is not None:
+            return InstallPlan(**base, refusal=refusal)
+        assert app_path is not None
+        return self._install_plan(
+            snapshot_dir, base, contract, app_path=app_path
+        )
+
+    def _install_plan(
+        self,
+        snapshot_dir: Path,
+        base: dict[str, Any],
+        contract: Any,
+        *,
+        app_path: str | None,
+    ) -> InstallPlan:
+        """The Node install plan from the root's lockfile.
+
+        Shared by plan() (``app_path`` None: a single-package repo)
+        and plan_workspace() (``app_path`` the resolved member, or
+        ``"."`` for a root app): manager selection, the
+        packageManager-mismatch and no-lockfile refusals, the
+        corepack-pinned rendering and the frozen install step are
+        identical; a workspace plan additionally scopes the
+        contract steps to the member and records the workspace
+        facts on the plan.
+        """
         pm_name, pm_version = read_package_manager(snapshot_dir)
         # A packageManager that disagrees with the lockfile present
         # is a typed refusal. Checked against the lockfiles actually
@@ -1425,6 +1736,18 @@ class NodeAdapter:
         manager, argv = select_package_manager(
             snapshot_dir, "node", lockfile_name
         )
+        if app_path is not None and manager not in ("pnpm", "npm"):
+            # Workspace support is implemented for pnpm and npm
+            # (plan 1.2b); another manager's workspace is a typed
+            # refusal naming it — never a silent fall-back. (bun
+            # joins this set under plan 1.2e.)
+            return InstallPlan(
+                **base,
+                refusal=(
+                    "workspaces not yet supported for package "
+                    f"manager {manager!r}"
+                ),
+            )
         # Addendum 37: EVERY Node install step carries the nodedir
         # env (compile fallback against the image's own headers).
         step_env: dict[str, str] = dict(NODE_INSTALL_ENV)
@@ -1472,7 +1795,19 @@ class NodeAdapter:
                 )
             )
         steps.append(PlanStep(phase="install", argv=argv, env=step_env))
-        steps.extend(_contract_steps(contract))
+        # Plan 1.2b: a workspace plan scopes the contract steps to
+        # the app member (cwd relative to the root; "." and None
+        # both keep the steps at the root, as before).
+        step_cwd = app_path if app_path not in (None, ".") else None
+        steps.extend(_contract_steps(contract, cwd=step_cwd))
+        persisted = ["node_modules"]
+        if step_cwd is not None:
+            # The member's own node_modules (pnpm links the
+            # member's dependencies there) persists alongside the
+            # root's.
+            persisted.append(f"{step_cwd}/node_modules")
+        if corepack_version:
+            persisted.append(".pd-tools")
         return InstallPlan(
             **base,
             lockfile_name=lockfile_name,
@@ -1482,12 +1817,10 @@ class NodeAdapter:
                 pm_version if pm_name == manager else None
             ),
             corepack_version=corepack_version,
+            workspace_root="." if app_path is not None else None,
+            app_path=app_path,
             steps=steps,
-            persisted_dirs=(
-                ["node_modules", ".pd-tools"]
-                if corepack_version
-                else ["node_modules"]
-            ),
+            persisted_dirs=persisted,
         )
 
     @staticmethod
