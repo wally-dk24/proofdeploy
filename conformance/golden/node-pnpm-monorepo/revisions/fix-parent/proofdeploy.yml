@@ -19,5 +19,7 @@ auth:
   token_json_path: token
 fixture:
   repo_name: node-pnpm-monorepo
-  seed_note: seeded open note
-  intermediate_note: Sibling apps also translate a human-readable dialect marker (the syllable "sv") — include one seeded marker line so dialect-based authoring has a target.
+  seed_note: seed user seeduser/seedpass owns note id 1 (done=false) after seed
+  auth_mechanism: Bearer token from POST /register or /login in the Authorization header
+  auth_scope: a regular user token
+  flags_note: no feature flags
