@@ -55,6 +55,7 @@ tests/test_sandbox.py::test_sandbox_app_has_no_external_network
 tests/test_sandbox.py::test_sandbox_app_is_not_root
 tests/test_sandbox.py::test_sandbox_install_and_run
 tests/test_sandbox.py::test_sandbox_mounts_only_checkout
+tests/test_sandbox.py::test_sandbox_pnpm_monorepo_install_chmods_workspace_bin
 tests/test_uptime_kuma.py::test_uptime_kuma_head_ready_in_sandbox
 tests/test_wo81_generated_variant.py::test_unhashed_golden_ready_via_generated_lock
 tests/test_wo81b_sandbox.py::test_manager_lock_variant_ready_in_sandbox[pdm]

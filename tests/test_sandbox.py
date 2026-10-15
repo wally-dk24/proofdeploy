@@ -19,6 +19,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import urllib.request
 from pathlib import Path
@@ -51,6 +52,13 @@ requires_podman = pytest.mark.skipif(
 requires_build_network = pytest.mark.skipif(
     not _CAPS.build_network,
     reason="no bridge network: install phase needs a working podman bridge",
+)
+
+# Plan 1.2(g): the checkout-ownership defect exists only in the
+# userns-remap configuration (the only one measured runs allow).
+requires_userns_remap = pytest.mark.skipif(
+    not _CAPS.userns_remap,
+    reason="no userns remapping: ownership test needs the remapped sandbox",
 )
 
 APP_PY = """\
@@ -156,6 +164,76 @@ def test_sandbox_install_and_run(checkout):
         assert json.loads(body) == {"ok": True}
     finally:
         app.stop()
+
+
+@requires_podman
+@requires_build_network
+@requires_userns_remap
+def test_sandbox_pnpm_monorepo_install_chmods_workspace_bin(tmp_path):
+    """Plan 1.2(g), real sandbox: the pnpm monorepo golden's frozen
+    install chmods a workspace member's committed bin file
+    (packages/cli-tools/cli.js, committed without the exec bit) in
+    place via pnpm's linkBin. Before the checkout-ownership
+    transfer this provision failed with `EPERM: operation not
+    permitted, chmod '/checkout/packages/.../cli.js'` — the same
+    failure Directus hit on packages/extensions-sdk/cli.js in the
+    2026-10-15 readiness re-run, because the install process did
+    not own the checkout's files under --uidmap 0:1:65536."""
+    sys.path.insert(
+        0, str(Path(__file__).parent.parent / "conformance")
+    )
+    import kit
+
+    from proofdeploy.orchestrator import (
+        MeasureConfig,
+        Orchestrator,
+        _free_port,
+    )
+
+    root = tmp_path / "monorepo"
+    repo = root / "repo"
+    shas = kit.materialize_golden("node-pnpm-monorepo", repo)
+    records = root / "records"
+    records.mkdir(parents=True)
+    work = root / "work"
+    work.mkdir()
+    unit = root / "unit"
+    unit.mkdir()
+    cfg = MeasureConfig(
+        repo_dir=repo,
+        output_dir=records,
+        workdir=work,
+        no_skill=True,
+        sandbox=True,
+    )
+    side = Orchestrator(cfg)._provision_side_sandbox(
+        shas["base"], _free_port(), unit, "ownership"
+    )
+    provision = side.provision
+    kit.dump_logs("sandbox-monorepo-ownership", provision.logs)
+    assert provision.status.value == "ready", (
+        provision.reason,
+        "\n".join(provision.logs),
+    )
+    install_steps = [
+        s for s in provision.executed_steps if s["phase"] == "install"
+    ]
+    assert install_steps and all(
+        s["exit_code"] == 0 for s in install_steps
+    ), provision.executed_steps
+    snap = side.snapshot_dir
+    cli = snap / "packages" / "cli-tools" / "cli.js"
+    assert cli.stat().st_mode & 0o111, (
+        "pnpm linkBin never chmodded the workspace bin file"
+    )
+    assert (
+        snap
+        / "packages"
+        / "notes-app"
+        / "node_modules"
+        / ".bin"
+        / "pd-golden-cli"
+    ).exists()
 
 
 @requires_podman
@@ -383,6 +461,47 @@ def test_install_refuses_without_bridge(monkeypatch, tmp_path):
     checkout.mkdir()
     with pytest.raises(SandboxError, match="must not use --net=host"):
         sb.install(checkout, ["echo hi"], env={}, proxy_env={}, timeout=60)
+
+
+def test_install_transfers_checkout_ownership_when_remapped(
+    monkeypatch, tmp_path
+):
+    """Plan 1.2(g): with userns remapping, preparing the checkout
+    transfers its ownership to the sandbox runtime uid
+    (podman unshare chown ... 1:1) BEFORE the first install container
+    runs — the install process must own the files it provisions, or
+    a chmod on a committed file is EPERM (the Directus linkBin
+    failure). The transfer happens once per checkout even though
+    _prepare_checkout runs again for the app phase."""
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, build_network=True)
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    assert sb.install(checkout, ["echo hi"], env={}, proxy_env={}, timeout=60)
+    sb._prepare_checkout(checkout)  # the app phase prepares again
+    unshare_calls = [c for c in fake.calls if "unshare" in c]
+    assert len(unshare_calls) == 1, fake.calls
+    call = unshare_calls[0]
+    assert call[call.index("unshare") + 1] == "chown"
+    assert "1:1" in call and str(checkout) in call
+    install_call = _install_run_args(fake)
+    assert fake.calls.index(call) < fake.calls.index(install_call)
+
+
+def test_no_ownership_transfer_without_userns_remap(monkeypatch, tmp_path):
+    """Plan 1.2(g): the nobody fallback (--user 65534) has no mapping
+    to transfer ownership into; preparing the checkout must not
+    attempt an unshare chown there."""
+    _patch_sandbox_caps(monkeypatch, userns_remap=False, build_network=True)
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"], allow_no_userns=True))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    assert sb.install(checkout, ["echo hi"], env={}, proxy_env={}, timeout=60)
+    assert not [c for c in fake.calls if "unshare" in c], fake.calls
 
 
 def test_app_start_uses_no_host_network(monkeypatch, tmp_path):

@@ -549,6 +549,7 @@ tests/test_sandbox.py::test_groq_key_stripped_from_app_env
 tests/test_sandbox.py::test_groq_key_stripped_from_install_env
 tests/test_sandbox.py::test_install_command_failure_returns_false
 tests/test_sandbox.py::test_install_refuses_without_bridge
+tests/test_sandbox.py::test_install_transfers_checkout_ownership_when_remapped
 tests/test_sandbox.py::test_install_uses_bridge_never_host
 tests/test_sandbox.py::test_isolation_evidence_fields
 tests/test_sandbox.py::test_isolation_evidence_uid_zero_when_remapped
@@ -558,6 +559,7 @@ tests/test_sandbox.py::test_measurement_gate_refuses_no_build_network
 tests/test_sandbox.py::test_measurement_gate_refuses_no_podman
 tests/test_sandbox.py::test_measurement_gate_refuses_no_userns
 tests/test_sandbox.py::test_measurement_gate_returns_caps_dict
+tests/test_sandbox.py::test_no_ownership_transfer_without_userns_remap
 tests/test_sandbox.py::test_prepare_checkout_chmod_failure_logs
 tests/test_sandbox.py::test_resolve_network_mode_auto_isolated
 tests/test_sandbox.py::test_resolve_network_mode_auto_none_socket

@@ -8,8 +8,13 @@ importers:
 
   .: {}
 
+  packages/cli-tools: {}
+
   packages/notes-app:
     dependencies:
+      '@pd-golden/cli-tools':
+        specifier: workspace:*
+        version: link:../cli-tools
       '@pd-golden/shared':
         specifier: workspace:*
         version: link:../shared
