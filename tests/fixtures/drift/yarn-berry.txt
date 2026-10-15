@@ -1,0 +1,30 @@
+➤ YN0000: · Yarn 4.18.1
+➤ YN0000: ┌ Resolution step
+➤ YN0085: │ + lodash@npm:4.17.21
+➤ YN0085: │ - lodash@npm:4.17.20
+➤ YN0000: └ Completed
+
+➤ YN0000: ┌ Post-resolution validation
+➤ YN0000: │ @@ -8,14 +8,13 @@
+➤ YN0000: │  "drift-berry@workspace:.":
+➤ YN0000: │    version: 0.0.0-use.local
+➤ YN0000: │    resolution: "drift-berry@workspace:."
+➤ YN0000: │    dependencies:
+➤ YN0028: │ -    lodash: "npm:4.17.20"
+➤ YN0028: │ +    lodash: "npm:4.17.21"
+➤ YN0000: │    languageName: unknown
+➤ YN0000: │    linkType: soft
+➤ YN0000: │  
+➤ YN0028: │ -"lodash@npm:4.17.20":
+➤ YN0028: │ -  version: 4.17.20
+➤ YN0028: │ -  resolution: "lodash@npm:4.17.20"
+➤ YN0028: │ -  checksum: 10c0/faec37cb9f161b766bdc078a1356a07b9eaaa867796dd2520a407fe0a6a6d7be031e8f228f0cf3d305095703ee40258616c870b8d17dcdcb16f745bf31e8c3c2
+➤ YN0028: │ +"lodash@npm:4.17.21":
+➤ YN0028: │ +  version: 4.17.21
+➤ YN0028: │ +  resolution: "lodash@npm:4.17.21"
+➤ YN0000: │    languageName: node
+➤ YN0000: │    linkType: hard
+➤ YN0000: │ 
+➤ YN0028: │ The lockfile would have been modified by this install, which is explicitly forbidden.
+➤ YN0000: └ Completed
+➤ YN0000: · Failed with errors in 0s 44ms

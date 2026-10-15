@@ -88,6 +88,7 @@ from proofdeploy.runner import (
     ProvisionResult,
     ProvisionStatus,
     _first_error_line,
+    _lockfile_drift_reason,
     find_lockfile,
 )
 from proofdeploy.runpair import (
@@ -238,7 +239,10 @@ def check_sandbox_runtime(
 
 
 def _sandbox_step_command(
-    cmd: str, runtime: str = "python", manager: str | None = None
+    cmd: str,
+    runtime: str = "python",
+    manager: str | None = None,
+    corepack_version: str | None = None,
 ) -> str:
     """Render a contract step for the sandbox (WO-7 plan executor).
 
@@ -253,6 +257,16 @@ def _sandbox_step_command(
     .bin goes first on PATH for that command only — the Node analog
     of the venv rendering. The command itself is untouched.
 
+    Corepack-pinned Node plans (plan 1.2f): the plan bootstraps
+    corepack into the checkout's .pd-tools (persisted), and the
+    corepack package's own bin dir carries the manager shims
+    (pnpm/pnpx/yarn/yarnpkg). A shim resolves the snapshot's
+    packageManager pin from the checkout (walking up from the
+    step's directory), so a contract step calling bare `pnpm` or
+    `yarn` runs the plan's pinned version — never a PATH fallback.
+    That bin dir therefore goes first on PATH, ahead of
+    node_modules/.bin, for a corepack-pinned pnpm/yarn plan's steps.
+
     Bun plans (plan 1.2e): the plan's bootstrapped bun lives in the
     checkout's .pd-tools/bin (persisted), and an app's own contract
     steps may call `bun` (its build/start), so that dir goes first
@@ -260,6 +274,11 @@ def _sandbox_step_command(
     plan's own fact.
     """
     if runtime == "node":
+        if corepack_version is not None and manager in ("pnpm", "yarn"):
+            return (
+                "env PATH=/checkout/.pd-tools/node_modules/.bin:"
+                f"/checkout/node_modules/.bin:$PATH {cmd}"
+            )
         if manager == "bun":
             return (
                 "env PATH=/checkout/.pd-tools/bin:"
@@ -1410,7 +1429,10 @@ class Orchestrator:
                 spec["argv_rendered"] = argv
             elif step.shell is not None:
                 rendered = _sandbox_step_command(
-                    step.shell, runtime_name, plan.package_manager
+                    step.shell,
+                    runtime_name,
+                    plan.package_manager,
+                    corepack_version=plan.corepack_version,
                 )
                 spec["command"] = rendered
                 spec["shell"] = rendered
@@ -1508,9 +1530,31 @@ class Orchestrator:
             step_output = getattr(sb, "failed_step_output", None)
             reason = "sandbox install failed"
             if step_output:
-                first_error = _first_error_line([step_output])
-                if first_error:
-                    reason = f"sandbox install failed: {first_error}"
+                # Plan 1.2(j): when the failed step is one of the
+                # plan's own install steps and its output is the
+                # manager's frozen-install refusal of a drifted
+                # lockfile, the reason is the typed not-supported
+                # string, not a generic failure. Contract steps
+                # (build/migrate/seed run through the same
+                # install_steps call) are NOT classified: their
+                # failures stay the generic BUILD_FAILED.
+                failed = next(
+                    (r for r in step_results if r["exit_code"] != 0),
+                    None,
+                )
+                drift = (
+                    _lockfile_drift_reason(
+                        plan.package_manager, [step_output]
+                    )
+                    if failed is not None and failed["phase"] == "install"
+                    else None
+                )
+                if drift is not None:
+                    reason = drift
+                else:
+                    first_error = _first_error_line([step_output])
+                    if first_error:
+                        reason = f"sandbox install failed: {first_error}"
             else:
                 failed_step = next(
                     (
@@ -1545,7 +1589,9 @@ class Orchestrator:
         # (S3): the plan's start step, rendered by
         # _sandbox_step_command for the plan's runtime — a Python
         # start beginning with `python` uses the venv binary directly;
-        # a Node start gets node_modules/.bin first on PATH.
+        # a Node start gets node_modules/.bin first on PATH (a
+        # corepack-pinned pnpm/yarn plan's start gets the persisted
+        # corepack's manager bin ahead of it — plan 1.2f).
         start_step = next(
             (s for s in plan.steps if s.phase == "start"), None
         )
@@ -1555,6 +1601,7 @@ class Orchestrator:
             else contract.start,
             runtime_name,
             plan.package_manager,
+            corepack_version=plan.corepack_version,
         )
         # Plan 1.2b: a workspace start runs in the app member's
         # directory (same scoping as the install-phase steps,

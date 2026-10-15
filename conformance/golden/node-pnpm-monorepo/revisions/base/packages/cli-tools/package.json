@@ -1,0 +1,8 @@
+{
+  "name": "@pd-golden/cli-tools",
+  "version": "1.0.0",
+  "private": true,
+  "bin": {
+    "pd-golden-cli": "./cli.js"
+  }
+}

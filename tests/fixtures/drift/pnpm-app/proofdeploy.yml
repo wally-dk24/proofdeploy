@@ -1,0 +1,4 @@
+build: "node --check app.js"
+start: "node app.js"
+readiness: "/health"
+env: {}

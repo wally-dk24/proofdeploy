@@ -177,6 +177,102 @@ def _first_error_line(lines: list) -> str | None:
     return last_nonempty[:300] if last_nonempty is not None else None
 
 
+# Plan 1.2(j) (D33, Master's option A on the reviewer's O9): a
+# committed lockfile that does not match its manifest is a typed
+# NOT-SUPPORTED class for every package manager — the same
+# mechanism as D18's "no frozen lockfile", one class over. The
+# repo's own install is never repaired, regenerated or
+# date-resolved (rule 9; REG-D D1(c)).
+#
+# Classification reads ONLY the manager's own refusal, from the
+# failed install step's own output — ProofDeploy never
+# re-implements version matching. Each pattern below was verified
+# against a REAL run of the pinned manager version on a drifted
+# project (one dependency bumped in the manifest, lockfile
+# unchanged) on 2026-10-15; the captures are committed as
+# fixtures under tests/fixtures/drift/ and the typed reason
+# embeds the first matching line verbatim:
+# - npm 10.9.4, `npm ci`: "npm error code EUSAGE" + the
+#   "can only install packages when your package.json and
+#   package-lock.json ... are in sync" prose (and, for other
+#   drift shapes, "Invalid: lock file's X does not satisfy Y" /
+#   "Missing: ... from lock file").
+# - pnpm 9.15.0, `pnpm install --frozen-lockfile`:
+#   "ERR_PNPM_OUTDATED_LOCKFILE" (the stable error code).
+# - yarn classic 1.22.22, `yarn install --frozen-lockfile`:
+#   "error Your lockfile needs to be updated, but yarn was run
+#   with `--frozen-lockfile`."
+# - yarn berry 4.18.1, `yarn install --immutable`: code YN0028
+#   with "The lockfile would have been modified by this install,
+#   which is explicitly forbidden."
+# - bun 1.4.3 (the plan's digest pin), `bun install
+#   --frozen-lockfile`: "error: lockfile had changes, but
+#   lockfile is frozen".
+# - uv 0.13.0 (the bootstrap pin), `uv lock --check` exit 1:
+#   "error: The lockfile at `uv.lock` needs to be updated, but
+#   `--check` was provided."
+# - pdm 2.29.2 (the bootstrap pin), `pdm lock --check` exit 1:
+#   "WARNING: Lockfile doesn't satisfy the project requirements,
+#   packages may be outdated" (the check prints no other line).
+# - poetry 2.5.1 (the bootstrap pin), `poetry install --sync`
+#   exit 1: "pyproject.toml changed significantly since
+#   poetry.lock was last generated. ..."
+# Patterns are tuples of substrings that must ALL appear on one
+# output line; alternatives are tried per line in output order
+# and the first matching line is the manager's refusal line.
+# Anything else — registry/network failures (E502, ETIMEDOUT,
+# ECONNRESET, ECONNREFUSED), peer-resolution failures
+# (ERESOLVE), every other install error — matches nothing here
+# and stays exactly the BUILD_FAILED it is today.
+_LOCKFILE_DRIFT_PATTERNS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "npm": (
+        (
+            "can only install packages when your package.json "
+            "and package-lock.json",
+        ),
+        ("npm error", "does not satisfy"),
+        ("npm error", "Missing:", "from lock file"),
+    ),
+    "pnpm": (("ERR_PNPM_OUTDATED_LOCKFILE",),),
+    "yarn": (
+        ("Your lockfile needs to be updated",),
+        ("YN0028", "lockfile would have been modified"),
+    ),
+    "bun": (("lockfile had changes, but lockfile is frozen",),),
+    "uv": (("The lockfile at", "needs to be updated"),),
+    "pdm": (("Lockfile doesn't satisfy the project requirements",),),
+    "poetry": (("pyproject.toml changed significantly",),),
+}
+
+
+def _lockfile_drift_reason(manager: str | None, lines: list) -> str | None:
+    """The typed not-supported reason when a failed install
+    step's own output is the package manager's frozen-install
+    refusal of a drifted lockfile (plan 1.2(j)); None otherwise.
+
+    ``lines`` has the same shape as ``_first_error_line``'s input
+    (log entries, possibly multi-line blobs); the ``$ podman``
+    command echo is skipped for the same Addendum 38 reason.
+    """
+    if manager is None:
+        return None
+    alternatives = _LOCKFILE_DRIFT_PATTERNS.get(manager)
+    if not alternatives:
+        return None
+    for entry in lines:
+        for line in str(entry).splitlines():
+            stripped = line.strip()
+            if stripped.startswith("$ podman"):
+                continue
+            for alternative in alternatives:
+                if all(part in stripped for part in alternative):
+                    return (
+                        "not supported: lockfile out of sync with "
+                        f"its manifest ({manager}): {stripped[:300]}"
+                    )
+    return None
+
+
 def _exit_code_from_reason(ok: bool, reason: str | None) -> int | None:
     """The exit code behind an _exec result (Addendum 31 recording).
 
@@ -1453,6 +1549,25 @@ class Provisioner:
             venv_bin = str(venv_dir / "bin")
             logs.append(f"venv: {venv_dir} (bin first on PATH)")
         first_on_path = run_bin or venv_bin
+        if (
+            plan.corepack_version is not None
+            and package_manager in ("pnpm", "yarn")
+        ):
+            # Plan 1.2(f): a corepack-pinned plan bootstraps corepack
+            # into the checkout's .pd-tools (persisted); the corepack
+            # package's own bin dir carries the manager shims
+            # (pnpm/pnpx/yarn/yarnpkg), which resolve the snapshot's
+            # packageManager pin — so contract steps (and the start)
+            # calling bare `pnpm` / `yarn` run the plan's pinned
+            # version, never a PATH fallback. The manager's bin goes
+            # first on PATH — the host rendering of the sandbox's
+            # corepack PATH treatment.
+            manager_bin = str(snap / ".pd-tools" / "node_modules" / ".bin")
+            first_on_path = (
+                manager_bin + os.pathsep + first_on_path
+                if first_on_path
+                else manager_bin
+            )
         if package_manager == "bun":
             # Plan 1.2e: the plan's bootstrapped bun lives in the
             # checkout's .pd-tools/bin; an app's own contract steps
@@ -1556,6 +1671,19 @@ class Provisioner:
                 phase="install",
             )
             if not ok:
+                drift = _lockfile_drift_reason(
+                    package_manager, logs[log_mark:]
+                )
+                if drift is not None:
+                    return _bail(
+                        ProvisionStatus.BUILD_FAILED,
+                        drift,
+                        plan,
+                        runtime=runtime,
+                        runtime_version=actual_version,
+                        package_manager=package_manager,
+                        lockfile_sha256=lockfile_sha,
+                    )
                 first_error = _first_error_line(logs[log_mark:])
                 return _bail(
                     ProvisionStatus.BUILD_FAILED,
@@ -1574,6 +1702,17 @@ class Provisioner:
             phase="install",
         )
         if not ok:
+            drift = _lockfile_drift_reason(package_manager, logs[log_mark:])
+            if drift is not None:
+                return _bail(
+                    ProvisionStatus.BUILD_FAILED,
+                    drift,
+                    plan,
+                    runtime=runtime,
+                    runtime_version=actual_version,
+                    package_manager=package_manager,
+                    lockfile_sha256=lockfile_sha,
+                )
             first_error = _first_error_line(logs[log_mark:])
             return _bail(
                 ProvisionStatus.BUILD_FAILED,
