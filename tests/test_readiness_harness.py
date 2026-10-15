@@ -1007,3 +1007,182 @@ def test_provision_repo_mid_unit_failure_one_row_per_side(
     nxt = [r["status"] for r in rows if r["unit"] == "T-NEXT"]
     assert nxt == ["READY", "READY"]
     assert len(rows) == 4
+
+
+# --- plans 1.2h + 1.2i: the committed nest contract -----------------
+
+
+def _nest_shaped_snapshot(tmp_path: Path) -> Path:
+    """A nest-shaped workspace snapshot: root package.json with
+    workspaces + a root package-lock.json, one member package."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "nest-root",
+                "private": True,
+                "workspaces": ["packages/*"],
+                "engines": {"node": ">=20"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snap / "package-lock.json").write_text("{}", encoding="utf-8")
+    member = snap / "packages" / "core"
+    member.mkdir(parents=True)
+    (member / "package.json").write_text(
+        json.dumps({"name": "@nestjs/core"}), encoding="utf-8"
+    )
+    return snap
+
+
+def test_nest_contract_plans_flags_and_regd(tmp_path: Path) -> None:
+    """The committed nest contract, planned readiness-shaped:
+    the adapter's frozen npm ci carries the contract's
+    --legacy-peer-deps (plan 1.2h) and the sample install renders
+    the unit's cutoff as --before (REG-D, plan 1.2i). This is the
+    test both plants target: drop the flag rendering or the
+    --before rendering and it fails."""
+    contract = load_contract(rp.contract_path("nestjs/nest"))
+    assert contract.app_path == "."
+    assert contract.npm_flags == ["--legacy-peer-deps"]
+    snap = _nest_shaped_snapshot(tmp_path)
+    cutoff = "2025-02-03T04:05:06Z"
+    plan = NodeAdapter().plan(snap, contract, lock_cutoff=cutoff)
+    assert plan.refusal is None
+    assert plan.package_manager == "npm"
+    assert plan.npm_flags == ["--legacy-peer-deps"]
+    install = next(s for s in plan.steps if s.phase == "install")
+    assert install.argv is not None
+    ci = install.argv.index("ci")
+    assert install.argv[ci + 1] == "--legacy-peer-deps"
+    build = next(s for s in plan.steps if s.phase == "build")
+    assert build.shell is not None
+    assert f"--before={cutoff}" in build.shell
+    assert "{regd_cutoff}" not in build.shell
+    assert "npm ci" not in build.shell
+    assert plan.regd == {
+        "sample_path": "sample/01-cats-app",
+        "cutoff": cutoff,
+        "command": (
+            "npm --prefix sample/01-cats-app install "
+            f"--legacy-peer-deps --before={cutoff}"
+        ),
+    }
+
+
+def test_row_from_provision_carries_npm_flags_and_regd() -> None:
+    plan = {
+        "declared_range": ">=20",
+        "package_manager": "npm",
+        "npm_flags": ["--legacy-peer-deps"],
+        "regd": {
+            "sample_path": "sample/01-cats-app",
+            "cutoff": "2025-02-03T04:05:06Z",
+            "command": (
+                "npm --prefix sample/01-cats-app install "
+                "--legacy-peer-deps --before=2025-02-03T04:05:06Z"
+            ),
+        },
+        "refusal": None,
+    }
+    side = _fake_side(plan=plan)
+    row = rp.row_from_provision(
+        BUG_UNIT, BUG_UNIT["sides"][1], "h" * 40, 1, "isolated", side
+    )
+    assert row["npm_flags"] == ["--legacy-peer-deps"]
+    assert row["regd"]["applied"] is True
+    assert row["regd"]["sample_path"] == "sample/01-cats-app"
+    assert row["regd"]["cutoff"] == "2025-02-03T04:05:06Z"
+    assert row["regd"]["command"].endswith(
+        "--before=2025-02-03T04:05:06Z"
+    )
+    assert row["regd"]["tree_sha256"] is None
+
+
+def test_row_from_provision_without_regd_marks_not_applied() -> None:
+    plan = {"declared_range": ">=22", "package_manager": "pnpm"}
+    side = _fake_side(plan=plan)
+    row = rp.row_from_provision(
+        BUG_UNIT, BUG_UNIT["sides"][1], "h" * 40, 1, "isolated", side
+    )
+    assert row["npm_flags"] == []
+    assert row["regd"]["applied"] is False
+    assert row["regd"]["cutoff"] is None
+
+
+def test_capture_regd_tree_records_sha_and_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REG-D D4: the resolved tree is captured from the
+    provisioned snapshot with a real `npm ls --all --json`; its
+    sha256 lands on the row and the JSON rides pd-logs/."""
+    import hashlib
+    import shutil
+
+    if shutil.which("npm") is None:
+        pytest.skip("npm not available on this host")
+    monkeypatch.chdir(tmp_path)
+    snap = tmp_path / "snapshot"
+    sample = snap / "sample" / "01-cats-app"
+    dep = sample / "node_modules" / "left-pad"
+    dep.mkdir(parents=True)
+    (sample / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "sample",
+                "version": "1.0.0",
+                "dependencies": {"left-pad": "1.3.0"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (dep / "package.json").write_text(
+        json.dumps({"name": "left-pad", "version": "1.3.0"}),
+        encoding="utf-8",
+    )
+    row = {
+        "regd": rp._regd_row(
+            {
+                "sample_path": "sample/01-cats-app",
+                "cutoff": "2025-02-03T04:05:06Z",
+                "command": "npm --prefix sample/01-cats-app install",
+            }
+        )
+    }
+    side = SimpleNamespace(snapshot_dir=snap)
+    rp._capture_regd_tree(BUG_UNIT, BUG_UNIT["sides"][1], 1, side, row)
+    regd = row["regd"]
+    assert regd["tree_error"] is None
+    assert regd["tree_artifact"] == "pd-logs/regd-tree-T2-fix-a1.json"
+    artifact = tmp_path / "pd-logs" / "regd-tree-T2-fix-a1.json"
+    text = artifact.read_text(encoding="utf-8")
+    assert regd["tree_sha256"] == hashlib.sha256(
+        text.encode()
+    ).hexdigest()
+    tree = json.loads(text)
+    assert tree["dependencies"]["left-pad"]["version"] == "1.3.0"
+
+
+def test_capture_regd_tree_failure_is_recorded_not_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    row = {
+        "regd": rp._regd_row(
+            {
+                "sample_path": "sample/01-cats-app",
+                "cutoff": "2025-02-03T04:05:06Z",
+                "command": "npm --prefix sample/01-cats-app install",
+            }
+        )
+    }
+    # The snapshot has no sample directory at all: the capture
+    # fails, and the failure is recorded on the row (D4 fields are
+    # never silently absent).
+    side = SimpleNamespace(snapshot_dir=tmp_path / "no-such-snapshot")
+    rp._capture_regd_tree(BUG_UNIT, BUG_UNIT["sides"][1], 1, side, row)
+    assert row["regd"]["tree_sha256"] is None
+    assert row["regd"]["tree_artifact"] is None
+    assert row["regd"]["tree_error"]
