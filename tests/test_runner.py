@@ -452,6 +452,20 @@ def test_provision_start_unreachable_is_start_failed(tmp_path):
         ("3.12.0", "==3.11.*", "python", False),
         ("24.20.0", "*", "node", True),
         ("24.20.0", "", "node", True),
+        # npm bare partials are x-ranges (WO-8.4a): "22" is 22.x,
+        # "22.2" is 22.2.x; a full x.y.z stays exact; the "*"
+        # component spells the same wildcard as "x".
+        ("22.23.3", "22", "node", True),
+        ("23.0.0", "22", "node", False),
+        ("22.2.9", "22.2", "node", True),
+        ("22.3.0", "22.2", "node", False),
+        ("22.23.3", "22.*", "node", True),
+        ("22.14.0", "22.14.0", "node", True),
+        ("22.23.3", "22.14.0", "node", False),
+        # PEP 440 has no bare specifier: the Python side keeps the
+        # exact reading of a bare version.
+        ("3.12.15", "3.12", "python", False),
+        ("3.12.0", "3.12", "python", True),
     ],
 )
 def test_satisfies_range(version, spec, ecosystem, expected):

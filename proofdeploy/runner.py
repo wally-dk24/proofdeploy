@@ -346,9 +346,12 @@ def _parse_token(
     if not m:
         return []
     op, ver = m.group(1) or "", m.group(2)
-    # Wildcards: 1.x, 1.2.x
+    # Wildcards: 1.x, 1.2.x, 1.* — a bare token whose components
+    # include "*" is the x form spelled with an asterisk. (The
+    # op guard keeps PEP 440's ==x.y.* / !=x.y.* on their own
+    # prefix path below.)
     low = ver.lower()
-    if "x" in low or low == "*":
+    if "x" in low or low == "*" or (op in ("", "=") and "*" in low.split(".")):
         nums = [p for p in re.split(r"[.]", low) if p not in ("x", "*")]
         t = _parse_version(".".join(nums) if nums else "0")
         if len(nums) <= 1:
@@ -370,6 +373,17 @@ def _parse_token(
     if op == "~=":
         return _expand_compatible(t, specified)
     if op in ("", "="):
+        # npm: a bare partial version is a range over its
+        # unspecified components — "22" means 22.x and "22.2"
+        # means 22.2.x; only a full x.y.z is exact. (WO-8.4a:
+        # reading "22" as ==22.0.0 refused Directus's declared
+        # range against the pinned 22.23.3 image.) PEP 440 has
+        # no bare specifier, so other ecosystems keep the exact
+        # reading.
+        if ecosystem == "node" and specified < 3:
+            if specified <= 1:
+                return [(">=", (t[0], 0, 0)), ("<", (t[0] + 1, 0, 0))]
+            return [(">=", (t[0], t[1], 0)), ("<", (t[0], t[1] + 1, 0))]
         return [("==", t)]
     return [(op, t)]
 
@@ -409,8 +423,9 @@ def satisfies_range(version: str, range_spec: str, ecosystem: str = "node") -> b
     """True if `version` satisfies the declared range spec.
 
     Supports the common npm (`engines`) and PEP 440 (`requires-python`)
-    range syntax: >=, <=, >, <, ==, !=, ^, ~, ~=, x-wildcards, hyphen
-    ranges, comma AND, || OR.
+    range syntax: >=, <=, >, <, ==, !=, ^, ~, ~=, x-wildcards, bare
+    partial versions (npm: "22" means 22.x), hyphen ranges, comma
+    AND, || OR.
     """
     spec = (range_spec or "").strip()
     if not spec or spec in ("*", "x", "X", "latest"):
