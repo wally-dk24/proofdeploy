@@ -188,30 +188,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Selection counts (WAL-102 partition proof)
-        id: counts
-        if: steps.gate.outputs.proceed == 'true'
-        run: |
-          set -o pipefail
-          python scripts/check_test_manifest.py --counts "sandbox" -- ${{ matrix.files }} ${{ matrix.nodeids }} | tee /tmp/counts-${{ matrix.shard }}.txt
-          grep '^shard_count=' /tmp/counts-${{ matrix.shard }}.txt >> "$GITHUB_OUTPUT"
-          # WAL-109: the file-set partition guard that used to be
-          # embedded here (a hardcoded list of the files holding
-          # sandbox tests) is owned by scripts/check_test_manifest.py
-          # in the ci workflow's lint job: the collected sandbox
-          # selection must equal tests/expected_sandbox_nodeids.txt
-          # and every test must be selected by exactly one shard of
-          # this matrix.
-          # Gate-speed item 0: this step used to run two fresh
-          # pytest collections per shard; importing the suite runs
-          # a real podman capability probe at import time in
-          # several test modules (~110s per collection), so the
-          # counts now come from the generated manifests via the
-          # script's --counts mode. The Verify step below still
-          # compares this shard's REAL run against the derived
-          # count, and the ci lint job proves the manifests equal
-          # real collection on the same commit.
-
       - name: Run sandbox selection (this shard)
         # B3 (Addendum 16): PD_REQUIRE_SANDBOX=1 turns any sandbox
         # test skip into a failure; the Verify step below additionally
@@ -249,12 +225,27 @@ jobs:
         # B3 successor: reads THIS run's JUnit report (the old step
         # re-ran three already-run tests for 393s). Proves the shard's
         # collected sandbox tests all ran and none skipped.
+        # WO-CI-SPEED task 3 (collect once per job): the expected
+        # count is derived HERE, in the step that verifies the run —
+        # from the generated manifests, via the script's --counts
+        # mode — and the ran count comes from THIS run's JUnit
+        # report. There is no separate counts step/process anymore.
+        # WAL-109: the partition proof is owned by
+        # scripts/check_test_manifest.py in the ci workflow's lint
+        # job: the collected sandbox selection must equal
+        # tests/expected_sandbox_nodeids.txt and every test must be
+        # selected by exactly one shard of this matrix. The ci lint
+        # job proves the manifests equal real collection on the same
+        # commit.
         if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
         env:
-          EXPECTED: ${{ steps.counts.outputs.shard_count }}
           SHARD: ${{ matrix.shard }}
         run: |
-          python3 - <<'EOF'
+          set -o pipefail
+          python scripts/check_test_manifest.py --counts "sandbox" -- ${{ matrix.files }} ${{ matrix.nodeids }} | tee /tmp/counts-${{ matrix.shard }}.txt
+          EXPECTED=$(grep '^shard_count=' /tmp/counts-${{ matrix.shard }}.txt | cut -d= -f2)
+          echo "expected for this shard (from the manifest): $EXPECTED"
+          EXPECTED=$EXPECTED SHARD=$SHARD python3 - <<'EOF'
           import os
           import xml.etree.ElementTree as ET
 

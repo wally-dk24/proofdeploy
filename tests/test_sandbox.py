@@ -38,11 +38,24 @@ from proofdeploy.sandbox import (
     check_sandbox_capabilities,
 )
 
-# Probe once at import: the capability checks run real containers.
-_CAPS = check_sandbox_capabilities()
+# The capability probe starts real containers (~20s), so it must
+# NOT run at import/collection time (WO-CI-SPEED task 2): it runs
+# lazily, on first use, and is cached for the process. The skipif
+# conditions below are strings — pytest's lazy form, evaluated at
+# test setup in this module's globals — so collection never probes.
+_CAPS: SandboxCapabilities | None = None
+
+
+def _caps() -> SandboxCapabilities:
+    """The host's sandbox capabilities, probed once per process."""
+    global _CAPS
+    if _CAPS is None:
+        _CAPS = check_sandbox_capabilities()
+    return _CAPS
+
 
 requires_podman = pytest.mark.skipif(
-    not _CAPS.podman,
+    "not _caps().podman",
     reason="no container runtime: sandbox tests need podman",
 )
 
@@ -50,14 +63,14 @@ requires_podman = pytest.mark.skipif(
 # the host's netavark is broken, the install test skips with a reason
 # instead of failing: the fail-closed refusal is the correct behavior.
 requires_build_network = pytest.mark.skipif(
-    not _CAPS.build_network,
+    "not _caps().build_network",
     reason="no bridge network: install phase needs a working podman bridge",
 )
 
 # Plan 1.2(g): the checkout-ownership defect exists only in the
 # userns-remap configuration (the only one measured runs allow).
 requires_userns_remap = pytest.mark.skipif(
-    not _CAPS.userns_remap,
+    "not _caps().userns_remap",
     reason="no userns remapping: ownership test needs the remapped sandbox",
 )
 
