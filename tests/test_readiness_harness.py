@@ -199,8 +199,11 @@ def test_row_from_provision_records_the_refusal_that_fired(
     tmp_path: Path,
 ) -> None:
     # Directus shape (ten-repo re-run on c867b4b, WAL-119): a
-    # workspaces repo whose declared Node range is the bare "22",
-    # which no pinned image satisfies. The real Node plan for such
+    # workspaces repo whose declared Node range no pinned image
+    # satisfies (the re-run's Directus declared the bare "22",
+    # which the pre-WO-8.4a parser misread as exact 22.0.0; the
+    # shape now declares "23", for which no image is pinned).
+    # The real Node plan for such
     # a snapshot carries BOTH refusals — `refusal` ("workspaces not
     # yet supported") and the sandbox-only `image_refusal` (the
     # range refusal) — and the sandbox executor checks
@@ -217,7 +220,7 @@ def test_row_from_provision_records_the_refusal_that_fired(
         json.dumps(
             {
                 "name": "directus-shaped",
-                "engines": {"node": "22"},
+                "engines": {"node": "23"},
                 "workspaces": ["packages/*"],
             }
         ),
@@ -233,7 +236,7 @@ def test_row_from_provision_records_the_refusal_that_fired(
     # The premise, from the real planner: both refusals on one plan.
     assert plan.refusal == "workspaces not yet supported"
     assert plan.image_refusal == (
-        "declared range 22 not satisfiable by pinned images"
+        "declared range 23 not satisfiable by pinned images"
     )
     assert plan.lockfile_name is None
     side = _fake_side(
@@ -263,9 +266,9 @@ def test_provision_side_row_agrees_with_its_log_on_both_refusals(
     # the side's own dumped pd-log (the refusal that fired), even
     # though the attached plan also carries a `refusal` that never
     # fired in the sandbox.
-    range_refusal = "declared range 22 not satisfiable by pinned images"
+    range_refusal = "declared range 23 not satisfiable by pinned images"
     plan = {
-        "declared_range": "22",
+        "declared_range": "23",
         "refusal": "workspaces not yet supported",
         "image_refusal": range_refusal,
     }
