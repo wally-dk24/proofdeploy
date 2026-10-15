@@ -490,38 +490,68 @@ def regd_unit_summaries(
     differing trees, the ``name@version`` entries added and
     removed, computed from the two captured JSON trees (read back
     from the pd-logs artifacts the capture wrote, in row order).
-    A unit whose trees cannot be read back is omitted — its rows
-    already carry the per-side tree_error."""
+
+    The comparison is over the SET of ``name@version`` entries,
+    so it ignores where in the tree an entry resolved (which
+    parent depends on it, at what depth). That is fine for D4:
+    the report's question is whether the two sides resolved the
+    same versions, not whether their layouts match.
+
+    A unit whose trees cannot be read back is never dropped
+    silently: it is emitted with ``regd_trees_identical`` null
+    and the per-side ``tree_errors`` (keyed by side role) — the
+    row's recorded capture error, or the read-back failure when
+    the artifact is missing or unparseable. Only the sides that
+    errored appear in ``tree_errors``. A unit where REG-D did
+    not apply on both sides gets no summary at all."""
     summaries: list[dict[str, Any]] = []
     by_unit: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         by_unit.setdefault(str(row["unit"]), []).append(row)
     for unit_id, unit_rows in by_unit.items():
-        captured = [
+        applied = [
             row
             for row in unit_rows
             if (row.get("regd") or {}).get("applied")
-            and (row.get("regd") or {}).get("tree_sha256")
-            and (row.get("regd") or {}).get("tree_artifact")
         ]
-        if len(captured) < 2:
+        if len(applied) < 2:
             continue
-        first, second = captured[0], captured[1]
-        try:
-            tree_first = json.loads(
-                Path(str(first["regd"]["tree_artifact"])).read_text(
-                    encoding="utf-8"
+        first, second = applied[0], applied[1]
+        trees: list[Any] = []
+        tree_errors: dict[str, str] = {}
+        for row in (first, second):
+            regd = row.get("regd") or {}
+            role = str(row.get("role"))
+            capture_error = regd.get("tree_error")
+            artifact = regd.get("tree_artifact")
+            if capture_error or not artifact:
+                tree_errors[role] = str(
+                    capture_error or "no tree artifact recorded"
                 )
-            )
-            tree_second = json.loads(
-                Path(str(second["regd"]["tree_artifact"])).read_text(
-                    encoding="utf-8"
+                trees.append(None)
+                continue
+            try:
+                trees.append(
+                    json.loads(
+                        Path(str(artifact)).read_text(
+                            encoding="utf-8"
+                        )
+                    )
                 )
+            except (OSError, json.JSONDecodeError) as exc:
+                tree_errors[role] = f"{type(exc).__name__}: {exc}"
+                trees.append(None)
+        if tree_errors:
+            summaries.append(
+                {
+                    "unit": unit_id,
+                    "regd_trees_identical": None,
+                    "tree_errors": tree_errors,
+                }
             )
-        except (OSError, json.JSONDecodeError):
             continue
         identical, added, removed = _regd_tree_diff(
-            tree_first, tree_second
+            trees[0], trees[1]
         )
         summary: dict[str, Any] = {
             "unit": unit_id,
