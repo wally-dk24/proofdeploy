@@ -1,0 +1,12 @@
+{
+  "name": "pd-home-scan-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "bun@1.4.3",
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "dependencies": {
+    "pd-fake-nx": "file:./pd-fake-nx-22.3.3.tgz"
+  }
+}

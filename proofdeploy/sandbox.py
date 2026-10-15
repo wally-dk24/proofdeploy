@@ -41,6 +41,30 @@ transferred to the mapped runtime uid (``podman unshare chown``), so
 the install process owns the files it provisions. The mapping, the
 capability sets, the mounts and the networks are unchanged.
 
+Sandbox HOME (plan 1.2(k)): the sandbox user's HOME used to be a
+directory INSIDE the checkout (``/checkout/.sandbox-home``), so
+every tool cache that rides on HOME — bun's install cache, the
+corepack cache, the pnpm store, the npm cache — landed inside the
+app's own tree. Vendure's build died on exactly that: bun's cache
+held an extracted ``nx`` package whose top-level ``project.json``
+names an ``implicitDependencies`` entry (``graph-client``) that
+exists nowhere in Vendure, and nx's workspace scan — which prunes
+``node_modules`` but nothing else — discovered the cached file as
+a workspace project and refused (``WorkspaceValidityError``). The
+fix: HOME is a per-side scratch directory NEXT TO the snapshot on
+the host, mounted read-write at ``/pd-home`` in every step
+container of the side (install, build, seed, start), with its
+ownership transferred by the same mechanism as the checkout's.
+ProofDeploy's tool state no longer lives in the tree it measures.
+The capability sets, the uidmap and the networks are unchanged;
+the mount itself is recorded in ADR-0009 as a dated posture note.
+One manager needs a word beyond HOME: pnpm anchors its store on
+the project's filesystem when the HOME-based store would be
+cross-device, which would put it at ``/checkout/.pnpm-store`` —
+install steps therefore pin the store into /pd-home through pnpm's
+env config channel, unless the app declares its own store location
+(install_steps, _pnpm_store_dir_declared).
+
 Customer secrets never enter the container environment. The contract
 env passed to the sandbox must already be secret-free (the
 orchestrator passes only declared-public config); auth tokens travel
@@ -98,11 +122,63 @@ IMAGES = {
 # hardcoded: it differs per machine.
 PLATFORM_CA_CONTAINER = "/ca/hatch-egress-ca.crt"
 
+# In-container path of the per-side HOME (plan 1.2(k)): a host
+# directory NEXT TO the checkout snapshot, mounted read-write at
+# this path in every step container of the side, so the tool state
+# that rides on HOME (bun's install cache, the corepack cache, the
+# pnpm store, the npm and pip/uv caches) persists across the
+# side's step containers — like the checkout does — without ever
+# living inside the app's tree.
+PD_HOME_CONTAINER = "/pd-home"
+
+
+def sandbox_home_dir(checkout: Path) -> Path:
+    """A checkout's per-side HOME directory on the host (plan 1.2(k)).
+
+    A sibling of the snapshot, named ``<checkout>.pd-home``: created
+    next to (never inside) the app's tree, never the host's real
+    home, never shared across sides or runs (each side's snapshot
+    path is unique to that side and run). It dies with the run's
+    workdir, through the same cleanup path as the checkout itself.
+    """
+    return checkout.parent / f"{checkout.name}.pd-home"
+
 # Env vars that must never enter a container, even if present in the
 # caller's environment or contract env. The Groq key authenticates the
 # model client on the host; the container has no use for it and must
 # never see it.
 _SECRET_ENV_BLOCKLIST = frozenset({"GROQ_API_KEY"})
+
+
+def _pnpm_store_dir_declared(checkout: Path) -> bool:
+    """True when the app itself declares pnpm's store location.
+
+    pnpm reads ``store-dir`` from the workspace root's ``.npmrc``
+    (every pnpm in the field) and ``storeDir`` from
+    ``pnpm-workspace.yaml`` (pnpm 10+). When the app declares
+    either, its choice stands — the sandbox's /pd-home store
+    default (install_steps) is only for apps that declare
+    neither (generic alignment: the app's own configuration
+    wins). A file that cannot be read counts as undeclared;
+    the default then applies, which matches the effective
+    behavior such an app already had.
+    """
+    try:
+        npmrc = (checkout / ".npmrc").read_text(encoding="utf-8")
+    except OSError:
+        npmrc = ""
+    for line in npmrc.splitlines():
+        if line.split("=", 1)[0].strip().lower() == "store-dir":
+            return True
+    try:
+        workspace = (checkout / "pnpm-workspace.yaml").read_text(
+            encoding="utf-8"
+        )
+    except OSError:
+        workspace = ""
+    return any(
+        line.startswith("storeDir:") for line in workspace.splitlines()
+    )
 
 
 def _strip_secret_env(env: dict[str, str]) -> dict[str, str]:
@@ -447,7 +523,8 @@ class SandboxConfig:
 
     image: str = IMAGES["python"]
     # Extra read-only mounts (absolute host paths). Empty by default:
-    # only the checkout is mounted.
+    # the sandbox's own mounts are the checkout and the per-side
+    # HOME (/pd-home, plan 1.2(k)) only.
     extra_mounts: list[tuple[str, str]] = field(default_factory=list)
     # Network mode: "auto" (isolated bridge if available, else none+socket),
     # "isolated", "none+socket". "host" is refused for unattended runs.
@@ -903,6 +980,14 @@ class Sandbox:
             "-w",
             "/checkout",
         ]
+        # Plan 1.2(k): the per-side HOME, mounted read-write at
+        # /pd-home (HOME itself is set by the callers). Created
+        # here as well as in _prepare_checkout: podman would
+        # otherwise create a missing bind source as a root-owned
+        # directory the workload cannot write.
+        home = sandbox_home_dir(checkout)
+        home.mkdir(parents=True, exist_ok=True)
+        args += ["-v", f"{home}:{PD_HOME_CONTAINER}"]
         if with_network:
             # Install phase only: mount the platform CA (if configured
             # and present) so pip/npm can verify a TLS-intercepting
@@ -925,12 +1010,20 @@ class Sandbox:
         """Make the checkout usable by the sandbox user.
 
         The checkout is a disposable snapshot copy; granting read/write
-        is safe and required for the de-privileged workload.
+        is safe and required for the de-privileged workload. The
+        side's HOME directory (plan 1.2(k)) is created NEXT TO the
+        checkout — never inside it — with the same treatment.
         """
+        home = sandbox_home_dir(checkout)
         try:
-            (checkout / ".sandbox-home").mkdir(exist_ok=True)
+            home.mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 ["chmod", "-R", "a+rwX", str(checkout)],
+                capture_output=True,
+                timeout=60,
+            )
+            subprocess.run(
+                ["chmod", "-R", "a+rwX", str(home)],
                 capture_output=True,
                 timeout=60,
             )
@@ -966,6 +1059,10 @@ class Sandbox:
         is never touched. Best-effort and logged, in the house style
         of the chmod above: a failed transfer surfaces later as the
         install's own error, never as a new exception here.
+
+        Plan 1.2(k): the side's HOME directory rides in the same
+        transfer — the install process must own the caches it
+        writes under /pd-home exactly as it owns the checkout.
         """
         key = str(checkout)
         if key in self._ownership_transferred:
@@ -984,7 +1081,10 @@ class Sandbox:
             return
         ok, reason = _run(
             _podman_base()
-            + ["unshare", "chown", "-R", "1:1", str(checkout)],
+            + [
+                "unshare", "chown", "-R", "1:1",
+                str(checkout), str(sandbox_home_dir(checkout)),
+            ],
             300,
             self.log,
         )
@@ -992,7 +1092,8 @@ class Sandbox:
             self._ownership_transferred.add(key)
             self.log.append(
                 "checkout ownership: transferred to the sandbox "
-                "runtime uid (podman unshare chown 1:1; plan 1.2(g))"
+                "runtime uid (podman unshare chown 1:1; plan 1.2(g), "
+                "home dir included under plan 1.2(k))"
             )
         else:
             self.log.append(
@@ -1054,9 +1155,34 @@ class Sandbox:
             full_env["NODE_EXTRA_CA_CERTS"] = PLATFORM_CA_CONTAINER
             full_env["PIP_CERT"] = PLATFORM_CA_CONTAINER
         self.log.append(f"install: ca_cert_used={ca_used}")
-        # The sandbox user has no home; give it a writable one inside
-        # the checkout.
-        full_env["HOME"] = "/checkout/.sandbox-home"
+        # The sandbox user has no home; give it the per-side one
+        # mounted at /pd-home — OUTSIDE the checkout (plan 1.2(k)):
+        # tool caches that ride on HOME must never land in the
+        # app's tree, where a workspace scanner can discover them.
+        full_env["HOME"] = PD_HOME_CONTAINER
+        # pnpm's store (plan 1.2(k)): left to HOME alone, pnpm
+        # anchors its content-addressable store on the PROJECT's
+        # filesystem whenever the HOME-based store would be
+        # cross-device (@pnpm/store-path's fallback: a
+        # .pnpm-store at the project filesystem's root) — and
+        # /checkout is its own mount, so the store would land at
+        # /checkout/.pnpm-store, back inside the tree this plan
+        # line exists to keep clean. (Observed with pnpm 9.15.0:
+        # home on another device -> store path resolves to
+        # <fs root>/.pnpm-store; with the pin below it resolves
+        # under HOME and the install leaves nothing in the tree.)
+        # Pin the store into /pd-home through pnpm's own env
+        # config channel, unless the caller already set it or the
+        # app declares a store location in its own config (the
+        # app's choice wins; _pnpm_store_dir_declared). npm, bun
+        # and python steps simply ignore the key.
+        if (checkout / "package.json").is_file() and (
+            not _pnpm_store_dir_declared(checkout)
+        ):
+            full_env.setdefault(
+                "npm_config_store_dir",
+                f"{PD_HOME_CONTAINER}/.pnpm-store",
+            )
         results: list[dict] = []
         self.failed_step_output = None
         for i, step in enumerate(steps):
@@ -1104,7 +1230,9 @@ class Sandbox:
         self._prepare_checkout(checkout)
         mode = self._resolve_network_mode()
         env = _strip_secret_env(dict(env))
-        env.setdefault("HOME", "/checkout/.sandbox-home")
+        # Plan 1.2(k): same per-side HOME as the install steps —
+        # the mounted /pd-home, never a directory in the checkout.
+        env.setdefault("HOME", PD_HOME_CONTAINER)
         # No proxy variables, ever, for the app.
         env = {k: v for k, v in env.items() if "proxy" not in k.lower()}
         run_env = dict(env)
@@ -1241,6 +1369,11 @@ class Sandbox:
         ]
         args += self._user_args()
         args += ["-v", f"{checkout}:/checkout", "-w", "/checkout"]
+        # Plan 1.2(k): the per-side HOME mount, as in _common_args
+        # (this start path builds its args by hand).
+        home = sandbox_home_dir(checkout)
+        home.mkdir(parents=True, exist_ok=True)
+        args += ["-v", f"{home}:{PD_HOME_CONTAINER}"]
         # The short socket dir, visible to both host and container.
         args += ["-v", f"{sock_dir}:/pd-sock"]
         for host_path, container_path in self.config.extra_mounts:

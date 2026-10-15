@@ -28,6 +28,7 @@ import pytest
 
 from proofdeploy.sandbox import (
     IMAGES,
+    PD_HOME_CONTAINER,
     Sandbox,
     SandboxCapabilities,
     SandboxConfig,
@@ -36,6 +37,7 @@ from proofdeploy.sandbox import (
     assert_measurement_gate,
     check_podman,
     check_sandbox_capabilities,
+    sandbox_home_dir,
 )
 
 # Probe once at import: the capability checks run real containers.
@@ -102,6 +104,45 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 result["external"] = "BLOCKED"
             body = j.dumps(result).encode()
+        else:
+            body = b'{"ok": false}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+HTTPServer(("127.0.0.1", int(os.environ["PORT"])), Handler).serve_forever()
+"""
+
+# Plan 1.2(k): an app that reports its HOME and reads back a
+# marker an install step wrote under $HOME — the persistence
+# proof for the /pd-home mount across a side's step containers.
+PD_HOME_APP_PY = """\
+import json as j
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            body = b'{"ok": true}'
+        elif self.path == "/home":
+            body = j.dumps({"home": os.environ.get("HOME", "")}).encode()
+        elif self.path == "/home-marker":
+            p = os.path.join(
+                os.environ.get("HOME", ""), "pd-marker", "step.txt"
+            )
+            try:
+                with open(p) as fh:
+                    body = j.dumps({"marker": fh.read().strip()}).encode()
+            except OSError as e:
+                body = j.dumps({"marker": None, "error": str(e)}).encode()
         else:
             body = b'{"ok": false}'
         self.send_response(200)
@@ -243,6 +284,265 @@ def test_sandbox_pnpm_monorepo_install_chmods_workspace_bin(tmp_path):
 
 
 @requires_podman
+@requires_build_network
+def test_sandbox_home_is_pd_home_outside_checkout(tmp_path):
+    """Plan 1.2(k), real sandbox: the sandbox user's HOME is
+    /pd-home — a host directory NEXT TO the checkout, never inside
+    it — for install steps and the app alike, and it persists
+    across the side's step containers: a marker an install step
+    writes under $HOME is readable by the app, and on the host it
+    sits in the sibling dir, not the tree."""
+    checkout = tmp_path / "app"
+    checkout.mkdir()
+    (checkout / "app.py").write_text(PD_HOME_APP_PY)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"], allow_no_userns=True))
+    results = sb.install_steps(
+        checkout,
+        [
+            {
+                "phase": "install",
+                "command": (
+                    'test "$HOME" = /pd-home && mkdir -p "$HOME/pd-marker" '
+                    '&& echo installed > "$HOME/pd-marker/step.txt"'
+                ),
+            }
+        ],
+        env={},
+        proxy_env=_proxy_env(),
+        timeout=120,
+    )
+    assert [r["exit_code"] for r in results] == [0], sb.log[-5:]
+    home = sandbox_home_dir(checkout)
+    assert home.parent == checkout.parent and home != checkout
+    assert (home / "pd-marker" / "step.txt").read_text().strip() == (
+        "installed"
+    )
+    assert not (checkout / ".sandbox-home").exists()
+    assert not (checkout / "pd-marker").exists()
+    app = sb.start(
+        checkout, "python app.py", env={}, port=18099, name="sandbox-pdhome"
+    )
+    try:
+        assert app.wait_ready("/health", timeout=60)
+        body = urllib.request.urlopen(
+            app.target_url + "/home", timeout=10
+        ).read()
+        assert json.loads(body)["home"] == PD_HOME_CONTAINER == "/pd-home"
+        body = urllib.request.urlopen(
+            app.target_url + "/home-marker", timeout=10
+        ).read()
+        assert json.loads(body)["marker"] == "installed"
+    finally:
+        app.stop()
+
+
+def _provision_golden_side(tmp_path: Path, golden: str, tag: str):
+    """Materialize a conformance golden and provision its base
+    side through the real sandbox path (the #100 test's shape).
+    Returns (side, repo, shas); the caller stops the READY app."""
+    sys.path.insert(
+        0, str(Path(__file__).parent.parent / "conformance")
+    )
+    import kit
+
+    from proofdeploy.orchestrator import (
+        MeasureConfig,
+        Orchestrator,
+        _free_port,
+    )
+
+    root = tmp_path / tag
+    repo = root / "repo"
+    shas = kit.materialize_golden(golden, repo)
+    records = root / "records"
+    records.mkdir(parents=True)
+    work = root / "work"
+    work.mkdir()
+    unit = root / "unit"
+    unit.mkdir()
+    cfg = MeasureConfig(
+        repo_dir=repo,
+        output_dir=records,
+        workdir=work,
+        no_skill=True,
+        sandbox=True,
+    )
+    side = Orchestrator(cfg)._provision_side_sandbox(
+        shas["base"], _free_port(), unit, tag
+    )
+    kit.dump_logs(f"sandbox-pdhome-{tag}", side.provision.logs)
+    return side, repo, shas
+
+
+@pytest.mark.parametrize(
+    "golden,manager",
+    [
+        ("node-bun-sqlite", "bun"),
+        ("node-pnpm-sqlite", "pnpm"),
+        ("node-express-sqlite", "npm"),
+    ],
+)
+@requires_podman
+@requires_build_network
+@requires_userns_remap
+def test_golden_home_outside_checkout(tmp_path, golden, manager):
+    """Plan 1.2(k), real sandbox: provisioning a bun, a pnpm and
+    an npm golden leaves NOTHING ProofDeploy-owned under /checkout
+    beyond the plan's declared persisted_dirs (no .sandbox-home),
+    and the caches that ride on HOME — bun's install cache, the
+    corepack cache and pnpm store, the npm cache — land in the
+    per-side /pd-home sibling instead, where they persist across
+    the side's step containers exactly as they did in the tree."""
+    side, repo, shas = _provision_golden_side(tmp_path, golden, "pdhome")
+    provision = side.provision
+    try:
+        assert provision.status.value == "ready", (
+            provision.reason,
+            "\n".join(provision.logs),
+        )
+        snap = side.snapshot_dir
+        home = sandbox_home_dir(snap)
+        assert home.is_dir() and home.parent == snap.parent
+        assert not (snap / ".sandbox-home").exists()
+        home_paths = {
+            str(p.relative_to(home)) for p in home.rglob("*")
+        }
+        assert home_paths, "per-side HOME is empty after provisioning"
+        if manager == "bun":
+            assert any(
+                p == ".bun/install/cache"
+                or p.startswith(".bun/install/cache/")
+                for p in home_paths
+            ), sorted(home_paths)
+        elif manager == "pnpm":
+            assert any(
+                "pnpm" in p.split("/") for p in home_paths
+            ), sorted(home_paths)
+        else:  # npm
+            assert any(
+                p == ".npm" or p.startswith(".npm/") for p in home_paths
+            ), sorted(home_paths)
+        # The tree's top level may only gain: the plan's declared
+        # persisted dirs, the app's own database file, and (in
+        # none+socket mode) the bridge script — beyond the
+        # committed tree itself.
+        committed = set(
+            subprocess.run(
+                ["git", "-C", str(repo), "ls-tree", "--name-only",
+                 shas["base"]],
+                capture_output=True, text=True, check=True, timeout=60,
+            ).stdout.split()
+        )
+        plan = provision.install_plan or {}
+        allowed = (
+            committed
+            | set(plan.get("persisted_dirs") or [])
+            | {"app.db", ".pd-bridge.py"}
+        )
+        actual = {p.name for p in snap.iterdir()}
+        assert actual <= allowed, sorted(actual - allowed)
+    finally:
+        if provision.proc is not None:
+            provision.proc.stop()
+
+
+@requires_podman
+@requires_build_network
+@requires_userns_remap
+def test_sandbox_bun_cache_project_json_stays_out_of_workspace(tmp_path):
+    """Plan 1.2(k) regression, real sandbox — the Vendure failure
+    mode. The fixture app (tests/fixtures/pd-home-scan) depends on
+    a local tarball package that ships a top-level project.json
+    (as nx does); bun's install extracts it into the cache under
+    $HOME. The contract's build step runs a workspace scanner in
+    nx's shape — walk the tree pruning only node_modules, any
+    project.json is a project — and fails the build if it sees
+    one. With HOME outside the tree, the cached project.json sits
+    in /pd-home and the side provisions READY; with HOME inside
+    the checkout (the pre-1.2(k) behavior) the scanner finds the
+    cached copy inside the workspace and the build fails (the
+    plant in the PR that introduced this test)."""
+    fixture = Path(__file__).parent / "fixtures" / "pd-home-scan"
+    root = tmp_path / "scan"
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    for f in sorted(fixture.iterdir()):
+        if f.is_file():
+            shutil.copyfile(f, repo / f.name)
+
+    def git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, check=True, timeout=120,
+        )
+        return proc.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "pd-home-test")
+    git("config", "user.email", "pd-home@proofdeploy.invalid")
+    git("add", "-A")
+    git("commit", "-q", "-m", "pd-home-scan fixture")
+    sha = git("rev-parse", "HEAD")
+    records = root / "records"
+    records.mkdir()
+    work = root / "work"
+    work.mkdir()
+    unit = root / "unit"
+    unit.mkdir()
+
+    sys.path.insert(
+        0, str(Path(__file__).parent.parent / "conformance")
+    )
+    import kit
+
+    from proofdeploy.orchestrator import (
+        MeasureConfig,
+        Orchestrator,
+        _free_port,
+    )
+
+    cfg = MeasureConfig(
+        repo_dir=repo,
+        output_dir=records,
+        workdir=work,
+        no_skill=True,
+        sandbox=True,
+    )
+    side = Orchestrator(cfg)._provision_side_sandbox(
+        sha, _free_port(), unit, "pdhome"
+    )
+    provision = side.provision
+    kit.dump_logs("sandbox-pdhome-scan", provision.logs)
+    try:
+        assert provision.status.value == "ready", (
+            provision.reason,
+            "\n".join(provision.logs),
+        )
+        build = [
+            s for s in provision.executed_steps if s["phase"] == "build"
+        ]
+        assert build and all(s["exit_code"] == 0 for s in build), (
+            provision.executed_steps
+        )
+        # The stray project.json EXISTS — in bun's cache under
+        # /pd-home, outside the workspace it would have poisoned.
+        home = sandbox_home_dir(side.snapshot_dir)
+        assert [p for p in home.rglob("project.json")], (
+            "bun cache under /pd-home holds no project.json; "
+            "the fixture did not reproduce the failure mode"
+        )
+        in_tree = [
+            p
+            for p in side.snapshot_dir.rglob("project.json")
+            if "node_modules" not in p.parts
+        ]
+        assert in_tree == []
+    finally:
+        if provision.proc is not None:
+            provision.proc.stop()
+
+
+@requires_podman
 def test_sandbox_app_is_not_root(checkout):
     sb = Sandbox(SandboxConfig(image=IMAGES["python"], allow_no_userns=True))
     app = sb.start(
@@ -307,8 +607,11 @@ def test_sandbox_mounts_only_checkout(checkout):
     )
     try:
         assert app.wait_ready("/health", timeout=60)
-        # The container's mount table: only /checkout (plus container
-        # internals) should be a host bind.
+        # The container's mount table: only /checkout and the
+        # per-side /pd-home (plus container internals) should be
+        # host binds. (Plan 1.2(k) added /pd-home; the home dir is
+        # a sibling of the checkout, so its path contains the
+        # checkout path as a prefix and is stripped with it below.)
         r = subprocess.run(
             _podman_base() + ["inspect", "sandbox-mounts", "--format", "{{.Mounts}}"],
             capture_output=True, text=True, timeout=30,
@@ -494,6 +797,107 @@ def test_install_transfers_checkout_ownership_when_remapped(
     assert "1:1" in call and str(checkout) in call
     install_call = _install_run_args(fake)
     assert fake.calls.index(call) < fake.calls.index(install_call)
+
+
+def test_install_home_is_pd_home_with_sibling_mount(monkeypatch, tmp_path):
+    """Plan 1.2(k): install containers get HOME=/pd-home and the
+    /pd-home bind mount of a host dir NEXT TO the checkout; the
+    old in-checkout home appears in no container arg. The app
+    container's args carry the same mount."""
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, build_network=True)
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    assert sb.install(checkout, ["echo hi"], env={}, proxy_env={}, timeout=60)
+    args = _install_run_args(fake)
+    assert f"HOME={PD_HOME_CONTAINER}" in args
+    home = sandbox_home_dir(checkout)
+    assert home.parent == checkout.parent and home != checkout
+    assert f"{home}:{PD_HOME_CONTAINER}" in args
+    assert home.is_dir()
+    assert not [a for a in args if ".sandbox-home" in a]
+    app_args = sb._common_args(checkout, "probe-app", False, detach=True)
+    assert f"{home}:{PD_HOME_CONTAINER}" in app_args
+    assert not [a for a in app_args if ".sandbox-home" in a]
+
+
+def test_install_pins_pnpm_store_into_pd_home(monkeypatch, tmp_path):
+    """Plan 1.2(k): pnpm's cross-device store fallback would put
+    its store at /checkout/.pnpm-store (the checkout mount's
+    root); with no app-declared store location, install
+    containers carry a store pin into /pd-home through pnpm's
+    env config channel."""
+    _patch_sandbox_caps(
+        monkeypatch, userns_remap=True, build_network=True
+    )
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    (checkout / "package.json").write_text("{}")
+    assert sb.install(
+        checkout, ["echo hi"], env={}, proxy_env={}, timeout=60
+    )
+    args = _install_run_args(fake)
+    assert (
+        f"npm_config_store_dir={PD_HOME_CONTAINER}/.pnpm-store" in args
+    )
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        (".npmrc", "store-dir=/the/apps/own/store\n"),
+        ("pnpm-workspace.yaml", "storeDir: /the/apps/own/store\n"),
+    ],
+)
+def test_install_respects_app_declared_pnpm_store(
+    monkeypatch, tmp_path, declaration
+):
+    """Plan 1.2(k), generic alignment: an app that declares its
+    own store location (``store-dir`` in .npmrc, ``storeDir`` in
+    pnpm-workspace.yaml) keeps its choice — no sandbox store
+    env is injected over it."""
+    _patch_sandbox_caps(
+        monkeypatch, userns_remap=True, build_network=True
+    )
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    (checkout / "package.json").write_text("{}")
+    name, content = declaration
+    (checkout / name).write_text(content)
+    assert sb.install(
+        checkout, ["echo hi"], env={}, proxy_env={}, timeout=60
+    )
+    args = _install_run_args(fake)
+    assert not [
+        a for a in args if a.startswith("npm_config_store_dir=")
+    ]
+
+
+def test_ownership_transfer_covers_home_dir(monkeypatch, tmp_path):
+    """Plan 1.2(k): the 1.2(g) ownership transfer covers the
+    per-side HOME dir in the same single unshare chown call — the
+    install process owns the caches it writes under /pd-home,
+    exactly as it owns the checkout."""
+    _patch_sandbox_caps(monkeypatch, userns_remap=True, build_network=True)
+    fake = _FakeRun()
+    monkeypatch.setattr("proofdeploy.sandbox._run", fake)
+    sb = Sandbox(SandboxConfig(image=IMAGES["python"]))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    assert sb.install(checkout, ["echo hi"], env={}, proxy_env={}, timeout=60)
+    unshare_calls = [c for c in fake.calls if "unshare" in c]
+    assert len(unshare_calls) == 1, fake.calls
+    call = unshare_calls[0]
+    assert str(checkout) in call
+    assert str(sandbox_home_dir(checkout)) in call
 
 
 def test_no_ownership_transfer_without_userns_remap(monkeypatch, tmp_path):

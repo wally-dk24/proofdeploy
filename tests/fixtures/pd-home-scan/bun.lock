@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "pd-home-scan-fixture",
+      "dependencies": {
+        "pd-fake-nx": "file:./pd-fake-nx-22.3.3.tgz",
+      },
+    },
+  },
+  "packages": {
+    "pd-fake-nx": ["pd-fake-nx@./pd-fake-nx-22.3.3.tgz", {}, "sha512-6dCS7WOS6Z3q2GkOzKixMtkAcUXleBkFEOEhGrf+Xwr9o+Tjch9rmaMQWBIonD9D8E8NTBsLhk9UBRCdEQBz1A=="],
+  }
+}

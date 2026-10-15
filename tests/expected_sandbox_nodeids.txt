@@ -60,9 +60,14 @@ tests/test_node_headers.py::test_pinned_node_image_ships_its_headers[26.11.1-26]
 tests/test_orchestrator.py::test_sandboxed_end_to_end_orchestrator
 tests/test_orchestrator.py::test_sandboxed_failed_start_captures_app_log
 tests/test_orchestrator.py::test_sandboxed_provision_keeps_installed_dependencies
+tests/test_sandbox.py::test_golden_home_outside_checkout[node-bun-sqlite-bun]
+tests/test_sandbox.py::test_golden_home_outside_checkout[node-express-sqlite-npm]
+tests/test_sandbox.py::test_golden_home_outside_checkout[node-pnpm-sqlite-pnpm]
 tests/test_sandbox.py::test_podman_available
 tests/test_sandbox.py::test_sandbox_app_has_no_external_network
 tests/test_sandbox.py::test_sandbox_app_is_not_root
+tests/test_sandbox.py::test_sandbox_bun_cache_project_json_stays_out_of_workspace
+tests/test_sandbox.py::test_sandbox_home_is_pd_home_outside_checkout
 tests/test_sandbox.py::test_sandbox_install_and_run
 tests/test_sandbox.py::test_sandbox_mounts_only_checkout
 tests/test_sandbox.py::test_sandbox_pnpm_monorepo_install_chmods_workspace_bin
