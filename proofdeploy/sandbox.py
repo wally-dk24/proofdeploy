@@ -936,9 +936,7 @@ class Sandbox:
             )
         except (OSError, subprocess.TimeoutExpired) as e:
             self.log.append(f"chmod checkout failed: {e}")
-        # PLANT (plan 1.2(g), to be reverted): ownership transfer
-        # disabled to prove the tests bite.
-        # self._own_checkout_for_sandbox(checkout)
+        self._own_checkout_for_sandbox(checkout)
 
     def _own_checkout_for_sandbox(self, checkout: Path) -> None:
         """Transfer the checkout's ownership to the sandbox runtime uid.
