@@ -123,6 +123,38 @@ def test_select_image_unsatisfiable_returns_none():
     assert select_image("node", ">=99") is None
 
 
+def test_select_image_bare_major_is_an_x_range():
+    # WO-8.4a: in npm semver a bare "22" is the range 22.x, not the
+    # exact version 22.0.0. Reading it as exact refused every
+    # Directus side (engines {"node": "22"}) against the pinned
+    # 22.23.3 image. The bare form must select the same row as the
+    # spelled-out ranges for the same line.
+    row22 = select_image("node", "22")
+    assert row22 is not None
+    assert row22.version == "22.23.3"  # the table's only 22 line row
+    for spec in ("22.x", "22.*", "^22", ">=22 <23"):
+        assert select_image("node", spec) == row22, spec
+    # Not a 22 special case: another bare major selects its own line.
+    row20 = select_image("node", "20")
+    assert row20 is not None and row20.version.startswith("20.")
+
+
+def test_select_image_bare_partial_and_exact_forms():
+    # A bare minor partial is the matching minor range: "22.23"
+    # means 22.23.x (satisfied by the pinned 22.23.3), while "22.2"
+    # means 22.2.x, which no pinned row satisfies.
+    row = select_image("node", "22.23")
+    assert row is not None and row.version == "22.23.3"
+    assert select_image("node", "22.2") is None
+    # A full x.y.z stays exact: a different patch is not a match,
+    # the pinned patch itself is.
+    assert select_image("node", "22.14.0") is None
+    row = select_image("node", "22.23.3")
+    assert row is not None and row.version == "22.23.3"
+    # A bare major with no pinned line stays unsatisfiable.
+    assert select_image("node", "23") is None
+
+
 # ---------------------------------------------------------------------------
 # The Python adapter's plan.
 # ---------------------------------------------------------------------------
