@@ -211,29 +211,35 @@ def test_sandbox_pnpm_monorepo_install_chmods_workspace_bin(tmp_path):
     )
     provision = side.provision
     kit.dump_logs("sandbox-monorepo-ownership", provision.logs)
-    assert provision.status.value == "ready", (
-        provision.reason,
-        "\n".join(provision.logs),
-    )
-    install_steps = [
-        s for s in provision.executed_steps if s["phase"] == "install"
-    ]
-    assert install_steps and all(
-        s["exit_code"] == 0 for s in install_steps
-    ), provision.executed_steps
-    snap = side.snapshot_dir
-    cli = snap / "packages" / "cli-tools" / "cli.js"
-    assert cli.stat().st_mode & 0o111, (
-        "pnpm linkBin never chmodded the workspace bin file"
-    )
-    assert (
-        snap
-        / "packages"
-        / "notes-app"
-        / "node_modules"
-        / ".bin"
-        / "pd-golden-cli"
-    ).exists()
+    try:
+        assert provision.status.value == "ready", (
+            provision.reason,
+            "\n".join(provision.logs),
+        )
+        install_steps = [
+            s for s in provision.executed_steps if s["phase"] == "install"
+        ]
+        assert install_steps and all(
+            s["exit_code"] == 0 for s in install_steps
+        ), provision.executed_steps
+        snap = side.snapshot_dir
+        cli = snap / "packages" / "cli-tools" / "cli.js"
+        assert cli.stat().st_mode & 0o111, (
+            "pnpm linkBin never chmodded the workspace bin file"
+        )
+        assert (
+            snap
+            / "packages"
+            / "notes-app"
+            / "node_modules"
+            / ".bin"
+            / "pd-golden-cli"
+        ).exists()
+    finally:
+        # The READY side's app (and its bridge socket dir) is ours to
+        # stop — SB5 fails the session on a leftover /tmp/pd-* dir.
+        if provision.proc is not None:
+            provision.proc.stop()
 
 
 @requires_podman
