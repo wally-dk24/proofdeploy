@@ -1,12 +1,15 @@
 """Tests for the probe schema harness (WAL-58)."""
 
+import inspect
 import json
 
 import pytest
 
+from proofdeploy import probe as probe_module
 from proofdeploy.probe import (
     HARNESS_VERSION,
     ProbeRejected,
+    ProbeSchema,
     ProbeSet,
     parse_probes,
     validate_probe,
@@ -224,3 +227,25 @@ def test_probeset_keeps_invalid_blocks():
     ps3 = ProbeSet.from_author_output("   \n  ")
     assert not ps3.has_valid_probes
     assert ps3.invalid_blocks[0]["rejection_reason"] == "model returned empty content"
+
+
+def test_probe_schema_surface_matches_builtin_implementation():
+    """Plan 1.4(b): the ProbeSchema Protocol names the probe-type
+    surface, and this module's functions are its built-in
+    implementation — every Protocol member exists as a module
+    function with the same parameters (the surface is module-level,
+    so conformance is checked here rather than by mypy call sites).
+    """
+    for name in ("validate_probe", "parse_probes", "parse_probes_lenient"):
+        proto_fn = getattr(ProbeSchema, name)
+        impl_fn = getattr(probe_module, name)
+        assert callable(impl_fn)
+        proto_params = list(inspect.signature(proto_fn).parameters.values())
+        impl_params = list(inspect.signature(impl_fn).parameters.values())
+        # The Protocol method's leading `self` has no counterpart in
+        # the module function; the remaining parameters must agree in
+        # name and default.
+        assert proto_params[0].name == "self"
+        assert [(p.name, p.default) for p in proto_params[1:]] == [
+            (p.name, p.default) for p in impl_params
+        ]
