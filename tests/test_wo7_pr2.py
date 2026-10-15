@@ -416,15 +416,15 @@ def test_sandbox_executor_runs_corepack_pinned_pnpm_plan(
     ]
     build = next(d for d in fake.descriptors if d["phase"] == "build")
     assert build["shell"] == (
-        "env PATH=/checkout/.pd-tools/node_modules/.bin:"
-        "/checkout/node_modules/.bin:$PATH pnpm --version"
+        "export PATH=/checkout/.pd-tools/node_modules/.bin:"
+        "/checkout/node_modules/.bin:$PATH; pnpm --version"
     )
     start = next(
         e for e in side.provision.executed_steps if e["phase"] == "start"
     )
     assert start["shell"] == (
-        "env PATH=/checkout/.pd-tools/node_modules/.bin:"
-        "/checkout/node_modules/.bin:$PATH pnpm run start"
+        "export PATH=/checkout/.pd-tools/node_modules/.bin:"
+        "/checkout/node_modules/.bin:$PATH; pnpm run start"
     )
 
 
@@ -463,7 +463,7 @@ def test_sandbox_executor_unpinned_pnpm_plan_gets_no_manager_bin(
     assert side.provision.install_plan["corepack_version"] is None
     build = next(d for d in fake.descriptors if d["phase"] == "build")
     assert build["shell"] == (
-        "env PATH=/checkout/node_modules/.bin:$PATH pnpm --version"
+        "export PATH=/checkout/node_modules/.bin:$PATH; pnpm --version"
     )
 
 
@@ -518,8 +518,8 @@ def test_sandbox_executor_runs_bun_plan(monkeypatch, tmp_path):
     ]
     build = next(d for d in fake.descriptors if d["phase"] == "build")
     assert build["shell"] == (
-        "env PATH=/checkout/.pd-tools/bin:"
-        "/checkout/node_modules/.bin:$PATH node --check server.js"
+        "export PATH=/checkout/.pd-tools/bin:"
+        "/checkout/node_modules/.bin:$PATH; node --check server.js"
     )
 
 
@@ -1524,3 +1524,91 @@ def test_replay_rechecks_assertions_against_recorded_responses():
     # would still report the catch. The replay must not.
     assert tampered["fix_results"][0]["verdict"] == "pass"
     assert kit.replay_verdict(tampered) == "no_catch"
+
+
+def test_sandbox_step_command_renders_export_form_for_every_branch():
+    """Plan 1.2(m): every PATH-prepend branch of
+    _sandbox_step_command renders `export PATH=<dirs>:$PATH; {cmd}`
+    — corepack (pnpm/yarn), bun, plain node_modules and venv — with
+    the contract command itself byte-untouched. The python-leading
+    venv rewrite carries no PATH prepend and is unchanged."""
+    from proofdeploy.orchestrator import _sandbox_step_command
+
+    cmd = "cd packages/dev-server && bun run populate"
+    corepack = (
+        "export PATH=/checkout/.pd-tools/node_modules/.bin:"
+        "/checkout/node_modules/.bin:$PATH; "
+    )
+    assert _sandbox_step_command(
+        cmd, "node", "pnpm", corepack_version="0.36.0"
+    ) == corepack + cmd
+    assert _sandbox_step_command(
+        cmd, "node", "yarn", corepack_version="0.36.0"
+    ) == corepack + cmd
+    assert _sandbox_step_command(cmd, "node", "bun") == (
+        "export PATH=/checkout/.pd-tools/bin:"
+        "/checkout/node_modules/.bin:$PATH; " + cmd
+    )
+    assert _sandbox_step_command(cmd, "node", "npm") == (
+        "export PATH=/checkout/node_modules/.bin:$PATH; " + cmd
+    )
+    assert _sandbox_step_command(cmd, "node") == (
+        "export PATH=/checkout/node_modules/.bin:$PATH; " + cmd
+    )
+    assert _sandbox_step_command("pytest -q", "python") == (
+        "export PATH=/checkout/.venv/bin:$PATH; pytest -q"
+    )
+    assert _sandbox_step_command(
+        "python manage.py migrate", "python"
+    ) == "/checkout/.venv/bin/python manage.py migrate"
+
+
+def test_sandbox_step_command_builtin_leading_command_runs(tmp_path):
+    """Plan 1.2(m), defect 1: a contract command whose first token
+    is a shell builtin must RUN. Vendure's seed/start begin with
+    `cd ...`; under the old `env PATH=... {cmd}` rendering, env
+    tried to exec the builtin and the step died with exit 127
+    (`env: 'cd': No such file or directory`). The rendered command
+    is executed exactly as the sandbox executes it (bash -c); the
+    prepended /checkout dirs need not exist for the export to take
+    effect, only the working directory does."""
+    from proofdeploy.orchestrator import _sandbox_step_command
+
+    (tmp_path / "sub").mkdir()
+    for runtime, manager in (("node", "npm"), ("python", None)):
+        rendered = _sandbox_step_command("cd sub && pwd", runtime, manager)
+        result = subprocess.run(
+            ["bash", "-c", rendered],
+            cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == str(tmp_path.resolve() / "sub")
+
+
+def test_sandbox_step_command_compound_command_keeps_prepended_path(
+    tmp_path,
+):
+    """Plan 1.2(m), defect 2: in a compound contract command, the
+    part after `&&` must still see the prepended dirs on PATH — that
+    PATH is the lookup source for a tool named there (Vendure's
+    `cd packages/dev-server && bun run populate`: the `bun` after
+    `&&` resolves through it). printenv runs as the second simple
+    command and reports the PATH in effect at exactly that point;
+    under a rendering that sets PATH only on the first simple
+    command (the `env` form, or a `PATH=... cd ...` prefix),
+    printenv reports the caller's original PATH instead."""
+    from proofdeploy.orchestrator import _sandbox_step_command
+
+    (tmp_path / "sub").mkdir()
+    rendered = _sandbox_step_command(
+        "cd sub && printenv PATH", "node", "npm"
+    )
+    result = subprocess.run(
+        ["bash", "-c", rendered],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (
+        "/checkout/node_modules/.bin:/usr/bin:/bin"
+    )
