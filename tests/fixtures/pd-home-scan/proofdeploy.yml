@@ -1,0 +1,4 @@
+build: "node scan-workspace.js"
+start: "node server.js"
+readiness: "/health"
+env: {}

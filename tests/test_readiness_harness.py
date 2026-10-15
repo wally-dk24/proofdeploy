@@ -172,6 +172,29 @@ def test_row_from_provision_ready() -> None:
     assert row["attempt"] == 1
 
 
+def test_row_from_provision_carries_plan_workspace_facts() -> None:
+    """Plan 1.2(k) trace fix: the row's app_path / workspace_root
+    come from the plan, like every other plan fact on the row. A
+    workspace plan that resolved the root app (Vendure's shape)
+    shows "." on its row; before this fix the row carried no
+    app_path field at all, so any reader saw a phantom None that
+    no code had written and that contradicted the plan."""
+    plan = {
+        "declared_range": ">=20",
+        "selected_version": "22.11.0",
+        "package_manager": "bun",
+        "app_path": ".",
+        "workspace_root": ".",
+        "refusal": None,
+    }
+    side = _fake_side(plan=plan)
+    row = rp.row_from_provision(
+        BUG_UNIT, BUG_UNIT["sides"][1], "h" * 40, 1, "isolated", side
+    )
+    assert row["app_path"] == "."
+    assert row["workspace_root"] == "."
+
+
 def test_row_from_provision_build_failed_plan_refusal() -> None:
     plan = {"declared_range": None, "refusal": "workspaces not yet supported"}
     side = _fake_side(
