@@ -930,6 +930,74 @@ def test_regd_non_iso_cutoff_is_a_typed_refusal(tmp_path):
     assert plan.steps == []
 
 
+def test_regd_offset_cutoff_is_a_typed_refusal(tmp_path):
+    # The registered text says ISO 8601 UTC: an offset form is a
+    # well-formed timestamp but NOT UTC, so it is refused, never
+    # converted or rendered.
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    plan = plan_provisioning(
+        snap,
+        _regd_contract(),
+        lock_cutoff="2025-06-07T08:09:10+02:00",
+    )
+    assert plan.refusal is not None
+    assert plan.refusal.startswith("REG-D:")
+    assert plan.steps == []
+    assert plan.regd is None
+
+
+def test_regd_sample_with_lockfile_is_refused_exactly(tmp_path):
+    # REG-D D1(b): a sample carrying its own lockfile must
+    # install frozen — REG-D refuses with the registered wording.
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "t", "engines": {"node": ">=20"}},
+    )
+    sample = snap / "sample" / "01-cats-app"
+    sample.mkdir(parents=True)
+    (sample / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    plan = plan_provisioning(
+        snap, _regd_contract(), lock_cutoff=REGD_CUTOFF
+    )
+    assert plan.refusal == (
+        "REG-D: sample sample/01-cats-app has a lockfile "
+        "(package-lock.json); REG-D does not apply — the sample "
+        "must install frozen"
+    )
+    assert plan.steps == []
+    assert plan.regd is None
+
+
+def test_regd_sample_lockfile_names_are_all_refused(tmp_path):
+    # Every lockfile name in the D1(b) set refuses, named in the
+    # refusal; the ROOT lockfile (the app's own frozen install)
+    # never triggers it — only the sample's does.
+    for name in (
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
+    ):
+        side_dir = tmp_path / name
+        side_dir.mkdir()
+        snap = _node_snapshot(
+            side_dir,
+            package_json={"name": "t", "engines": {"node": ">=20"}},
+        )
+        sample = snap / "sample" / "01-cats-app"
+        sample.mkdir(parents=True)
+        (sample / name).write_text("{}\n", encoding="utf-8")
+        plan = plan_provisioning(
+            snap, _regd_contract(), lock_cutoff=REGD_CUTOFF
+        )
+        assert plan.refusal is not None
+        assert f"({name})" in plan.refusal
+
+
 def test_regd_absent_leaves_plan_untouched(tmp_path):
     snap = _node_snapshot(
         tmp_path,

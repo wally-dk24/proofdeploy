@@ -1163,6 +1163,102 @@ def test_capture_regd_tree_records_sha_and_artifact(
     ).hexdigest()
     tree = json.loads(text)
     assert tree["dependencies"]["left-pad"]["version"] == "1.3.0"
+    # REG-D D4: the version of the npm that captured the tree is
+    # recorded on the row.
+    import subprocess
+
+    expected_npm = subprocess.run(
+        ["npm", "--version"], capture_output=True, text=True
+    ).stdout.strip()
+    assert regd["tree_npm_version"] == expected_npm
+
+
+def _regd_captured_row(unit: str, role: str, artifact: str) -> dict:
+    return {
+        "unit": unit,
+        "role": role,
+        "regd": {
+            "applied": True,
+            "tree_sha256": "0" * 64,
+            "tree_artifact": artifact,
+        },
+    }
+
+
+def _write_tree(tmp_path: Path, name: str, tree: dict) -> str:
+    out = tmp_path / "pd-logs" / name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(tree), encoding="utf-8")
+    return f"pd-logs/{name}"
+
+
+def test_regd_unit_summaries_identical_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REG-D D4 two-side report: both sides applied REG-D and
+    captured the SAME resolved tree -> regd_trees_identical."""
+    monkeypatch.chdir(tmp_path)
+    tree = {
+        "name": "sample",
+        "version": "1.0.0",
+        "dependencies": {
+            "a": {"version": "1.0.0"},
+            "b": {
+                "version": "2.0.0",
+                "dependencies": {"c": {"version": "3.0.0"}},
+            },
+        },
+    }
+    rows = [
+        _regd_captured_row("U1", "fix^", _write_tree(tmp_path, "t1.json", tree)),
+        _regd_captured_row("U1", "fix", _write_tree(tmp_path, "t2.json", tree)),
+        # A unit with only one captured side gets no summary.
+        _regd_captured_row("U2", "C", _write_tree(tmp_path, "t3.json", tree)),
+    ]
+    assert rp.regd_unit_summaries(rows) == [
+        {"unit": "U1", "regd_trees_identical": True}
+    ]
+
+
+def test_regd_unit_summaries_differing_trees_list_the_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REG-D D4 two-side report: differing trees are reported
+    with the name@version entries added and removed between the
+    sides, computed from the two captured JSON trees (nested
+    dependencies included)."""
+    monkeypatch.chdir(tmp_path)
+    first = {
+        "dependencies": {
+            "a": {"version": "1.0.0"},
+            "b": {
+                "version": "2.0.0",
+                "dependencies": {"c": {"version": "3.0.0"}},
+            },
+        }
+    }
+    second = {
+        "dependencies": {
+            "a": {"version": "1.0.1"},
+            "b": {
+                "version": "2.0.0",
+                "dependencies": {"d": {"version": "4.0.0"}},
+            },
+        }
+    }
+    rows = [
+        _regd_captured_row(
+            "U1", "fix^", _write_tree(tmp_path, "t1.json", first)
+        ),
+        _regd_captured_row(
+            "U1", "fix", _write_tree(tmp_path, "t2.json", second)
+        ),
+    ]
+    (summary,) = rp.regd_unit_summaries(rows)
+    assert summary["unit"] == "U1"
+    assert summary["regd_trees_identical"] is False
+    assert summary["added"] == ["a@1.0.1", "d@4.0.0"]
+    assert summary["removed"] == ["a@1.0.0", "c@3.0.0"]
 
 
 def test_capture_regd_tree_failure_is_recorded_not_silent(

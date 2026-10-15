@@ -494,12 +494,27 @@ def _contract_steps(
 # identically (REG-D D2/D3).
 REGD_CUTOFF_TOKEN = "{regd_cutoff}"
 
+# REG-D D1(b): dated resolution applies only to a sample WITHOUT
+# its own lockfile. A sample carrying any of these already has a
+# frozen install path, so the plan refuses (named in this order).
+REGD_SAMPLE_LOCKFILES = (
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+)
+
 # The cutoff is rendered into a shell string, so it is validated
-# as an ISO 8601 timestamp before substitution: a validated value
-# is digits, '-', 'T', ':', and a zone designator only — a date,
-# never arbitrary text in the command.
+# as an ISO 8601 UTC timestamp before substitution (the registered
+# text says "ISO 8601 UTC"; the orchestrator emits `Z`): a
+# validated value is digits, '-', 'T', ':', an optional fraction
+# and the `Z` designator only — a date, never arbitrary text in
+# the command. A non-UTC offset (e.g. `+02:00`) is refused, not
+# converted.
 _REGD_CUTOFF_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$"
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$"
 )
 _REGD_PREFIX_RE = re.compile(r"--prefix\s+(\S+)")
 
@@ -540,9 +555,9 @@ def _regd_render(
     if not value or not _REGD_CUTOFF_RE.match(str(value)):
         return None, (
             "REG-D: the contract declares dated sample resolution "
-            f"({REGD_CUTOFF_TOKEN}) but no ISO 8601 lock cutoff is "
-            "available for this unit; refusing to run an undated "
-            "sample install (REG-D D6)"
+            f"({REGD_CUTOFF_TOKEN}) but no ISO 8601 UTC lock "
+            "cutoff is available for this unit; refusing to run "
+            "an undated sample install (REG-D D6)"
         )
     cutoff = str(value)
     command: str | None = None
@@ -2129,6 +2144,24 @@ class NodeAdapter:
         regd, regd_refusal = _regd_render(contract_steps, lock_cutoff)
         if regd_refusal is not None:
             return InstallPlan(**base, refusal=regd_refusal)
+        if regd is not None:
+            # REG-D D1(b): the scope check — a sample that carries
+            # its own lockfile at this side's SHA must install
+            # frozen; routing it through dated resolution would
+            # unfreeze it. Reads the sample directory in THIS
+            # snapshot, so each side is judged on its own tree.
+            sample_rel = str(regd["sample_path"] or ".")
+            sample_dir = snapshot_dir / sample_rel
+            for name in REGD_SAMPLE_LOCKFILES:
+                if (sample_dir / name).is_file():
+                    return InstallPlan(
+                        **base,
+                        refusal=(
+                            f"REG-D: sample {sample_rel} has a "
+                            f"lockfile ({name}); REG-D does not "
+                            "apply — the sample must install frozen"
+                        ),
+                    )
         steps.extend(contract_steps)
         persisted = ["node_modules"]
         if step_cwd is not None:

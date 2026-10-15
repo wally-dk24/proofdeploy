@@ -30,7 +30,10 @@ Guarantees (Addendum 65):
   resolved dependency tree is captured from the provisioned
   snapshot (``npm ls --all --json``), written under ``pd-logs/``
   as ``regd-tree-<unit>-<role>-a<attempt>.json`` with its sha256
-  on the row.
+  and the capturing npm's version on the row. The run summary
+  carries the D4 two-side report (``regd_summaries``): per unit
+  where both sides captured trees, whether they are identical,
+  and the entries added/removed between differing trees.
 * A READY side is a live container: it is stopped in a ``finally``
   so no outcome — row written, row failed, exception — can leak it.
 
@@ -240,6 +243,7 @@ def _regd_row(plan_regd: Any) -> dict[str, Any]:
         "tree_sha256": None,
         "tree_artifact": None,
         "tree_error": None,
+        "tree_npm_version": None,
     }
     if plan_regd:
         block.update(
@@ -401,6 +405,18 @@ def _capture_regd_tree(
         return
     sample_dir = Path(side.snapshot_dir) / str(regd["sample_path"])
     try:
+        # REG-D D4: the npm that produces the tree is part of the
+        # evidence — record its version on the row.
+        version_proc = subprocess.run(
+            ["npm", "--version"],
+            cwd=sample_dir, capture_output=True, text=True, timeout=60,
+        )
+        if version_proc.returncode != 0 or not version_proc.stdout.strip():
+            raise RuntimeError(
+                f"npm --version exited {version_proc.returncode}: "
+                f"{version_proc.stderr.strip()[:200]}"
+            )
+        regd["tree_npm_version"] = version_proc.stdout.strip()
         proc = subprocess.run(
             ["npm", "ls", "--all", "--json"],
             cwd=sample_dir, capture_output=True, text=True, timeout=300,
@@ -424,6 +440,93 @@ def _capture_regd_tree(
         regd["tree_artifact"] = f"pd-logs/{name}"
     except Exception as exc:
         regd["tree_error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _regd_tree_entries(tree: Any) -> set[str]:
+    """Flatten an ``npm ls --all --json`` tree to the set of
+    ``name@version`` entries it resolves, at every depth."""
+    entries: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        deps = node.get("dependencies")
+        if isinstance(deps, dict):
+            for name, info in deps.items():
+                if isinstance(info, dict):
+                    version = info.get("version")
+                    if version:
+                        entries.add(f"{name}@{version}")
+                    walk(info)
+
+    walk(tree)
+    return entries
+
+
+def _regd_tree_diff(
+    first: Any, second: Any
+) -> tuple[bool, list[str], list[str]]:
+    """Compare two captured REG-D trees: (identical, added,
+    removed) where added holds the entries the SECOND tree has
+    that the first lacks, and removed the reverse."""
+    first_entries = _regd_tree_entries(first)
+    second_entries = _regd_tree_entries(second)
+    added = sorted(second_entries - first_entries)
+    removed = sorted(first_entries - second_entries)
+    return (not added and not removed), added, removed
+
+
+def regd_unit_summaries(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """REG-D D4, the two-side report: per unit where both sides
+    applied REG-D and captured their resolved trees, whether the
+    two trees are identical (``regd_trees_identical``); between
+    differing trees, the ``name@version`` entries added and
+    removed, computed from the two captured JSON trees (read back
+    from the pd-logs artifacts the capture wrote, in row order).
+    A unit whose trees cannot be read back is omitted — its rows
+    already carry the per-side tree_error."""
+    summaries: list[dict[str, Any]] = []
+    by_unit: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_unit.setdefault(str(row["unit"]), []).append(row)
+    for unit_id, unit_rows in by_unit.items():
+        captured = [
+            row
+            for row in unit_rows
+            if (row.get("regd") or {}).get("applied")
+            and (row.get("regd") or {}).get("tree_sha256")
+            and (row.get("regd") or {}).get("tree_artifact")
+        ]
+        if len(captured) < 2:
+            continue
+        first, second = captured[0], captured[1]
+        try:
+            tree_first = json.loads(
+                Path(str(first["regd"]["tree_artifact"])).read_text(
+                    encoding="utf-8"
+                )
+            )
+            tree_second = json.loads(
+                Path(str(second["regd"]["tree_artifact"])).read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+        identical, added, removed = _regd_tree_diff(
+            tree_first, tree_second
+        )
+        summary: dict[str, Any] = {
+            "unit": unit_id,
+            "regd_trees_identical": identical,
+        }
+        if not identical:
+            summary["added"] = added
+            summary["removed"] = removed
+        summaries.append(summary)
+    return summaries
 
 
 def provision_side(
@@ -561,6 +664,7 @@ def provision_repo(
         "attempt": attempt,
         "network_mode": network_mode,
         "rows": rows,
+        "regd_summaries": regd_unit_summaries(rows),
     }
 
 
