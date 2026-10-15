@@ -1453,6 +1453,25 @@ class Provisioner:
             venv_bin = str(venv_dir / "bin")
             logs.append(f"venv: {venv_dir} (bin first on PATH)")
         first_on_path = run_bin or venv_bin
+        if (
+            plan.corepack_version is not None
+            and package_manager in ("pnpm", "yarn")
+        ):
+            # Plan 1.2(f): a corepack-pinned plan bootstraps corepack
+            # into the checkout's .pd-tools (persisted); the corepack
+            # package's own bin dir carries the manager shims
+            # (pnpm/pnpx/yarn/yarnpkg), which resolve the snapshot's
+            # packageManager pin — so contract steps (and the start)
+            # calling bare `pnpm` / `yarn` run the plan's pinned
+            # version, never a PATH fallback. The manager's bin goes
+            # first on PATH — the host rendering of the sandbox's
+            # corepack PATH treatment.
+            manager_bin = str(snap / ".pd-tools" / "node_modules" / ".bin")
+            first_on_path = (
+                manager_bin + os.pathsep + first_on_path
+                if first_on_path
+                else manager_bin
+            )
         if package_manager == "bun":
             # Plan 1.2e: the plan's bootstrapped bun lives in the
             # checkout's .pd-tools/bin; an app's own contract steps
