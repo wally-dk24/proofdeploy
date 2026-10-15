@@ -23,10 +23,18 @@ Per registered side of a repo (``readiness/manifest.json``):
   explicit rootless build network,
   ``slirp4netns:allow_host_loopback=false`` (network during the
   build only: outbound NAT for package registries, no route back
-  to services bound on the host's loopback), userns-remapped and
-  with ``--cap-drop=ALL`` -- a Dockerfile's RUN steps are
-  untrusted code and must not execute as host root any more than
-  the run may. The build originally ran on the native install
+  to services bound on the host's loopback), userns-remapped,
+  with every capability dropped (``--cap-drop=ALL``) and only
+  the minimal ``BUILD_CAPS`` set added back -- a Dockerfile's
+  RUN steps are untrusted code and must not execute as host
+  root any more than the run may, but ordinary Dockerfiles
+  perform file-ownership operations (``chown`` above all) that
+  a bare drop-all makes impossible: the first Directus re-run
+  on the fixed network died at ``RUN chown node:node .`` with
+  ``Operation not permitted`` because drop-all removes
+  CAP_CHOWN (WAL-120). The added-back set is build-only; the
+  run keeps ``--cap-drop=ALL`` with no additions. The build
+  originally ran on the native install
   path's named ``pd-build`` netavark bridge; the first real runs
   on main (2026-10-14) proved a userns-mapped ``podman build``
   cannot join a named netavark network on podman 4.9.3 (every
@@ -140,6 +148,24 @@ BUILD_NETWORK_MODE = "slirp4netns:allow_host_loopback=false"
 # allow_host_loopback to true is the plant that must make that
 # test fail.
 BUILD_NETWORK_HOST_ADDR = "10.0.2.2"
+
+# The build's capability set (WAL-120). The build drops every
+# capability (--cap-drop=ALL) and adds back exactly this set:
+# the file-ownership and identity operations ordinary
+# Dockerfiles perform -- chown a copied tree to the app's user
+# (Directus's `RUN chown node:node .`, which the drop-all build
+# refused with "Operation not permitted" on the first re-run
+# over the fixed build network), read/write past ownership
+# (DAC_OVERRIDE), chmod/setuid-bit handling as a file's owner
+# (FOWNER), file-capability and set-id bit management on files
+# the build creates (FSETID), and switching to the app's uid /
+# gid for later steps (SETUID / SETGID). Nothing beyond that:
+# no MKNOD, no NET_ADMIN, no SYS_ADMIN -- a step needing one of
+# those still fails, proven by the sandbox property test in
+# tests/test_container_spike.py. BUILD ONLY: the app run keeps
+# --cap-drop=ALL with no --cap-add, unchanged. The set is
+# recorded on every row (build_caps) and in the run header.
+BUILD_CAPS = ("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETUID", "SETGID")
 
 
 class UsernsUnavailableError(RuntimeError):
@@ -461,14 +487,18 @@ def build_user_args_for(userns_remap: bool) -> list[str]:
     """The build's userns/cap args. A Dockerfile's RUN steps are
     untrusted code: with remapping available they execute as
     container root mapped away from host root (the build-form
-    uid/gid maps), and capabilities are dropped either way.
-    Without remapping there is nothing to map -- a run only
-    reaches a build at all behind the dev fallback flag -- and
-    ``--cap-drop=ALL`` still applies."""
+    uid/gid maps). Either way every capability is dropped and
+    only the minimal BUILD_CAPS set is added back -- the build
+    alone gets that set; the run's args (user_args_for) add
+    nothing back. Without remapping there is nothing to map --
+    a run only reaches a build at all behind the dev fallback
+    flag -- and the drop-all-plus-BUILD_CAPS posture still
+    applies."""
+    caps = ["--cap-drop=ALL", "--cap-add=" + ",".join(BUILD_CAPS)]
     if userns_remap:
         return ["--userns-uid-map", "0:1:65536",
-                "--userns-gid-map", "0:1:65536", "--cap-drop=ALL"]
-    return ["--cap-drop=ALL"]
+                "--userns-gid-map", "0:1:65536", *caps]
+    return caps
 
 
 def build_command(
@@ -771,6 +801,7 @@ def _row(
         "kind": "container-spike",
         "repo": unit["repo"],
         "unit": unit["unit_id"],
+        "unit_id": unit["unit_id"],
         "role": side_spec["role"],
         "registered_sha": side_spec["sha"],
         "status": status,
@@ -782,6 +813,7 @@ def _row(
         "port": port,
         "network_mode": "none+socket",
         "build_network": BUILD_NETWORK_MODE,
+        "build_caps": list(BUILD_CAPS),
         "userns_fallback": userns_fallback,
         "attempt": attempt,
     }
@@ -1024,6 +1056,7 @@ def spike_repo(
     run_log.append(f"run user args: {args_for_user}")
     run_log.append(f"build user args: {build_args}")
     run_log.append(f"build network: {BUILD_NETWORK_MODE}")
+    run_log.append(f"build caps: {','.join(BUILD_CAPS)}")
     if userns_fallback:
         run_log.append(
             "WARNING: userns remapping unavailable; the explicit dev "
