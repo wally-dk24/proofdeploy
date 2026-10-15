@@ -332,6 +332,23 @@ class InstallPlan:
     package_manager: str | None = None
     package_manager_version: str | None = None
     corepack_version: str | None = None
+    # Plan 1.2h: the contract's allowlisted npm flags
+    # (install.npm_flags), rendered into the frozen npm ci argv
+    # after `ci` and recorded here; empty for every non-npm plan
+    # and every contract that declares none. (The flags align the
+    # install with the repo's own install mode — nest's CI uses
+    # --legacy-peer-deps; `npm ci` still requires an exact lock
+    # match, so nothing unfreezes.)
+    npm_flags: list[str] = field(default_factory=list)
+    # REG-D (plan 1.2i): dated-resolution facts when a contract
+    # step declares the {regd_cutoff} placeholder: {"sample_path",
+    # "cutoff", "command"} — the sample app directory, the unit's
+    # REG-A lock cutoff the placeholder rendered to, and the exact
+    # sample install command as rendered. None when REG-D does not
+    # apply to the plan. The resolved dependency TREE is execution
+    # evidence, not plan data: the readiness harness records it
+    # (readiness/provision.py, REG-D D4).
+    regd: dict[str, Any] | None = None
     # Plan 1.2e (D22): set on bun plans — the selected bun version
     # (the app's packageManager pin when declared, else the pin
     # table's default) and the sha256 of the pinned release
@@ -464,6 +481,108 @@ def _contract_steps(
     if start:
         steps.append(PlanStep(phase="start", shell=str(start), cwd=cwd))
     return steps
+
+
+# REG-D (registered 2026-10-15; plan 1.2i): a contract step asks
+# for dated sample resolution by writing the placeholder
+# `--before={regd_cutoff}` in the sample's install command. The
+# Node adapter renders the placeholder AT PLAN TIME with the
+# unit's REG-A lock cutoff — never by shell expansion and never
+# hard-coded in the contract — so the rendered command on the
+# plan is the exact command both executors run and record, and
+# both sides of a unit (which share the run's one cutoff) render
+# identically (REG-D D2/D3).
+REGD_CUTOFF_TOKEN = "{regd_cutoff}"
+
+# REG-D D1(b): dated resolution applies only to a sample WITHOUT
+# its own lockfile. A sample carrying any of these already has a
+# frozen install path, so the plan refuses (named in this order).
+REGD_SAMPLE_LOCKFILES = (
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+)
+
+# The cutoff is rendered into a shell string, so it is validated
+# as an ISO 8601 UTC timestamp before substitution (the registered
+# text says "ISO 8601 UTC"; the orchestrator emits `Z`): a
+# validated value is digits, '-', 'T', ':', an optional fraction
+# and the `Z` designator only — a date, never arbitrary text in
+# the command. A non-UTC offset (e.g. `+02:00`) is refused, not
+# converted.
+_REGD_CUTOFF_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$"
+)
+_REGD_PREFIX_RE = re.compile(r"--prefix\s+(\S+)")
+
+
+def _regd_render(
+    steps: list[PlanStep], lock_cutoff: LockCutoff
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Render REG-D's {regd_cutoff} placeholder in contract steps.
+
+    Mutates the token-bearing steps' shell in place (the steps are
+    freshly built for this plan) and returns (regd_facts,
+    refusal): regd_facts {"sample_path", "cutoff", "command"} when
+    a step declared the placeholder and it rendered; a typed
+    refusal naming REG-D when the placeholder is declared but no
+    usable cutoff is available — REG-D D6: a failure to resolve
+    dated is a typed refusal, never a silent fall-back to an
+    undated install. (None, None) when no step declares it.
+
+    The cutoff is evaluated exactly as the Python path evaluates
+    it (a plain string, or the lazy callable the orchestrator
+    supplies) — and ONLY when a step declares the placeholder, so
+    every other Node plan keeps never reading a commit time.
+    """
+    marked = [
+        s for s in steps if s.shell and REGD_CUTOFF_TOKEN in s.shell
+    ]
+    if not marked:
+        return None, None
+    try:
+        value = lock_cutoff() if callable(lock_cutoff) else lock_cutoff
+    except Exception as exc:
+        return None, (
+            "REG-D: the contract declares dated sample resolution "
+            f"({REGD_CUTOFF_TOKEN}) but the unit's lock cutoff "
+            f"could not be read ({type(exc).__name__}); refusing "
+            "to run an undated sample install (REG-D D6)"
+        )
+    if not value or not _REGD_CUTOFF_RE.match(str(value)):
+        return None, (
+            "REG-D: the contract declares dated sample resolution "
+            f"({REGD_CUTOFF_TOKEN}) but no ISO 8601 UTC lock "
+            "cutoff is available for this unit; refusing to run "
+            "an undated sample install (REG-D D6)"
+        )
+    cutoff = str(value)
+    command: str | None = None
+    sample_path: str | None = None
+    for step in marked:
+        assert step.shell is not None
+        rendered = step.shell.replace(REGD_CUTOFF_TOKEN, cutoff)
+        step.shell = rendered
+        if command is None:
+            segments = [seg.strip() for seg in rendered.split("&&")]
+            segment = next(
+                (seg for seg in segments if "--before=" in seg),
+                next(seg for seg in segments if cutoff in seg),
+            )
+            command = segment
+            prefix = _REGD_PREFIX_RE.search(segment)
+            sample_path = (
+                prefix.group(1) if prefix else (step.cwd or ".")
+            )
+    facts = {
+        "sample_path": sample_path,
+        "cutoff": cutoff,
+        "command": command,
+    }
+    return facts, None
 
 
 # ---------------------------------------------------------------------------
@@ -1368,7 +1487,7 @@ class PythonAdapter:
                 declared_range=det.declared_range,
                 **image,
                 refusal=(
-                    "no frozen lockfile found in snapshot "
+                    "not supported: no frozen lockfile found in snapshot "
                     "for runtime 'python'"
                 ),
             )
@@ -1604,6 +1723,16 @@ BUN_RELEASE_SHA256: dict[str, dict[str, tuple[str, str]]] = {
             "a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b",
         ),
     },
+    "1.2.20": {
+        "x86_64": (
+            "bun-linux-x64.zip",
+            "4e9edc4cba0c7c1623a288be01e53bbde11a4d073f2cf339cab026627858b548",
+        ),
+        "aarch64": (
+            "bun-linux-aarch64.zip",
+            "98d2e0b2c09421569172b4d46b6f81378c2dbdd77480ebb27f3989dd4e72e18b",
+        ),
+    },
     "1.2.19": {
         "x86_64": (
             "bun-linux-x64.zip",
@@ -1707,6 +1836,14 @@ class NodeAdapter:
       images ship the runtime's own headers there, so a native
       module without a prebuild compiles locally — no nodejs.org
       download, no tarball extraction.
+    - The contract's ``install.npm_flags`` (plan 1.2h, allowlisted
+      at load) render into the ``npm ci`` argv after ``ci`` and are
+      recorded on the plan; declared flags on a non-npm plan are a
+      typed refusal.
+    - A contract step declaring REG-D's ``{regd_cutoff}``
+      placeholder (plan 1.2i) has it rendered at plan time with
+      the unit's REG-A lock cutoff (see _regd_render); a declared
+      placeholder with no usable cutoff is a typed refusal.
     """
 
     name = "node"
@@ -1728,9 +1865,11 @@ class NodeAdapter:
         lock_cutoff: LockCutoff = None,
     ) -> InstallPlan:
         # Node never generates a lock (REG-A is Python-only); the
-        # cutoff is accepted for the Protocol and ignored (and, being
-        # possibly a lazy callable, never evaluated here).
-        del lock_cutoff
+        # cutoff is threaded through for REG-D only (plan 1.2i):
+        # _regd_render evaluates it — lazily, exactly as the
+        # Python path does — when a contract step declares the
+        # {regd_cutoff} placeholder, and never otherwise, so a
+        # plain Node plan still never reads a commit time.
         det = self.detect(snapshot_dir)
         assert det is not None, "plan() called without a node detection"
         image = _image_fields("node", det.declared_range)
@@ -1744,8 +1883,13 @@ class NodeAdapter:
         # workspace-aware method — frozen install at the root,
         # contract steps scoped to the resolved app member.
         if self._declares_workspaces(snapshot_dir):
-            return self.plan_workspace(snapshot_dir, contract)
-        return self._install_plan(snapshot_dir, base, contract, app_path=None)
+            return self.plan_workspace(
+                snapshot_dir, contract, lock_cutoff=lock_cutoff
+            )
+        return self._install_plan(
+            snapshot_dir, base, contract,
+            app_path=None, lock_cutoff=lock_cutoff,
+        )
 
     def plan_workspace(
         self,
@@ -1767,9 +1911,9 @@ class NodeAdapter:
         supported set under plan 1.2e, through this same method
         and with no interface change.
         """
-        # Node never generates a lock; the cutoff is ignored (and
-        # never evaluated), exactly as in plan().
-        del lock_cutoff
+        # The cutoff is threaded for REG-D only, exactly as in
+        # plan(): evaluated solely when a contract step declares
+        # the {regd_cutoff} placeholder.
         det = self.detect(snapshot_dir)
         assert det is not None, (
             "plan_workspace() called without a node detection"
@@ -1793,7 +1937,8 @@ class NodeAdapter:
             return InstallPlan(**base, refusal=refusal)
         assert app_path is not None
         return self._install_plan(
-            snapshot_dir, base, contract, app_path=app_path
+            snapshot_dir, base, contract,
+            app_path=app_path, lock_cutoff=lock_cutoff,
         )
 
     def _install_plan(
@@ -1803,6 +1948,7 @@ class NodeAdapter:
         contract: Any,
         *,
         app_path: str | None,
+        lock_cutoff: LockCutoff = None,
     ) -> InstallPlan:
         """The Node install plan from the root's lockfile.
 
@@ -1844,7 +1990,7 @@ class NodeAdapter:
             return InstallPlan(
                 **base,
                 refusal=(
-                    "no frozen lockfile found in snapshot "
+                    "not supported: no frozen lockfile found in snapshot "
                     "for runtime 'node'"
                 ),
             )
@@ -1880,6 +2026,28 @@ class NodeAdapter:
                     f"manager {manager!r}"
                 ),
             )
+        # Plan 1.2h: the contract's allowlisted npm flags render
+        # into the frozen npm ci argv, right after `ci` (ahead of
+        # the argv's own --no-audit/--no-fund). The allowlist was
+        # enforced at contract load (yml.py); here the flags meet
+        # the manager: declared flags on a non-npm plan are a typed
+        # refusal, never a silent no-op — the contract asked for an
+        # install mode this plan cannot render.
+        npm_flags = list(getattr(contract, "npm_flags", None) or [])
+        if npm_flags and manager != "npm":
+            return InstallPlan(
+                **base,
+                refusal=(
+                    "install.npm_flags applies to npm plans only; "
+                    f"this snapshot's package manager is {manager!r} "
+                    "(plan 1.2h)"
+                ),
+            )
+        if npm_flags:
+            ci_index = argv.index("ci")
+            argv = [
+                *argv[: ci_index + 1], *npm_flags, *argv[ci_index + 1:],
+            ]
         # Addendum 37: EVERY Node install step carries the nodedir
         # env (compile fallback against the image's own headers).
         step_env: dict[str, str] = dict(NODE_INSTALL_ENV)
@@ -1978,7 +2146,34 @@ class NodeAdapter:
         # the app member (cwd relative to the root; "." and None
         # both keep the steps at the root, as before).
         step_cwd = app_path if app_path not in (None, ".") else None
-        steps.extend(_contract_steps(contract, cwd=step_cwd))
+        contract_steps = _contract_steps(contract, cwd=step_cwd)
+        # REG-D (plan 1.2i): render the {regd_cutoff} placeholder
+        # in the contract steps with the unit's lock cutoff. A
+        # declared placeholder with no usable cutoff refuses the
+        # whole plan typed (REG-D D6) — the sample never installs
+        # undated.
+        regd, regd_refusal = _regd_render(contract_steps, lock_cutoff)
+        if regd_refusal is not None:
+            return InstallPlan(**base, refusal=regd_refusal)
+        if regd is not None:
+            # REG-D D1(b): the scope check — a sample that carries
+            # its own lockfile at this side's SHA must install
+            # frozen; routing it through dated resolution would
+            # unfreeze it. Reads the sample directory in THIS
+            # snapshot, so each side is judged on its own tree.
+            sample_rel = str(regd["sample_path"] or ".")
+            sample_dir = snapshot_dir / sample_rel
+            for name in REGD_SAMPLE_LOCKFILES:
+                if (sample_dir / name).is_file():
+                    return InstallPlan(
+                        **base,
+                        refusal=(
+                            f"REG-D: sample {sample_rel} has a "
+                            f"lockfile ({name}); REG-D does not "
+                            "apply — the sample must install frozen"
+                        ),
+                    )
+        steps.extend(contract_steps)
         persisted = ["node_modules"]
         if step_cwd is not None:
             # The member's own node_modules (pnpm links the
@@ -1996,6 +2191,8 @@ class NodeAdapter:
                 pm_version if pm_name == manager else None
             ),
             corepack_version=corepack_version,
+            npm_flags=npm_flags,
+            regd=regd,
             bun_version=bun_version,
             bun_sha256=bun_sha256,
             workspace_root="." if app_path is not None else None,

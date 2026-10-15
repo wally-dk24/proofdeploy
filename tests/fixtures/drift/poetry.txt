@@ -1,0 +1,4 @@
+The `--sync` option is deprecated and slated for removal, use the `poetry sync` command instead.
+Installing dependencies from lock file
+
+pyproject.toml changed significantly since poetry.lock was last generated. Run `poetry lock` to fix the lock file.

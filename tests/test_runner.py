@@ -150,7 +150,7 @@ def test_verify_lockfile_missing(tmp_path):
     snap = tmp_path / "snap"
     snap.mkdir()
     (snap / "package.json").write_text("{}\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="no frozen lockfile"):
+    with pytest.raises(ValueError, match="not supported: no frozen lockfile"):
         verify_lockfile(snap, "node")
 
 
@@ -367,7 +367,7 @@ def test_provision_missing_lockfile(tmp_path):
         require_lockfile_match=False,
     )
     assert result.status == ProvisionStatus.BUILD_FAILED
-    assert result.reason is not None and "no frozen lockfile" in result.reason
+    assert result.reason is not None and "not supported: no frozen lockfile" in result.reason
     assert result.runtime == "node"
 
 
@@ -561,6 +561,51 @@ def test_provision_prefers_package_manager_lockfile(tmp_path, monkeypatch):
         recorded[1]
     )
     assert "--frozen-lockfile" in recorded[1]
+
+
+def test_provision_corepack_pinned_pnpm_manager_bin_first_on_path(
+    tmp_path, monkeypatch
+):
+    """Plan 1.2(f), host executor: a corepack-pinned pnpm plan's
+    contract steps run with the persisted corepack's manager bin
+    dir (snap/.pd-tools/node_modules/.bin — the corepack package's
+    own shims, which resolve the snapshot's packageManager pin)
+    FIRST on PATH, so a step calling bare `pnpm` runs the plan's
+    pinned version, never a PATH fallback."""
+    _no_corepack(monkeypatch)
+    recorded: list[str] = []
+    envs: list[dict[str, str]] = []
+    prov = Provisioner(workdir=tmp_path)
+
+    def fake_exec(cmd, cwd, timeout, logs, env):
+        recorded.append(" ".join(cmd))
+        envs.append(dict(env))
+        logs.append(f"$ {' '.join(cmd)} (mocked)")
+        return True, None
+
+    prov._exec = fake_exec  # type: ignore[method-assign]
+    snap = _node_snapshot(
+        tmp_path,
+        lockfile="package-lock.json",
+        package_json={
+            "packageManager": "pnpm@9.1.0",
+            "engines": {"node": ">=18"},
+        },
+    )
+    (snap / "pnpm-lock.yaml").write_text("", encoding="utf-8")
+    result = prov.provision(
+        snapshot_dir=snap,
+        contract=_contract(build="pnpm --version", start=""),
+        port=18097,
+        expected_lockfile_sha256=find_lockfile(
+            snap, "node", preferred=["pnpm-lock.yaml"]
+        )[1],
+    )
+    assert result.package_manager == "pnpm"
+    assert result.status == ProvisionStatus.BUILD_FAILED  # missing start
+    idx = recorded.index("pnpm --version")
+    manager_bin = str(snap / ".pd-tools" / "node_modules" / ".bin")
+    assert envs[idx]["PATH"].startswith(manager_bin + os.pathsep)
 
 
 # --- frozen requirements.txt (finding 4) ---

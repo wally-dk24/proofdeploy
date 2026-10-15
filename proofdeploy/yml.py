@@ -24,6 +24,16 @@ adapter installs frozen from the workspace root and runs the
 contract's build/migrate/seed/start scoped to that directory. A
 workspace with several candidate apps and no `app.path` is a typed
 refusal ("ambiguous app: <n> candidates"), never a guess.
+
+`install` (optional, added 2026-10-15, plan 1.2h) declares how the
+adapter's own frozen install is invoked: a mapping with the single
+key `npm_flags` — extra flags rendered into the frozen `npm ci`
+argv. The flags exist to align the install with the repo's own
+install mode (nestjs/nest's CI installs with `--legacy-peer-deps`);
+they can never unfreeze anything (`npm ci` still requires an exact
+lock match), so the set is ALLOWLISTED at load: today the only
+allowlisted flag is `--legacy-peer-deps`, and any other flag is a
+typed refusal here, at load time, before anything runs.
 """
 
 from __future__ import annotations
@@ -41,6 +51,12 @@ OPTIONAL_KEYS = ("migrate", "seed")
 # A bootstrap env name must be a valid environment variable name (and a
 # valid ${NAME} placeholder name, so providers can reference it).
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# The allowlist for `install.npm_flags` (plan 1.2h): flags the
+# adapter may render into the frozen `npm ci` argv. Deliberately a
+# single entry — a flag joins this set only by a reviewed change,
+# never by a contract asking for it.
+_NPM_FLAGS_ALLOWLIST = frozenset({"--legacy-peer-deps"})
 
 # Per-mode key sets for the `auth:` mapping (WO-8.3). Unknown keys are
 # refused (typos must fail, not silently pass). `bootstrap_env` is the
@@ -90,6 +106,13 @@ class RepoContract:
     # from the workspace layout itself (single member, or the root)
     # or refuses an ambiguous workspace with a typed refusal.
     app_path: str | None = None
+    # Extra flags for the adapter's frozen `npm ci` (optional, plan
+    # 1.2h): the contract's `install.npm_flags`, validated against
+    # the allowlist at load (see _validate_install). Empty when the
+    # contract declares no `install` mapping. The Node adapter
+    # renders these into the install argv and records them on the
+    # plan; they never apply to another manager's install.
+    npm_flags: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> RepoContract:
@@ -140,6 +163,7 @@ class RepoContract:
         if auth is not None:
             auth = _validate_auth(auth)
         app_path = _validate_app(data.get("app"))
+        npm_flags = _validate_install(data.get("install"))
         return cls(
             build=data["build"],
             start=data["start"],
@@ -151,6 +175,7 @@ class RepoContract:
             database=database,
             auth=auth,
             app_path=app_path,
+            npm_flags=npm_flags,
         )
 
 
@@ -184,6 +209,56 @@ def _validate_app(app: Any) -> str | None:
             f"checkout, got: {path!r}"
         )
     return str(Path(path))
+
+
+def _validate_install(install: Any) -> list[str]:
+    """Validate the contract's `install:` mapping (plan 1.2h).
+
+    The one key is `npm_flags`: extra flags for the adapter's
+    frozen `npm ci`. Unknown keys are refused (the same rule as
+    the `app`/`database`/`auth` mappings: typos must fail, not
+    silently pass), and every flag must be on the allowlist
+    (_NPM_FLAGS_ALLOWLIST) — an unlisted flag is a typed refusal
+    at load, before anything runs, because a contract is untrusted
+    input and the frozen install's argv is ours to control.
+    Returns the flags in declared order, or [] when `install` is
+    absent.
+    """
+    if install is None:
+        return []
+    if not isinstance(install, dict):
+        raise ValueError("proofdeploy.yml 'install' must be a mapping")
+    unknown = set(install) - {"npm_flags"}
+    if unknown:
+        raise ValueError(
+            f"proofdeploy.yml 'install' has unknown keys: {sorted(unknown)}"
+        )
+    flags = install.get("npm_flags")
+    if flags is None:
+        return []
+    if (
+        not isinstance(flags, list)
+        or not flags
+        or not all(isinstance(f, str) for f in flags)
+    ):
+        raise ValueError(
+            "proofdeploy.yml 'install.npm_flags' must be a non-empty "
+            "list of flag strings"
+        )
+    out: list[str] = []
+    for flag in flags:
+        if flag not in _NPM_FLAGS_ALLOWLIST:
+            raise ValueError(
+                f"proofdeploy.yml 'install.npm_flags' has unsupported "
+                f"flag {flag!r}: the allowlist is "
+                f"{sorted(_NPM_FLAGS_ALLOWLIST)} (plan 1.2h)"
+            )
+        if flag in out:
+            raise ValueError(
+                f"proofdeploy.yml 'install.npm_flags' repeats {flag!r}"
+            )
+        out.append(flag)
+    return out
 
 
 @overload
