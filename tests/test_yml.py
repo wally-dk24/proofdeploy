@@ -107,3 +107,53 @@ def test_database_valid_loads(tmp_path):
     good = VALID + 'database:\n  kind: sqlite\n  path: ./app.db\n'
     c = load_contract(write(tmp_path, good))
     assert c.database == {"kind": "sqlite", "path": "./app.db"}
+
+
+# ---------------------------------------------------------------------------
+# app.path (plan 1.2b): the workspace member to build and start.
+# ---------------------------------------------------------------------------
+
+
+def test_app_path_loads(tmp_path):
+    c = load_contract(write(tmp_path, VALID + 'app:\n  path: "packages/web"\n'))
+    assert c.app_path == "packages/web"
+
+
+def test_app_absent_defaults_to_none(tmp_path):
+    c = load_contract(write(tmp_path, VALID))
+    assert c.app_path is None
+
+
+def test_app_root_path_loads(tmp_path):
+    c = load_contract(write(tmp_path, VALID + 'app:\n  path: "."\n'))
+    assert c.app_path == "."
+
+
+def test_app_path_is_normalized(tmp_path):
+    c = load_contract(write(tmp_path, VALID + 'app:\n  path: "./packages/web/"\n'))
+    assert c.app_path == "packages/web"
+
+
+def test_app_must_be_a_mapping(tmp_path):
+    with pytest.raises(ValueError, match="'app' must be a mapping"):
+        load_contract(write(tmp_path, VALID + 'app: "packages/web"\n'))
+
+
+def test_app_unknown_keys_rejected(tmp_path):
+    bad = VALID + 'app:\n  path: "packages/web"\n  pat: "typo"\n'
+    with pytest.raises(ValueError, match="'app' has unknown keys"):
+        load_contract(write(tmp_path, bad))
+
+
+def test_app_path_required(tmp_path):
+    with pytest.raises(ValueError, match="'app.path' must be a non-empty string"):
+        load_contract(write(tmp_path, VALID + "app:\n  path: ''\n"))
+    with pytest.raises(ValueError, match="'app.path' must be a non-empty string"):
+        load_contract(write(tmp_path, VALID + "app: {}\n"))
+
+
+def test_app_path_must_stay_inside_checkout(tmp_path):
+    with pytest.raises(ValueError, match="'app.path' must resolve inside"):
+        load_contract(write(tmp_path, VALID + 'app:\n  path: "/abs/web"\n'))
+    with pytest.raises(ValueError, match="'app.path' must resolve inside"):
+        load_contract(write(tmp_path, VALID + 'app:\n  path: "../outside"\n'))

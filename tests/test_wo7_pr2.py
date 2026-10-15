@@ -176,25 +176,44 @@ def test_node_plan_package_manager_lockfile_mismatch_refused(tmp_path):
     assert "pnpm" in plan.refusal
 
 
-def test_node_plan_workspaces_field_refused(tmp_path):
-    """Monorepo workspaces are refused with the registered wording."""
+def test_node_plan_workspaces_field_plans_the_member(tmp_path):
+    """Plan 1.2b: a package.json `workspaces` declaration is planned,
+    not refused (before 1.2b this asserted the typed refusal
+    "workspaces not yet supported" — the behavior the plan line
+    replaces). The single member is the app; the frozen install
+    stays at the root."""
     snap = _node_snapshot(
         tmp_path,
         package_json={"name": "t", "workspaces": ["packages/*"]},
     )
+    member = snap / "packages" / "app"
+    member.mkdir(parents=True)
+    (member / "package.json").write_text('{"name": "app"}\n', encoding="utf-8")
     plan = plan_provisioning(snap, _contract())
-    assert plan.refusal == "workspaces not yet supported"
+    assert plan.refusal is None
+    assert plan.package_manager == "npm"
+    assert plan.app_path == "packages/app"
+    start = next(s for s in plan.steps if s.phase == "start")
+    assert start.cwd == "packages/app"
 
 
-def test_node_plan_pnpm_workspace_yaml_refused(tmp_path):
+def test_node_plan_pnpm_workspace_yaml_plans_the_member(tmp_path):
+    """Plan 1.2b: a pnpm-workspace.yaml declaration is planned, not
+    refused (the pre-1.2b assertion of "workspaces not yet
+    supported" is the behavior the plan line replaces)."""
     snap = _node_snapshot(
         tmp_path,
         package_json={"name": "t"},
         lockfiles={"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
         extra={"pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n"},
     )
+    member = snap / "packages" / "app"
+    member.mkdir(parents=True)
+    (member / "package.json").write_text('{"name": "app"}\n', encoding="utf-8")
     plan = plan_provisioning(snap, _contract())
-    assert plan.refusal == "workspaces not yet supported"
+    assert plan.refusal is None
+    assert plan.package_manager == "pnpm"
+    assert plan.app_path == "packages/app"
 
 
 def test_node_plan_runtime_selection_from_engines(tmp_path):
@@ -362,7 +381,16 @@ def test_sandbox_executor_refuses_bun_plan(monkeypatch, tmp_path):
     assert fake.descriptors == []
 
 
-def test_sandbox_executor_refuses_workspaces_plan(monkeypatch, tmp_path):
+def test_sandbox_executor_refuses_ambiguous_workspace_plan(
+    monkeypatch, tmp_path
+):
+    """Plan 1.2b: a workspace the planner refuses (here: two member
+    apps and no contract app.path — the typed ambiguity refusal)
+    still fails closed in the sandbox executor: BUILD_FAILED with
+    the refusal as the reason, and no install step runs. (Before
+    1.2b this fixture was a single root workspace refused as
+    "workspaces not yet supported"; that shape is planned now, so
+    the refused-plan subject is the ambiguous shape.)"""
     from proofdeploy.runner import ProvisionStatus
     from proofdeploy.yml import RepoContract
 
@@ -372,6 +400,12 @@ def test_sandbox_executor_refuses_workspaces_plan(monkeypatch, tmp_path):
         json.dumps({"name": "t", "workspaces": ["packages/*"]}) + "\n"
     )
     (snap / "package-lock.json").write_text("{}\n")
+    for name in ("app", "other"):
+        member = snap / "packages" / name
+        member.mkdir(parents=True)
+        (member / "package.json").write_text(
+            json.dumps({"name": name}) + "\n", encoding="utf-8"
+        )
     contract = RepoContract(
         build="node --check server.js",
         start="node server.js",
@@ -382,7 +416,7 @@ def test_sandbox_executor_refuses_workspaces_plan(monkeypatch, tmp_path):
     orch = _stub_sandbox(monkeypatch, snap, contract, fake)
     side = orch._provision_side_sandbox("fakerev", 18095, snap / "unit", "t")
     assert side.provision.status == ProvisionStatus.BUILD_FAILED
-    assert side.provision.reason == "workspaces not yet supported"
+    assert side.provision.reason == "ambiguous app: 2 candidates"
     assert fake.descriptors == []
 
 
