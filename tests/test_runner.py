@@ -150,7 +150,7 @@ def test_verify_lockfile_missing(tmp_path):
     snap = tmp_path / "snap"
     snap.mkdir()
     (snap / "package.json").write_text("{}\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="no frozen lockfile"):
+    with pytest.raises(ValueError, match="not supported: no frozen lockfile"):
         verify_lockfile(snap, "node")
 
 
@@ -367,7 +367,7 @@ def test_provision_missing_lockfile(tmp_path):
         require_lockfile_match=False,
     )
     assert result.status == ProvisionStatus.BUILD_FAILED
-    assert result.reason is not None and "no frozen lockfile" in result.reason
+    assert result.reason is not None and "not supported: no frozen lockfile" in result.reason
     assert result.runtime == "node"
 
 
