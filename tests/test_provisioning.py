@@ -458,6 +458,60 @@ def test_node_plan_bun_digest_pinned_from_package_manager(tmp_path):
     assert plan.persisted_dirs == ["node_modules", ".pd-tools"]
 
 
+def test_node_plan_bun_1_2_20_digest_pinned_from_package_manager(
+    tmp_path,
+):
+    """Plan 1.2(e) follow-up: bun 1.2.20 (the version hono's
+    packageManager declares) has a digest pin — the plan resolves
+    it instead of refusing, records the version, and the bootstrap
+    step carries the committed digest for the host architecture."""
+    from proofdeploy.provisioning import BUN_RELEASE_SHA256
+
+    # The 1.2.20 digests, recorded literally: taken from the
+    # bun-v1.2.20 release's own SHASUMS256.txt and verified against
+    # the downloaded artifacts when the rows were added (ADR-0014's
+    # method). Pinning the values here means corrupting a table row
+    # fails this test, not just the install-time sha256sum -c.
+    assert BUN_RELEASE_SHA256["1.2.20"] == {
+        "x86_64": (
+            "bun-linux-x64.zip",
+            "4e9edc4cba0c7c1623a288be01e53bbde11a4d073f2cf339cab026627858b548",
+        ),
+        "aarch64": (
+            "bun-linux-aarch64.zip",
+            "98d2e0b2c09421569172b4d46b6f81378c2dbdd77480ebb27f3989dd4e72e18b",
+        ),
+    }
+
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={
+            "name": "t",
+            "packageManager": "bun@1.2.20",
+            "engines": {"node": ">=20"},
+        },
+        lockfile="bun.lock",
+    )
+    plan = plan_provisioning(snap, _contract(start="node server.js"))
+    assert plan.refusal is None
+    assert plan.package_manager == "bun"
+    assert plan.package_manager_version == "1.2.20"
+    assert plan.bun_version == "1.2.20"
+    artifact, digest = BUN_RELEASE_SHA256["1.2.20"][platform.machine()]
+    assert plan.bun_sha256 == digest
+    install = [s for s in plan.steps if s.phase == "install"]
+    assert len(install) == 2
+    bootstrap, frozen = install
+    assert bootstrap.argv is not None
+    assert bootstrap.argv[:2] == ["bash", "-c"]
+    script = bootstrap.argv[2]
+    assert "bun-v1.2.20" in script and artifact in script
+    assert digest in script and "sha256sum -c" in script
+    assert frozen.argv == [
+        "{checkout}/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+    ]
+
+
 def test_node_plan_bun_without_pin_uses_recorded_default(tmp_path):
     """No packageManager pin: the pin table's default bun is
     selected, digest-pinned exactly like a declared pin, and the

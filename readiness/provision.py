@@ -668,13 +668,28 @@ def provision_repo(
     }
 
 
+def _is_not_supported_row(row: dict) -> bool:
+    """A row in a typed not-supported class (D18's mechanism; the
+    drift class of plan 1.2(j) carries the registered
+    ``not supported:`` prefix on its typed reason). Such a side
+    is terminal by definition — the repo cannot be provisioned
+    as committed — so the harness never retries it (H5 judges it
+    skipped with its reason published); harness/environment
+    failures, which carry no such reason, are retried."""
+    typed = row.get("typed_reason") or ""
+    return typed.startswith("not supported:")
+
+
 def _rerun_targets(prior_path: Path) -> list[tuple[str, str]]:
+    """(unit, role) pairs to re-provision on an attempt-2 run:
+    every non-READY side from the prior attempt's rows, except
+    sides in a typed not-supported class (never retried)."""
     data = json.loads(prior_path.read_text(encoding="utf-8"))
     prior_rows = data["rows"] if isinstance(data, dict) else data
     return [
         (str(r["unit"]), str(r["role"]))
         for r in prior_rows
-        if r["status"] != "READY"
+        if r["status"] != "READY" and not _is_not_supported_row(r)
     ]
 
 

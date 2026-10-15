@@ -88,6 +88,7 @@ from proofdeploy.runner import (
     ProvisionResult,
     ProvisionStatus,
     _first_error_line,
+    _lockfile_drift_reason,
     find_lockfile,
 )
 from proofdeploy.runpair import (
@@ -1529,9 +1530,31 @@ class Orchestrator:
             step_output = getattr(sb, "failed_step_output", None)
             reason = "sandbox install failed"
             if step_output:
-                first_error = _first_error_line([step_output])
-                if first_error:
-                    reason = f"sandbox install failed: {first_error}"
+                # Plan 1.2(j): when the failed step is one of the
+                # plan's own install steps and its output is the
+                # manager's frozen-install refusal of a drifted
+                # lockfile, the reason is the typed not-supported
+                # string, not a generic failure. Contract steps
+                # (build/migrate/seed run through the same
+                # install_steps call) are NOT classified: their
+                # failures stay the generic BUILD_FAILED.
+                failed = next(
+                    (r for r in step_results if r["exit_code"] != 0),
+                    None,
+                )
+                drift = (
+                    _lockfile_drift_reason(
+                        plan.package_manager, [step_output]
+                    )
+                    if failed is not None and failed["phase"] == "install"
+                    else None
+                )
+                if drift is not None:
+                    reason = drift
+                else:
+                    first_error = _first_error_line([step_output])
+                    if first_error:
+                        reason = f"sandbox install failed: {first_error}"
             else:
                 failed_step = next(
                     (
