@@ -788,7 +788,7 @@ def test_workspace_without_lockfile_refuses_at_root(tmp_path):
     snap = _workspace_snapshot(tmp_path, lockfile=False)
     plan = NodeAdapter().plan(snap, _ws_contract(app_path="packages/app"))
     assert plan.refusal == (
-        "no frozen lockfile found in snapshot for runtime 'node'"
+        "not supported: no frozen lockfile found in snapshot for runtime 'node'"
     )
 
 
