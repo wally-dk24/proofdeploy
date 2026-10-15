@@ -25,6 +25,10 @@ from types import SimpleNamespace
 import pytest
 
 from proofdeploy.provisioning import (
+    InstallPlan,
+    NodeAdapter,
+    PythonAdapter,
+    detect_workspace,
     get_adapter,
     load_images,
     plan_provisioning,
@@ -409,13 +413,6 @@ def test_plan_provisioning_unknown_snapshot_raises(tmp_path):
 # workspace root; the contract steps are scoped to the resolved app
 # member; ambiguity and unsupported managers are typed refusals.
 # ---------------------------------------------------------------------------
-
-from proofdeploy.provisioning import (
-    InstallPlan,
-    NodeAdapter,
-    PythonAdapter,
-    detect_workspace,
-)
 
 
 def _workspace_snapshot(
