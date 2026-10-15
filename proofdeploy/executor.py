@@ -68,6 +68,7 @@ from typing import Any
 
 from proofdeploy.probe import SCHEMA_VERSION, ProbeRejected, validate_probe
 from proofdeploy.setup_auth import (
+    AuthProvider,
     CredentialProvider,
     PlaceholderError,
     SetupContext,
@@ -698,7 +699,7 @@ class Executor:
         return InconclusiveReason.AUTH
 
     def _provide_ghost_jwt(
-        self, provider: CredentialProvider, ctx: SetupContext, details: list[str]
+        self, provider: AuthProvider, ctx: SetupContext, details: list[str]
     ) -> InconclusiveReason | None:
         """Mint a short-lived Ghost Admin API JWT for this request."""
         cfg = provider.config
@@ -742,7 +743,7 @@ class Executor:
 
     def _provide_refresh(
         self,
-        provider: CredentialProvider,
+        provider: AuthProvider,
         ctx: SetupContext,
         details: list[str],
         writes: list[str],
@@ -927,7 +928,7 @@ class Executor:
 
     def _provide_login(
         self,
-        provider: CredentialProvider,
+        provider: AuthProvider,
         ctx: SetupContext,
         details: list[str],
         writes: list[str],
@@ -957,7 +958,7 @@ class Executor:
 
     def _provide_register(
         self,
-        provider: CredentialProvider,
+        provider: AuthProvider,
         ctx: SetupContext,
         details: list[str],
         writes: list[str],
