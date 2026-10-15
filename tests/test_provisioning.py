@@ -25,6 +25,10 @@ from types import SimpleNamespace
 import pytest
 
 from proofdeploy.provisioning import (
+    InstallPlan,
+    NodeAdapter,
+    PythonAdapter,
+    detect_workspace,
     get_adapter,
     load_images,
     plan_provisioning,
@@ -402,3 +406,235 @@ def test_plan_provisioning_unknown_snapshot_raises(tmp_path):
     empty.mkdir()
     with pytest.raises(ValueError):
         plan_provisioning(empty, _contract())
+
+
+# ---------------------------------------------------------------------------
+# Workspaces / monorepos (plan 1.2b): the frozen install runs at the
+# workspace root; the contract steps are scoped to the resolved app
+# member; ambiguity and unsupported managers are typed refusals.
+# ---------------------------------------------------------------------------
+
+
+def _workspace_snapshot(
+    tmp_path: Path,
+    *,
+    members: tuple[str, ...] = ("packages/app",),
+    manager: str = "pnpm",
+    root_extra: dict | None = None,
+    lockfile: bool = True,
+) -> Path:
+    """A Node workspace snapshot: root + member package dirs."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    root_pkg: dict = {
+        "name": "ws-root",
+        "private": True,
+        "engines": {"node": ">=20 <25"},
+    }
+    if manager == "pnpm":
+        root_pkg["packageManager"] = "pnpm@9.15.0"
+        (snap / "pnpm-workspace.yaml").write_text(
+            "packages:\n  - 'packages/*'\n", encoding="utf-8"
+        )
+        if lockfile:
+            (snap / "pnpm-lock.yaml").write_text(
+                "lockfileVersion: '9.0'\n", encoding="utf-8"
+            )
+    elif manager == "npm":
+        root_pkg["workspaces"] = ["packages/*"]
+        if lockfile:
+            (snap / "package-lock.json").write_text("{}", encoding="utf-8")
+    elif manager == "yarn":
+        root_pkg["workspaces"] = ["packages/*"]
+        if lockfile:
+            (snap / "yarn.lock").write_text("# yarn lockfile v1\n",
+                                            encoding="utf-8")
+    if root_extra:
+        root_pkg.update(root_extra)
+    (snap / "package.json").write_text(json.dumps(root_pkg), encoding="utf-8")
+    for member in members:
+        d = snap / member
+        d.mkdir(parents=True)
+        (d / "package.json").write_text(
+            json.dumps({"name": member.replace("/", "-")}),
+            encoding="utf-8",
+        )
+    return snap
+
+
+def _ws_contract(**kw):
+    return _contract(
+        build="npm run build", start="node server.js", **kw
+    )
+
+
+def test_detect_workspace_from_pnpm_yaml(tmp_path):
+    snap = _workspace_snapshot(
+        tmp_path, members=("packages/lib", "packages/app")
+    )
+    layout = detect_workspace(snap)
+    assert layout is not None
+    assert layout.source == "pnpm-workspace.yaml"
+    assert layout.members == ["packages/app", "packages/lib"]
+
+
+def test_detect_workspace_from_package_json_forms(tmp_path):
+    snap = _workspace_snapshot(tmp_path, manager="npm")
+    layout = detect_workspace(snap)
+    assert layout is not None
+    assert layout.source == "package.json"
+    assert layout.members == ["packages/app"]
+    # The mapping form ({packages: [...]}) declares the same globs.
+    pkg = json.loads((snap / "package.json").read_text(encoding="utf-8"))
+    pkg["workspaces"] = {"packages": ["packages/*"], "nohoist": []}
+    (snap / "package.json").write_text(json.dumps(pkg), encoding="utf-8")
+    layout = detect_workspace(snap)
+    assert layout is not None
+    assert layout.members == ["packages/app"]
+
+
+def test_detect_workspace_applies_exclusions(tmp_path):
+    snap = _workspace_snapshot(
+        tmp_path, members=("packages/app", "packages/excluded")
+    )
+    (snap / "pnpm-workspace.yaml").write_text(
+        "packages:\n  - 'packages/*'\n  - '!packages/excluded'\n",
+        encoding="utf-8",
+    )
+    layout = detect_workspace(snap)
+    assert layout is not None
+    assert layout.members == ["packages/app"]
+
+
+def test_pnpm_workspace_plan_scopes_contract_steps(tmp_path):
+    snap = _workspace_snapshot(
+        tmp_path, members=("packages/app", "packages/lib")
+    )
+    plan = NodeAdapter().plan(snap, _ws_contract(app_path="packages/app"))
+    assert plan.refusal is None
+    assert plan.workspace_root == "."
+    assert plan.app_path == "packages/app"
+    assert plan.package_manager == "pnpm"
+    assert plan.lockfile_name == "pnpm-lock.yaml"
+    installs = [s for s in plan.steps if s.phase == "install"]
+    assert installs and all(s.cwd is None for s in installs)
+    frozen = [
+        s for s in installs if s.argv and "--frozen-lockfile" in s.argv
+    ]
+    assert frozen, [s.argv for s in installs]
+    scoped = {s.phase: s.cwd for s in plan.steps if s.shell}
+    assert scoped == {"build": "packages/app", "start": "packages/app"}
+    assert "packages/app/node_modules" in plan.persisted_dirs
+    assert "node_modules" in plan.persisted_dirs
+
+
+def test_workspace_single_member_needs_no_declaration(tmp_path):
+    snap = _workspace_snapshot(tmp_path, members=("packages/app",))
+    plan = NodeAdapter().plan(snap, _ws_contract())
+    assert plan.refusal is None
+    assert plan.app_path == "packages/app"
+    start = next(s for s in plan.steps if s.phase == "start")
+    assert start.cwd == "packages/app"
+
+
+def test_workspace_two_members_no_declaration_is_ambiguous(tmp_path):
+    snap = _workspace_snapshot(
+        tmp_path, members=("packages/app", "packages/other")
+    )
+    plan = NodeAdapter().plan(snap, _ws_contract())
+    assert plan.refusal == "ambiguous app: 2 candidates"
+    assert plan.lockfile_name is None
+    assert plan.steps == []
+
+
+def test_workspace_declared_path_must_be_a_member(tmp_path):
+    snap = _workspace_snapshot(tmp_path, members=("packages/app",))
+    plan = NodeAdapter().plan(snap, _ws_contract(app_path="packages/nope"))
+    assert plan.refusal is not None
+    assert plan.refusal.startswith(
+        "app.path 'packages/nope' is not a workspace package"
+    )
+
+
+def test_workspace_no_members_scopes_to_root(tmp_path):
+    snap = _workspace_snapshot(tmp_path, members=())
+    (snap / "pnpm-workspace.yaml").write_text(
+        "packages: []\n", encoding="utf-8"
+    )
+    plan = NodeAdapter().plan(snap, _ws_contract())
+    assert plan.refusal is None
+    assert plan.app_path == "."
+    assert all(s.cwd is None for s in plan.steps)
+
+
+def test_npm_workspace_plan(tmp_path):
+    snap = _workspace_snapshot(tmp_path, manager="npm")
+    plan = NodeAdapter().plan(snap, _ws_contract())
+    assert plan.refusal is None
+    assert plan.package_manager == "npm"
+    assert plan.app_path == "packages/app"
+    installs = [s for s in plan.steps if s.phase == "install"]
+    assert any(
+        s.argv and s.argv[:2] == ["npm", "ci"] for s in installs
+    )
+    start = next(s for s in plan.steps if s.phase == "start")
+    assert start.cwd == "packages/app"
+
+
+def test_yarn_workspace_is_a_typed_refusal(tmp_path):
+    snap = _workspace_snapshot(tmp_path, manager="yarn")
+    plan = NodeAdapter().plan(snap, _ws_contract())
+    assert plan.refusal == (
+        "workspaces not yet supported for package manager 'yarn'"
+    )
+
+
+def test_workspace_without_lockfile_refuses_at_root(tmp_path):
+    snap = _workspace_snapshot(tmp_path, lockfile=False)
+    plan = NodeAdapter().plan(snap, _ws_contract(app_path="packages/app"))
+    assert plan.refusal == (
+        "no frozen lockfile found in snapshot for runtime 'node'"
+    )
+
+
+def test_python_plan_workspace_is_a_typed_refusal(tmp_path):
+    snap = _python_snapshot(
+        tmp_path, pyproject='[project]\nname = "x"\nrequires-python = ">=3.12"\n'
+    )
+    plan = PythonAdapter().plan_workspace(snap, _contract())
+    assert plan.refusal == (
+        "workspaces not yet supported for runtime 'python'"
+    )
+    assert plan.steps == []
+
+
+def test_plan_provisioning_routes_a_workspace_snapshot(tmp_path):
+    snap = _workspace_snapshot(
+        tmp_path, members=("packages/app", "packages/lib")
+    )
+    plan = plan_provisioning(snap, _ws_contract(app_path="packages/lib"))
+    assert plan.refusal is None
+    assert plan.app_path == "packages/lib"
+
+
+def test_workspace_plan_round_trips_through_dict(tmp_path):
+    snap = _workspace_snapshot(tmp_path)
+    plan = NodeAdapter().plan(snap, _ws_contract())
+    again = InstallPlan.from_dict(plan.to_dict())
+    assert again.to_dict() == plan.to_dict()
+    assert again.app_path == "packages/app"
+    start = next(s for s in again.steps if s.phase == "start")
+    assert start.cwd == "packages/app"
+
+
+def test_non_workspace_plan_carries_no_workspace_fields(tmp_path):
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "plain", "engines": {"node": ">=20 <25"}},
+    )
+    (snap / "package-lock.json").write_text("{}", encoding="utf-8")
+    plan = NodeAdapter().plan(snap, _ws_contract())
+    assert plan.refusal is None
+    assert plan.workspace_root is None
+    assert plan.app_path is None
+    assert all(s.cwd is None for s in plan.steps)

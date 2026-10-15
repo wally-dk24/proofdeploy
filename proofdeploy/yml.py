@@ -15,6 +15,15 @@ a list of env NAMES for which ProofDeploy generates a fresh random
 value per side and per run (Addendum 43/44). The generated values are
 never written into the contract or any committed file; the contract
 declares only the names.
+
+`app` (optional, added 2026-10-14 for monorepo/workspace support,
+plan 1.2b) names the workspace member to build and start: a mapping
+with the single key `path` — the package directory inside the
+checkout ("." for the workspace root itself). The provisioning
+adapter installs frozen from the workspace root and runs the
+contract's build/migrate/seed/start scoped to that directory. A
+workspace with several candidate apps and no `app.path` is a typed
+refusal ("ambiguous app: <n> candidates"), never a guess.
 """
 
 from __future__ import annotations
@@ -75,6 +84,12 @@ class RepoContract:
     # `headers` and `login_body` are string mappings and `bootstrap_env`
     # is a list of env names (WO-8.3), so the mapping is dict[str, Any].
     auth: dict[str, Any] | None = None
+    # Workspace member to build and start (optional, plan 1.2b): the
+    # `app.path` declaration, normalized ("packages/web", or "." for
+    # the workspace root). Absent means the adapter resolves the app
+    # from the workspace layout itself (single member, or the root)
+    # or refuses an ambiguous workspace with a typed refusal.
+    app_path: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> RepoContract:
@@ -124,6 +139,7 @@ class RepoContract:
         auth = data.get("auth")
         if auth is not None:
             auth = _validate_auth(auth)
+        app_path = _validate_app(data.get("app"))
         return cls(
             build=data["build"],
             start=data["start"],
@@ -134,7 +150,40 @@ class RepoContract:
             fixture=dict(fixture),
             database=database,
             auth=auth,
+            app_path=app_path,
         )
+
+
+def _validate_app(app: Any) -> str | None:
+    """Validate the contract's `app:` mapping (plan 1.2b).
+
+    The one key is `path`: the workspace member directory to build
+    and start, declared so a multi-app workspace names its app
+    instead of the adapter guessing. Unknown keys are refused (the
+    same rule as the `database` and `auth` mappings: typos must
+    fail, not silently pass). The path must stay inside the
+    checkout (same rule as `database.path` — the contract comes
+    from untrusted repos). Returns the normalized path ("." for
+    the workspace root itself), or None when `app` is absent.
+    """
+    if app is None:
+        return None
+    if not isinstance(app, dict):
+        raise ValueError("proofdeploy.yml 'app' must be a mapping")
+    unknown = set(app) - {"path"}
+    if unknown:
+        raise ValueError(
+            f"proofdeploy.yml 'app' has unknown keys: {sorted(unknown)}"
+        )
+    path = app.get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError("proofdeploy.yml 'app.path' must be a non-empty string")
+    if path.startswith("/") or ".." in Path(path).parts:
+        raise ValueError(
+            "proofdeploy.yml 'app.path' must resolve inside the "
+            f"checkout, got: {path!r}"
+        )
+    return str(Path(path))
 
 
 @overload

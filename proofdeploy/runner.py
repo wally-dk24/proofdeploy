@@ -1188,6 +1188,11 @@ class Provisioner:
                 entry["shell"] = shell
             else:
                 entry["argv_rendered"] = list(cmd)
+            if cwd != snap:
+                # Plan 1.2b: a workspace-scoped step ran in the app
+                # member's directory; record where, relative to the
+                # checkout root (the sandbox records the same fact).
+                entry["cwd"] = cwd.relative_to(snap).as_posix()
             entry["exit_code"] = _exit_code_from_reason(ok, reason)
             executed.append(entry)
             return ok, reason
@@ -1623,7 +1628,9 @@ class Provisioner:
             step_name = step.phase
             logs.append(f"contract step: {step_name}")
             ok, reason = _run_step(
-                shlex.split(step.shell), snap, self.build_timeout,
+                shlex.split(step.shell),
+                snap / step.cwd if step.cwd else snap,
+                self.build_timeout,
                 {**step_env, **step.env},
                 phase=step.phase, shell=step.shell,
             )
@@ -1696,6 +1703,10 @@ class Provisioner:
             "shell": start_cmd,
             "exit_code": None,
         }
+        if start_step is not None and start_step.cwd:
+            # Plan 1.2b: the workspace app starts in its member
+            # directory (recorded, as the sandbox records it).
+            start_record["cwd"] = start_step.cwd
         executed.append(start_record)
         proc: subprocess.Popen[str] | None = None
         keep_proc = False  # set True on READY to transfer ownership to caller
@@ -1704,7 +1715,11 @@ class Provisioner:
             try:
                 proc = subprocess.Popen(
                     shlex.split(start_cmd),
-                    cwd=snap,
+                    cwd=(
+                        snap / start_step.cwd
+                        if start_step is not None and start_step.cwd
+                        else snap
+                    ),
                     stdout=log_fh,
                     stderr=subprocess.STDOUT,
                     text=True,

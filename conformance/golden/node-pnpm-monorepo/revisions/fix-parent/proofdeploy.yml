@@ -1,0 +1,25 @@
+build: "node --check server.js"
+migrate: node migrate.js
+seed: node seed.js
+start: node server.js
+readiness: /health
+app:
+  path: packages/notes-app
+env:
+  CANARY_SECRET: pdcanary-env-monorepo
+database:
+  kind: sqlite
+  path: ./packages/notes-app/app.db
+auth:
+  mode: register
+  path: /register
+  method: POST
+  username_field: username
+  password_field: password
+  token_json_path: token
+fixture:
+  repo_name: node-pnpm-monorepo
+  seed_note: seed user seeduser/seedpass owns note id 1 (done=false) after seed
+  auth_mechanism: Bearer token from POST /register or /login in the Authorization header
+  auth_scope: a regular user token
+  flags_note: no feature flags

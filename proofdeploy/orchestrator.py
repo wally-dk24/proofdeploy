@@ -1385,26 +1385,34 @@ class Orchestrator:
                 key: render_argv([value], argv_mapping, [])[0]
                 for key, value in step.env.items()
             }
+            spec: dict = {"phase": step.phase, "env": step_env}
             if step.argv is not None:
                 argv = render_argv(
                     step.argv,
                     argv_mapping,
                     pip_flags(plan, sandbox=True),
                 )
-                step_specs.append({
-                    "phase": step.phase,
-                    "command": shlex.join(argv),
-                    "argv_rendered": argv,
-                    "env": step_env,
-                })
+                spec["command"] = shlex.join(argv)
+                spec["argv_rendered"] = argv
             elif step.shell is not None:
                 rendered = _sandbox_step_command(step.shell, runtime_name)
-                step_specs.append({
-                    "phase": step.phase,
-                    "command": rendered,
-                    "shell": rendered,
-                    "env": step_env,
-                })
+                spec["command"] = rendered
+                spec["shell"] = rendered
+            else:
+                continue
+            if step.cwd:
+                # Plan 1.2b: the step is scoped to a workspace
+                # member — run it in that directory inside the
+                # checkout (the container's workdir stays the
+                # checkout root; the cd is part of the recorded
+                # command, as issued). The member path comes from
+                # the untrusted repo, so it is shell-quoted: an
+                # odd-but-legal directory name stays a single cd
+                # argument instead of breaking out into the shell.
+                quoted = shlex.quote(f"/checkout/{step.cwd}")
+                spec["command"] = f"cd {quoted} && {spec['command']}"
+                spec["cwd"] = step.cwd
+            step_specs.append(spec)
         # PIP_NO_CACHE_DIR=1: pip warns the cache dir isn't writable as
         # the sandbox user; the venv removes the running-as-root warning.
         # WO-8.3: the install phase (build/migrate/seed) runs with this
@@ -1425,6 +1433,8 @@ class Orchestrator:
                 entry["argv_rendered"] = spec["argv_rendered"]
             else:
                 entry["shell"] = spec["shell"]
+            if "cwd" in spec:
+                entry["cwd"] = spec["cwd"]
             entry["exit_code"] = result["exit_code"]
             executed.append(entry)
         # REG-A (WO-8.1): read the generated lock back for the
@@ -1529,15 +1539,27 @@ class Orchestrator:
             else contract.start,
             runtime_name,
         )
+        # Plan 1.2b: a workspace start runs in the app member's
+        # directory (same scoping as the install-phase steps,
+        # including the shell-quoting of the repo-controlled path).
+        start_cwd = (
+            start_step.cwd if start_step is not None else None
+        )
+        if start_cwd:
+            quoted = shlex.quote(f"/checkout/{start_cwd}")
+            start_cmd = f"cd {quoted} && {start_cmd}"
         # Addendum 31: the start step is recorded as it is issued; its
         # exit_code stays None (the app container's exit is not a
         # completed step exit the executor observes).
-        executed.append({
+        start_entry: dict = {
             "phase": "start",
             "executor": "sandbox",
             "shell": start_cmd,
             "exit_code": None,
-        })
+        }
+        if start_cwd:
+            start_entry["cwd"] = start_cwd
+        executed.append(start_entry)
         try:
             # WO-8.3: the app container also gets this side's generated
             # bootstrap values (e.g. an instance that reads its admin

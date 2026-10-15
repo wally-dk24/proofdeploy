@@ -1,0 +1,10 @@
+{
+  "name": "notes-app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@pd-golden/shared": "workspace:*",
+    "better-sqlite3": "^12.11.1",
+    "express": "^5.0.0"
+  }
+}

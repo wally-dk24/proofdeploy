@@ -203,9 +203,14 @@ def test_row_from_provision_records_the_refusal_that_fired(
     # satisfies (the re-run's Directus declared the bare "22",
     # which the pre-WO-8.4a parser misread as exact 22.0.0; the
     # shape now declares "23", for which no image is pinned).
-    # The real Node plan for such
-    # a snapshot carries BOTH refusals — `refusal` ("workspaces not
-    # yet supported") and the sandbox-only `image_refusal` (the
+    # Since plan 1.2b the workspace side of the shape is an
+    # AMBIGUOUS workspace — two member packages and no contract
+    # app.path — whose plan refusal is "ambiguous app: 2
+    # candidates" (before 1.2b it was "workspaces not yet
+    # supported"; the both-refusals premise this test exists for
+    # is unchanged). The real Node plan for such
+    # a snapshot carries BOTH refusals — `refusal` (the ambiguity
+    # refusal) and the sandbox-only `image_refusal` (the
     # range refusal) — and the sandbox executor checks
     # `image_refusal` before `plan.refusal` is ever consulted, so
     # the side stops on the range refusal: that is its provision
@@ -229,12 +234,16 @@ def test_row_from_provision_records_the_refusal_that_fired(
     (snap / "pnpm-workspace.yaml").write_text(
         "packages:\n  - 'packages/*'\n", encoding="utf-8"
     )
-    (snap / "pnpm-lock.yaml").write_text(
-        "lockfileVersion: '9.0'\n", encoding="utf-8"
-    )
+    for member in ("packages/a", "packages/b"):
+        member_dir = snap / member
+        member_dir.mkdir(parents=True)
+        (member_dir / "package.json").write_text(
+            json.dumps({"name": member.replace("/", "-")}),
+            encoding="utf-8",
+        )
     plan = NodeAdapter().plan(snap, contract=None)
     # The premise, from the real planner: both refusals on one plan.
-    assert plan.refusal == "workspaces not yet supported"
+    assert plan.refusal == "ambiguous app: 2 candidates"
     assert plan.image_refusal == (
         "declared range 23 not satisfiable by pinned images"
     )

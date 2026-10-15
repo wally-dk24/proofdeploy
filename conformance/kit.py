@@ -50,7 +50,15 @@ from typing import Any
 
 GOLDEN_DIR = Path(__file__).parent / "golden"
 
-APPS = ("node-express-sqlite", "node-pnpm-sqlite", "python-flask-sqlite")
+APPS = (
+    "node-express-sqlite",
+    "node-pnpm-sqlite",
+    "python-flask-sqlite",
+    # Plan 1.2b: a pnpm workspace — a shared library package plus
+    # the app package (packages/notes-app) the contract's app.path
+    # names; the planted bug lives in the library.
+    "node-pnpm-monorepo",
+)
 
 # The app's own history, in commit order. The kit maps these onto the
 # measured-run revs: B^ = base, B = bug, fix^ = fix-parent, fix = fix,
