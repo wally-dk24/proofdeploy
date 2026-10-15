@@ -65,6 +65,10 @@ FROZEN_INSTALL = {
     "node-pnpm-sqlite": ["/checkout/.pd-tools/node_modules/.bin/corepack",
                          "pnpm@9.15.0", "install", "--frozen-lockfile"],
     "python-flask-sqlite": ["install", "--require-hashes", "--no-deps"],
+    # The workspace golden installs frozen from the root with the
+    # same corepack-pinned pnpm as node-pnpm-sqlite.
+    "node-pnpm-monorepo": ["/checkout/.pd-tools/node_modules/.bin/corepack",
+                           "pnpm@9.15.0", "install", "--frozen-lockfile"],
 }
 
 # The concrete install error each ecosystem prints when the lockfile
@@ -73,6 +77,7 @@ MISMATCH_MARKERS = {
     "node-express-sqlite": "EUSAGE",
     "node-pnpm-sqlite": "OUTDATED_LOCKFILE",
     "python-flask-sqlite": "DO NOT MATCH",
+    "node-pnpm-monorepo": "OUTDATED_LOCKFILE",
 }
 
 

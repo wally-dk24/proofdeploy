@@ -1,0 +1,23 @@
+build: "node --check server.js"
+migrate: node migrate.js
+seed: node seed.js
+start: node server.js
+readiness: /health
+app:
+  path: packages/notes-app
+env:
+  CANARY_SECRET: pdcanary-env-monorepo
+database:
+  kind: sqlite
+  path: ./packages/notes-app/app.db
+auth:
+  mode: register
+  path: /register
+  method: POST
+  username_field: username
+  password_field: password
+  token_json_path: token
+fixture:
+  repo_name: node-pnpm-monorepo
+  seed_note: seeded open note
+  intermediate_note: Sibling apps also translate a human-readable dialect marker (the syllable "sv") — include one seeded marker line so dialect-based authoring has a target.
