@@ -12,23 +12,32 @@ candidate selection, implementing REG-C (wo6-selection-rule.md) as amended:
   matching, case-insensitive).
 - Item 3 as amended by A2 (Node) and A3 (Python): mechanical filters at
   the default branch's HEAD SHA (file checks only; no issues, PRs,
-  commits or diffs are ever fetched).
+  commits or diffs are ever fetched). Per the reviewer's F1 ruling on
+  PR #108, A2's workspace packages are the members declared by the
+  repo's own workspace configuration (root package.json `workspaces`,
+  pnpm-workspace.yaml `packages`, lerna.json `packages`), never every
+  nested package.json. Per F2, a truncated recursive tree is decided
+  from non-recursive per-directory listings, and an undecidable repo
+  is a harness failure, never an exclusion.
 - Item 4, unchanged: survivors sorted by stars descending, ties by
   owner/name.
 
 Running this script against the live API IS the A5 single run; it is
 reviewed before that happens. The token, if any, comes from the
 GITHUB_TOKEN environment variable (read-only, per REG-C item 1) and is
-never written to any output. Rate limits are handled by waiting and
+never written to any output; the record carries only
+`authenticated: true/false`. Rate limits are handled by waiting and
 retrying; a repo whose checks still fail after retries is recorded as
 "harness or environment: <error>", never as excluded.
 """
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import io
 import json
 import os
+import re
 import tarfile
 import time
 import urllib.error
@@ -76,6 +85,10 @@ class HarnessError(Exception):
     """
 
 
+class NotFound(HarnessError):
+    """The API answered 404: the path does not exist at that SHA (F3)."""
+
+
 def pushed_since(snapshot_date: str) -> str:
     """REG-C item 1: pushed:>=(snapshot date minus 90 days)."""
     d = date.fromisoformat(snapshot_date)
@@ -108,6 +121,7 @@ class Fetcher:
     failure (403/429 rate limiting, 5xx, network error) is retried after
     the server-provided wait (Retry-After, else X-RateLimit-Reset, else
     exponential backoff); after max_retries the call raises HarnessError.
+    A 404 raises NotFound immediately (F3: typed, never substring-matched).
     """
 
     def __init__(
@@ -121,6 +135,11 @@ class Fetcher:
         self._sleep = sleep
         self._max_retries = max_retries
         self._raw_fetch = raw_fetch or self._urllib_fetch
+
+    @property
+    def authenticated(self) -> bool:
+        """True when a token is in use (the token itself is never recorded)."""
+        return self._token is not None
 
     def _urllib_fetch(
         self, url: str, headers: dict[str, str]
@@ -161,7 +180,7 @@ class Fetcher:
             if status == 200:
                 return body
             if status == 404:
-                raise HarnessError(f"GET {url} -> 404")
+                raise NotFound(f"GET {url} -> 404")
             retryable = status in (0, 403, 429) or 500 <= status < 600
             last = f"GET {url} -> HTTP {status}"
             if not retryable:
@@ -179,13 +198,21 @@ class Fetcher:
 
 def collect_pool(
     fetcher: Fetcher, snapshot_date: str, sleep: Callable[[float], None] = time.sleep
-) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
-    """REG-C item 1 as amended by A1. Returns (pool, per-query counts)."""
+) -> tuple[dict[str, dict[str, Any]], dict[str, int], dict[str, Any]]:
+    """REG-C item 1 as amended by A1.
+
+    Returns (pool, per-query counts, per-language search metadata).
+    The metadata records every page's returned count, total_count and
+    incomplete_results (F4).
+    """
     pool: dict[str, dict[str, Any]] = {}
     counts: dict[str, int] = {}
+    search_meta: dict[str, Any] = {}
     for language in LANGUAGES:
         q = urllib.parse.quote(search_query(language, snapshot_date))
         returned = 0
+        pages_meta: list[dict[str, Any]] = []
+        lang_incomplete = False
         for page in range(1, MAX_PAGES + 1):
             url = (
                 f"{API}/search/repositories?q={q}"
@@ -193,6 +220,14 @@ def collect_pool(
             )
             data = fetcher.get_json(url)
             items = data.get("items", [])
+            incomplete = bool(data.get("incomplete_results", False))
+            lang_incomplete = lang_incomplete or incomplete
+            pages_meta.append({
+                "page": page,
+                "returned": len(items),
+                "total_count": data.get("total_count"),
+                "incomplete_results": incomplete,
+            })
             returned += len(items)
             for it in items:
                 fn = it["full_name"]
@@ -209,7 +244,11 @@ def collect_pool(
                 break
             sleep(2)
         counts[language] = returned
-    return pool, counts
+        search_meta[language] = {
+            "pages": pages_meta,
+            "incomplete_results": lang_incomplete,
+        }
+    return pool, counts, search_meta
 
 
 def head_sha(fetcher: Fetcher, full_name: str, default_branch: str) -> str:
@@ -227,51 +266,205 @@ def repo_paths(fetcher: Fetcher, full_name: str, sha: str) -> tuple[set[str], bo
     return paths, bool(data.get("truncated", False))
 
 
+class TreeIndex:
+    """Path oracle for the item-3 filters, over one repo at one SHA.
+
+    Complete mode answers from the recursive tree's blob set. When the
+    recursive tree is truncated (F2), membership answers stay sound:
+    a path present in the truncated set exists, and anything else is
+    decided from a non-recursive contents-API listing of its directory
+    (root, depth-one dirs, matched workspace dirs — fetched on demand
+    and cached). A listing that cannot be fetched at all raises
+    HarnessError("tree truncated"): the repo is recorded as a harness
+    failure, never excluded on missing data.
+    """
+
+    def __init__(
+        self,
+        fetcher: Fetcher,
+        full_name: str,
+        sha: str,
+        paths: set[str],
+        truncated: bool,
+    ) -> None:
+        self._fetcher = fetcher
+        self._full_name = full_name
+        self._sha = sha
+        self._paths = paths
+        self._truncated = truncated
+        self._dirs: set[str] | None = None
+        self._listings: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+
+    def _all_dirs(self) -> set[str]:
+        if self._dirs is None:
+            dirs: set[str] = set()
+            for p in self._paths:
+                parts = p.split("/")[:-1]
+                for i in range(1, len(parts) + 1):
+                    dirs.add("/".join(parts[:i]))
+            self._dirs = dirs
+        return self._dirs
+
+    def _listing(self, dir_path: str) -> tuple[frozenset[str], frozenset[str]]:
+        """(file paths, subdir paths) directly inside dir_path ('' = root)."""
+        cached = self._listings.get(dir_path)
+        if cached is not None:
+            return cached
+        quoted = urllib.parse.quote(dir_path, safe="/")
+        url = f"{API}/repos/{self._full_name}/contents"
+        if dir_path:
+            url += f"/{quoted}"
+        url += f"?ref={self._sha}"
+        try:
+            data = self._fetcher.get_json(url)
+        except NotFound:
+            result: tuple[frozenset[str], frozenset[str]] = (frozenset(), frozenset())
+        except HarnessError as e:
+            raise HarnessError("tree truncated") from e
+        else:
+            if isinstance(data, list):
+                files = frozenset(
+                    str(e["path"]) for e in data
+                    if isinstance(e, dict) and e.get("type") in ("file", "symlink")
+                )
+                dirs = frozenset(
+                    str(e["path"]) for e in data
+                    if isinstance(e, dict) and e.get("type") == "dir"
+                )
+                result = (files, dirs)
+            else:  # the path is a file, not a directory: no children
+                result = (frozenset(), frozenset())
+        self._listings[dir_path] = result
+        return result
+
+    def root_files(self) -> set[str]:
+        if not self._truncated:
+            return {p for p in self._paths if "/" not in p}
+        files, _ = self._listing("")
+        return set(files)
+
+    def has_file(self, path: str) -> bool:
+        if path in self._paths:
+            return True
+        if not self._truncated:
+            return False
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        files, _ = self._listing(parent)
+        return path in files
+
+    def child_dirs(self, dir_path: str) -> set[str]:
+        if self._truncated:
+            _, dirs = self._listing(dir_path)
+            return set(dirs)
+        return {
+            d for d in self._all_dirs()
+            if (d.rsplit("/", 1)[0] if "/" in d else "") == dir_path
+        }
+
+    def match_dirs(self, patterns: list[str]) -> list[str]:
+        """Directories matched by workspace patterns (F1).
+
+        Positive patterns union; `!` patterns subtract. `*` matches
+        one path segment, `**` any number (including zero).
+        """
+        matched: set[str] = set()
+        for pat in patterns:
+            if not pat.startswith("!"):
+                matched |= self._expand_pattern(pat)
+        for pat in patterns:
+            if pat.startswith("!"):
+                matched -= self._expand_pattern(pat[1:])
+        return sorted(matched)
+
+    def _expand_pattern(self, pattern: str) -> set[str]:
+        pat = pattern.strip()
+        if pat.startswith("./"):
+            pat = pat[2:]
+        segs = [s for s in pat.strip("/").split("/") if s not in ("", ".")]
+        current = {""}
+        for seg in segs:
+            nxt: set[str] = set()
+            if seg == "**":
+                seen = set(current)
+                frontier = list(current)
+                while frontier:
+                    d = frontier.pop()
+                    for child in self.child_dirs(d):
+                        if child not in seen:
+                            seen.add(child)
+                            frontier.append(child)
+                nxt = seen
+            else:
+                for d in current:
+                    for child in self.child_dirs(d):
+                        if fnmatch.fnmatchcase(child.rsplit("/", 1)[-1], seg):
+                            nxt.add(child)
+            current = nxt
+            if not current:
+                break
+        return current
+
+
 def fetch_file_text(fetcher: Fetcher, full_name: str, path: str, sha: str) -> str | None:
-    """A file's raw content at the SHA, or None when it does not exist."""
+    """A file's raw content at the SHA, or None when it does not exist.
+
+    "Does not exist" is decided by the typed NotFound (F3), never by
+    matching "404" in an error message.
+    """
     url = (
         f"{API}/repos/{full_name}/contents/{urllib.parse.quote(path, safe='/')}"
         f"?ref={sha}"
     )
     try:
         return fetcher.get_text(url)
-    except HarnessError as e:
-        if "404" in str(e):
-            return None
-        raise
+    except NotFound:
+        return None
 
 
 def fetch_package_json(
     fetcher: Fetcher, full_name: str, path: str, sha: str
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, bool]:
+    """(parsed package.json or None, unparseable flag) (F5).
+
+    (None, False) = the file does not exist at the SHA. (None, True) =
+    it exists but is not a parseable JSON object; callers give it its
+    own typed reason instead of treating it as absent.
+    """
     text = fetch_file_text(fetcher, full_name, path, sha)
     if text is None:
-        return None
+        return None, False
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+        return None, True
+    if not isinstance(parsed, dict):
+        return None, True
+    return parsed, False
 
 
-def repo_contains_string(fetcher: Fetcher, full_name: str, sha: str, needle: bytes) -> bool:
-    """True when the needle appears in any file of the repo at the SHA.
+def repo_contains_string(
+    fetcher: Fetcher, full_name: str, sha: str, needle: bytes
+) -> tuple[bool, int]:
+    """(found, members skipped over the size cap) for a tarball scan.
 
     One tarball fetch for the exact SHA, scanned member by member (the
     mechanism scripts/wo6/regc_stage2.py used for the same check).
+    Members larger than TARBALL_MEMBER_CAP are skipped; the skip count
+    is returned so a not-found verdict can say so (F5).
     """
     blob = fetcher.get_bytes(f"{API}/repos/{full_name}/tarball/{sha}")
+    skipped = 0
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
         for member in tf.getmembers():
-            if member.isfile() and member.size <= TARBALL_MEMBER_CAP:
-                f = tf.extractfile(member)
-                if f is not None and needle in f.read():
-                    return True
-    return False
-
-
-def _root_files(paths: set[str]) -> set[str]:
-    return {p for p in paths if "/" not in p}
+            if not member.isfile():
+                continue
+            if member.size > TARBALL_MEMBER_CAP:
+                skipped += 1
+                continue
+            f = tf.extractfile(member)
+            if f is not None and needle in f.read():
+                return True, skipped
+    return False, skipped
 
 
 def _dependencies(pkg: dict[str, Any] | None) -> set[str]:
@@ -288,47 +481,147 @@ def _has_start(pkg: dict[str, Any] | None) -> bool:
     return isinstance(scripts, dict) and "start" in scripts
 
 
+def _parse_pnpm_workspace(text: str) -> list[str]:
+    """The `packages:` list of a pnpm-workspace.yaml (F1).
+
+    Minimal line parser (the script stays stdlib-only); handles the
+    block form (one `- pattern` per line) and the flow form
+    (`packages: ['apps/*']`).
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^packages\s*:\s*(.*)$", line)
+        if not m:
+            continue
+        rest = m.group(1).strip()
+        if rest.startswith("["):
+            inner = rest.strip().strip("[]")
+            return [p.strip().strip("'\"") for p in inner.split(",") if p.strip()]
+        if rest:
+            return [rest.strip().strip("'\"")]
+        patterns: list[str] = []
+        for follow in lines[i + 1:]:
+            item = re.match(r"^\s*-\s+(.+?)\s*$", follow)
+            if not item:
+                if follow.strip():
+                    break
+                continue
+            val = item.group(1)
+            if val[:1] in ("'", '"'):
+                end = val.find(val[0], 1)
+                val = val[1:end] if end > 0 else val.strip("'\"")
+            else:
+                val = val.split(" #", 1)[0].strip()
+            if val:
+                patterns.append(val)
+        return patterns
+    return []
+
+
+def _declared_workspace_patterns(
+    fetcher: Fetcher,
+    full_name: str,
+    sha: str,
+    root_pkg: dict[str, Any] | None,
+    root_files: set[str],
+) -> list[str]:
+    """The repo's declared workspace patterns (F1 ruling), unioned from
+    root package.json `workspaces` (array, or the object form's
+    `packages`), pnpm-workspace.yaml `packages`, and lerna.json
+    `packages` (lerna's default `packages/*` when the file declares
+    none). nx.json / turbo.json declare no members and contribute
+    nothing."""
+    patterns: list[str] = []
+    if root_pkg is not None:
+        ws = root_pkg.get("workspaces")
+        if isinstance(ws, list):
+            patterns.extend(p for p in ws if isinstance(p, str))
+        elif isinstance(ws, dict):
+            pkgs = ws.get("packages")
+            if isinstance(pkgs, list):
+                patterns.extend(p for p in pkgs if isinstance(p, str))
+    if "pnpm-workspace.yaml" in root_files:
+        text = fetch_file_text(fetcher, full_name, "pnpm-workspace.yaml", sha)
+        if text is not None:
+            patterns.extend(_parse_pnpm_workspace(text))
+    if "lerna.json" in root_files:
+        declared: list[str] = []
+        text = fetch_file_text(fetcher, full_name, "lerna.json", sha)
+        if text is not None:
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict) and isinstance(data.get("packages"), list):
+                declared = [p for p in data["packages"] if isinstance(p, str)]
+        patterns.extend(declared if declared else ["packages/*"])
+    return patterns
+
+
 def node_filter(
-    fetcher: Fetcher, full_name: str, sha: str, paths: set[str]
-) -> tuple[bool, str | None, list[str]]:
-    """A2. Returns (passed, app.path, typed drop reasons)."""
+    fetcher: Fetcher, full_name: str, sha: str, tree: TreeIndex
+) -> tuple[bool, str | None, list[str], dict[str, Any]]:
+    """A2. Returns (passed, app.path, typed drop reasons, extra record).
+
+    The extra record carries the declared workspace patterns and the
+    matched members in workspace mode (F1).
+    """
     reasons: list[str] = []
-    root = _root_files(paths)
-    root_pkg = (
-        fetch_package_json(fetcher, full_name, "package.json", sha)
-        if "package.json" in root
-        else None
-    )
+    info: dict[str, Any] = {}
+    root = tree.root_files()
+    root_pkg: dict[str, Any] | None = None
+    root_unparseable = False
+    if "package.json" in root:
+        root_pkg, root_unparseable = fetch_package_json(
+            fetcher, full_name, "package.json", sha
+        )
+        if root_unparseable:
+            reasons.append("package.json unparseable at package.json")
     workspace_root = (root_pkg is not None and "workspaces" in root_pkg) or bool(
         root & set(NODE_MONOREPO_FILES)
     )
     app_pkg: dict[str, Any] | None = None
     app_path: str | None = None
     if not workspace_root:
-        app_path = "."
-        if root_pkg is None:
+        if root_pkg is None and not root_unparseable:
             reasons.append("no root package.json")
         elif not _has_start(root_pkg):
-            reasons.append("root package.json has no scripts.start")
+            if not root_unparseable:
+                reasons.append("root package.json has no scripts.start")
         else:
+            app_path = "."
             app_pkg = root_pkg
     else:
-        start_pkgs: list[tuple[str, dict[str, Any]]] = []
-        candidates = sorted(
-            p
-            for p in paths
-            if p.endswith("/package.json") and "node_modules" not in p.split("/")
+        patterns = _declared_workspace_patterns(
+            fetcher, full_name, sha, root_pkg, root
         )
-        for pkg_path in candidates:
-            pkg = fetch_package_json(fetcher, full_name, pkg_path, sha)
-            if _has_start(pkg):
-                start_pkgs.append((pkg_path.rsplit("/", 1)[0], pkg))
-        if not start_pkgs:
-            reasons.append("no workspace package with scripts.start")
-        elif len(start_pkgs) > 1:
-            reasons.append("ambiguous app")
+        info["workspace_patterns"] = patterns
+        members: list[str] = []
+        if not patterns:
+            # Markers exist (e.g. nx.json / turbo.json only) but no
+            # workspace members are declared anywhere (F1).
+            reasons.append("no declared workspace members")
         else:
-            app_path, app_pkg = start_pkgs[0]
+            members = [
+                d for d in tree.match_dirs(patterns)
+                if tree.has_file(f"{d}/package.json")
+            ]
+            start_pkgs: list[tuple[str, dict[str, Any]]] = []
+            for d in members:
+                pkg, unparseable = fetch_package_json(
+                    fetcher, full_name, f"{d}/package.json", sha
+                )
+                if unparseable:
+                    reasons.append(f"package.json unparseable at {d}/package.json")
+                if _has_start(pkg):
+                    start_pkgs.append((d, pkg))
+            if len(start_pkgs) > 1:
+                reasons.append("ambiguous app")
+            elif len(start_pkgs) == 1:
+                app_path, app_pkg = start_pkgs[0]
+            else:
+                reasons.append("no workspace package with scripts.start")
+        info["workspace_members"] = members
     locks = [f for f in NODE_LOCKFILES if f in root]
     if not locks:
         reasons.append("no root lockfile")
@@ -340,41 +633,56 @@ def node_filter(
             "no sqlite dependency (sqlite3, better-sqlite3, @libsql/client) "
             "in root or app package.json dependencies"
         )
-    return (not reasons), (app_path if not reasons else None), reasons
+    return (not reasons), (app_path if not reasons else None), reasons, info
 
 
 def python_filter(
-    fetcher: Fetcher, full_name: str, sha: str, paths: set[str]
-) -> tuple[bool, str | None, list[str]]:
-    """A3. Returns (passed, app.path, typed drop reasons)."""
+    fetcher: Fetcher, full_name: str, sha: str, tree: TreeIndex
+) -> tuple[bool, str | None, list[str], dict[str, Any]]:
+    """A3. Returns (passed, app.path, typed drop reasons, extra record).
+
+    The extra record carries the sqlite tarball scan's skipped-member
+    count (F5).
+    """
     reasons: list[str] = []
-    root = _root_files(paths)
-    depth_one_dirs = sorted(
-        {p.split("/", 1)[0] for p in paths if p.count("/") == 1 and p.endswith("/manage.py")}
-    )
+    info: dict[str, Any] = {}
+    root = tree.root_files()
     app_path: str | None = None
     if "manage.py" in root:
         app_path = "."
-    elif len(depth_one_dirs) == 1:
-        app_path = depth_one_dirs[0]
-    elif len(depth_one_dirs) > 1:
-        reasons.append("ambiguous app")
     else:
-        reasons.append("no manage.py at root or at depth one")
-    if not repo_contains_string(fetcher, full_name, sha, SQLITE_BACKEND):
-        reasons.append("django.db.backends.sqlite3 not found in repository")
+        depth_one = sorted(
+            d for d in tree.child_dirs("") if tree.has_file(f"{d}/manage.py")
+        )
+        if len(depth_one) == 1:
+            app_path = depth_one[0]
+        elif len(depth_one) > 1:
+            reasons.append("ambiguous app")
+        else:
+            reasons.append("no manage.py at root or at depth one")
+    found, skipped = repo_contains_string(fetcher, full_name, sha, SQLITE_BACKEND)
+    info["sqlite_scan_skipped_members"] = skipped
+    if not found:
+        if skipped:
+            reasons.append(
+                "django.db.backends.sqlite3 not found in repository "
+                f"({skipped} tarball members skipped over the 4 MB scan cap)"
+            )
+        else:
+            reasons.append("django.db.backends.sqlite3 not found in repository")
     lock_dirs = [app_path] if app_path is not None else []
     if "." not in lock_dirs:
         lock_dirs.append(".")
     has_lock = any(
-        (f"{d}/{f}" if d != "." else f) in paths for d in lock_dirs for f in PY_LOCKFILES
+        tree.has_file(f"{d}/{f}" if d != "." else f)
+        for d in lock_dirs for f in PY_LOCKFILES
     )
     if not has_lock:
         reasons.append(
             "no lockfile (uv.lock, poetry.lock, pdm.lock, requirements.txt "
             "or pyproject.toml) in app directory or root"
         )
-    return (not reasons), (app_path if not reasons else None), reasons
+    return (not reasons), (app_path if not reasons else None), reasons, info
 
 
 def check_repo(
@@ -393,24 +701,33 @@ def check_repo(
         entry["head_sha"] = sha
         paths, truncated = repo_paths(fetcher, rec["full_name"], sha)
         entry["tree_truncated"] = truncated
+        tree = TreeIndex(fetcher, rec["full_name"], sha, paths, truncated)
         verdicts: dict[str, Any] = {}
         langs = set(rec["queries"])
         if langs & {"JavaScript", "TypeScript"}:
-            passed, app_path, reasons = node_filter(fetcher, rec["full_name"], sha, paths)
+            passed, app_path, reasons, info = node_filter(
+                fetcher, rec["full_name"], sha, tree
+            )
             verdicts["node"] = {
                 "passed": passed,
                 "app_path": app_path,
                 "drop_reasons": reasons,
+                **info,
             }
         if "Python" in langs:
-            passed, app_path, reasons = python_filter(fetcher, rec["full_name"], sha, paths)
+            passed, app_path, reasons, info = python_filter(
+                fetcher, rec["full_name"], sha, tree
+            )
             verdicts["python"] = {
                 "passed": passed,
                 "app_path": app_path,
                 "drop_reasons": reasons,
+                **info,
             }
         entry["stacks"] = verdicts
         entry["survivor"] = any(v["passed"] for v in verdicts.values())
+        if len(verdicts) == 2 and all(v["passed"] for v in verdicts.values()):
+            entry["both_stacks_passed"] = True  # F5: ruled on before provisioning
     except HarnessError as e:
         entry["error"] = f"harness or environment: {e}"
         entry["survivor"] = False
@@ -428,22 +745,32 @@ def run(
     out_dir: Path,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    pool, counts = collect_pool(fetcher, snapshot_date, sleep=sleep)
+    pool, counts, search_meta = collect_pool(fetcher, snapshot_date, sleep=sleep)
     entries = [check_repo(fetcher, rec) for rec in pool.values()]
     entries.sort(key=item4_key)
     survivors = [e for e in entries if e.get("survivor")]
     for i, e in enumerate(survivors):
         e["order"] = i + 1
+    errored = [
+        {"full_name": e["full_name"], "stars": e["stars"]}
+        for e in entries if "error" in e
+    ]
     result: dict[str, Any] = {
         "rule": "REG-C as amended by Addendum 2 (A1-A3); items 2 and 4 unchanged",
         "snapshot_date": snapshot_date,
         "pushed_since": pushed_since(snapshot_date),
+        "authenticated": bool(getattr(fetcher, "authenticated", False)),
         "query_counts": counts,
+        "search_pages": search_meta,
         "pool_size": len(pool),
         "survivor_count": len(survivors),
+        "error_count": len(errored),
+        "errored_repos": errored,
         "entries": entries,
         "survivors": survivors,
     }
+    if any(m["incomplete_results"] for m in search_meta.values()):
+        result["search_incomplete"] = True  # F4: ruled on before provisioning
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "regc-add2-raw.json").write_text(json.dumps(result, indent=1))
     (out_dir / "regc-add2-survivors.json").write_text(json.dumps(survivors, indent=1))
