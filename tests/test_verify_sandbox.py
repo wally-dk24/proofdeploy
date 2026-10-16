@@ -212,6 +212,7 @@ def test_verify_sandbox_unprovisionable_change_is_inconclusive(tmp_path):
     assert code == 2
     assert output["verdict"] == "INCONCLUSIVE"
     assert output["typed_reason"] == "environment"
+    assert output["cause"] == "provisioning_failed"
     record = _record_for(output, out_dir)
     assert record["sandboxed"] is True
     assert record["c_results"] == []

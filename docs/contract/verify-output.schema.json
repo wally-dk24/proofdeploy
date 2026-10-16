@@ -36,8 +36,46 @@
   "$id": "verify-output.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "INCONCLUSIVE"
+          }
+        },
+        "required": [
+          "verdict"
+        ]
+      },
+      "then": {
+        "properties": {
+          "cause": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "typed_reason": {
+            "enum": [
+              "environment",
+              "auth",
+              "drift",
+              "probe"
+            ]
+          }
+        },
+        "required": [
+          "typed_reason",
+          "cause"
+        ]
+      }
+    }
+  ],
   "description": "The versioned machine-readable output of `proofdeploy verify` (plan 1.10, WO-1.10 / D81). Prose contract: the verify section of docs/contract/result-contract.md. Every key is always present; fields that do not apply are null or empty, never absent. A stopped run (refusal, usage error, internal error) carries verdict null and its exit code; a completed run carries the fail-closed verdict and the evidence record it wrote.",
   "properties": {
+    "cause": {
+      "$ref": "#/$defs/string_or_null",
+      "description": "The specific run-level cause of an INCONCLUSIVE verdict (D84), a registered token: model_transport, model_overflow, author_output_invalid, leak_check, provisioning_failed, probe_inconclusive. Required and non-empty when the verdict is INCONCLUSIVE (enforced by the allOf rule); null on PASS, FAIL, and stopped runs. The cause never replaces the typed reason: governance (which class may be admin-relaxed) reads typed_reason only."
+    },
     "detail": {
       "$ref": "#/$defs/string_or_null",
       "description": "Human-readable detail for a stop or an INCONCLUSIVE run; null when the verdict speaks for itself."
@@ -143,7 +181,7 @@
     },
     "typed_reason": {
       "$ref": "#/$defs/string_or_null",
-      "description": "For INCONCLUSIVE: the first inconclusive probe's typed reason (environment/auth/drift/probe), or a run-level typed cause (leak_check, model_transport, model_overflow). For exits 3/4/5: the refusal or error, named. Null on PASS and FAIL."
+      "description": "For INCONCLUSIVE: one of the four registered reason classes only — environment, auth, drift, probe (enforced by the allOf rule): the first inconclusive probe's class, or the class of the run-level stop; the specific cause rides in `cause`, never here. For exits 3/4/5: the refusal or error, named. Null on PASS and FAIL."
     },
     "verdict": {
       "description": "The fail-closed verdict, or null when the run stopped before a verdict (exit 3/4/5). INCONCLUSIVE is never rendered as a pass: it has its own value and exit code.",
@@ -170,6 +208,7 @@
     "verdict",
     "exit_code",
     "typed_reason",
+    "cause",
     "detail",
     "probes",
     "refs",

@@ -30,6 +30,20 @@ Every probe is reported individually, invalid author blocks
 included (never sent, INCONCLUSIVE ``probe``). INCONCLUSIVE is
 never shown as a pass: it has its own exit code.
 
+Typed reasons and causes (D84): an INCONCLUSIVE output's
+``typed_reason`` is ALWAYS one of the four registered reason
+classes — ``environment`` / ``auth`` / ``drift`` / ``probe``, the
+governance classes of the per-probe reason (only ``environment``
+may ever be admin-relaxed to "warn"). The specific run-level cause
+rides in the separate ``cause`` field, required (non-empty) on
+INCONCLUSIVE and null otherwise: ``model_transport`` (class
+environment), ``model_overflow`` (probe), ``author_output_invalid``
+(probe), ``leak_check`` (probe — a refused author bundle; it never
+surfaces as a typed reason and its class can never be relaxed),
+``provisioning_failed`` (environment), ``probe_inconclusive``
+(the winning probe's own class). A free-form run-level string is
+never a typed reason.
+
 Exit codes (registered, pinned by tests):
 
     0  PASS
@@ -104,6 +118,25 @@ _VERDICT_EXIT_CODES = {
 #: Engine identity stamped on every verify output.
 ENGINE = f"proofdeploy/{__version__}"
 
+# Registered INCONCLUSIVE cause tokens (D84): the specific
+# run-level cause an INCONCLUSIVE output carries in its ``cause``
+# field, beside the four-class ``typed_reason``.
+CAUSE_LEAK_CHECK = "leak_check"
+CAUSE_MODEL_TRANSPORT = "model_transport"
+CAUSE_MODEL_OVERFLOW = "model_overflow"
+CAUSE_AUTHOR_OUTPUT_INVALID = "author_output_invalid"
+CAUSE_PROVISIONING_FAILED = "provisioning_failed"
+CAUSE_PROBE_INCONCLUSIVE = "probe_inconclusive"
+
+#: The typed-reason class of a model failure, by cause (D84): a
+#: transport failure is the environment's; an overflow is the
+#: authoring side's (the bundle could not be authored from), class
+#: probe. ModelCallError validates its cause, so this is total.
+_MODEL_FAILURE_CLASSES = {
+    CAUSE_MODEL_TRANSPORT: "environment",
+    CAUSE_MODEL_OVERFLOW: "probe",
+}
+
 # Stage 1 typed refusals (exit 3). The exact strings are the
 # contract: each names what is not supported and where it lands.
 NOT_SUPPORTED_TARGET_URL = (
@@ -136,22 +169,43 @@ def compute_verdict(results: list[ProbeResult]) -> tuple[str, str | None]:
     return "PASS", None
 
 
+def rollup_cause(results: list[ProbeResult]) -> str:
+    """The run-level cause token for a rollup INCONCLUSIVE (D84).
+
+    The winning (first) inconclusive probe decides: a probe that
+    was never sent is an invalid author block — the engine's
+    ``author_output_invalid``; a probe that ran and could not be
+    decided is ``probe_inconclusive`` (its specifics live in that
+    probe's own details, and its class is the verdict's typed
+    reason). No results at all is the rollup's no-valid-probe case:
+    ``author_output_invalid``.
+    """
+    for r in results:
+        if r.verdict is Verdict.INCONCLUSIVE:
+            return CAUSE_PROBE_INCONCLUSIVE if r.sent else CAUSE_AUTHOR_OUTPUT_INVALID
+    return CAUSE_AUTHOR_OUTPUT_INVALID
+
+
 def stop_output(
     *,
     exit_code: int,
     typed_reason: str,
+    cause: str | None = None,
     detail: str | None = None,
     refs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A verify output for a run that stopped before a verdict: a
     refusal (exit 3), a usage/config error (exit 4), or an internal
     error (exit 5). Same shape as a verdict output, with ``verdict``
-    null and no probes or record."""
+    null and no probes or record. The one stop that DOES carry a
+    verdict — the leak refusal — passes verdict INCONCLUSIVE with
+    a four-class typed reason and its ``cause`` (D84)."""
     return {
         "verify_output_version": VERIFY_OUTPUT_VERSION,
         "verdict": None,
         "exit_code": exit_code,
         "typed_reason": typed_reason,
+        "cause": cause,
         "detail": detail,
         "probes": [],
         "refs": refs
@@ -343,6 +397,7 @@ class _VerifyRun:
         record_path: Path | None,
         probe_set_sha256: str | None,
         isolation_mode: str | None,
+        cause: str | None = None,
         detail: str | None = None,
     ) -> dict[str, Any]:
         output: dict[str, Any] = {
@@ -350,6 +405,7 @@ class _VerifyRun:
             "verdict": verdict,
             "exit_code": _VERDICT_EXIT_CODES[verdict],
             "typed_reason": typed_reason,
+            "cause": cause,
             "detail": detail,
             "probes": [r.to_dict() for r in results],
             "refs": self.refs,
@@ -401,10 +457,14 @@ class _VerifyRun:
         except SecretLeakError as exc:
             # A leak stop writes NO record: the bundle is tainted,
             # and persisting its prompt is exactly what the check
-            # exists to prevent. The refusal is the evidence.
+            # exists to prevent. The refusal is the evidence. Its
+            # class is `probe` (D84): a refused author bundle, with
+            # the specific cause in `cause` — never a typed reason,
+            # and never a relaxable class.
             out = stop_output(
                 exit_code=EXIT_INCONCLUSIVE,
-                typed_reason="leak_check",
+                typed_reason="probe",
+                cause=CAUSE_LEAK_CHECK,
                 detail=(
                     "leak check refused the author bundle before any "
                     f"model call: {exc}"
@@ -463,10 +523,18 @@ class _VerifyRun:
                 manifest=manifest, manifest_sha=manifest_sha,
                 truncation_flags=truncation_flags, side=None,
                 results=invalid_results,
+                # The record carries the engine's own cause for this
+                # stop (orchestrator's author_output_invalid record).
+                inconclusive_cause=CAUSE_AUTHOR_OUTPUT_INVALID,
+                inconclusive_error=(
+                    "author output contained no valid probe "
+                    f"({len(probeset.invalid_blocks)} invalid block(s))"
+                ),
             )
             self.timings["total_s"] = round(time.monotonic() - started, 3)
             out = self._output(
                 verdict="INCONCLUSIVE", typed_reason="probe",
+                cause=CAUSE_AUTHOR_OUTPUT_INVALID,
                 results=invalid_results, record_id=record_id, record_path=path,
                 probe_set_sha256=record["parsed_probes_sha256"],
                 isolation_mode=None,
@@ -513,14 +581,23 @@ class _VerifyRun:
 
         verdict: str
         typed_reason: str | None
+        cause: str | None = None
+        record_cause: str | None = None
+        record_error: str | None = None
         if side is None or not side.provision.ready:
             verdict, typed_reason = "INCONCLUSIVE", "environment"
+            cause = CAUSE_PROVISIONING_FAILED
             detail = (
                 "the target could not be provisioned: "
                 f"{side.provision.reason if side is not None else 'no side'}"
             )
+            # The record carries the run-level cause too; the
+            # provision reason prose is its error text.
+            record_cause, record_error = cause, detail
         else:
             verdict, typed_reason = compute_verdict(results)
+            if verdict == "INCONCLUSIVE":
+                cause = rollup_cause(results)
             detail = None
 
         # Step 7-8: write the evidence record, then report.
@@ -529,6 +606,8 @@ class _VerifyRun:
             manifest=manifest, manifest_sha=manifest_sha,
             truncation_flags=truncation_flags, side=side,
             results=results,
+            inconclusive_cause=record_cause,
+            inconclusive_error=record_error,
         )
         self.timings["total_s"] = round(time.monotonic() - started, 3)
         isolation_mode = None
@@ -538,7 +617,7 @@ class _VerifyRun:
         elif side is not None:
             isolation_mode = "sandbox"
         out = self._output(
-            verdict=verdict, typed_reason=typed_reason,
+            verdict=verdict, typed_reason=typed_reason, cause=cause,
             results=results, record_id=record_id, record_path=path,
             probe_set_sha256=record["parsed_probes_sha256"],
             isolation_mode=isolation_mode, detail=detail,
@@ -575,7 +654,10 @@ class _VerifyRun:
     ) -> tuple[dict[str, Any], int]:
         """The model call failed (after its one registered retry, if
         any): the evidence record carries the typed cause, and the
-        verdict is INCONCLUSIVE with that cause as its typed reason."""
+        verdict is INCONCLUSIVE whose typed reason is the cause's
+        registered class (D84) — transport is environment, overflow
+        is probe — with the specific cause in the output's ``cause``
+        field."""
         record_id, path, record = self._write_record(
             prompt=prompt, raw=None, probeset=None,
             manifest=manifest, manifest_sha=manifest_sha,
@@ -583,7 +665,9 @@ class _VerifyRun:
             inconclusive_cause=exc.cause, inconclusive_error=str(exc),
         )
         out = self._output(
-            verdict="INCONCLUSIVE", typed_reason=exc.cause,
+            verdict="INCONCLUSIVE",
+            typed_reason=_MODEL_FAILURE_CLASSES[exc.cause],
+            cause=exc.cause,
             results=[], record_id=record_id, record_path=path,
             probe_set_sha256=record["parsed_probes_sha256"],
             isolation_mode=None,

@@ -46,7 +46,8 @@ _SCHEMA_PATH = (
 # ---------------------------------------------------------------------------
 # JSON Schema validation, stdlib subset (the same subset the result
 # contract's test implements: type, enum, const, required, properties,
-# additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref).
+# additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref —
+# plus, for the verify schema's D84 rule, allOf, if/then, minLength).
 # ---------------------------------------------------------------------------
 
 
@@ -86,6 +87,15 @@ def _schema_errors(instance, schema, root, path="$"):
         if all(_schema_errors(instance, sub, root, path) for sub in schema["anyOf"]):
             errors.append(f"{path}: anyOf matched no schema")
         return errors
+    if "allOf" in schema:
+        for sub in schema["allOf"]:
+            errors.extend(_schema_errors(instance, sub, root, path))
+    if "if" in schema:
+        if not _schema_errors(instance, schema["if"], root, path):
+            if "then" in schema:
+                errors.extend(_schema_errors(instance, schema["then"], root, path))
+        elif "else" in schema:
+            errors.extend(_schema_errors(instance, schema["else"], root, path))
     if "const" in schema and instance != schema["const"]:
         errors.append(f"{path}: {instance!r} != const {schema['const']!r}")
     if "enum" in schema and instance not in schema["enum"]:
@@ -126,6 +136,11 @@ def _schema_errors(instance, schema, root, path="$"):
         if not re.search(schema["pattern"], instance):
             errors.append(
                 f"{path}: {instance!r} does not match pattern {schema['pattern']!r}"
+            )
+    if isinstance(instance, str) and "minLength" in schema:
+        if len(instance) < schema["minLength"]:
+            errors.append(
+                f"{path}: {instance!r} shorter than minLength {schema['minLength']}"
             )
     return errors
 
@@ -286,6 +301,8 @@ def test_exit_codes_are_the_registered_table():
     # Plant (a) target: INCONCLUSIVE must not map to the PASS code.
     out = verify_mod.stop_output(exit_code=2, typed_reason="probe")
     assert out["exit_code"] == 2 and out["exit_code"] != verify_mod.EXIT_PASS
+    # A stop carries no cause unless one is named (D84).
+    assert out["cause"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +587,7 @@ def test_host_run_inconclusive_environment_with_record(tmp_path, no_sandbox):
     assert code == 2
     assert output["verdict"] == "INCONCLUSIVE"
     assert output["typed_reason"] == "environment"
+    assert output["cause"] == "provisioning_failed"
     assert output["exit_code"] == 2
     assert output["model"] == MODEL_ID
     assert output["refs"]["from_sha"] == sha1
@@ -586,12 +604,15 @@ def test_host_run_inconclusive_environment_with_record(tmp_path, no_sandbox):
     assert record["c_sha"] == sha2
     assert record["parsed_probes_sha256"] == output["probe_set_sha256"]
     assert record["parsed_probes"] == [_SIMPLE_PROBE]
+    # The record carries the run-level cause beside the class (D84).
+    assert record["inconclusive_cause"] == "provisioning_failed"
 
 
 def test_host_run_via_cli_json(tmp_path, monkeypatch, capsys):
     # The CLI path end to end, with the model transport failing the
     # way an unauthenticated CI host's would: deterministic
-    # INCONCLUSIVE (model_transport), JSON on stdout, schema-valid.
+    # INCONCLUSIVE (class environment, cause model_transport),
+    # JSON on stdout, schema-valid.
     def _no_model(prompt: str, runner=None) -> ModelResponse:
         raise RuntimeError("Groq credential unavailable (test)")
 
@@ -608,7 +629,8 @@ def test_host_run_via_cli_json(tmp_path, monkeypatch, capsys):
     assert code == 2
     output = json.loads(capsys.readouterr().out)
     assert output["verdict"] == "INCONCLUSIVE"
-    assert output["typed_reason"] == "model_transport"
+    assert output["typed_reason"] == "environment"
+    assert output["cause"] == "model_transport"
     _assert_output_schema_valid(output)
 
 
@@ -628,7 +650,10 @@ def test_seeded_leak_refused_before_any_model_call(tmp_path):
     assert calls == []
     assert code == 2
     assert output["verdict"] == "INCONCLUSIVE"
-    assert output["typed_reason"] == "leak_check"
+    # D84: the class is probe; leak_check is the cause, never a
+    # typed reason (and probe can never be admin-relaxed).
+    assert output["typed_reason"] == "probe"
+    assert output["cause"] == "leak_check"
     # A leak stop writes no record (the bundle is tainted).
     assert output["evidence_record"] is None
     assert not (tmp_path / "records" / "runs.jsonl").exists()
@@ -650,7 +675,8 @@ def test_model_transport_retried_once_then_inconclusive(tmp_path):
     )
     assert len(calls) == 2  # exactly one retry
     assert code == 2
-    assert output["typed_reason"] == "model_transport"
+    assert output["typed_reason"] == "environment"
+    assert output["cause"] == "model_transport"
     record = next(
         r
         for r in read_records(tmp_path / "records")
@@ -675,7 +701,8 @@ def test_model_overflow_not_retried(tmp_path):
     )
     assert len(calls) == 1
     assert code == 2
-    assert output["typed_reason"] == "model_overflow"
+    assert output["typed_reason"] == "probe"
+    assert output["cause"] == "model_overflow"
 
 
 def test_model_runtime_error_normalized_to_transport(tmp_path):
@@ -693,7 +720,8 @@ def test_model_runtime_error_normalized_to_transport(tmp_path):
     )
     assert len(calls) == 2
     assert code == 2
-    assert output["typed_reason"] == "model_transport"
+    assert output["typed_reason"] == "environment"
+    assert output["cause"] == "model_transport"
     record = next(
         r
         for r in read_records(tmp_path / "records")
@@ -712,6 +740,7 @@ def test_author_output_invalid_is_inconclusive_probe(tmp_path, no_sandbox):
     assert code == 2
     assert output["verdict"] == "INCONCLUSIVE"
     assert output["typed_reason"] == "probe"
+    assert output["cause"] == "author_output_invalid"
     record = next(
         r
         for r in read_records(tmp_path / "records")
@@ -720,6 +749,166 @@ def test_author_output_invalid_is_inconclusive_probe(tmp_path, no_sandbox):
     # Provisioning never started: no provision was recorded.
     assert record["c_provision"] == {}
     assert record["parsed_probes"] == []
+    # The record carries the engine's cause for this stop (D84).
+    assert record["inconclusive_cause"] == "author_output_invalid"
+
+
+# ---------------------------------------------------------------------------
+# D84: every INCONCLUSIVE path carries a four-class typed reason
+# plus a specific run-level cause — never a free-form reason.
+# ---------------------------------------------------------------------------
+
+_TYPED_REASON_CLASSES = {"environment", "auth", "drift", "probe"}
+
+
+def _assert_inconclusive_shape(output, typed_reason, cause):
+    assert output["verdict"] == "INCONCLUSIVE"
+    assert output["typed_reason"] in _TYPED_REASON_CLASSES
+    assert output["typed_reason"] == typed_reason
+    assert output["cause"] == cause
+    assert output["cause"]  # non-empty
+    _assert_output_schema_valid(output)
+
+
+def test_inconclusive_matrix_class_and_cause(tmp_path, no_sandbox):
+    def _repo(name: str, **kwargs):
+        parent = tmp_path / name
+        parent.mkdir()
+        return _make_repo(parent, **kwargs)
+
+    # (1) Leak stop: class probe, cause leak_check, no record.
+    repo, sha1, sha2 = _repo("leak", leak=True)
+    output, code = verify_mod.run_verify(
+        repo_dir=repo, from_ref=sha1, to_ref=sha2,
+        output_dir=tmp_path / "leak-records", workdir=tmp_path / "leak-work",
+        model_runner=_probe_runner(),
+    )
+    assert code == 2
+    _assert_inconclusive_shape(output, "probe", "leak_check")
+
+    # (2) Model transport failure (after its one retry): class
+    # environment, cause model_transport.
+    repo, sha1, sha2 = _repo("transport")
+
+    def _transport(prompt: str) -> ModelResponse:
+        raise ModelCallError("connection reset", cause="model_transport")
+
+    output, code = verify_mod.run_verify(
+        repo_dir=repo, from_ref=sha1, to_ref=sha2,
+        output_dir=tmp_path / "t-records", workdir=tmp_path / "t-work",
+        model_runner=_transport,
+    )
+    assert code == 2
+    _assert_inconclusive_shape(output, "environment", "model_transport")
+
+    # (3) Model overflow (no retry): class probe, cause
+    # model_overflow.
+    repo, sha1, sha2 = _repo("overflow")
+
+    def _overflow(prompt: str) -> ModelResponse:
+        raise ModelCallError("prompt too long", cause="model_overflow")
+
+    output, code = verify_mod.run_verify(
+        repo_dir=repo, from_ref=sha1, to_ref=sha2,
+        output_dir=tmp_path / "o-records", workdir=tmp_path / "o-work",
+        model_runner=_overflow,
+    )
+    assert code == 2
+    _assert_inconclusive_shape(output, "probe", "model_overflow")
+
+    # (4) A bare RuntimeError from the pinned client is normalized
+    # to model_transport: same (class, cause) as (2).
+    repo, sha1, sha2 = _repo("runtime")
+
+    def _runtime(prompt: str) -> ModelResponse:
+        raise RuntimeError("Groq API call failed: connection reset")
+
+    output, code = verify_mod.run_verify(
+        repo_dir=repo, from_ref=sha1, to_ref=sha2,
+        output_dir=tmp_path / "r-records", workdir=tmp_path / "r-work",
+        model_runner=_runtime,
+    )
+    assert code == 2
+    _assert_inconclusive_shape(output, "environment", "model_transport")
+
+    # (5) No valid probe in the author output: class probe, cause
+    # author_output_invalid (the engine's existing name).
+    repo, sha1, sha2 = _repo("invalid")
+    output, code = verify_mod.run_verify(
+        repo_dir=repo, from_ref=sha1, to_ref=sha2,
+        output_dir=tmp_path / "i-records", workdir=tmp_path / "i-work",
+        model_runner=_runner_returning("the model said nothing parseable"),
+    )
+    assert code == 2
+    _assert_inconclusive_shape(output, "probe", "author_output_invalid")
+
+    # (6) Provisioning failure (sandbox-less host): class
+    # environment, cause provisioning_failed.
+    repo, sha1, sha2 = _repo("provision")
+    output, code = verify_mod.run_verify(
+        repo_dir=repo, from_ref=sha1, to_ref=sha2,
+        output_dir=tmp_path / "p-records", workdir=tmp_path / "p-work",
+        model_runner=_probe_runner(),
+    )
+    assert code == 2
+    _assert_inconclusive_shape(output, "environment", "provisioning_failed")
+
+
+def test_rollup_inconclusive_cause_derivation():
+    # An executed probe that could not be decided: the class is the
+    # probe's own; the cause is probe_inconclusive.
+    results = [
+        _result(Verdict.PASS),
+        _result(Verdict.INCONCLUSIVE, InconclusiveReason.ENVIRONMENT, index=1),
+    ]
+    assert verify_mod.compute_verdict(results) == ("INCONCLUSIVE", "environment")
+    assert verify_mod.rollup_cause(results) == "probe_inconclusive"
+
+    # The winning inconclusive probe is an invalid author block
+    # (never sent): the cause is the engine's author_output_invalid.
+    invalid = ProbeResult(
+        probe_index=1, verdict=Verdict.INCONCLUSIVE,
+        reason=InconclusiveReason.PROBE, sent=False,
+    )
+    results = [_result(Verdict.PASS), invalid]
+    assert verify_mod.compute_verdict(results) == ("INCONCLUSIVE", "probe")
+    assert verify_mod.rollup_cause(results) == "author_output_invalid"
+
+    # No results at all: the rollup's no-valid-probe case.
+    assert verify_mod.compute_verdict([]) == ("INCONCLUSIVE", "probe")
+    assert verify_mod.rollup_cause([]) == "author_output_invalid"
+
+
+def test_schema_refuses_a_run_level_cause_as_typed_reason():
+    schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    def errors(output):
+        return _schema_errors(output, schema, schema)
+
+    # The leak stop's shape, as the code builds it: valid.
+    good = verify_mod.stop_output(
+        exit_code=2, typed_reason="probe", cause="leak_check"
+    )
+    good["verdict"] = "INCONCLUSIVE"
+    assert errors(good) == []
+
+    # A run-level cause in typed_reason (the pre-D84 shape) is
+    # refused by the schema itself, for every registered cause.
+    for cause in (
+        "leak_check", "model_transport", "model_overflow",
+        "author_output_invalid", "provisioning_failed",
+    ):
+        bad = dict(good, typed_reason=cause)
+        assert errors(bad) != [], cause
+
+    # An INCONCLUSIVE without a cause, or with an empty one, is
+    # refused; a PASS with neither stays valid.
+    assert errors(dict(good, cause=None)) != []
+    assert errors(dict(good, cause="")) != []
+    passing = verify_mod.stop_output(exit_code=0, typed_reason="x")
+    passing["verdict"] = "PASS"
+    passing["typed_reason"] = None
+    assert errors(passing) == []
 
 
 # ---------------------------------------------------------------------------

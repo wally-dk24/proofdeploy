@@ -400,7 +400,7 @@ The verdict is reported as a separate, versioned JSON object
 [`verify-output.schema.json`](verify-output.schema.json) beside
 this document: verdict, exit code (0 PASS / 1 FAIL / 2
 INCONCLUSIVE / 3 not supported / 4 usage / 5 internal), typed
-reason, per-probe results (this contract's per-probe objects
+reason, cause, per-probe results (this contract's per-probe objects
 verbatim), refs (repo, from/to SHAs), model, probe-set SHA-256
 (the record's `parsed_probes_sha256`), engine, isolation mode,
 the evidence record's path + `record_id` and its `schema_version`,
@@ -413,6 +413,29 @@ never defaulted. The record a verify run writes remains fully
 replayable offline through `proofdeploy/replay.py`
 (`replay_side` over `c_results`), and re-applying the verify
 rollup to the replayed results reproduces the printed verdict.
+
+**Typed reasons and causes (D84).** For an INCONCLUSIVE verify
+output, `typed_reason` is one of the four registered reason classes
+only — `environment` / `auth` / `drift` / `probe`, the governance
+classes of the per-probe reason above (only `environment` may ever
+be admin-relaxed to "warn"). The specific run-level cause rides in
+the separate `cause` field: required and non-empty on INCONCLUSIVE
+(the schema enforces both, via an `allOf` if/then rule), null on
+PASS, FAIL, and stopped runs. The registered cause tokens and
+their classes: `model_transport` → `environment`; `model_overflow`
+→ `probe`; `author_output_invalid` → `probe` (the author output
+held no valid probe, or the verdict's winning inconclusive probe
+is an invalid, never-sent author block); `leak_check` → `probe`;
+`provisioning_failed` → `environment` (the side never became
+ready; the provision reason prose stays in `detail`);
+`probe_inconclusive` → the winning executed probe's own class.
+`leak_check` is ruled a refused author bundle: its class is
+`probe`, it never surfaces as a `typed_reason`, and — not being
+`environment` — it can never be admin-relaxed. A run-level string
+is never a typed reason; when a stop also writes an evidence
+record, the record's `inconclusive_cause` carries the same cause
+token (for a model failure, the model's own cause, as a measured
+run records it).
 
 ## The schema and its test
 

@@ -162,6 +162,8 @@ def _render_verify_output(output: dict, fmt: str) -> str:
         lines.append(f"verdict: {verdict} (exit {output.get('exit_code')})")
         if output.get("typed_reason"):
             lines.append(f"typed reason: {output['typed_reason']}")
+        if output.get("cause"):
+            lines.append(f"cause: {output['cause']}")
     refs = output.get("refs") or {}
     if refs.get("from_sha") or refs.get("to_sha"):
         lines.append(
