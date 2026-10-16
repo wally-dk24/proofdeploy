@@ -84,6 +84,60 @@ Traceback (most recent call last):
 http.client.IncompleteRead: IncompleteRead(35618816 bytes read)
 ```
 
-## Second execution (the D66 re-run)
+## Second execution (the D66 re-run) — ALSO DIED BEFORE ANY OUTPUT
 
-_(Results appended when the re-run completes.)_
+- Started: 2026-10-16T06:17Z. Died: 2026-10-16T06:52Z (elapsed ~35m).
+- Exit: code 1, no signal — the same uncaught-exception death.
+- **No output was written.** The output directory was again never
+  created; no run record or raw output file exists from this
+  execution either. The working tree stayed clean.
+- Cause, from the log: the same defect in a different call site.
+  While fetching a recursive git tree (`repo_paths` → `get_json`),
+  the connection broke mid-body after 382,279 of 432,459 bytes and
+  `http.client` raised `IncompleteRead` inside `r.read()` — again an
+  `HTTPException`, not an `OSError`, so the Fetcher's retry loop
+  never engaged.
+- Per D66, the re-run dying ends the matter on this side: **the run
+  has no result — the survivor list is unknown, not zero (A6 is not
+  triggered; it applies to a completed run with zero survivors).**
+  What happens next is Master's decision. The defect itself is in
+  the accepted script's fetch layer, not in the registration:
+  `_urllib_fetch` reads with no timeout and `get_bytes` retries only
+  `OSError`, so any mid-body connection break (`IncompleteRead`, and
+  plausibly other `http.client` exceptions) kills the whole run
+  instead of recording a per-repo harness error or retrying.
+
+Full console log of the second execution (verbatim):
+
+```
+Traceback (most recent call last):
+  File "/home/hatch/workspace/proofdeploy-wo6phasea/scripts/wo6/regc_add2_run.py", line 820, in <module>
+    main()
+  File "/home/hatch/workspace/proofdeploy-wo6phasea/scripts/wo6/regc_add2_run.py", line 805, in main
+    result = run(fetcher, args.snapshot_date, args.out)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hatch/workspace/proofdeploy-wo6phasea/scripts/wo6/regc_add2_run.py", line 763, in run
+    entries = [check_repo(fetcher, rec) for rec in pool.values()]
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hatch/workspace/proofdeploy-wo6phasea/scripts/wo6/regc_add2_run.py", line 716, in check_repo
+    paths, truncated = repo_paths(fetcher, rec["full_name"], sha)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hatch/workspace/proofdeploy-wo6phasea/scripts/wo6/regc_add2_run.py", line 264, in repo_paths
+    data = fetcher.get_json(f"{API}/repos/{full_name}/git/trees/{sha}?recursive=1")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hatch/workspace/proofdeploy-wo6phasea/scripts/wo6/regc_add2_run.py", line 193, in get_json
+    return json.loads(self.get_bytes(url).decode("utf-8"))
+                      ^^^^^^^^^^^^^^^^^^
+  File "/home/hatch/workspace/proofdeploy-wo6phasea/scripts/wo6/regc_add2_run.py", line 176, in get_bytes
+    status, resp_headers, body = self._raw_fetch(url, headers)
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hatch/workspace/proofdeploy-wo6phasea/scripts/wo6/regc_add2_run.py", line 150, in _urllib_fetch
+    return r.status, dict(r.headers.items()), r.read()
+                                              ^^^^^^^^
+  File "/usr/lib/python3.12/http/client.py", line 500, in read
+    s = self._safe_read(self.length)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/http/client.py", line 650, in _safe_read
+    raise IncompleteRead(data, amt - len(data))
+http.client.IncompleteRead: IncompleteRead(382279 bytes read, 50180 more expected)
+```
