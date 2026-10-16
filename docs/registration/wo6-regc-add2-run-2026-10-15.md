@@ -282,3 +282,86 @@ Journal event — death in the runtime restart, 2026-10-16 ~19:04Z:
   while the run was live exited immediately — exit code 1, no
   output; `events.jsonl` unchanged (9 lines); the journal was
   untouched.
+
+### D140 follow-up — the three lock-transition starts attributed; integrity rerun
+
+Reconstruction from the surviving records (journal `events.jsonl`,
+the watcher logs in `wo6-scratch`, the coordinator session's exec
+logs, file birth times, and the live process list). Where a fact is
+not in the records, it is written as not established.
+
+Start 7 — 2026-10-16T20:39:48Z (console log
+`regc-add2-console-run3-resume5.log`), the post-death-6 resume:
+
+- Under the lock: NO. The lock file did not exist when this instance
+  started — `.run.lock` birth is 2026-10-16T20:41:42.999Z, two
+  minutes later — and its launch record shows a plain
+  `setsid nohup python3 …` invocation with no `flock`. It ran as
+  PID 12632 (PPID 12630; the coordinator's verification ps caught it
+  at etime 00:05: "12632 12630 00:05 python3
+  scripts/wo6/regc_add2_run.py …"). watcher9: "2026-10-16T20:41:17Z
+  alive pid=12632 entries=2096".
+- How it ended: KILLED by the coordinator applying D140. The kill of
+  PID 12632 began ~20:41:48Z (runtime monitor record). watcher9:
+  "2026-10-16T20:42:17Z PROCESS 12632 EXITED entries=2096"; the
+  coordinator's monitor log: "=== MONITOR: process 12632 no longer
+  alive at 2026-10-16T20:42:17Z ===". The exact death instant inside
+  20:41:48Z–20:42:17Z is not pinned by the records, and no exit code
+  exists (killed process; `events.jsonl` carries no exit event).
+
+Start 8 — 2026-10-16T20:41:43Z (console log
+`regc-add2-console-run3-resume6.log`), the first locked start:
+
+- Under the lock: YES. `.run.lock` birth 2026-10-16T20:41:42.999Z
+  precedes this start event (20:41:43.322Z) by 0.32 s — the lock file
+  is created by this launch's `flock`.
+- Alive at the same time as start 7: YES, briefly. Start 8 began at
+  20:41:43.322Z while PID 12632 was still alive — the kill against
+  it only began ~20:41:48Z and its exit was confirmed at 20:42:17Z.
+  Because start 7 held no lock, the locked launch was not blocked;
+  the overlap ended when the kill took effect, sometime inside
+  20:41:48Z–20:42:17Z (the instant is not pinned). Caveat: the last
+  watcher poll proving 12632 alive is at 20:41:17Z, 26 s before
+  start 8; a spontaneous death of 12632 inside
+  20:41:17Z–20:41:43Z cannot be excluded from the timestamps alone,
+  and nothing in the records indicates one. Entries stood at 2,096 at
+  both the 20:41:17Z and the 20:42:17Z polls — neither instance
+  appended an entry during the overlap window.
+- How it ended: not established by the surviving records. No kill
+  command, exit code, or console output for start 8 survives (its
+  console log is 0 bytes, like every run-3 console log, and no record
+  preserves its PID). What is established: it had ended by
+  2026-10-16T20:43:15Z, because start 9's launcher then acquired the
+  same lock with `flock -n` and succeeded — the kernel grants that
+  only when no process holds the lock.
+
+Start 9 — 2026-10-16T20:43:18Z (console log
+`regc-add2-console-run3-resume7.log`), the current live instance:
+
+- Under the lock: YES — proven by its live process ancestry:
+  launcher bash PID 2449 (started Fri Oct 16 20:43:15 2026) → PID
+  2451 "flock -n /home/hatch/workspace/wo6-scratch/regc-add2-journal-2026-10-16/.run.lock
+  python3 scripts/wo6/regc_add2_run.py --snapshot-date 2026-10-16
+  --main-sha 29045fbee500ab4700c97fe661a5717bdc6b138e --journal
+  /home/hatch/workspace/wo6-scratch/regc-add2-journal-2026-10-16" →
+  python PID 2452. The launcher's recorded output: "launch issued at
+  2026-10-16T20:43:15Z"; the start event followed at 20:43:18.007Z.
+- Alive at the same time as either earlier start: NO. Start 7 was
+  dead by 20:42:17Z, and start 9's `flock -n` acquisition at
+  20:43:15Z succeeded, which is only possible once start 8 had
+  released the lock. Since 20:43:15Z exactly one instance has been
+  alive — watcher10: "2026-10-16T20:44:52Z alive pid=2452
+  entries=2096", "2026-10-16T21:14:53Z alive pid=2452 entries=2121" —
+  and it is still running at the time of this append.
+
+Integrity rerun after the lock transition (2026-10-16 ~21:19Z):
+
+- `entries.jsonl`: 2,127 lines; every line valid JSON (0 bad);
+  2,127 distinct `full_name` values; duplicates: 0; the file ends
+  with a newline, with 0 bytes after it — no torn or partial line.
+  The 20:41:43Z–20:42:17Z overlap left no damage.
+- `events.jsonl`: 9 lines, every line valid JSON.
+- `header.json` unchanged: script sha256
+  `b80013adf2056165733d8a90fbc4c0f73fd4608737f5b2ebce3c998ecfeee636`,
+  main SHA `29045fbee500ab4700c97fe661a5717bdc6b138e`, snapshot
+  date `2026-10-16`.
