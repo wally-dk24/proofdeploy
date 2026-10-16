@@ -567,13 +567,18 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
     # from its approved fixture, and Ghost's (ghost_jwt, approved
     # D87: without it the checkpoint's Ghost unit could not have
     # authenticated in a measured run either). Both name env NAMES
-    # only — values are generated per run.
+    # only — values are generated per run. Vendure's is the third
+    # (login with the D120 token_header, approved D120/D131): its
+    # login body names upstream's published core-default superadmin
+    # credentials — the same on every instance, not per-run secrets.
     for path in sorted(rp.CONTRACTS_DIR.glob("*.yml")):
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         if path.name == "directus__directus.yml":
             assert data.get("auth", {}).get("mode") == "refresh"
         elif path.name == "TryGhost__Ghost.yml":
             assert data.get("auth", {}).get("mode") == "ghost_jwt"
+        elif path.name == "vendure-ecommerce__vendure.yml":
+            assert data.get("auth", {}).get("mode") == "login"
         else:
             assert "auth" not in data, path.name
 

@@ -9,3 +9,24 @@ readiness: "/health"
 env:
   DB: sqlite
   RUN_JOB_QUEUE: "1"
+# PROVENANCE 2026-10-16 (D131, REG-E): auth + fixture added. auth is the
+# login mode with the D120 token_header: Vendure's admin login returns the
+# session token only in the vendure-auth-token response header, never in
+# the body. The credentials written literally in the login mutation are
+# upstream's published core defaults (dev-config.ts declares no
+# superadminCredentials), the same on every instance — caller credentials,
+# not per-run secrets. The fixture text is the reviewer's ruled D131 text;
+# its render from this committed contract is sha256 ca9e5e07… (1390 bytes).
+auth:
+  mode: login
+  path: /admin-api
+  method: POST
+  body:
+    query: 'mutation { login(username: \"superadmin\", password: \"superadmin\") { ... on CurrentUser { id identifier } } }'
+  token_header: vendure-auth-token
+fixture:
+  repo_name: "Vendure"
+  seed_note: "Vendure's own populate seed, run as the setup step, created five roles (the built-in SuperAdmin and Customer roles, plus three roles with the codes administrator, order-manager and inventory-manager) and eleven users: the superadmin account and ten deterministic mock customers, each with an address and the password 'test'. It also created the default channel and Vendure's initial reference data, and imported a sample product catalogue from a products.csv file that ships with the repository."
+  auth_mechanism: "the token is presented in the Authorization header in the form 'Bearer <token>'"
+  auth_scope: "a session token belonging to the superadmin account, obtained by signing in to the admin API as that account; the account's username and password are upstream's published defaults, the same for every instance, because the instance config declares no others. The account holds the SuperAdmin role. At this version's default configuration a session lasts one year"
+  flags_note: "no feature flags were enabled or changed; the server runs upstream's own development configuration on top of Vendure's defaults, with its job queue processed in the server process"
