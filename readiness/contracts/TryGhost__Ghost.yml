@@ -14,3 +14,9 @@ auth:
   key_file: .pd-auth/admin_key
   ttl_seconds: 300
   bootstrap_env: [ADMIN_EMAIL, ADMIN_PASSWORD]
+fixture:
+  repo_name: "Ghost"
+  seed_note: "Ghost's own first-run setup created one owner account (the site title was set to 'ProofDeploy'), Ghost's built-in roles, its built-in integrations (some with their own API keys) and its default content; ProofDeploy's setup signed in as the owner once and added one custom integration. Nothing else was created or changed."
+  auth_mechanism: "the token is presented in the Authorization header in the form 'Ghost <token>'"
+  auth_scope: "a JWT signed with the custom integration's Admin API key (Ghost's 'Admin Integration' role), minted fresh for each request; it is not a staff user's session"
+  flags_note: "Labs feature flags are at this Ghost version's defaults; none were changed"
