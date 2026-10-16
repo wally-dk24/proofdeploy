@@ -460,6 +460,30 @@ def _dig_json_path(data: Any, path: str) -> Any:
     return cur
 
 
+def _expires_in_seconds(cfg: dict[str, Any], data: Any) -> float | None:
+    """The token lifetime declared by an auth response, in seconds.
+
+    `expires_in_json_path` names the value in the response; the
+    optional `expires_in_unit` declares its unit — "seconds" (the
+    default) or "milliseconds" (D137). The unit matters: Directus's
+    `data.expires` is 900000 MILLISECONDS for a 15-minute token, and
+    read as seconds it lands ~10 days out, so a provider-issued
+    token would never come near expiry and proactive refresh would
+    never fire. Validated at load (yml.py); anything undeclared or
+    unrecognized here is treated as seconds, matching the default.
+    """
+    expires_path = cfg.get("expires_in_json_path")
+    if not isinstance(expires_path, str) or not expires_path:
+        return None
+    node = _dig_json_path(data, expires_path)
+    if not isinstance(node, (int, float)) or isinstance(node, bool) or node <= 0:
+        return None
+    value = float(node)
+    if cfg.get("expires_in_unit") == "milliseconds":
+        value /= 1000.0
+    return value
+
+
 def _check_remote_method(
     method: str, url: str, provisioned: bool = False
 ) -> tuple[bool, str]:
@@ -825,13 +849,7 @@ class Executor:
                 f"credential provider failed: no token at '{token_path}' in refresh response"
             )
             return InconclusiveReason.AUTH
-        expires_in: float | None = None
-        expires_path = cfg.get("expires_in_json_path")
-        if isinstance(expires_path, str) and expires_path:
-            node = _dig_json_path(data, expires_path)
-            if isinstance(node, (int, float)) and node > 0:
-                expires_in = float(node)
-        ctx.provide_token(cur, expires_in_seconds=expires_in)
+        ctx.provide_token(cur, expires_in_seconds=_expires_in_seconds(cfg, data))
         # Refresh endpoints commonly rotate the refresh token; rebind
         # the fresh one for the next renewal (WO-8.3).
         self._capture_refresh_token(ctx, data, cfg)
@@ -948,13 +966,7 @@ class Executor:
                     f"credential provider failed: no token at '{token_path}' in login response"
                 )
                 return InconclusiveReason.AUTH
-        expires_in: float | None = None
-        expires_path = cfg.get("expires_in_json_path")
-        if isinstance(expires_path, str) and expires_path:
-            node = _dig_json_path(data, expires_path)
-            if isinstance(node, (int, float)) and node > 0:
-                expires_in = float(node)
-        ctx.provide_token(token, expires_in_seconds=expires_in)
+        ctx.provide_token(token, expires_in_seconds=_expires_in_seconds(cfg, data))
         self._capture_refresh_token(ctx, data, cfg)
         details.append("credential provider: token acquired")
         return None
