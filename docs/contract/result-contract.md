@@ -336,7 +336,10 @@ handled under D8's five conditions; in record terms:
   that alters the **meaning** of an existing field, rather than adding
   fields with defaults, is the kind of change this defaulting cannot
   absorb — it needs a bump and, per the registered-rule discipline, a
-  registration decision, not a silent edit.
+  registration decision, not a silent edit. Since WO-1.10 the major
+  half of that discipline is enforced, not just documented: every
+  reader refuses an unknown `schema_version` major through the one
+  shared check (see ambiguity 1, resolved).
 
 ## Ambiguities flagged, not resolved
 
@@ -344,12 +347,22 @@ These are places where the code or the older documents do not pin a
 single reading. This contract documents them; resolving them is future
 work, not this PR.
 
-1. **"Readers must refuse unknown versions" is stated but not
-   implemented.** The `runpair.py` module docstring says readers must
-   refuse unknown versions; no read path in the code checks
-   `schema_version` at all — readers accept records by defaulting
-   absent keys, including versions they do not know. The docstring
-   states the intended rule; the code does not enforce it.
+1. **"Readers must refuse unknown versions" was stated but not
+   implemented — RESOLVED by WO-1.10 (plan 1.10).** One shared
+   reader-side check now exists (`proofdeploy/versions.py`:
+   `check_schema_version`, `SUPPORTED_SCHEMA_MAJORS = (1,)`) and
+   every reader passes through it: the JSONL loader
+   (`read_records`), the at-commit re-score read
+   (`_read_record_at_commit`), offline replay (`replay_side`), and
+   per-probe result rebuilds (`ProbeResult.from_dict`). The rule is
+   major-based: within major 1, readers keep the defaulting behavior
+   described under [Versioning](#versioning-and-bump-rules), so
+   records at 1.0.0–1.5.0 load and re-score byte-identically; a
+   record stamped with an unknown major is refused with a typed
+   `UnknownSchemaVersionError` naming the version found and the
+   supported majors. A **missing** `schema_version` keeps the
+   previous behavior exactly: it is accepted (the pre-versioning
+   legacy artifacts carry none, and the loaders default the rest).
 2. **Older documents name stale versions.** The `runpair.py` module
    docstring says `schema_version` is "currently `1.3.0`" and
    ADR-0009's schema-version section says `"1.0.0"`. The constant in
@@ -366,6 +379,40 @@ work, not this PR.
    fixes only that they are JSON objects. `model_request`'s contents
    are described by its builder comment ("model, temperature,
    per-message hashes, seed/tools as sent"), not by a schema.
+
+## The verify output (plan 1.10)
+
+`proofdeploy verify` (WO-1.10 / D81) verifies one change in a
+developer's own repo: it authors probes from the `from`..`to` diff
+with the pinned model client, provisions `to` in the rootless
+sandbox through the same orchestrator path a measured run uses,
+executes the probes, and writes an **evidence record in this
+contract's format** (single-side shape: `run_kind` `"clean"` fields
+hold the verified side; `measured_result` is **false** — a verify
+run never counts as a measured result, and no score or judgment
+record is written: verify's verdict is its own registered
+fail-closed rollup — any FAIL → FAIL; else any INCONCLUSIVE →
+INCONCLUSIVE with that probe's typed reason; all PASS → PASS; no
+valid probe → INCONCLUSIVE `probe`).
+
+The verdict is reported as a separate, versioned JSON object
+(`verify_output_version: "1.0.0"`), schema'd at
+[`verify-output.schema.json`](verify-output.schema.json) beside
+this document: verdict, exit code (0 PASS / 1 FAIL / 2
+INCONCLUSIVE / 3 not supported / 4 usage / 5 internal), typed
+reason, per-probe results (this contract's per-probe objects
+verbatim), refs (repo, from/to SHAs), model, probe-set SHA-256
+(the record's `parsed_probes_sha256`), engine, isolation mode,
+the evidence record's path + `record_id` and its `schema_version`,
+and per-phase timings. No secret values: the output is redacted by
+value with the same pool the record uses before it is rendered.
+Readers of a verify output pass the same shared version check as
+record readers (`proofdeploy.versions.check_schema_version`,
+applied to `verify_output_version`): an unknown major is refused,
+never defaulted. The record a verify run writes remains fully
+replayable offline through `proofdeploy/replay.py`
+(`replay_side` over `c_results`), and re-applying the verify
+rollup to the replayed results reproduces the printed verdict.
 
 ## The schema and its test
 

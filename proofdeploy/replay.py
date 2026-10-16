@@ -48,6 +48,7 @@ from proofdeploy.executor import (
     evaluate_assertions,
 )
 from proofdeploy.runpair import RunPairVerdict, score_run_pair_detailed
+from proofdeploy.versions import check_schema_version
 
 
 class NotReplayableError(ValueError):
@@ -178,6 +179,9 @@ def replay_probe(probe: dict, result: dict) -> ProbeResult:
 def replay_side(evidence: dict, results_key: str) -> list[ProbeResult]:
     """Re-decide every probe of one side of an evidence record
     (``fix_parent_results`` / ``fix_results`` / ``c_results``)."""
+    # Reader-side version check (plan 1.10): replay refuses an
+    # evidence record stamped with an unknown schema major.
+    check_schema_version(evidence.get("schema_version"), kind="evidence record")
     probes = evidence.get("parsed_probes") or []
     rebuilt: list[ProbeResult] = []
     for result in evidence.get(results_key) or []:

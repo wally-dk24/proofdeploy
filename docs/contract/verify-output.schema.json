@@ -1,0 +1,186 @@
+{
+  "$defs": {
+    "sha_or_null": {
+      "oneOf": [
+        {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "string_or_null": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sha256_or_null": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$id": "verify-output.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The versioned machine-readable output of `proofdeploy verify` (plan 1.10, WO-1.10 / D81). Prose contract: the verify section of docs/contract/result-contract.md. Every key is always present; fields that do not apply are null or empty, never absent. A stopped run (refusal, usage error, internal error) carries verdict null and its exit code; a completed run carries the fail-closed verdict and the evidence record it wrote.",
+  "properties": {
+    "detail": {
+      "$ref": "#/$defs/string_or_null",
+      "description": "Human-readable detail for a stop or an INCONCLUSIVE run; null when the verdict speaks for itself."
+    },
+    "engine": {
+      "description": "The engine that produced the verdict, name/version (proofdeploy/<package version>). The verdict logic is the shared engine's; verify adds no verdict logic of its own beyond the registered rollup.",
+      "type": "string"
+    },
+    "evidence_record": {
+      "description": "The evidence record this run wrote (result-contract format), or null when the run stopped before any record (refusals, usage errors, leak stops, internal errors).",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "record_id": {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "record_id"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "exit_code": {
+      "description": "0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 not supported (typed), 4 usage/config error, 5 internal error.",
+      "enum": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "type": "integer"
+    },
+    "isolation_mode": {
+      "$ref": "#/$defs/string_or_null",
+      "description": "The sandbox app network mode actually in effect for the provisioned side (from the record's sandbox evidence), or 'sandbox' when the side was provisioned without a reported mode. Null when nothing was provisioned."
+    },
+    "model": {
+      "description": "The pinned probe-author model id. Stage 1 has no model selection (parked, O11).",
+      "type": "string"
+    },
+    "probe_set_sha256": {
+      "$ref": "#/$defs/sha256_or_null",
+      "description": "SHA-256 of the canonical JSON of the parsed probe set \u2014 the same value the evidence record stores as parsed_probes_sha256. Null when no record was written."
+    },
+    "probes": {
+      "description": "Every probe reported individually, in probe order \u2014 the result contract's per-probe result objects verbatim (proofdeploy.executor.ProbeResult.to_dict), including invalid author blocks (never sent, INCONCLUSIVE probe). Empty when the run stopped before execution.",
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "record_schema_version": {
+      "$ref": "#/$defs/string_or_null",
+      "description": "The schema_version stamped on the evidence record (the result contract's SCHEMA_VERSION). Null when no record was written."
+    },
+    "refs": {
+      "additionalProperties": false,
+      "properties": {
+        "from_ref": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "from_sha": {
+          "$ref": "#/$defs/sha_or_null"
+        },
+        "repo": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "to_ref": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "to_sha": {
+          "$ref": "#/$defs/sha_or_null"
+        }
+      },
+      "required": [
+        "repo",
+        "from_ref",
+        "to_ref",
+        "from_sha",
+        "to_sha"
+      ],
+      "type": "object"
+    },
+    "timings": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "description": "Wall-clock seconds per phase (bundle_s, author_s, provision_s, execute_s, total_s), rounded to milliseconds. Only the phases that ran are present.",
+      "type": "object"
+    },
+    "typed_reason": {
+      "$ref": "#/$defs/string_or_null",
+      "description": "For INCONCLUSIVE: the first inconclusive probe's typed reason (environment/auth/drift/probe), or a run-level typed cause (leak_check, model_transport, model_overflow). For exits 3/4/5: the refusal or error, named. Null on PASS and FAIL."
+    },
+    "verdict": {
+      "description": "The fail-closed verdict, or null when the run stopped before a verdict (exit 3/4/5). INCONCLUSIVE is never rendered as a pass: it has its own value and exit code.",
+      "oneOf": [
+        {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "INCONCLUSIVE"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "verify_output_version": {
+      "const": "1.0.0",
+      "description": "This output format's version. Readers refuse an unknown major (proofdeploy.versions.check_schema_version)."
+    }
+  },
+  "required": [
+    "verify_output_version",
+    "verdict",
+    "exit_code",
+    "typed_reason",
+    "detail",
+    "probes",
+    "refs",
+    "model",
+    "probe_set_sha256",
+    "engine",
+    "isolation_mode",
+    "evidence_record",
+    "record_schema_version",
+    "timings"
+  ],
+  "title": "proofdeploy verify output",
+  "type": "object"
+}

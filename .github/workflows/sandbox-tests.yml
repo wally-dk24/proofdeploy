@@ -140,7 +140,7 @@ jobs:
           - shard: apps-python-flask
             nodeids: "tests/test_conformance.py::test_case1_frozen_lockfile_honored[python-flask-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[python-flask-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[python-flask-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[python-flask-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[python-flask-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[python-flask-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[python-flask-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[python-flask-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[python-flask-sqlite] tests/test_conformance.py::test_case10_record_replays_to_same_verdict[python-flask-sqlite]"
           - shard: provisions-managers
-            files: "tests/test_wo81b_sandbox.py tests/test_wo81_generated_variant.py"
+            files: "tests/test_verify_sandbox.py tests/test_wo81b_sandbox.py tests/test_wo81_generated_variant.py"
           - shard: provisions-real-apps
             nodeids: "tests/test_wo83_sandbox.py::test_directus_login_refresh_proof_in_sandbox tests/test_wo83_sandbox.py::test_ghost_ghost_jwt_proof_in_sandbox"
           - shard: provisions-wo83-goldens
