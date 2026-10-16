@@ -42,6 +42,16 @@ repo, and the final outputs are built only from the journal. A death
 resumes the same journal; the journal header carries this script's
 sha256, the main SHA and the snapshot date, and a resume with any of
 them different refuses. One journal is one run (A5).
+
+D79 (2026-10-16) adds one rule on top: an errored repo is retried,
+never silently dropped. After the full pass, every entry with an
+error is re-screened in up to two further passes (three attempts per
+repo at most). Each attempt is journaled as its own line carrying an
+`attempt` number; the latest line per repo wins when the outputs are
+built, and a repo still errored after its passes stays in
+`errored_repos` with every attempt's message. The run prints ERRORED
+next to SURVIVORS; while it is non-zero the survivor list is not
+final and Phase C does not start.
 """
 from __future__ import annotations
 
@@ -71,6 +81,7 @@ LANGUAGES = ("JavaScript", "TypeScript", "Python")
 PER_PAGE = 100
 MAX_PAGES = 10  # A1: 10 pages x 100 = the first 1000 results per query.
 REQUEST_TIMEOUT = 120.0  # D74: every request gets a timeout (seconds).
+MAX_SCREEN_ATTEMPTS = 3  # D79: first pass + up to 2 retry passes per repo.
 
 NODE_LOCKFILES = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock")
 NODE_MONOREPO_FILES = ("pnpm-workspace.yaml", "lerna.json", "nx.json", "turbo.json")
@@ -786,6 +797,67 @@ def item4_key(entry: dict[str, Any]) -> tuple[int, str]:
     return (-int(entry["stars"]), str(entry["full_name"]).lower())
 
 
+def _attempt_entry(entry: dict[str, Any], attempt: int) -> dict[str, Any]:
+    """One screening attempt, stamped with its attempt number (D79).
+
+    The stamp is journal bookkeeping: it is stripped from the entry
+    the outputs are built from (see _winners_and_error_history).
+    """
+    stamped = dict(entry)
+    stamped["attempt"] = attempt
+    return stamped
+
+
+def _retry_errored(
+    screen: Callable[[dict[str, Any]], dict[str, Any]],
+    pool_list: list[dict[str, Any]],
+    history: dict[str, list[dict[str, Any]]],
+    record: Callable[[dict[str, Any]], None],
+) -> None:
+    """D79: re-screen every still-errored repo, up to
+    MAX_SCREEN_ATTEMPTS attempts per repo in total.
+
+    Each re-screen is recorded as a new attempt before it joins the
+    history. A repo that already used its attempts keeps them — a
+    session that died mid-pass recorded the attempts it completed, so
+    a resume continues the pass instead of repeating it.
+    """
+    while True:
+        pending = [
+            rec for rec in pool_list
+            if "error" in history[rec["full_name"]][-1]
+            and len(history[rec["full_name"]]) < MAX_SCREEN_ATTEMPTS
+        ]
+        if not pending:
+            return
+        for rec in pending:
+            name = rec["full_name"]
+            entry = _attempt_entry(screen(rec), len(history[name]) + 1)
+            record(entry)
+            history[name].append(entry)
+
+
+def _winners_and_error_history(
+    pool_list: list[dict[str, Any]],
+    history: dict[str, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """The latest attempt per repo wins (D79), in pool order; a repo
+    whose latest attempt is still an error keeps every attempt's
+    message, in attempt order."""
+    winners: list[dict[str, Any]] = []
+    error_history: dict[str, list[str]] = {}
+    for rec in pool_list:
+        lines = history[rec["full_name"]]
+        winner = dict(lines[-1])
+        winner.pop("attempt", None)
+        winners.append(winner)
+        if "error" in lines[-1]:
+            error_history[rec["full_name"]] = [
+                str(line["error"]) for line in lines if "error" in line
+            ]
+    return winners, error_history
+
+
 class JournalMismatch(Exception):
     """A resume was attempted against a journal whose header names a
     different script, main SHA or snapshot date. The resume refuses:
@@ -823,7 +895,8 @@ class Journal:
     header.json identifies the run (script sha256, main SHA, snapshot
     date). pool.json — the collected pool in order, the per-query
     counts and the search metadata — is written before any screening.
-    entries.jsonl gains one line per screened repo, as it completes.
+    entries.jsonl gains one line per screened repo, as it completes,
+    plus one further line per retry attempt of an errored repo (D79).
     events.jsonl records every start and resume (UTC time and the
     previous exit cause) and the exit of a completed session. The
     final outputs are built only from these files, so a process death
@@ -975,17 +1048,26 @@ def _finalize(
     pool_size: int,
     authenticated: bool,
     out_dir: Path,
+    error_history: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Item 4 ordering and the accepted output files, from entries in
     pool order (the same objects appear in entries and survivors, so
     the assigned order shows in both, as the format has always been).
+    A still-errored repo is listed with every attempt's message (D79).
     """
     entries = sorted(entries, key=item4_key)
     survivors = [e for e in entries if e.get("survivor")]
     for i, e in enumerate(survivors):
         e["order"] = i + 1
+    history_map = error_history or {}
     errored = [
-        {"full_name": e["full_name"], "stars": e["stars"]}
+        {
+            "full_name": e["full_name"],
+            "stars": e["stars"],
+            "errors": history_map.get(
+                str(e["full_name"]), [str(e["error"])]
+            ),
+        }
         for e in entries if "error" in e
     ]
     result: dict[str, Any] = {
@@ -1023,15 +1105,27 @@ def run(
     authenticated = bool(getattr(fetcher, "authenticated", False))
     if journal_dir is None:
         pool, counts, search_meta = collect_pool(fetcher, snapshot_date, sleep=sleep)
-        entries = [check_repo(fetcher, rec) for rec in pool.values()]
+        pool_list = list(pool.values())
+        history = {
+            rec["full_name"]: [_attempt_entry(check_repo(fetcher, rec), 1)]
+            for rec in pool_list
+        }
+        _retry_errored(
+            lambda rec: check_repo(fetcher, rec),
+            pool_list,
+            history,
+            lambda entry: None,
+        )
+        entries, error_history = _winners_and_error_history(pool_list, history)
         return _finalize(
             entries,
             snapshot_date=snapshot_date,
             counts=counts,
             search_meta=search_meta,
-            pool_size=len(pool),
+            pool_size=len(pool_list),
             authenticated=authenticated,
             out_dir=out_dir,
+            error_history=error_history,
         )
     # D74 journaled run: the pool and every screened entry reach disk
     # before the outputs are built, and the outputs are built only
@@ -1052,13 +1146,22 @@ def run(
         stored = journal.read_pool()
     assert stored is not None  # write_pool just landed (or was already there)
     pool_list, counts, search_meta = stored
-    done = {e["full_name"] for e in journal.read_entries()}
+    history = {}
+    for line in journal.read_entries():
+        history.setdefault(str(line["full_name"]), []).append(line)
     for rec in pool_list:
-        if rec["full_name"] in done:
+        if rec["full_name"] in history:
             continue  # recorded in a previous session; never re-screened
-        journal.append_entry(check_repo(fetcher, rec))
-    journaled = {e["full_name"]: e for e in journal.read_entries()}
-    entries = [journaled[rec["full_name"]] for rec in pool_list]
+        entry = _attempt_entry(check_repo(fetcher, rec), 1)
+        journal.append_entry(entry)
+        history[rec["full_name"]] = [entry]
+    _retry_errored(
+        lambda rec: check_repo(fetcher, rec),
+        pool_list,
+        history,
+        journal.append_entry,
+    )
+    entries, error_history = _winners_and_error_history(pool_list, history)
     result = _finalize(
         entries,
         snapshot_date=snapshot_date,
@@ -1067,6 +1170,7 @@ def run(
         pool_size=len(pool_list),
         authenticated=authenticated,
         out_dir=out_dir,
+        error_history=error_history,
     )
     journal.record_exit("completed")
     return result
@@ -1125,6 +1229,7 @@ def main() -> None:
         print(f"query language:{lang}: returned={result['query_counts'][lang]}")
     print(f"pool after dedup: {result['pool_size']}")
     print(f"SURVIVORS: {result['survivor_count']}")
+    print(f"ERRORED: {result['error_count']}")
     for e in result["survivors"]:
         stacks = ",".join(k for k, v in e["stacks"].items() if v["passed"])
         apps = ",".join(

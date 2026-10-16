@@ -5,7 +5,8 @@ per-repo file maps, and the Fetcher's retry logic is exercised with an
 injected raw_fetch. Each filter test pins one A2/A3 branch; the
 changes-round tests pin the reviewer's F1-F6 findings on PR #108; the
 D74 tests pin the fetcher fix (timeout, HTTPException retries, per-repo
-error rows) and the journal/resume mechanics.
+error rows) and the journal/resume mechanics; the D79 tests pin the
+errored-repo retry passes and the torn-final-line resume.
 """
 from __future__ import annotations
 
@@ -828,7 +829,13 @@ def test_run_records_error_count_and_errored_repos(tmp_path: Path) -> None:
     fetcher = FakeFetcher(repos=repos, search_pages={"JavaScript": pages})
     result = mod.run(fetcher, "2026-10-15", tmp_path, sleep=NO_SLEEP)
     assert result["error_count"] == 1
-    assert result["errored_repos"] == [{"full_name": "acme/flaky", "stars": 9000}]
+    # D79: the flaky repo was retried to its 3 attempts and stays
+    # listed with every attempt's message.
+    assert result["errored_repos"] == [{
+        "full_name": "acme/flaky",
+        "stars": 9000,
+        "errors": ["harness or environment: simulated check failure"] * 3,
+    }]
     assert result["survivor_count"] == 1
     errored = [e for e in result["entries"] if "error" in e]
     assert errored[0]["full_name"] == "acme/flaky"
@@ -967,7 +974,12 @@ def test_persistent_fetch_failure_is_a_row_and_the_run_continues(
     fetcher = mod.Fetcher(sleep=NO_SLEEP, raw_fetch=raw_fetch, max_retries=2)
     result = mod.run(fetcher, "2026-10-15", tmp_path, sleep=NO_SLEEP)
     assert result["error_count"] == 1
-    assert result["errored_repos"] == [{"full_name": "acme/flaky", "stars": 9000}]
+    # D79: retried to its 3 attempts; every attempt's message is kept.
+    assert result["errored_repos"][0]["full_name"] == "acme/flaky"
+    assert result["errored_repos"][0]["stars"] == 9000
+    errors = result["errored_repos"][0]["errors"]
+    assert len(errors) == 3
+    assert all(e.startswith("harness or environment:") for e in errors)
     assert result["survivor_count"] == 1
     assert result["survivors"][0]["full_name"] == "acme/good"
     errored = [e for e in result["entries"] if "error" in e]
@@ -1140,3 +1152,247 @@ def test_journal_resume_refuses_on_identity_mismatch(tmp_path: Path) -> None:
     # A refused resume writes nothing: no start event, no new entries.
     assert (journal_dir / "entries.jsonl").read_text() == entries_before
     assert (journal_dir / "events.jsonl").read_text() == events_before
+
+
+# ------------------------------------------- D79 errored-repo retries
+
+
+class ScreeningScriptFetcher(FakeFetcher):
+    """FakeFetcher whose per-repo screening outcomes follow a script.
+
+    failures: {full_name: [outcome, ...]} — the repo's n-th screening
+    consumes the n-th outcome at its branch fetch: an exception
+    instance is raised, None raises KeyboardInterrupt (a death
+    mid-screening: that attempt records nothing). Screenings past the
+    scripted list delegate to the fixtures normally. `screenings`
+    counts, per repo, how many screenings this fetcher began.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        failures: dict[str, list[Any]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._failures = failures or {}
+        self.screenings: dict[str, int] = {}
+
+    def get_json(self, url: str) -> Any:
+        if "/branches/" in url:
+            fn = url.split("/repos/", 1)[1].split("/branches/")[0]
+            script = self._failures.get(fn)
+            if script is not None:
+                n = self.screenings.get(fn, 0)
+                self.screenings[fn] = n + 1
+                if n < len(script):
+                    outcome = script[n]
+                    if outcome is None:
+                        raise KeyboardInterrupt
+                    raise outcome
+        return super().get_json(url)
+
+
+def _good_files() -> dict[str, str]:
+    return {
+        "package.json": json.dumps({
+            "scripts": {"start": "node index.js"},
+            "dependencies": {"sqlite3": "^5.1.0"},
+        }),
+        "package-lock.json": "{}",
+    }
+
+
+def _journal_lines(journal_dir: Path, full_name: str) -> list[dict[str, Any]]:
+    return [
+        json.loads(ln)
+        for ln in (journal_dir / "entries.jsonl").read_text().splitlines()
+        if json.loads(ln)["full_name"] == full_name
+    ]
+
+
+def test_errored_repo_retried_and_recovers_with_real_verdict(
+    tmp_path: Path,
+) -> None:
+    # D79 (i): errored in pass 1, healthy in pass 2 — the repo ends
+    # with its real verdict, not the error row.
+    repos = {"acme/flaky": {"files": _good_files()}}
+    pages = [[item("acme/flaky", 2000)]]
+    fetcher = ScreeningScriptFetcher(
+        repos=repos, search_pages={"JavaScript": pages},
+        failures={"acme/flaky": [mod.HarnessError("down once")]},
+    )
+    journal_dir = tmp_path / "journal"
+    result = mod.run(
+        fetcher, "2026-10-15", tmp_path / "out", sleep=NO_SLEEP,
+        journal_dir=journal_dir, **IDENTITY,
+    )
+    assert fetcher.screenings["acme/flaky"] == 2
+    assert result["error_count"] == 0
+    assert result["errored_repos"] == []
+    assert result["survivor_count"] == 1
+    survivor = result["survivors"][0]
+    assert survivor["full_name"] == "acme/flaky"
+    assert "error" not in survivor
+    assert survivor["stacks"]["node"]["passed"] is True
+    # Both attempts are journaled, stamped, the error first.
+    lines = _journal_lines(journal_dir, "acme/flaky")
+    assert [ln["attempt"] for ln in lines] == [1, 2]
+    assert lines[0]["error"] == "harness or environment: down once"
+    assert "error" not in lines[1]
+    assert lines[1]["stacks"]["node"]["passed"] is True
+
+
+def test_permanently_errored_repo_attempted_exactly_three_times(
+    tmp_path: Path,
+) -> None:
+    # D79 (ii): a repo that never recovers is attempted exactly
+    # MAX_SCREEN_ATTEMPTS times and stays listed with every message.
+    repos = {
+        "acme/good": {"files": _good_files()},
+        "acme/dead": {"files": _good_files()},
+    }
+    pages = [[item("acme/dead", 9000), item("acme/good", 2000)]]
+    fetcher = ScreeningScriptFetcher(
+        repos=repos, search_pages={"JavaScript": pages},
+        failures={"acme/dead": [
+            mod.HarnessError("boom 1"),
+            mod.HarnessError("boom 2"),
+            mod.HarnessError("boom 3"),
+            mod.HarnessError("boom 4"),  # never reached: 3 is the cap
+        ]},
+    )
+    journal_dir = tmp_path / "journal"
+    result = mod.run(
+        fetcher, "2026-10-15", tmp_path / "out", sleep=NO_SLEEP,
+        journal_dir=journal_dir, **IDENTITY,
+    )
+    assert fetcher.screenings["acme/dead"] == 3
+    assert result["survivor_count"] == 1
+    assert result["error_count"] == 1
+    assert result["errored_repos"] == [{
+        "full_name": "acme/dead",
+        "stars": 9000,
+        "errors": [
+            "harness or environment: boom 1",
+            "harness or environment: boom 2",
+            "harness or environment: boom 3",
+        ],
+    }]
+    lines = _journal_lines(journal_dir, "acme/dead")
+    assert [ln["attempt"] for ln in lines] == [1, 2, 3]
+
+
+def test_resume_mid_retry_pass_continues_without_repeating(
+    tmp_path: Path,
+) -> None:
+    # D79 (iii): the first session dies during the retry pass — the
+    # flaky repo's retry has completed, the dead repo's has not. The
+    # resume continues the pass: completed attempts are not repeated
+    # and the dead repo uses only its remaining attempts.
+    repos = {
+        "acme/good": {"files": _good_files()},
+        "acme/flaky": {"files": _good_files()},
+        "acme/dead": {"files": _good_files()},
+    }
+    pages = [[
+        item("acme/good", 3000), item("acme/flaky", 2000),
+        item("acme/dead", 1000),
+    ]]
+    journal_dir = tmp_path / "journal"
+    out_dir = tmp_path / "out"
+    session1 = ScreeningScriptFetcher(
+        repos=repos, search_pages={"JavaScript": pages},
+        failures={
+            "acme/flaky": [mod.HarnessError("flaky down")],
+            "acme/dead": [mod.HarnessError("boom 1"), None],  # dies on retry
+        },
+    )
+    with pytest.raises(KeyboardInterrupt):
+        mod.run(
+            session1, "2026-10-15", out_dir, sleep=NO_SLEEP,
+            journal_dir=journal_dir, **IDENTITY,
+        )
+    assert [ln["attempt"] for ln in _journal_lines(journal_dir, "acme/good")] == [1]
+    assert [ln["attempt"] for ln in _journal_lines(journal_dir, "acme/flaky")] == [1, 2]
+    assert [ln["attempt"] for ln in _journal_lines(journal_dir, "acme/dead")] == [1]
+
+    session2 = ScreeningScriptFetcher(
+        repos=repos, search_pages={"JavaScript": pages},
+        failures={"acme/dead": [
+            mod.HarnessError("boom 2"), mod.HarnessError("boom 3"),
+        ]},
+    )
+    result = mod.run(
+        session2, "2026-10-15", out_dir, sleep=NO_SLEEP,
+        journal_dir=journal_dir, **IDENTITY,
+    )
+    # Only the dead repo was screened in the resume, exactly twice:
+    # the completed attempts (good, flaky) were not repeated. (The
+    # scripted failures raise before the fixture dispatch records a
+    # call, so an empty calls list confirms nothing else was fetched:
+    # a wrongly re-screened good/flaky repo would have delegated and
+    # been recorded, and the journaled pool needs no search.)
+    assert session2.screenings == {"acme/dead": 2}
+    assert session2.calls == []
+    assert result["survivor_count"] == 2
+    assert result["error_count"] == 1
+    assert result["errored_repos"] == [{
+        "full_name": "acme/dead",
+        "stars": 1000,
+        "errors": [
+            "harness or environment: boom 1",
+            "harness or environment: boom 2",
+            "harness or environment: boom 3",
+        ],
+    }]
+    assert [ln["attempt"] for ln in _journal_lines(journal_dir, "acme/dead")] == [1, 2, 3]
+    flaky = next(e for e in result["entries"] if e["full_name"] == "acme/flaky")
+    assert flaky["survivor"] is True
+    assert "error" not in flaky
+
+
+def test_journal_torn_final_line_is_rescreened_on_resume(
+    tmp_path: Path,
+) -> None:
+    # D79 torn-line: a death mid-append leaves a truncated final
+    # line in entries.jsonl. On resume that repo was never durably
+    # recorded: it is re-screened, the run completes, and the outputs
+    # are byte-identical to an uninterrupted run. (Reviewer plant (c)
+    # on the D74 round: removing the torn-line drop from read_entries
+    # must fail this test.)
+    ref_out = tmp_path / "ref-out"
+    mod.run(
+        _four_app_fetcher(), "2026-10-15", ref_out, sleep=NO_SLEEP,
+        journal_dir=tmp_path / "ref-journal", **IDENTITY,
+    )
+    ref_raw = (ref_out / "regc-add2-raw.json").read_bytes()
+    ref_survivors = (ref_out / "regc-add2-survivors.json").read_bytes()
+
+    journal_dir = tmp_path / "journal"
+    out_dir = tmp_path / "out"
+    mod.run(
+        _four_app_fetcher(), "2026-10-15", out_dir, sleep=NO_SLEEP,
+        journal_dir=journal_dir, **IDENTITY,
+    )
+    entries_path = journal_dir / "entries.jsonl"
+    lines = entries_path.read_text().splitlines()
+    assert len(lines) == 4
+    last = lines[-1]
+    assert json.loads(last)["full_name"] == "acme/app4"
+    torn = "\n".join(lines[:-1]) + "\n" + last[: len(last) // 2]
+    entries_path.write_text(torn)  # no trailing newline: mid-append
+
+    resumed_fetcher = _four_app_fetcher()
+    result = mod.run(
+        resumed_fetcher, "2026-10-15", out_dir, sleep=NO_SLEEP,
+        journal_dir=journal_dir, **IDENTITY,
+    )
+    assert result["survivor_count"] == 4
+    screened = {
+        c.split("/repos/", 1)[1].split("/branches/")[0]
+        for c in resumed_fetcher.calls if "/branches/" in c
+    }
+    assert screened == {"acme/app4"}  # exactly the torn repo re-screened
+    assert (out_dir / "regc-add2-raw.json").read_bytes() == ref_raw
+    assert (out_dir / "regc-add2-survivors.json").read_bytes() == ref_survivors
