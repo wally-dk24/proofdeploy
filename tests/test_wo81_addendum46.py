@@ -287,12 +287,12 @@ def test_generated_bootstrap_is_hash_pinned_and_recorded(tmp_path):
     for s in installs:
         assert "uv==0.13.0" not in (s.argv or [])
     # Step order: tools venv, the writer that materializes the
-    # committed bootstrap file into .pd-tools, the hash-checked
+    # committed bootstrap file into {pd_tools}, the hash-checked
     # install from it, then the resolve.
     writer, boot = installs[1], installs[2]
     assert (writer.argv or [])[1] == "-c"
     assert (writer.argv or [])[3] == (
-        "{checkout}/.pd-tools/uv-requirements.txt"
+        "{pd_tools}/uv-requirements.txt"
     )
     committed = _bootstrap_file()
     text = committed.read_text(encoding="utf-8")
@@ -300,12 +300,12 @@ def test_generated_bootstrap_is_hash_pinned_and_recorded(tmp_path):
     assert "uv==0.13.0" in text
     assert f"--hash=sha256:{UV_WHEEL_SHA256}" in text
     argv = boot.argv or []
-    assert argv[0] == "{checkout}/.pd-tools/bin/pip"
+    assert argv[0] == "{pd_tools}/bin/pip"
     assert "--require-hashes" in argv
     assert "--no-deps" in argv
     assert "--only-binary" in argv and ":all:" in argv
     assert argv[argv.index("-r") + 1] == (
-        "{checkout}/.pd-tools/uv-requirements.txt"
+        "{pd_tools}/uv-requirements.txt"
     )
     # The plan records the committed file's sha256.
     assert plan.lock_resolver_bootstrap_sha256 == hashlib.sha256(
@@ -314,10 +314,17 @@ def test_generated_bootstrap_is_hash_pinned_and_recorded(tmp_path):
 
 
 def _host_mapping(checkout: Path) -> dict:
+    # The host executor's rendering (runner.py): {pd_tools} and
+    # {venv} live in the checkout's per-side home sibling (plan
+    # 1.2(n)), never in the checkout.
+    from proofdeploy.sandbox import sandbox_home_dir
+
+    home = sandbox_home_dir(checkout)
     return {
         "{runtime_bin}": sys.executable,
         "{checkout}": str(checkout),
-        "{venv}": str(checkout / ".venv"),
+        "{venv}": str(home / ".venv"),
+        "{pd_tools}": str(home / ".pd-tools"),
     }
 
 
@@ -358,15 +365,19 @@ def _real_generated_plan(tmp_path: Path, name: str):
 
 def test_bootstrap_install_for_real_installs_pinned_uv(tmp_path):
     """The rendered bootstrap steps, run for real against PyPI,
-    install exactly uv 0.13.0 into .pd-tools."""
+    install exactly uv 0.13.0 into the per-side home's .pd-tools
+    (plan 1.2(n)) — nothing lands in the checkout."""
+    from proofdeploy.sandbox import sandbox_home_dir
+
     plan = _real_generated_plan(tmp_path, "snap-good")
     checkout = tmp_path / "co-good"
     _, failure = _run_bootstrap_for_real(plan, checkout)
     assert failure is None, (
         failure.stdout + failure.stderr if failure else ""
     )
-    uv_bin = checkout / ".pd-tools" / "bin" / "uv"
+    uv_bin = sandbox_home_dir(checkout) / ".pd-tools" / "bin" / "uv"
     assert uv_bin.is_file()
+    assert not (checkout / ".pd-tools").exists()
     out = subprocess.run(
         [str(uv_bin), "--version"],
         capture_output=True, text=True, timeout=60,
@@ -380,16 +391,21 @@ def test_wrong_bootstrap_hash_fails_the_install_step(tmp_path):
     bootstrap file makes pip refuse the install (hash-checking
     mode), so the bootstrap step fails instead of installing an
     unverified uv."""
+    from proofdeploy.sandbox import sandbox_home_dir
+
     plan = _real_generated_plan(tmp_path, "snap-bad")
     installs = _install_steps(plan)
     assert (installs[1].argv or [])[1] == "-c"  # the writer step
     checkout = tmp_path / "co-bad"
     checkout.mkdir()
-    # Tools venv + writer run for real; the file lands in .pd-tools.
+    # Tools venv + writer run for real; the file lands in the
+    # per-side home's .pd-tools.
     for step in installs[:2]:
         proc = _run_step_for_real(step, checkout)
         assert proc.returncode == 0, proc.stdout + proc.stderr
-    req_file = checkout / ".pd-tools" / "uv-requirements.txt"
+    req_file = (
+        sandbox_home_dir(checkout) / ".pd-tools" / "uv-requirements.txt"
+    )
     text = req_file.read_text(encoding="utf-8")
     assert UV_WHEEL_SHA256 in text
     # The plant: corrupt the one hash the install will check.
@@ -399,4 +415,6 @@ def test_wrong_bootstrap_hash_fails_the_install_step(tmp_path):
     proc = _run_step_for_real(installs[2], checkout)
     assert proc.returncode != 0
     assert "DO NOT MATCH THE HASHES" in (proc.stdout + proc.stderr)
-    assert not (checkout / ".pd-tools" / "bin" / "uv").exists()
+    assert not (
+        sandbox_home_dir(checkout) / ".pd-tools" / "bin" / "uv"
+    ).exists()

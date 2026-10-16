@@ -514,10 +514,10 @@ def test_sandbox_uv_sync_step_carries_the_run_cutoff(
         d
         for d in cap.descriptors
         if d["command"]
-        == "/checkout/.pd-tools/bin/uv sync --frozen --python python3"
+        == "/pd-home/.pd-tools/bin/uv sync --frozen --python python3"
     )
     assert sync_desc["env"]["UV_EXCLUDE_NEWER"] == CUTOFF
-    assert sync_desc["env"]["UV_PROJECT_ENVIRONMENT"] == "/checkout/.venv"
+    assert sync_desc["env"]["UV_PROJECT_ENVIRONMENT"] == "/pd-home/.venv"
     plan = side.provision.install_plan
     assert plan is not None
     assert plan["build_cutoff"] == CUTOFF

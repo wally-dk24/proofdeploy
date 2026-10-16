@@ -22,7 +22,8 @@ different stack:
 `tests/test_node26_corepack.py`: engines widened to the Node 26
 row, proving a packageManager-pinned app provisions on the 26
 row — where corepack is not bundled and the adapter bootstraps it
-explicitly (into the checkout's `.pd-tools`, Addendum 35).
+explicitly (into the per-side home's `.pd-tools`, Addendum 35;
+plan 1.2(n)).
 
 `golden/node-express-sqlite/variant-forced-compile/` holds a
 one-file overlay (`.npmrc`: build-from-source + foreground-scripts)

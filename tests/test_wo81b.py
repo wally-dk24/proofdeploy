@@ -13,8 +13,9 @@ was BUILD_FAILED in every measured run.
 What this work order builds:
 
 - The plan carries the whole frozen install (one plan, both
-  executors): the checkout venv created from the selected
-  interpreter; the manager bootstrapped into /checkout/.pd-tools
+  executors): the app venv created from the selected
+  interpreter in the per-side home (plan 1.2(n)); the manager
+  bootstrapped into the home's .pd-tools
   BY HASH from a committed bootstrap requirements file at ONE
   pinned version (uv 0.13.0 — the REG-A resolver pin; poetry
   2.5.1, PyPI 2026-09-20; pdm 2.29.2, PyPI 2026-09-17 — each the
@@ -22,9 +23,10 @@ What this work order builds:
   the file's sha256 recorded on the plan
   (manager_bootstrap_sha256) and the version in
   package_manager_version; the frozen install into
-  /checkout/.venv (``uv sync --frozen`` with
+  the home's .venv (``uv sync --frozen`` with
   UV_PROJECT_ENVIRONMENT + --python, ``poetry install --sync``
-  into the in-project venv, ``pdm sync``); and the tool's own
+  and ``pdm sync`` into it through the activated environment,
+  D77 Q2); and the tool's own
   lock-freshness check where the install command does not refuse
   a stale lock itself (verified against the pinned tools:
   ``uv sync --frozen`` and ``pdm sync`` both exit 0 on a stale
@@ -32,7 +34,8 @@ What this work order builds:
   --check`` first; ``poetry install --sync`` exits 1 itself, so
   poetry gets no separate check).
 - The sandbox manager gate grows to {pip, uv, poetry, pdm}.
-- The host executor creates the checkout venv for these managers
+- The host executor creates the app venv (in the per-side home
+  since plan 1.2(n)) for these managers
   and puts it first on PATH for install/build/migrate/seed/start
   (previously only pip got a venv on PATH), renders step env
   through the plan mapping, and names a failed step's first error
@@ -68,23 +71,23 @@ PKG_DIR = Path(provisioning.__file__).parent
 # work order registers, not whatever the code's constants say.
 PINNED = {
     "uv": ("0.13.0", "uv_bootstrap_requirements.txt",
-           ".pd-tools/uv-requirements.txt", "uv.lock"),
+           "uv-requirements.txt", "uv.lock"),
     "poetry": ("2.5.1", "poetry_bootstrap_requirements.txt",
-               ".pd-tools/poetry-requirements.txt", "poetry.lock"),
+               "poetry-requirements.txt", "poetry.lock"),
     "pdm": ("2.29.2", "pdm_bootstrap_requirements.txt",
-            ".pd-tools/pdm-requirements.txt", "pdm.lock"),
+            "pdm-requirements.txt", "pdm.lock"),
 }
 
 FROZEN_ARGV = {
     "uv": [
-        "{checkout}/.pd-tools/bin/uv",
+        "{pd_tools}/bin/uv",
         "sync",
         "--frozen",
         "--python",
         "{runtime_bin}",
     ],
-    "poetry": ["{checkout}/.pd-tools/bin/poetry", "install", "--sync"],
-    "pdm": ["{checkout}/.pd-tools/bin/pdm", "sync"],
+    "poetry": ["{pd_tools}/bin/poetry", "install", "--sync"],
+    "pdm": ["{pd_tools}/bin/pdm", "sync"],
 }
 
 FROZEN_ENV = {
@@ -97,16 +100,22 @@ FROZEN_ENV = {
         "UV_PROJECT_ENVIRONMENT": "{venv}",
         "UV_EXCLUDE_NEWER": "2026-01-02T03:04:05Z",
     },
-    "poetry": {"POETRY_VIRTUALENVS_IN_PROJECT": "true"},
-    "pdm": {},
+    # Plan 1.2(n) (D77 Q2): poetry and pdm install into the
+    # out-of-project {venv} through the activated environment;
+    # poetry's in-project creation is disabled outright.
+    "poetry": {
+        "POETRY_VIRTUALENVS_IN_PROJECT": "false",
+        "VIRTUAL_ENV": "{venv}",
+    },
+    "pdm": {"VIRTUAL_ENV": "{venv}"},
 }
 
 # Managers whose install command does not itself refuse a stale
 # lock (see the module docstring) get the tool's own freshness
 # check as the step right before the frozen install.
 CHECK_ARGV = {
-    "uv": ["{checkout}/.pd-tools/bin/uv", "lock", "--check"],
-    "pdm": ["{checkout}/.pd-tools/bin/pdm", "lock", "--check"],
+    "uv": ["{pd_tools}/bin/uv", "lock", "--check"],
+    "pdm": ["{pd_tools}/bin/pdm", "lock", "--check"],
 }
 
 
@@ -172,7 +181,7 @@ def test_bootstrap_file_pins_exact_version_with_hashes(manager):
 
 @pytest.mark.parametrize("manager", ["uv", "poetry", "pdm"])
 def test_committed_lock_plan_shape(manager, tmp_path):
-    version, file_name, checkout_path, lockfile = PINNED[manager]
+    version, file_name, pd_tools_path, lockfile = PINNED[manager]
     # Plan from a COPY so planning can never write into the fixture.
     snap = tmp_path / "snap"
     shutil.copytree(FIXTURES / manager, snap)
@@ -193,33 +202,33 @@ def test_committed_lock_plan_shape(manager, tmp_path):
     assert plan.manager_bootstrap_sha256 == hashlib.sha256(
         committed
     ).hexdigest()
-    assert plan.persisted_dirs == [".venv", ".pd-tools"]
+    assert plan.persisted_dirs == ["pd_home:.venv", "pd_home:.pd-tools"]
 
     steps = plan.steps
-    # 1. The checkout venv, created from the selected interpreter.
+    # 1. The app venv, created from the selected interpreter.
     assert steps[0].phase == "venv"
     assert steps[0].argv == ["{runtime_bin}", "-m", "venv", "{venv}"]
     installs = _install_steps(plan)
     # 2. The manager bootstrap: tools venv, the committed file
     # materialized verbatim, the hash-checked install.
     assert installs[0].argv == [
-        "{runtime_bin}", "-m", "venv", "{checkout}/.pd-tools",
+        "{runtime_bin}", "-m", "venv", "{pd_tools}",
     ]
     write_step = installs[1]
     assert write_step.argv[:3] == [
         "{runtime_bin}", "-c", provisioning._WRITE_FILE_CODE,
     ]
-    assert write_step.argv[3] == f"{{checkout}}/{checkout_path}"
+    assert write_step.argv[3] == f"{{pd_tools}}/{pd_tools_path}"
     assert write_step.argv[4] == committed.decode("utf-8")
     assert installs[2].argv == [
-        "{checkout}/.pd-tools/bin/pip",
+        "{pd_tools}/bin/pip",
         "install",
         "--require-hashes",
         "--no-deps",
         "--only-binary",
         ":all:",
         "-r",
-        f"{{checkout}}/{checkout_path}",
+        f"{{pd_tools}}/{pd_tools_path}",
     ]
     # 3. The freshness check (where the tool needs one) directly
     # before the frozen install; the frozen install is LAST.
@@ -237,7 +246,7 @@ def test_committed_lock_plan_shape(manager, tmp_path):
     assert len(verify) == 1
     assert verify[0].executor == "sandbox"
     assert verify[0].argv is not None
-    assert verify[0].argv[0] == "/checkout/.venv/bin/python"
+    assert verify[0].argv[0] == "{venv}/bin/python"
     # 5. No generation machinery anywhere on a committed plan.
     assert all("compile" not in (s.argv or []) for s in steps)
 
@@ -245,7 +254,7 @@ def test_committed_lock_plan_shape(manager, tmp_path):
 # ---------------------------------------------------------------------------
 # The sandbox seam (podman-free): the gate no longer refuses, and
 # the rendered steps are the plan's — bootstrap, check, frozen
-# install — with the step env rendered (/checkout/.venv, not the
+# install — with the step env rendered (/pd-home/.venv, not the
 # {venv} token).
 # ---------------------------------------------------------------------------
 
@@ -324,9 +333,9 @@ def _stub_sandbox_side(monkeypatch, snap: Path, install):
 
 
 RENDERED_FROZEN = {
-    "uv": "/checkout/.pd-tools/bin/uv sync --frozen --python python3",
-    "poetry": "/checkout/.pd-tools/bin/poetry install --sync",
-    "pdm": "/checkout/.pd-tools/bin/pdm sync",
+    "uv": "/pd-home/.pd-tools/bin/uv sync --frozen --python python3",
+    "poetry": "/pd-home/.pd-tools/bin/poetry install --sync",
+    "pdm": "/pd-home/.pd-tools/bin/pdm sync",
 }
 
 
@@ -364,14 +373,14 @@ def test_sandbox_runs_manager_plan(monkeypatch, tmp_path, manager):
     if manager in CHECK_ARGV:
         check = RENDERED_FROZEN[manager].split(" sync")[0] + " lock --check"
         assert check in cap.commands, cap.commands
-    # The uv step env was RENDERED: /checkout/.venv, not the token.
+    # The uv step env was RENDERED: /pd-home/.venv, not the token.
     if manager == "uv":
         sync_desc = next(
             d for d in cap.descriptors
             if d["command"] == RENDERED_FROZEN["uv"]
         )
         assert sync_desc["env"]["UV_PROJECT_ENVIRONMENT"] == (
-            "/checkout/.venv"
+            "/pd-home/.venv"
         )
     # The plan on the provision records the manager facts.
     plan = side.provision.install_plan
@@ -403,8 +412,12 @@ def test_first_error_line_names_uv_lock_check_error():
 # ---------------------------------------------------------------------------
 # Host executor E2E (real tools, via the plan's own bootstrap):
 # each fixture provisions READY on the host, the app answers from
-# the checkout venv, and the mismatch fixture is BUILD_FAILED with
-# the tool's first error line in the reason.
+# the app venv, and the mismatch fixture is BUILD_FAILED with
+# the tool's first error line in the reason. Since plan 1.2(n)
+# these are also the D77 Q2 proof for the pinned poetry / pdm:
+# the dependencies land in the out-of-project {venv} (the per-side
+# home sibling) through the activated environment, and NO .venv or
+# .pd-tools is created inside the checkout.
 # ---------------------------------------------------------------------------
 
 
@@ -437,23 +450,34 @@ def _provision_fixture(tmp_path, variant: str):
 @pytest.mark.parametrize("manager", ["uv", "poetry", "pdm"])
 def test_host_provisions_committed_lock_ready(tmp_path, manager):
     from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.sandbox import sandbox_home_dir
 
     prov, snap, result = _provision_fixture(tmp_path, manager)
     try:
         assert result.status == ProvisionStatus.READY, "\n".join(
             result.logs
         )
-        # The manager was bootstrapped into the checkout, pinned.
-        assert (snap / ".pd-tools" / "bin" / manager).exists()
-        # The app runs from the checkout venv and its six is the
-        # locked 1.17.0 (only installable from that venv).
+        home = sandbox_home_dir(snap)
+        # The manager was bootstrapped into the per-side home,
+        # pinned — NOT into the checkout (plan 1.2(n)).
+        assert (home / ".pd-tools" / "bin" / manager).exists()
+        assert not (snap / ".pd-tools").exists()
+        # The app runs from the home's venv and its six is the
+        # locked 1.17.0 (only installable from that venv): the
+        # dependencies landed in {venv}, and no in-project .venv
+        # was created (D77 Q2, proven against the pinned tools).
         assert result.target_url is not None
         with urllib.request.urlopen(
             result.target_url + "/health", timeout=10
         ) as resp:
             body = json.loads(resp.read())
         assert body == {"ok": True, "six": "1.17.0"}
-        assert (snap / ".venv" / "bin" / "python").exists()
+        assert (home / ".venv" / "bin" / "python").exists()
+        six = list(
+            (home / ".venv" / "lib").glob("python*/site-packages/six.py")
+        )
+        assert six, "six did not land in the out-of-project venv"
+        assert not (snap / ".venv").exists()
         assert result.package_manager == manager
     finally:
         if result.proc is not None:

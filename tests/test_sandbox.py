@@ -447,9 +447,18 @@ def test_golden_home_outside_checkout(tmp_path, golden, manager):
             ).stdout.split()
         )
         plan = provision.install_plan or {}
+        # Plan 1.2(n) (D77 Q3): persisted_dirs entries are rooted
+        # (checkout:<relpath> / pd_home:<relpath>); the checkout's
+        # top level may only gain the checkout-rooted ones' first
+        # path segments.
+        persisted_top = {
+            entry.split(":", 1)[1].split("/")[0]
+            for entry in (plan.get("persisted_dirs") or [])
+            if entry.startswith("checkout:")
+        }
         allowed = (
             committed
-            | set(plan.get("persisted_dirs") or [])
+            | persisted_top
             | {"app.db", ".pd-bridge.py"}
         )
         actual = {p.name for p in snap.iterdir()}
@@ -550,6 +559,96 @@ def test_sandbox_bun_cache_project_json_stays_out_of_workspace(tmp_path):
             if "node_modules" not in p.parts
         ]
         assert in_tree == []
+    finally:
+        if provision.proc is not None:
+            provision.proc.stop()
+
+
+@requires_userns_remap
+def test_sandbox_checkout_root_has_no_tool_state(tmp_path):
+    """Plan 1.2(n) regression, real sandbox — the pd-home-scan
+    pattern aimed at the CHECKOUT root. The fixture app
+    (tests/fixtures/checkout-scan) is a bun app: its plan
+    bootstraps the digest-pinned bun (a .pd-tools tenant). The
+    contract's build step lists the checkout root and fails if
+    .pd-tools or .venv is in it. With the tools relocated to the
+    per-side home (/pd-home) the scan passes and the side
+    provisions READY; with the tools back in the tree (the
+    pre-1.2(n) rendering) the build fails — the plant in the PR
+    that introduced this test."""
+    fixture = Path(__file__).parent / "fixtures" / "checkout-scan"
+    root = tmp_path / "scan"
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    for f in sorted(fixture.iterdir()):
+        if f.is_file():
+            shutil.copyfile(f, repo / f.name)
+
+    def git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, check=True, timeout=120,
+        )
+        return proc.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "checkout-scan-test")
+    git("config", "user.email", "checkout-scan@proofdeploy.invalid")
+    git("add", "-A")
+    git("commit", "-q", "-m", "checkout-scan fixture")
+    sha = git("rev-parse", "HEAD")
+    records = root / "records"
+    records.mkdir()
+    work = root / "work"
+    work.mkdir()
+    unit = root / "unit"
+    unit.mkdir()
+
+    sys.path.insert(
+        0, str(Path(__file__).parent.parent / "conformance")
+    )
+    import kit
+
+    from proofdeploy.orchestrator import (
+        MeasureConfig,
+        Orchestrator,
+        _free_port,
+    )
+
+    cfg = MeasureConfig(
+        repo_dir=repo,
+        output_dir=records,
+        workdir=work,
+        no_skill=True,
+        sandbox=True,
+    )
+    side = Orchestrator(cfg)._provision_side_sandbox(
+        sha, _free_port(), unit, "checkoutscan"
+    )
+    provision = side.provision
+    kit.dump_logs("sandbox-checkout-scan", provision.logs)
+    try:
+        assert provision.status.value == "ready", (
+            provision.reason,
+            "\n".join(provision.logs),
+        )
+        build = [
+            s for s in provision.executed_steps if s["phase"] == "build"
+        ]
+        assert build and all(s["exit_code"] == 0 for s in build), (
+            provision.executed_steps
+        )
+        # The scan actually ran and saw a clean root (its listing
+        # is in the side's logs).
+        logs = "\n".join(provision.logs)
+        assert "checkout root:" in logs, logs
+        assert "scan: checkout root clean" in logs, logs
+        # The bun the plan bootstrapped EXISTS — under /pd-home,
+        # not in the tree.
+        home = sandbox_home_dir(side.snapshot_dir)
+        assert (home / ".pd-tools" / "bin" / "bun").is_file()
+        assert not (side.snapshot_dir / ".pd-tools").exists()
+        assert not (side.snapshot_dir / ".venv").exists()
     finally:
         if provision.proc is not None:
             provision.proc.stop()

@@ -551,7 +551,8 @@ def test_provision_prefers_package_manager_lockfile(tmp_path, monkeypatch):
     assert result.package_manager == "pnpm"
     # WO-7 PR 2 + Addendum 35: a packageManager pin renders through
     # corepack at the exact pinned version — bootstrapped into the
-    # checkout's .pd-tools (persisted) by the first step, then the
+    # per-side home's .pd-tools (persisted; plan 1.2(n)) by the
+    # first step, then the
     # install runs through the persisted corepack binary. Plan
     # data, independent of the planning host's own corepack —
     # never a silent fall-back to whatever pnpm is on PATH.
@@ -568,7 +569,8 @@ def test_provision_corepack_pinned_pnpm_manager_bin_first_on_path(
 ):
     """Plan 1.2(f), host executor: a corepack-pinned pnpm plan's
     contract steps run with the persisted corepack's manager bin
-    dir (snap/.pd-tools/node_modules/.bin — the corepack package's
+    dir (the per-side home's .pd-tools/node_modules/.bin — the
+    corepack package's
     own shims, which resolve the snapshot's packageManager pin)
     FIRST on PATH, so a step calling bare `pnpm` runs the plan's
     pinned version, never a PATH fallback."""
@@ -604,7 +606,11 @@ def test_provision_corepack_pinned_pnpm_manager_bin_first_on_path(
     assert result.package_manager == "pnpm"
     assert result.status == ProvisionStatus.BUILD_FAILED  # missing start
     idx = recorded.index("pnpm --version")
-    manager_bin = str(snap / ".pd-tools" / "node_modules" / ".bin")
+    from proofdeploy.sandbox import sandbox_home_dir
+
+    manager_bin = str(
+        sandbox_home_dir(snap) / ".pd-tools" / "node_modules" / ".bin"
+    )
     assert envs[idx]["PATH"].startswith(manager_bin + os.pathsep)
 
 
@@ -864,6 +870,36 @@ def test_cleanup_run_is_idempotent(tmp_path):
     assert not (tmp_path / "venvs" / "abc").exists()
     assert not (tmp_path / "runs" / "abc").exists()
     assert len(logs) == 2
+
+
+def test_cleanup_run_removes_pd_home_sibling_with_relocated_tools(
+    tmp_path,
+):
+    """Plan 1.2(n) (D77 Q6b): the relocated tool state — the
+    per-side home sibling (<checkout>.pd-home) holding .pd-tools
+    and the app .venv — dies with the run. The sibling lives
+    inside runs/<run_id> next to the snapshot, so cleanup_run's
+    containment removal takes the whole tree: snapshot, sibling,
+    tools and all."""
+    from proofdeploy.sandbox import sandbox_home_dir
+
+    prov = Provisioner(workdir=tmp_path)
+    run_dir = tmp_path / "runs" / "abc"
+    snap = run_dir / "snap"
+    snap.mkdir(parents=True)
+    (snap / "app.py").write_text("x = 1\n", encoding="utf-8")
+    home = sandbox_home_dir(snap)
+    tools_bin = home / ".pd-tools" / "bin"
+    tools_bin.mkdir(parents=True)
+    (tools_bin / "poetry").write_text("#!/bin/sh\n", encoding="utf-8")
+    venv_bin = home / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+    logs: list[str] = []
+    prov.cleanup_run("abc", logs)
+    assert not run_dir.exists()
+    assert not home.exists()
+    assert not snap.exists()
 
 
 def test_cleanup_run_routes_userns_remapped_tree_through_unshare(

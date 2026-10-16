@@ -12,8 +12,8 @@ Three groups:
 - The sandbox executor running a Node plan through the adapter
   (podman-free stubs, the Addendum 18 pattern): a Node plan is no
   longer refused wholesale; a bun plan runs too (plan 1.2e: its
-  digest-pinned bootstrap + frozen install, with .pd-tools/bin
-  first on the contract steps' PATH).
+  digest-pinned bootstrap + frozen install, with the home's
+  .pd-tools/bin first on the contract steps' PATH).
 - Addendum 31: each provision result records, per executed step,
   {phase, executor, argv_rendered | shell, exit_code} — for BOTH
   executors rendering the same plan, and the sandbox's install argv
@@ -84,21 +84,22 @@ def test_node_plan_pnpm_pin_renders_corepack_with_exact_version(tmp_path):
     assert plan.package_manager_version == "9.15.0"
     steps = _install_steps(plan)
     assert len(steps) == 2
-    # Addendum 35: corepack is bootstrapped into the checkout
-    # (.pd-tools, persisted) — never -g, which dies with the
+    # Addendum 35: corepack is bootstrapped into the per-side
+    # home (.pd-tools, persisted; plan 1.2(n)) — never -g, which
+    # dies with the
     # install container — and the pinned install runs through the
     # persisted binary.
     assert steps[0].argv == [
-        "npm", "install", "--prefix", "{checkout}/.pd-tools",
+        "npm", "install", "--prefix", "{pd_tools}",
         "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
     ]
     assert steps[1].argv == [
-        "{checkout}/.pd-tools/node_modules/.bin/corepack",
+        "{pd_tools}/node_modules/.bin/corepack",
         "pnpm@9.15.0", "install", "--frozen-lockfile",
     ]
     assert steps[1].env.get("COREPACK_ENABLE_DOWNLOAD_PROMPT") == "0"
     assert plan.corepack_version == "0.36.0"
-    assert plan.persisted_dirs == ["node_modules", ".pd-tools"]
+    assert plan.persisted_dirs == ["checkout:node_modules", "pd_home:.pd-tools"]
 
 
 def test_node_plan_pnpm_without_pin_uses_plain_frozen_install(tmp_path):
@@ -127,7 +128,7 @@ def test_node_plan_npm_pin_renders_corepack(tmp_path):
     assert len(steps) == 2
     step = steps[1]
     assert step.argv[:2] == [
-        "{checkout}/.pd-tools/node_modules/.bin/corepack", "npm@10.9.0",
+        "{pd_tools}/node_modules/.bin/corepack", "npm@10.9.0",
     ]
     assert "ci" in step.argv
     assert step.env.get("COREPACK_ENABLE_DOWNLOAD_PROMPT") == "0"
@@ -157,7 +158,7 @@ def test_node_plan_yarn_classic_vs_berry(tmp_path):
     # frozen install is the LAST install-phase step (the bootstrap
     # precedes it).
     step = _install_steps(plan)[-1]
-    assert step.argv[0] == "{checkout}/.pd-tools/node_modules/.bin/corepack"
+    assert step.argv[0] == "{pd_tools}/node_modules/.bin/corepack"
     assert "--immutable" in step.argv
     assert "--frozen-lockfile" not in step.argv
 
@@ -240,7 +241,7 @@ def test_node_plan_runtime_selection_from_engines(tmp_path):
     assert plan.image_ref == row.pinned_ref
     assert "@sha256:" in (plan.image_ref or "")
     # node_modules persists inside the checkout (install -> app).
-    assert plan.persisted_dirs == ["node_modules"]
+    assert plan.persisted_dirs == ["checkout:node_modules"]
 
 
 # ---------------------------------------------------------------------------
@@ -413,23 +414,23 @@ def test_sandbox_executor_runs_corepack_pinned_pnpm_plan(
     assert len(installs) == 2
     bootstrap, frozen = installs
     assert bootstrap["argv_rendered"] == [
-        "npm", "install", "--prefix", "/checkout/.pd-tools",
+        "npm", "install", "--prefix", "/pd-home/.pd-tools",
         "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
     ]
     assert frozen["argv_rendered"] == [
-        "/checkout/.pd-tools/node_modules/.bin/corepack",
+        "/pd-home/.pd-tools/node_modules/.bin/corepack",
         "pnpm@9.15.0", "install", "--frozen-lockfile",
     ]
     build = next(d for d in fake.descriptors if d["phase"] == "build")
     assert build["shell"] == (
-        "export PATH=/checkout/.pd-tools/node_modules/.bin:"
+        "export PATH=/pd-home/.pd-tools/node_modules/.bin:"
         "/checkout/node_modules/.bin:$PATH; pnpm --version"
     )
     start = next(
         e for e in side.provision.executed_steps if e["phase"] == "start"
     )
     assert start["shell"] == (
-        "export PATH=/checkout/.pd-tools/node_modules/.bin:"
+        "export PATH=/pd-home/.pd-tools/node_modules/.bin:"
         "/checkout/node_modules/.bin:$PATH; pnpm run start"
     )
 
@@ -520,11 +521,11 @@ def test_sandbox_executor_runs_bun_plan(monkeypatch, tmp_path):
     assert "bun-v1.4.3" in bootstrap["argv_rendered"][2]
     assert "sha256sum -c" in bootstrap["argv_rendered"][2]
     assert frozen["argv_rendered"] == [
-        "/checkout/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+        "/pd-home/.pd-tools/bin/bun", "install", "--frozen-lockfile",
     ]
     build = next(d for d in fake.descriptors if d["phase"] == "build")
     assert build["shell"] == (
-        "export PATH=/checkout/.pd-tools/bin:"
+        "export PATH=/pd-home/.pd-tools/bin:"
         "/checkout/node_modules/.bin:$PATH; node --check server.js"
     )
 
@@ -1045,7 +1046,7 @@ def _install_steps(plan):
 def test_node26_pin_plan_uses_persisted_corepack(tmp_path):
     """The pinned corepack rendering is identical on every row
     (Addendum 35): a bootstrap step installs corepack@0.36.0 into
-    the checkout's .pd-tools, and the install runs through the
+    the per-side home's .pd-tools, and the install runs through the
     persisted binary — on the 26 row, whose image does not bundle
     corepack at all, exactly as on the 24 row."""
     snap = _node_snapshot(
@@ -1064,15 +1065,15 @@ def test_node26_pin_plan_uses_persisted_corepack(tmp_path):
     steps = _install_steps(plan)
     assert len(steps) == 2
     assert steps[0].argv == [
-        "npm", "install", "--prefix", "{checkout}/.pd-tools",
+        "npm", "install", "--prefix", "{pd_tools}",
         "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
     ]
     assert steps[1].argv == [
-        "{checkout}/.pd-tools/node_modules/.bin/corepack",
+        "{pd_tools}/node_modules/.bin/corepack",
         "pnpm@9.15.0", "install", "--frozen-lockfile",
     ]
     assert plan.corepack_version == "0.36.0"
-    assert ".pd-tools" in plan.persisted_dirs
+    assert "pd_home:.pd-tools" in plan.persisted_dirs
 
 
 def test_node24_pin_plan_same_persisted_corepack_no_global(tmp_path):
@@ -1094,11 +1095,11 @@ def test_node24_pin_plan_same_persisted_corepack_no_global(tmp_path):
     steps = _install_steps(plan)
     assert len(steps) == 2
     assert steps[0].argv == [
-        "npm", "install", "--prefix", "{checkout}/.pd-tools",
+        "npm", "install", "--prefix", "{pd_tools}",
         "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
     ]
     assert steps[1].argv == [
-        "{checkout}/.pd-tools/node_modules/.bin/corepack",
+        "{pd_tools}/node_modules/.bin/corepack",
         "pnpm@9.15.0", "install", "--frozen-lockfile",
     ]
     for step in plan.steps:
@@ -1542,7 +1543,7 @@ def test_sandbox_step_command_renders_export_form_for_every_branch():
 
     cmd = "cd packages/dev-server && bun run populate"
     corepack = (
-        "export PATH=/checkout/.pd-tools/node_modules/.bin:"
+        "export PATH=/pd-home/.pd-tools/node_modules/.bin:"
         "/checkout/node_modules/.bin:$PATH; "
     )
     assert _sandbox_step_command(
@@ -1552,7 +1553,7 @@ def test_sandbox_step_command_renders_export_form_for_every_branch():
         cmd, "node", "yarn", corepack_version="0.36.0"
     ) == corepack + cmd
     assert _sandbox_step_command(cmd, "node", "bun") == (
-        "export PATH=/checkout/.pd-tools/bin:"
+        "export PATH=/pd-home/.pd-tools/bin:"
         "/checkout/node_modules/.bin:$PATH; " + cmd
     )
     assert _sandbox_step_command(cmd, "node", "npm") == (
@@ -1562,11 +1563,11 @@ def test_sandbox_step_command_renders_export_form_for_every_branch():
         "export PATH=/checkout/node_modules/.bin:$PATH; " + cmd
     )
     assert _sandbox_step_command("pytest -q", "python") == (
-        "export PATH=/checkout/.venv/bin:$PATH; pytest -q"
+        "export PATH=/pd-home/.venv/bin:$PATH; pytest -q"
     )
     assert _sandbox_step_command(
         "python manage.py migrate", "python"
-    ) == "/checkout/.venv/bin/python manage.py migrate"
+    ) == "/pd-home/.venv/bin/python manage.py migrate"
 
 
 def test_sandbox_step_command_builtin_leading_command_runs(tmp_path):

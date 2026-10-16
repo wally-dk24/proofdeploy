@@ -121,16 +121,16 @@ def test_pnpm_golden_variant_provisions_on_node26(tmp_path):
         ]
         assert len(installs) >= 2, provision.executed_steps
         # The persisted corepack bootstrap ran first (Addendum 35:
-        # into the checkout's .pd-tools, never -g — each step is its
+        # into the per-side home's .pd-tools, never -g — each step is its
         # own --rm container), and the pinned install ran through
         # the persisted corepack binary.
         assert installs[0]["argv_rendered"] == [
-            "npm", "install", "--prefix", "/checkout/.pd-tools",
+            "npm", "install", "--prefix", "/pd-home/.pd-tools",
             "--no-save", "--no-audit", "--no-fund", "corepack@0.36.0",
         ]
         assert installs[0]["exit_code"] == 0
         assert installs[1]["argv_rendered"] == [
-            "/checkout/.pd-tools/node_modules/.bin/corepack",
+            "/pd-home/.pd-tools/node_modules/.bin/corepack",
             "pnpm@9.15.0", "install", "--frozen-lockfile",
         ]
         assert installs[1]["exit_code"] == 0

@@ -277,7 +277,7 @@ def test_sandbox_executor_runs_bun_plan(monkeypatch, tmp_path):
     assert bootstrap["argv_rendered"][:2] == ["bash", "-c"]
     assert "sha256sum -c" in bootstrap["argv_rendered"][2]
     assert frozen["argv_rendered"] == [
-        "/checkout/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+        "/pd-home/.pd-tools/bin/bun", "install", "--frozen-lockfile",
     ]
 
 
