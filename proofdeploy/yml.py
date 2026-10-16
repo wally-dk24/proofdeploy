@@ -405,7 +405,12 @@ _EXPIRES_IN_UNITS = ("milliseconds", "seconds")
 
 
 def _validate_expires_unit(auth: dict[str, Any], out: dict[str, Any]) -> None:
-    """Validate + copy `expires_in_unit` (login/refresh modes)."""
+    """Validate + copy `expires_in_unit` (login/refresh modes).
+
+    A unit with no `expires_in_json_path` to apply to is a
+    contract error, refused at load: the declaration would
+    otherwise sit inert while the reader believes expiry is
+    unit-aware."""
     unit = _auth_str(auth, "expires_in_unit", required=False)
     if unit is None:
         return
@@ -413,6 +418,12 @@ def _validate_expires_unit(auth: dict[str, Any], out: dict[str, Any]) -> None:
         raise ValueError(
             "proofdeploy.yml 'auth.expires_in_unit' must be one of "
             f"{sorted(_EXPIRES_IN_UNITS)}, got: {unit!r}"
+        )
+    if not _auth_str(auth, "expires_in_json_path", required=False):
+        raise ValueError(
+            "proofdeploy.yml 'auth.expires_in_unit' requires "
+            "'auth.expires_in_json_path' (a unit with nothing to "
+            "apply to is a contract error)"
         )
     out["expires_in_unit"] = unit
 

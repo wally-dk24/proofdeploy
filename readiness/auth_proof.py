@@ -14,17 +14,33 @@ actually works end to end (REG-E item 4 shape):
    dictates: a mint for ghost_jwt, a login for login/refresh
    modes), acquisitions counted BY KIND from the provider's own
    detail lines;
-3. the same request with no Authorization header — expected to be
-   refused with the repo's registered status (auth is really
+3. the same request with no credentials at all — run through a
+   copy of the executor with the credential provider and any
+   static token REMOVED, so the leg performs no acquisition and
+   sends no Authorization header (through the provider-configured
+   executor the provider's proactive ensure would still acquire,
+   which is a credential event, not a bare request) — expected to
+   be refused with the repo's registered status (auth is really
    enforced, not merely accepted).
+
+The verdict is per-leg, never summed: each authenticated leg must
+show exactly one acquisition of the repo's registered kind, and
+the bare leg zero acquisitions. Where a repo's API answers a
+refusal as HTTP 200 with an error body (GraphQL), the spec
+additionally registers generic body checks — a JSON path that
+must be non-null on the authenticated legs, and a JSON path that
+must equal a registered value on the bare leg — evaluated over
+the recorded response bodies; status alone proves nothing there.
+Repos with real HTTP refusals register no body checks.
 
 The driver is contract-driven (D137): the provider configuration
 and the token presentation come from the repo's committed contract
 (the presentation scheme is the one the contract's fixture text
 names, in its fixed sentence "in the form '<Scheme> <token>'").
-The only per-repo inputs are the proof endpoint and the expected
-unauthenticated status, registered in PROOF_SPECS below — adding a
-repo is a registry entry plus its contract, never new driver code.
+The only per-repo inputs are the proof endpoint, the expected
+unauthenticated status, the expected acquisition kind and any
+body checks, registered in PROOF_SPECS below — adding a repo is
+a registry entry plus its contract, never new driver code.
 This module adds no auth logic of its own: provisioning, the
 executor and the registered providers are the engine's own, and
 the probes are plain executor probes whose ``${AUTH_TOKEN}``
@@ -58,6 +74,7 @@ harness itself failed.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -88,14 +105,28 @@ SEED_SOURCE = SEEDS_DIR / SEED_SNAPSHOT_NAME
 @dataclass(frozen=True)
 class ProofSpec:
     """The per-repo proof inputs (D137): how to call the proof
-    endpoint, and the status an unauthenticated request to it must
-    be refused with. Everything else — the provider, the token
-    presentation — is read from the repo's committed contract."""
+    endpoint, the status an unauthenticated request to it must be
+    refused with, and the acquisition kind each authenticated leg
+    must perform exactly once. Everything else — the provider,
+    the token presentation — is read from the repo's committed
+    contract.
+
+    The optional body checks are generic (never repo-specific
+    code): ``authenticated_body_path`` names a JSON path in the
+    response body that must resolve non-null on both authenticated
+    legs; ``unauthenticated_body_path`` / ``..._value`` name a
+    JSON path on the bare leg that must equal the registered
+    value. They exist for APIs that serve a refusal as HTTP 200
+    with an error body, where the status alone proves nothing."""
 
     method: str
     path: str
     unauthenticated_status: int
+    acquisition_kind: str
     body: dict[str, Any] | None = None
+    authenticated_body_path: str | None = None
+    unauthenticated_body_path: str | None = None
+    unauthenticated_body_value: Any = None
 
 
 # D91: Ghost's Admin API tags endpoint — its browse requires
@@ -105,16 +136,31 @@ class ProofSpec:
 # raises NoPermissionError). The site endpoint the WO-8.3 proof
 # used cannot serve: its read is public by design.
 PROOF_SPECS: dict[str, ProofSpec] = {
-    "TryGhost/Ghost": ProofSpec("GET", "/ghost/api/admin/tags/", 403),
+    "TryGhost/Ghost": ProofSpec(
+        "GET", "/ghost/api/admin/tags/", 403, acquisition_kind="mint"
+    ),
     # D113: Directus's current-user endpoint; no Authorization -> 401.
-    "directus/directus": ProofSpec("GET", "/users/me", 401),
+    "directus/directus": ProofSpec(
+        "GET", "/users/me", 401, acquisition_kind="login"
+    ),
     # D131: Vendure's admin API; the `me` query with the acquired
-    # session token presented as Bearer; no token -> refused.
+    # session token presented as Bearer. Vendure answers a request
+    # with no token as HTTP 200 with a GraphQL error body —
+    # ForbiddenError (code "FORBIDDEN") at the registered control
+    # SHA, per the reviewer's source check — so the bare leg's
+    # expectation is status 200 PLUS the body check, and each
+    # authenticated leg must show a non-null data.me.id (a 200
+    # with `me: null` is the same refusal wearing a success
+    # status).
     "vendure-ecommerce/vendure": ProofSpec(
         "POST",
         "/admin-api",
-        401,
+        200,
+        acquisition_kind="login",
         body={"query": "query { me { id identifier } }"},
+        authenticated_body_path="data.me.id",
+        unauthenticated_body_path="errors[0].extensions.code",
+        unauthenticated_body_value="FORBIDDEN",
     ),
 }
 
@@ -376,6 +422,47 @@ def _seed_evidence(side: Any, contract: RepoContract) -> dict[str, Any]:
     }
 
 
+_MISSING: Any = object()
+
+
+def _json_path_value(body: Any, path: str) -> Any:
+    """Resolve a generic JSON path ("data.me.id",
+    "errors[0].extensions.code") over a parsed body; _MISSING
+    when any step is absent or of the wrong shape. Dotted names
+    walk mappings, [n] indexes sequences — nothing repo-specific."""
+    current = body
+    for segment in path.split("."):
+        name, bracket, rest = segment.partition("[")
+        if name:
+            if not isinstance(current, dict) or name not in current:
+                return _MISSING
+            current = current[name]
+        while bracket:
+            index, close, rest = rest.partition("]")
+            if not close or not index.isdigit():
+                return _MISSING
+            if not isinstance(current, list) or int(index) >= len(current):
+                return _MISSING
+            current = current[int(index)]
+            bracket, rest = ("[", rest[1:]) if rest.startswith("[") else ("", rest)
+    return current
+
+
+def _record_body(result: Any, redactor: Redactor) -> Any:
+    """The response body as the row records it: parsed JSON when
+    the body parses (the body checks in _proof_passed walk it),
+    else the scrubbed raw text, else None. Scrubbed by value like
+    every other string the harness emits."""
+    raw = getattr(result, "http_body", "") or ""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return redactor.scrub(raw)
+    return redactor.scrub_obj(parsed)
+
+
 def _request_record(
     result: Any,
     *,
@@ -386,8 +473,9 @@ def _request_record(
 ) -> dict[str, Any]:
     """One proof request as the row records it: method, path, the
     Authorization header's SHAPE (never its value), the HTTP
-    status the executor observed, the verdict, and the provider's
-    acquisitions for this request, counted by kind."""
+    status the executor observed, the response body (scrubbed),
+    the verdict, and the provider's acquisitions for this
+    request, counted by kind."""
     kinds = _acquisition_kinds(result.details)
     return {
         "method": spec.method,
@@ -396,6 +484,7 @@ def _request_record(
             f"{scheme} <redacted:acquired_token>" if authenticated else None
         ),
         "http_status": result.http_status,
+        "body": _record_body(result, redactor),
         "verdict": result.verdict.value,
         "reason": result.reason.value if result.reason else None,
         "acquisitions": sum(kinds.values()),
@@ -414,28 +503,76 @@ def _register_result_secrets(redactor: Redactor, result: Any) -> None:
             redactor.add("bootstrap_value", value)
 
 
+def _bare_executor(executor: Any) -> Any:
+    """A copy of the side's executor with NO credential provider
+    and NO static token, for the unauthenticated leg: through the
+    provider-configured executor the provider's proactive ensure
+    would still acquire before the request — a credential event
+    that would make the "bare" leg neither bare nor
+    acquisition-free. The copy shares the target, the snapshot
+    and the provisioned flag; only the credential wiring is
+    removed."""
+    bare = copy.copy(executor)
+    bare.credential_config = None
+    bare.auth_token = None
+    return bare
+
+
 def _proof_passed(
     seed_ok: bool,
     records: list[dict[str, Any]],
-    expected_unauthenticated_status: int,
+    spec: ProofSpec,
 ) -> bool:
     """The proof verdict, composed from the seed evidence and the
-    three request records: the seed conjunct holds (a declared key
-    file is present; no conjunct when the contract declares none),
-    both authenticated requests were accepted (200) with exactly
-    one fresh acquisition each (two in total, of whatever kinds
-    the provider's mode performs), the unauthenticated request was
-    refused with the expected status, and every leg's own verdict
-    is a pass. Pure over its inputs so every conjunct is testable
-    (D106)."""
-    acquisition_total = records[0]["acquisitions"] + records[1]["acquisitions"]
+    three request records, PER LEG (never summed): the seed
+    conjunct holds (a declared key file is present; no conjunct
+    when the contract declares none); EACH authenticated leg was
+    accepted (200) with exactly one fresh acquisition, of the
+    spec's registered kind, and — when the spec registers an
+    authenticated body path — that path resolves non-null in the
+    leg's recorded body; the unauthenticated leg was refused with
+    the expected status, performed ZERO acquisitions, sent no
+    Authorization header, and — when the spec registers a bare-leg
+    body check — its body's path equals the registered value;
+    and every leg's own verdict is a pass. Pure over its inputs
+    so every conjunct is testable (D106)."""
+
+    def authenticated_ok(record: dict[str, Any]) -> bool:
+        if record["http_status"] != 200 or record["verdict"] != "pass":
+            return False
+        if record["acquisitions"] != 1:
+            return False
+        if record["acquisition_kinds"] != {spec.acquisition_kind: 1}:
+            return False
+        if spec.authenticated_body_path is not None:
+            value = _json_path_value(
+                record.get("body"), spec.authenticated_body_path
+            )
+            if value is _MISSING or value is None:
+                return False
+        return True
+
+    bare = records[2]
+    bare_ok = (
+        bare["http_status"] == spec.unauthenticated_status
+        and bare["verdict"] == "pass"
+        and bare["acquisitions"] == 0
+        and not bare["acquisition_kinds"]
+        and bare["authorization"] is None
+    )
+    if bare_ok and spec.unauthenticated_body_path is not None:
+        value = _json_path_value(
+            bare.get("body"), spec.unauthenticated_body_path
+        )
+        bare_ok = (
+            value is not _MISSING
+            and value == spec.unauthenticated_body_value
+        )
     return (
         seed_ok
-        and records[0]["http_status"] == 200
-        and records[1]["http_status"] == 200
-        and records[2]["http_status"] == expected_unauthenticated_status
-        and acquisition_total == 2
-        and all(r["verdict"] == "pass" for r in records)
+        and authenticated_ok(records[0])
+        and authenticated_ok(records[1])
+        and bare_ok
     )
 
 
@@ -522,7 +659,9 @@ def auth_proof_side(
             results = [
                 executor.run_probe(_authenticated_probe(spec, scheme), index=0),
                 executor.run_probe(_authenticated_probe(spec, scheme), index=1),
-                executor.run_probe(_unauthenticated_probe(spec), index=2),
+                _bare_executor(executor).run_probe(
+                    _unauthenticated_probe(spec), index=2
+                ),
             ]
             for result in results:
                 _register_result_secrets(redactor, result)
@@ -548,9 +687,7 @@ def auth_proof_side(
                 for kind, count in record["acquisition_kinds"].items():
                     kinds_total[kind] = kinds_total.get(kind, 0) + count
             seed_ok = seed_evidence["key_file_present"] is not False
-            passed = _proof_passed(
-                seed_ok, records, spec.unauthenticated_status
-            )
+            passed = _proof_passed(seed_ok, records, spec)
             row["seed"] = seed_evidence
             row["auth"] = {
                 "endpoint": spec.path,

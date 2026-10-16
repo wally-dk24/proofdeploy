@@ -612,6 +612,25 @@ def test_expires_in_unit_bad_value_refused(tmp_path):
         )
 
 
+def test_expires_in_unit_without_expires_path_refused(tmp_path):
+    # A unit with nothing to apply to is a contract error (D137
+    # reviewer minor): without expires_in_json_path the
+    # declaration would sit inert, refused at load in both modes
+    # that read lifetimes.
+    with pytest.raises(ValueError, match="expires_in_unit.*requires"):
+        _contract(
+            tmp_path,
+            "  mode: login\n  path: /login\n  token_json_path: token\n"
+            "  expires_in_unit: milliseconds\n",
+        )
+    with pytest.raises(ValueError, match="expires_in_unit.*requires"):
+        _contract(
+            tmp_path,
+            "  mode: refresh\n  path: /auth/refresh\n"
+            "  token_json_path: token\n  expires_in_unit: seconds\n",
+        )
+
+
 def test_expires_in_unit_refused_in_register_mode(tmp_path):
     # register mode never reads expires_in_json_path, so the unit
     # key is unknown there and refused like any other stray key.

@@ -1683,7 +1683,13 @@ def test_auth_proof_side_proves_auth_through_the_engine(
 
 
 def _proof_record(
-    http_status: int, *, verdict: str = "pass", acquisitions: int = 0
+    http_status: int,
+    *,
+    verdict: str = "pass",
+    acquisitions: int = 0,
+    kinds: dict[str, int] | None = None,
+    authorization: str | None = None,
+    body: Any = None,
 ) -> dict[str, Any]:
     """One request record as _request_record shapes it, for
     driving the pure verdict directly (D106)."""
@@ -1691,18 +1697,37 @@ def _proof_record(
         "http_status": http_status,
         "verdict": verdict,
         "acquisitions": acquisitions,
+        "acquisition_kinds": {} if kinds is None else kinds,
+        "authorization": authorization,
+        "body": body,
     }
+
+
+_GHOST_SPEC = ap.spec_for_repo("TryGhost/Ghost")
+_DIRECTUS_SPEC = ap.spec_for_repo("directus/directus")
+_VENDURE_SPEC = ap.spec_for_repo("vendure-ecommerce/vendure")
+
+
+def _minted(http_status: int, **kw: Any) -> dict[str, Any]:
+    """An authenticated Ghost-shaped record: one mint."""
+    return _proof_record(
+        http_status,
+        acquisitions=1,
+        kinds={"mint": 1},
+        authorization="Ghost <redacted:acquired_token>",
+        **kw,
+    )
 
 
 def test_auth_proof_verdict_accepts_only_the_exact_proof() -> None:
     records = [
-        _proof_record(200, acquisitions=1),
-        _proof_record(200, acquisitions=1),
+        _minted(200),
+        _minted(200),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records, 403) is True
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is True
     # The seed's key file missing fails the proof on its own.
-    assert ap._proof_passed(False, records, 403) is False
+    assert ap._proof_passed(False, records, _GHOST_SPEC) is False
 
 
 def test_auth_proof_verdict_accepts_the_directus_shape() -> None:
@@ -1710,14 +1735,20 @@ def test_auth_proof_verdict_accepts_the_directus_shape() -> None:
     # own fresh login, and the bare request refused with 401. No
     # key file is declared, so the caller's seed conjunct is True.
     records = [
-        _proof_record(200, acquisitions=1),
-        _proof_record(200, acquisitions=1),
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
         _proof_record(401),
     ]
-    assert ap._proof_passed(True, records, 401) is True
-    # The same records under Ghost's expected refusal fail: the
-    # expected unauthenticated status is an input, not a constant.
-    assert ap._proof_passed(True, records, 403) is False
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is True
+    # The same records under Ghost's spec fail: the expected
+    # unauthenticated status (and kind) are inputs, not constants.
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
 
 
 def test_auth_proof_verdict_fails_when_unauthenticated_accepted() -> None:
@@ -1725,44 +1756,180 @@ def test_auth_proof_verdict_fails_when_unauthenticated_accepted() -> None:
     # request answers 200. Every leg's own verdict still reads
     # "pass" here, so only the status conjunct can fail it.
     records = [
-        _proof_record(200, acquisitions=1),
-        _proof_record(200, acquisitions=1),
+        _minted(200),
+        _minted(200),
         _proof_record(200),
     ]
-    assert ap._proof_passed(True, records, 403) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
 
 
 def test_auth_proof_verdict_fails_on_acquisition_count_one() -> None:
     records = [
-        _proof_record(200, acquisitions=1),
-        _proof_record(200, acquisitions=0),
+        _minted(200),
+        _proof_record(200, authorization="Ghost <redacted:acquired_token>"),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records, 403) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
 
 
 def test_auth_proof_verdict_fails_on_acquisition_count_three() -> None:
     records = [
-        _proof_record(200, acquisitions=2),
-        _proof_record(200, acquisitions=1),
+        _proof_record(
+            200, acquisitions=2, kinds={"mint": 2},
+            authorization="Ghost <redacted:acquired_token>",
+        ),
+        _minted(200),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records, 403) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
 
 
 def test_auth_proof_verdict_fails_on_authenticated_non_200() -> None:
     records = [
-        _proof_record(500, acquisitions=1),
-        _proof_record(200, acquisitions=1),
+        _minted(500),
+        _minted(200),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records, 403) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
     records = [
-        _proof_record(200, acquisitions=1),
-        _proof_record(401, acquisitions=1),
+        _minted(200),
+        _minted(401),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records, 403) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
+
+
+def test_auth_proof_verdict_fails_on_split_acquisitions() -> None:
+    # The summed-check hole (D137 reviewer): 2 acquisitions on leg
+    # 1 and 0 on leg 2 totals two, but leg 2 was served by a token
+    # it did not freshly acquire — each leg must show exactly one.
+    records = [
+        _proof_record(
+            200, acquisitions=2, kinds={"login": 2},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(
+            200, authorization="Bearer <redacted:acquired_token>"
+        ),
+        _proof_record(401),
+    ]
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+    # And the mirror image: 0 on leg 1, 2 on leg 2.
+    records = [
+        _proof_record(
+            200, authorization="Bearer <redacted:acquired_token>"
+        ),
+        _proof_record(
+            200, acquisitions=2, kinds={"login": 2},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(401),
+    ]
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+
+
+def test_auth_proof_verdict_fails_on_wrong_acquisition_kind() -> None:
+    # The right count with the wrong kind: a refresh is not the
+    # fresh login the Directus spec registers per leg.
+    records = [
+        _proof_record(
+            200, acquisitions=1, kinds={"refresh": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(401),
+    ]
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+
+
+def test_auth_proof_verdict_fails_when_bare_leg_acquires() -> None:
+    # The bare leg must be credential-free: an acquisition on it
+    # (the provider-configured executor's proactive ensure) or an
+    # Authorization header shape both void the leg.
+    records = [
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(401, acquisitions=1, kinds={"login": 1}),
+    ]
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+    records[2] = _proof_record(
+        401, authorization="Bearer <redacted:acquired_token>"
+    )
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+
+
+def _vendure_records(
+    *,
+    me_id: Any = "1",
+    bare_body: Any = None,
+) -> list[dict[str, Any]]:
+    """Vendure-shaped records (D137): GraphQL answers refusals as
+    HTTP 200 with an error body, so the spec's body checks carry
+    what the status cannot."""
+    if bare_body is None:
+        bare_body = {
+            "errors": [
+                {
+                    "message": "Forbidden",
+                    "extensions": {"code": "FORBIDDEN"},
+                }
+            ]
+        }
+    authenticated = {
+        "data": {"me": {"id": me_id, "identifier": "superadmin"}}
+    }
+    return [
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+            body=authenticated,
+        ),
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+            body=authenticated,
+        ),
+        _proof_record(200, body=bare_body),
+    ]
+
+
+def test_auth_proof_verdict_accepts_the_vendure_shape() -> None:
+    assert (
+        ap._proof_passed(True, _vendure_records(), _VENDURE_SPEC)
+        is True
+    )
+
+
+def test_auth_proof_verdict_fails_when_vendure_me_is_null() -> None:
+    # A 200 whose data.me is null is the FORBIDDEN refusal wearing
+    # a success status; only the body check can fail it.
+    records = _vendure_records()
+    records[0]["body"] = {"data": {"me": None}}
+    assert ap._proof_passed(True, records, _VENDURE_SPEC) is False
+    records = _vendure_records(me_id=None)
+    assert ap._proof_passed(True, records, _VENDURE_SPEC) is False
+
+
+def test_auth_proof_verdict_fails_when_vendure_bare_lacks_forbidden() -> None:
+    # The bare leg at 200 without errors[0].extensions.code ==
+    # "FORBIDDEN" is not the registered refusal.
+    records = _vendure_records(bare_body={"data": {"me": None}})
+    assert ap._proof_passed(True, records, _VENDURE_SPEC) is False
+    records = _vendure_records(
+        bare_body={
+            "errors": [{"extensions": {"code": "INTERNAL_ERROR"}}]
+        }
+    )
+    assert ap._proof_passed(True, records, _VENDURE_SPEC) is False
 
 
 class _ScriptedExecutor:
@@ -1889,6 +2056,25 @@ def test_proof_specs_registered_for_the_three_checkpoint_repos() -> None:
     assert vendure.method == "POST"
     assert vendure.path == "/admin-api"
     assert vendure.body == {"query": "query { me { id identifier } }"}
+    # The per-leg acquisition kinds each spec registers (D137).
+    assert ghost.acquisition_kind == "mint"
+    assert directus.acquisition_kind == "login"
+    assert vendure.acquisition_kind == "login"
+    # Vendure refuses as HTTP 200 + a FORBIDDEN GraphQL error
+    # body, so its bare-leg expectation is 200 PLUS the body
+    # check, and its authenticated legs carry the data.me.id
+    # non-null check. Ghost and Directus refuse with real HTTP
+    # statuses and register no body checks.
+    assert vendure.unauthenticated_status == 200
+    assert vendure.authenticated_body_path == "data.me.id"
+    assert vendure.unauthenticated_body_path == (
+        "errors[0].extensions.code"
+    )
+    assert vendure.unauthenticated_body_value == "FORBIDDEN"
+    assert ghost.authenticated_body_path is None
+    assert ghost.unauthenticated_body_path is None
+    assert directus.authenticated_body_path is None
+    assert directus.unauthenticated_body_path is None
     with pytest.raises(ValueError, match="no auth-proof spec"):
         ap.spec_for_repo("nestjs/nest")
 
