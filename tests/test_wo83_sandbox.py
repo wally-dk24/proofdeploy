@@ -57,19 +57,34 @@ from proofdeploy.orchestrator import MeasureConfig, Orchestrator, _free_port
 from proofdeploy.runpair import build_evidence_record, write_evidence_record
 from proofdeploy.sandbox import sandbox_evidence
 
-_EVIDENCE = sandbox_evidence()
+# The capability probe starts real containers (~20s), so it must
+# NOT run at import/collection time (WO-CI-SPEED task 2): it runs
+# lazily, on first use, and is cached for the process. The skipif
+# condition below is a string — pytest's lazy form, evaluated at
+# test setup in this module's globals — so collection never probes.
+_EVIDENCE: dict[str, object] | None = None
+
+
+def _evidence() -> dict[str, object]:
+    """Sandbox capability evidence, probed once per process."""
+    global _EVIDENCE
+    if _EVIDENCE is None:
+        _EVIDENCE = sandbox_evidence()
+    return _EVIDENCE
+
+
+def _sandbox_ready() -> bool:
+    ev = _evidence()
+    return bool(
+        ev.get("podman") and ev.get("userns_remap") and ev.get("build_network")
+    )
+
+
 requires_sandbox = pytest.mark.skipif(
-    not (
-        _EVIDENCE.get("podman")
-        and _EVIDENCE.get("userns_remap")
-        and _EVIDENCE.get("build_network")
-    ),
+    "not _sandbox_ready()",
     reason=(
-        "sandbox unavailable: "
-        + ", ".join(
-            k for k in ("podman", "userns_remap", "build_network")
-            if not _EVIDENCE.get(k)
-        )
+        "sandbox unavailable: needs podman, userns remapping, "
+        "and a build network"
     ),
 )
 

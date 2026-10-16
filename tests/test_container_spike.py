@@ -750,23 +750,36 @@ def test_main_unknown_repo_exits_2(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+_ROOTLESS_PODMAN: list[bool] = []
+
+
 def _rootless_podman() -> bool:
     """True when podman here runs rootless — the only mode the
     build network exists in. Deliberately a cheap ``podman info``
     rather than the full sandbox capability probe: this module's
-    other tests are podman-free and must stay fast to collect."""
-    try:
-        proc = subprocess.run(
-            [*_podman_base(), "info", "--format", "{{.Host.Security.Rootless}}"],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return proc.returncode == 0 and proc.stdout.strip() == "true"
+    other tests are podman-free and must stay fast to collect.
+
+    WO-CI-SPEED task 2: probed lazily (the skipif below carries
+    its condition as a string, evaluated at test setup), never at
+    import/collection time, and cached for the process.
+    """
+    if not _ROOTLESS_PODMAN:
+        try:
+            proc = subprocess.run(
+                [*_podman_base(), "info",
+                 "--format", "{{.Host.Security.Rootless}}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            _ROOTLESS_PODMAN.append(
+                proc.returncode == 0 and proc.stdout.strip() == "true"
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            _ROOTLESS_PODMAN.append(False)
+    return _ROOTLESS_PODMAN[0]
 
 
 requires_rootless_podman = pytest.mark.skipif(
-    not _rootless_podman(),
+    "not _rootless_podman()",
     reason="rootless podman unavailable: the container build-network "
     "property test needs rootless podman (runs in the sandbox-tests CI job)",
 )

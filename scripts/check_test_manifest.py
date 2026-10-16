@@ -48,15 +48,17 @@ stronger: it catches renames and swaps that keep every count
 identical.
 
 Why collection runs ONCE (gate-speed item 0): importing the
-suite is expensive — several test modules run a real podman
-capability probe at import time (module-level `_CAPS` /
+suite used to be expensive — several test modules ran a real
+podman capability probe at import time (module-level `_CAPS` /
 `_EVIDENCE` assignments and a module-level skipif in the
 sandbox test files), ~20s per probe on a CI runner, so a single
-`pytest --collect-only` costs ~110s while the remaining ~40
-modules collect in ~0.5s each. This script used to collect 17
-times (3 full selections + one per shard of both matrices),
-and every shard job collected 2-4 more times for its counts —
-~50 probe-paying collections per PR gate. Now the check makes
+`pytest --collect-only` cost ~110s while the remaining ~40
+modules collect in ~0.5s each. WO-CI-SPEED task 2 made those
+probes lazy (first use, never at import), so collection is now
+fast — but the one-pass design stays: this script used to
+collect 17 times (3 full selections + one per shard of both
+matrices), and every shard job collected 2-4 more times for
+its counts — ~50 collections per PR gate. Now the check makes
 ONE collection pass: a throwaway pytest plugin records every
 item's nodeid and whether it carries the `sandbox` marker
 (the marker tests/conftest.py's pytest_itemcollected applies
