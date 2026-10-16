@@ -88,6 +88,7 @@ check names the uncovered file when it is missing).
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import subprocess
@@ -290,33 +291,160 @@ def coverage_problems(
     return problems
 
 
-def expanded_job_count(yml_path: Path) -> int:
-    """How many jobs one run of this workflow creates: each job
-    counts once, or once per matrix entry when it has a matrix
-    (an `include` list, as both gate workflows use; otherwise the
-    cartesian product of the matrix dimensions)."""
+def _matrix_expansion(
+    workflow: str, job_name: str, matrix_def: object
+) -> tuple[int, str | None]:
+    """(expanded count, problem) for one job's strategy.matrix.
+
+    Counts EXACTLY the shapes this counter can model, and refuses
+    the rest with a problem naming the workflow and the job: a
+    guard that undercounts silently is worse than no guard — it
+    certifies a budget it never measured. (The first version of
+    this counter counted any matrix containing `include` as
+    len(include) alone and skipped non-list dimensions, so a
+    dimensions+include matrix counted 1 where GitHub runs 5.)
+
+    Modelled: no matrix (1 job); an `include`-only matrix (one
+    job per entry, as both gate workflows use); pure list
+    dimensions (the cartesian product); list dimensions with
+    `exclude` (a combination is removed iff some exclude entry
+    matches it on every key the entry names — enumerated
+    exactly, so an entry naming a subset of the dimensions
+    removes every combination it matches).
+
+    Refused: dimensions combined with `include` (whether an
+    entry merges into an existing combination or appends a new
+    job depends on its keys in a way this counter does not
+    model); a dimension that is not a list (a scalar, or a
+    `${{ ... }}` expression whose value only GitHub knows at
+    run time); a matrix that is not a mapping at all (an
+    expression); `exclude` naming a key that is not a dimension.
+    """
+    label = f"{workflow} job {job_name!r}"
+    advice = (
+        "so the per-push job budget cannot be proven; write the "
+        "matrix as literal lists, dimensions with `exclude`, or "
+        "`include` entries alone (WO-CI-SPEED task 5)"
+    )
+    if matrix_def is None:
+        return 1, None
+    if not isinstance(matrix_def, dict):
+        return 0, (
+            f"{label}: strategy.matrix is not a mapping "
+            f"({matrix_def!r}) — its expanded job count is "
+            f"unknowable statically, {advice}"
+        )
+    if not matrix_def:
+        return 1, None
+    include = matrix_def.get("include")
+    exclude = matrix_def.get("exclude")
+    dims = {
+        key: value
+        for key, value in matrix_def.items()
+        if key not in ("include", "exclude")
+    }
+    if include is not None and dims:
+        return 0, (
+            f"{label}: strategy.matrix combines dimension(s) "
+            f"{sorted(dims)} with `include` — the expanded job "
+            f"count cannot be computed exactly here, {advice}"
+        )
+    if include is not None:
+        if not isinstance(include, list):
+            return 0, (
+                f"{label}: strategy.matrix `include` is not a "
+                f"list ({include!r}), {advice}"
+            )
+        return len(include), None
+    if not dims:
+        return 0, (
+            f"{label}: strategy.matrix has `exclude` but no "
+            f"dimensions for it to subtract from, {advice}"
+        )
+    for key, value in dims.items():
+        if not isinstance(value, list):
+            return 0, (
+                f"{label}: matrix dimension {key!r} is not a "
+                f"list ({value!r}) — its expanded count is only "
+                f"known to GitHub at run time, {advice}"
+            )
+    if exclude is None:
+        count = 1
+        for value in dims.values():
+            count *= len(value)
+        return count, None
+    if not isinstance(exclude, list) or any(
+        not isinstance(entry, dict) for entry in exclude
+    ):
+        return 0, (
+            f"{label}: strategy.matrix `exclude` is not a list "
+            f"of mappings ({exclude!r}), {advice}"
+        )
+    for entry in exclude:
+        unknown = sorted(set(entry) - set(dims))
+        if unknown:
+            return 0, (
+                f"{label}: `exclude` entry {entry!r} names "
+                f"key(s) {unknown} that are not matrix "
+                f"dimensions, {advice}"
+            )
+    keys = list(dims)
+    kept = 0
+    for combo in itertools.product(*(dims[key] for key in keys)):
+        values = dict(zip(keys, combo, strict=True))
+        if any(
+            all(values[key] == value for key, value in entry.items())
+            for entry in exclude
+        ):
+            continue
+        kept += 1
+    return kept, None
+
+
+def expanded_job_count(yml_path: Path) -> tuple[int, list[str]]:
+    """How many jobs one run of this workflow creates, and the
+    budget problems for any job whose matrix shape cannot be
+    counted exactly (see _matrix_expansion). An uncountable job
+    contributes 0 to the count and one problem each, so the
+    budget check fails closed instead of certifying a number
+    it never measured."""
     data = yaml.safe_load(yml_path.read_text(encoding="utf-8"))
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, dict):
+        return 0, [
+            f"{yml_path.name}: no `jobs` mapping — the expanded "
+            "job count cannot be computed, so the per-push job "
+            "budget cannot be proven (WO-CI-SPEED task 5)"
+        ]
     total = 0
-    for job in data["jobs"].values():
-        matrix_def = (job.get("strategy") or {}).get("matrix") or {}
-        if "include" in matrix_def:
-            total += len(matrix_def["include"])
-        elif matrix_def:
-            count = 1
-            for dim in matrix_def.values():
-                if isinstance(dim, list):
-                    count *= len(dim)
-            total += count
-        else:
-            total += 1
-    return total
+    problems: list[str] = []
+    for job_name, job in jobs.items():
+        strategy = job.get("strategy") if isinstance(job, dict) else None
+        matrix_def = (
+            strategy.get("matrix")
+            if isinstance(strategy, dict)
+            else None
+        )
+        count, problem = _matrix_expansion(
+            yml_path.name, str(job_name), matrix_def
+        )
+        total += count
+        if problem is not None:
+            problems.append(problem)
+    return total, problems
 
 
 def job_budget_problems() -> list[str]:
     """The two gate workflows together must stay within the
-    per-push job budget (see JOB_BUDGET_PER_PUSH)."""
-    ci = expanded_job_count(CI_YML)
-    sandbox = expanded_job_count(SANDBOX_YML)
+    per-push job budget (see JOB_BUDGET_PER_PUSH). A matrix
+    shape the counter cannot model is itself a problem: the
+    budget is then unproven, which fails this check exactly
+    as an over-budget count does."""
+    ci, ci_problems = expanded_job_count(CI_YML)
+    sandbox, sandbox_problems = expanded_job_count(SANDBOX_YML)
+    problems = ci_problems + sandbox_problems
+    if problems:
+        return problems
     if ci + sandbox <= JOB_BUDGET_PER_PUSH:
         return []
     return [
