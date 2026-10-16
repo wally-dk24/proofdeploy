@@ -123,18 +123,24 @@ def _assert_sandbox_evidence(record: dict) -> None:
 
 
 def _assert_tool_state_outside_tree(workdir: Path) -> None:
-    """Safety item 6, conditional on plan 1.2(n) (D77, in flight).
+    """Safety item 6, UNCONDITIONAL (D84 item 2; plan 1.2(n) landed).
 
-    Once the provisioning plans carry the {pd_tools} placeholder,
-    the verify snapshot tree must contain no tool state. Before
-    (n) lands there is nothing further to assert here — the host
-    suite's plan-matrix guard pins the pre-(n) state and activates
-    the strict assertion when the placeholder appears.
+    The verify snapshot tree contains no tool state, the side's
+    plan never addresses tool state through the checkout, and the
+    sandbox executor's own mapping renders {pd_tools} to
+    /pd-home/.pd-tools. There is no enabling condition: a
+    regression that hard-codes the old in-tree paths, or re-points
+    the executor's mapping into the checkout, fails here instead
+    of switching this assertion off.
     """
     snapshots = list(workdir.glob("*/snapshot-verify"))
     assert snapshots, "the verify snapshot must exist under the workdir"
     snapshot = snapshots[0]
-    from proofdeploy.provisioning import plan_provisioning
+    assert not (snapshot / ".pd-tools").exists()
+    assert not (snapshot / ".venv").exists()
+
+    from proofdeploy.orchestrator import sandbox_placeholder_mapping
+    from proofdeploy.provisioning import plan_provisioning, render_argv
     from proofdeploy.yml import load_contract
 
     plan = plan_provisioning(snapshot, load_contract(snapshot / "proofdeploy.yml"))
@@ -144,9 +150,20 @@ def _assert_tool_state_outside_tree(workdir: Path) -> None:
         strings.extend(step.env.values())
         if step.shell:
             strings.append(step.shell)
-    if any("{pd_tools}" in s for s in strings):
-        assert not (snapshot / ".pd-tools").exists()
-        assert not (snapshot / ".venv").exists()
+    for s in strings:
+        assert "{checkout}/.pd-tools" not in s, s
+        assert "{checkout}/.venv" not in s, s
+        assert "/checkout/.pd-tools" not in s, s
+        assert "/checkout/.venv" not in s, s
+    mapping = sandbox_placeholder_mapping(plan)
+    assert mapping["{pd_tools}"] == "/pd-home/.pd-tools"
+    if plan.runtime == "python":
+        assert mapping["{venv}"] == "/pd-home/.venv"
+    for s in strings:
+        for rendered in render_argv([s], mapping, []):
+            assert "/checkout/.pd-tools" not in rendered, rendered
+            assert "/checkout/.venv" not in rendered, rendered
+            assert "{pd_tools}" not in rendered, rendered
 
 
 def _assert_clean_records(output, out_dir: Path, app: str) -> dict:

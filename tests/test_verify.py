@@ -913,12 +913,17 @@ def test_schema_refuses_a_run_level_cause_as_typed_reason():
 
 # ---------------------------------------------------------------------------
 # Safety item 6 (tool state outside the app tree), asserted over the
-# provisioning plan matrix. DEPENDENCY: plan 1.2(n) (D77) relocates
-# tool state out of the checkout; it is in flight on its own branch.
-# Until it lands, plan data carries no {pd_tools} placeholder and
-# this test pins that pre-(n) state; the moment the placeholder
-# exists, the strict post-(n) assertion activates on its own. (A
-# skip/xfail is not available here: the CI shards assert skipped==0.)
+# provisioning plan matrix. Plan 1.2(n) (D77) has landed: the plans
+# carry the {pd_tools} placeholder and tool state renders under the
+# per-side home — /pd-home in the sandbox, the snapshot's .pd-home
+# sibling on the host — never inside the checkout. The assertion is
+# UNCONDITIONAL (D84 item 2): there is no enabling condition, so a
+# regression that hard-codes the old in-tree paths, drops the
+# placeholder, or re-points an executor's mapping into the tree
+# fails here instead of switching the assertion off. Renderings go
+# through the executors' OWN mapping functions
+# (sandbox_placeholder_mapping / host_placeholder_mapping, D82) —
+# this guard holds no copy of either table.
 # ---------------------------------------------------------------------------
 
 
@@ -933,7 +938,10 @@ def _plan_strings(plan) -> list[str]:
 
 
 def test_tool_state_plan_matrix_guard(tmp_path):
-    from proofdeploy.provisioning import plan_provisioning
+    from proofdeploy.orchestrator import sandbox_placeholder_mapping
+    from proofdeploy.provisioning import plan_provisioning, render_argv
+    from proofdeploy.runner import host_placeholder_mapping
+    from proofdeploy.sandbox import sandbox_home_dir
     from proofdeploy.yml import load_contract
 
     # A committed-uv Python snapshot and a pnpm Node snapshot: the
@@ -956,31 +964,56 @@ def test_tool_state_plan_matrix_guard(tmp_path):
     )
     assert (node / "pnpm-lock.yaml").is_file()
 
-    plans = [
-        plan_provisioning(py, load_contract(py / "proofdeploy.yml")),
-        plan_provisioning(node, load_contract(node / "proofdeploy.yml")),
+    cases = [
+        (py, plan_provisioning(py, load_contract(py / "proofdeploy.yml"))),
+        (
+            node,
+            plan_provisioning(node, load_contract(node / "proofdeploy.yml")),
+        ),
     ]
-    strings = [s for plan in plans for s in _plan_strings(plan)]
-    assert strings, "the plan matrix must produce steps"
 
-    if any("{pd_tools}" in s for s in strings):
-        # Post-1.2(n): render with the D77 destinations and assert
-        # no rendering puts tool state inside the checkout.
-        destinations = {
-            "{pd_tools}": "/pd-home/.pd-tools",
-            "{venv}": "/pd-home/.venv",
-            "{checkout}": "/checkout",
-            "{runtime_bin}": "python3",
-        }
+    def render(s: str, mapping: dict[str, str]) -> str:
+        # render_argv expands a bare {pip_flags} element to nothing.
+        out = render_argv([s], mapping, [])
+        return out[0] if out else ""
+
+    for snap, plan in cases:
+        strings = _plan_strings(plan)
+        assert strings, "the plan matrix must produce steps"
+        # The {pd_tools} placeholder is in use — unconditionally.
+        # A plan family that stops routing tool state through it
+        # (or hard-codes the old in-tree paths) fails here.
+        assert any("{pd_tools}" in s for s in strings)
         for s in strings:
-            rendered = s
-            for placeholder, dest in destinations.items():
-                rendered = rendered.replace(placeholder, dest)
-            assert "/checkout/.pd-tools" not in rendered, rendered
-            assert "/checkout/.venv" not in rendered, rendered
-    else:
-        # Pre-1.2(n) characterization (D77 in flight): the managers
-        # still bootstrap through {checkout}/.pd-tools. This branch
-        # exists so the strict assertion above activates the moment
-        # the relocation lands, without a red suite in between.
-        assert any("{checkout}/.pd-tools" in s for s in strings)
+            assert "{checkout}/.pd-tools" not in s, s
+            assert "{checkout}/.venv" not in s, s
+            assert "/checkout/.pd-tools" not in s, s
+            assert "/checkout/.venv" not in s, s
+        # Render through BOTH executors' own mapping functions and
+        # assert no rendering puts tool state inside the checkout,
+        # on either executor.
+        runtime_bin = "python3" if plan.runtime == "python" else "node"
+        mappings = [
+            sandbox_placeholder_mapping(plan),
+            host_placeholder_mapping(
+                runtime_bin, snap, sandbox_home_dir(snap) / ".venv"
+            ),
+        ]
+        for mapping in mappings:
+            for s in strings:
+                rendered = render(s, mapping)
+                assert "/checkout/.pd-tools" not in rendered, rendered
+                assert "/checkout/.venv" not in rendered, rendered
+                assert f"{snap}/.pd-tools" not in rendered, rendered
+                assert f"{snap}/.venv" not in rendered, rendered
+                assert "{pd_tools}" not in rendered, rendered
+        # Positive direction: tool state lands under the pd-home
+        # destinations — /pd-home in the sandbox rendering, the
+        # snapshot's .pd-home sibling in the host rendering.
+        sandbox_rendered = [render(s, mappings[0]) for s in strings]
+        assert any("/pd-home/.pd-tools" in r for r in sandbox_rendered)
+        host_rendered = [render(s, mappings[1]) for s in strings]
+        assert any(
+            str(sandbox_home_dir(snap) / ".pd-tools") in r
+            for r in host_rendered
+        )
