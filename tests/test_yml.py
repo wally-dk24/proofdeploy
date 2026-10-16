@@ -159,6 +159,58 @@ def test_app_path_must_stay_inside_checkout(tmp_path):
         load_contract(write(tmp_path, VALID + 'app:\n  path: "../outside"\n'))
 
 
+# ---------------------------------------------------------------------------
+# app.port (plan 1.2(o)): the app's own fixed listen port, declared,
+# never inferred. The bridge forwards to it when set; PORT is still
+# exported as assigned.
+# ---------------------------------------------------------------------------
+
+
+def test_app_port_loads(tmp_path):
+    text = VALID + 'app:\n  path: "."\n  port: 3000\n'
+    c = load_contract(write(tmp_path, text))
+    assert c.app_path == "."
+    assert c.app_port == 3000
+
+
+def test_app_port_absent_defaults_to_none(tmp_path):
+    c = load_contract(write(tmp_path, VALID + 'app:\n  path: "."\n'))
+    assert c.app_port is None
+    c = load_contract(write(tmp_path, VALID))
+    assert c.app_port is None
+
+
+def test_app_port_bounds_load(tmp_path):
+    for port in (1, 65535):
+        text = VALID + f'app:\n  path: "."\n  port: {port}\n'
+        c = load_contract(write(tmp_path, text))
+        assert c.app_port == port
+
+
+def test_app_port_out_of_range_rejected(tmp_path):
+    for port in ("0", "65536", "-1"):
+        bad = VALID + f'app:\n  path: "."\n  port: {port}\n'
+        with pytest.raises(ValueError, match="'app.port' must be an integer"):
+            load_contract(write(tmp_path, bad))
+
+
+def test_app_port_non_integer_rejected(tmp_path):
+    # A quoted port is a string, not an integer; a float and a bool
+    # are not integers either (bool is an int subclass in Python —
+    # it must not slip through).
+    for port in ('"3000"', "3000.5", "true"):
+        bad = VALID + f'app:\n  path: "."\n  port: {port}\n'
+        with pytest.raises(ValueError, match="'app.port' must be an integer"):
+            load_contract(write(tmp_path, bad))
+
+
+def test_app_port_does_not_replace_path(tmp_path):
+    # `port` is an addition to the mapping, not an alternative to
+    # `path`: an app mapping still names its member directory.
+    with pytest.raises(ValueError, match="'app.path' must be a non-empty string"):
+        load_contract(write(tmp_path, VALID + "app:\n  port: 3000\n"))
+
+
 # install.npm_flags (plan 1.2h): allowlisted flags for the frozen
 # npm ci. Anything off the allowlist is refused at load.
 

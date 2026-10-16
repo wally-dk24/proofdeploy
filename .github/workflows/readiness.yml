@@ -21,6 +21,15 @@
 # non-READY side once, report both"). Nothing here runs on push
 # or pull_request, and no run is dispatched before this PR's
 # review and merge.
+#
+# Auth-proof mode (D87): mode=auth-proof runs readiness/auth_proof
+# instead of the provision pass — the same provisioning path, then
+# three executor probes per side proving the contract's declared
+# auth (authenticated 200, a second authenticated 200 with a fresh
+# mint, unauthenticated 403). The optional `only` input restricts
+# it to comma-separated <unit>:<role> sides (the one-side
+# rehearsal). Auth-proof rows are labelled "auth-proof"; like the
+# provision rows they are evidence, never measured records.
 name: readiness
 
 on:
@@ -49,6 +58,19 @@ on:
         options:
           - "1"
           - "2"
+      mode:
+        description: "provision = readiness pass; auth-proof = D87 auth proof per side"
+        required: true
+        default: "provision"
+        type: choice
+        options:
+          - "provision"
+          - "auth-proof"
+      only:
+        description: "auth-proof only: comma-separated <unit>:<role> sides (empty = all sides)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -80,6 +102,7 @@ jobs:
         run: |
           python -c "from proofdeploy.sandbox import assert_measurement_gate; assert_measurement_gate(); print('measurement gate: capable')"
       - name: Provision attempt 1 (${{ inputs.repo }})
+        if: inputs.mode == 'provision'
         run: |
           python -m readiness.provision \
             --repo "${{ inputs.repo }}" \
@@ -87,7 +110,7 @@ jobs:
             --out "rows-attempt1.json" \
             --workdir readiness-work
       - name: Re-provision non-READY sides (attempt 2)
-        if: inputs.attempt == '2'
+        if: inputs.mode == 'provision' && inputs.attempt == '2'
         run: |
           python -m readiness.provision \
             --repo "${{ inputs.repo }}" \
@@ -95,6 +118,25 @@ jobs:
             --rerun-non-ready rows-attempt1.json \
             --out "rows-attempt2.json" \
             --workdir readiness-work
+      - name: Auth proof (${{ inputs.repo }})
+        if: inputs.mode == 'auth-proof'
+        env:
+          PROOF_REPO: ${{ inputs.repo }}
+          PROOF_ONLY: ${{ inputs.only }}
+        run: |
+          args=()
+          if [ -n "$PROOF_ONLY" ]; then
+            IFS=',' read -ra wanted <<< "$PROOF_ONLY"
+            for side in "${wanted[@]}"; do
+              args+=(--only "$side")
+            done
+          fi
+          python -m readiness.auth_proof \
+            --repo "$PROOF_REPO" \
+            --attempt 1 \
+            --out "rows-authproof.json" \
+            --workdir readiness-work \
+            "${args[@]}"
       - name: Upload readiness rows and provision logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -102,5 +144,6 @@ jobs:
           name: readiness-${{ steps.slug.outputs.slug }}-${{ inputs.attempt }}
           path: |
             rows-attempt*.json
+            rows-authproof*.json
             pd-logs/
           retention-days: 14

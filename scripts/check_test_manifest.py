@@ -109,8 +109,7 @@ SANDBOX_MANIFEST = ROOT / "tests" / "expected_sandbox_nodeids.txt"
 # finished ones (PR #112's measurement: at 23 jobs the late jobs'
 # queue medians were 599–1047.5s — longer than most jobs run).
 # Only the two gate workflows count: they are the ones that fire
-# on every push and every pull request. (pr-agent.yml fires on
-# pull-request events only and adds 1 job there; measure.yml,
+# on every push and every pull request. (measure.yml,
 # readiness*.yml and sandbox-focus.yml are manual dispatches.)
 JOB_BUDGET_PER_PUSH = 20
 

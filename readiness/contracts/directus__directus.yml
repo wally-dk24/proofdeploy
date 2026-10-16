@@ -1,10 +1,19 @@
 # PROVENANCE 2026-10-15: app.path declared "." under the reviewer's app-identification ruling (plan 1.2b follow-up) — the app is named in the contract; the tool never guesses. This contract's commands already run from the repo root, so "." preserves them exactly.
 app:
   path: "."
-build: "true"
-start: "directus start"
+# PROVENANCE 2026-10-16 (D98): build/migrate/start rewritten to upstream's own
+# flow, verified by the reviewer at all 4 registered SHAs: Dockerfile blob
+# b900f41b, directus/cli.js blob 50b5ead7, root build "pnpm --recursive run
+# build", pnpm@10.27.0 — upstream's image builds the workspace with
+# workspace concurrency 2, then runs node cli.js bootstrap and node cli.js
+# start from the directus package. The old contract (build: "true", migrate
+# "directus bootstrap") died in the 2026-10-16 re-run (run 38919702236) with
+# "directus: command not found": nothing ever built the workspace, so no
+# directus bin existed. Class: our gap, contract shape.
+build: "npm_config_workspace_concurrency=2 pnpm run build"
+start: "cd directus && node cli.js start"
 readiness: "/server/ping"
-migrate: "directus bootstrap"
+migrate: "cd directus && node cli.js bootstrap"
 env:
   DB_CLIENT: sqlite3
   DB_FILENAME: /checkout/data.db
@@ -22,3 +31,9 @@ auth:
     email: "${ADMIN_EMAIL}"
     password: "${ADMIN_PASSWORD}"
   bootstrap_env: [ADMIN_EMAIL, ADMIN_PASSWORD, SECRET]
+fixture:
+  repo_name: "Directus"
+  seed_note: "Directus's own bootstrap, run as the setup step, installed its system tables, ran its own migrations and created exactly one user — an administrator account whose email and password are generated fresh for each run — and exactly one role, 'Administrator', linked to one 'Administrator' policy granting full administrative access. Directus's migrations also created its built-in 'Public' policy, which applies to requests without a token, and its settings record with a generated project id. No content collections, items or files were created, and no other settings were changed."
+  auth_mechanism: "the token is presented in the Authorization header in the form 'Bearer <token>'"
+  auth_scope: "an access token belonging to the single administrator account the bootstrap created, obtained by signing in as that account with its per-run generated email and password and renewed by refresh before it expires; access tokens last 15 minutes and the refresh token 7 days. The token carries the account's full administrative access; the account has no static API token"
+  flags_note: "no feature flags or experimental options were enabled or changed"

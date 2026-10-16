@@ -375,6 +375,146 @@ def test_login_with_other_sides_credentials_fails(auth_app):
     assert r.reason == InconclusiveReason.AUTH
 
 
+# ----------------------------------------------------------------------
+# login mode: token_header (D120) — the token arrives in a response
+# header, not the JSON body. Driven through Executor.run_probe with
+# the executor's HTTP replaced by a scripted target.
+# ----------------------------------------------------------------------
+
+HEADER_LOGIN_CONFIG = {
+    "mode": "login",
+    "path": "/login",
+    "method": "POST",
+    "body": {"username": "${ADMIN_USER}", "password": "${ADMIN_PASSWORD}"},
+    "token_header": "X-Session-Token",
+}
+
+_HEADER_BOOTSTRAP = {"ADMIN_USER": "root", "ADMIN_PASSWORD": "pw"}
+_HEADER_TOKEN = "header-token-123"
+
+
+def _fake_http(monkeypatch, login_response, seen):
+    """Script the executor's HTTP layer.
+
+    `login_response` is the (status, headers, body) for POST /login.
+    Any other request is the probe's act: it is recorded in `seen`
+    and answered 200 only when it carries the header token as Bearer.
+    """
+    import proofdeploy.executor as executor_mod
+
+    def fake_do_http(method, url, headers, body, timeout):
+        if url.endswith("/login"):
+            status, resp_headers, resp_body = login_response
+            return status, resp_headers, resp_body, []
+        seen.append((method, url, dict(headers or {})))
+        if (headers or {}).get("Authorization") == f"Bearer {_HEADER_TOKEN}":
+            return 200, {}, '{"ok": true}', []
+        return 401, {}, '{"error": "unauthorized"}', []
+
+    monkeypatch.setattr(executor_mod, "_do_http", fake_do_http)
+
+
+def _header_executor() -> Executor:
+    return Executor(
+        target_url="http://127.0.0.1:8931",
+        provisioned=True,
+        credential_config=dict(HEADER_LOGIN_CONFIG),
+        bootstrap_env=dict(_HEADER_BOOTSTRAP),
+    )
+
+
+def test_login_token_header_validates(tmp_path):
+    contract = _contract(
+        tmp_path,
+        "  mode: login\n"
+        "  path: /admin/login\n"
+        "  token_header: X-Auth-Token\n",
+    )
+    assert contract.auth is not None
+    assert contract.auth["token_header"] == "X-Auth-Token"
+    assert "token_json_path" not in contract.auth
+
+
+def test_login_both_token_sources_refused(tmp_path):
+    with pytest.raises(ValueError, match="exactly one"):
+        _contract(
+            tmp_path,
+            "  mode: login\n  path: /login\n  token_json_path: token\n"
+            "  token_header: X-Auth-Token\n",
+        )
+
+
+def test_login_no_token_source_refused(tmp_path):
+    with pytest.raises(ValueError, match="exactly one"):
+        _contract(tmp_path, "  mode: login\n  path: /login\n")
+
+
+def test_login_token_header_present_token_used(monkeypatch):
+    seen: list = []
+    _fake_http(
+        monkeypatch,
+        (200, {"x-session-token": _HEADER_TOKEN}, '{"user": {"id": 1}}'),
+        seen,
+    )
+    r = _header_executor().run_probe(_me_probe())
+    assert r.verdict == Verdict.PASS, r.details
+    assert any("(login)" in d for d in r.details)
+    # The act carried the header token, presented as before (Bearer).
+    assert seen and seen[0][2].get("Authorization") == f"Bearer {_HEADER_TOKEN}"
+
+
+def test_login_token_header_name_case_insensitive(monkeypatch):
+    # The declared name is matched case-insensitively (the executor
+    # normalizes the response header names itself).
+    seen: list = []
+    _fake_http(
+        monkeypatch,
+        (200, {"X-SeSsIoN-ToKeN": _HEADER_TOKEN}, '{"user": {"id": 1}}'),
+        seen,
+    )
+    r = _header_executor().run_probe(_me_probe())
+    assert r.verdict == Verdict.PASS, r.details
+
+
+def test_login_token_header_missing_is_inconclusive_auth(monkeypatch):
+    seen: list = []
+    _fake_http(monkeypatch, (200, {}, '{"user": {"id": 1}}'), seen)
+    r = _header_executor().run_probe(_me_probe())
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.AUTH
+    assert seen == []  # the act is never sent without a credential
+
+
+def test_login_token_header_empty_is_inconclusive_auth(monkeypatch):
+    seen: list = []
+    _fake_http(monkeypatch, (200, {"x-session-token": ""}, "{}"), seen)
+    r = _header_executor().run_probe(_me_probe())
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.AUTH
+    assert seen == []
+
+
+def test_login_200_without_header_never_a_token(monkeypatch):
+    # GraphQL-style failure: HTTP 200, an error body — and even a
+    # token-shaped value in the body. In header mode the body is
+    # never the token carrier, so this is an auth failure.
+    seen: list = []
+    _fake_http(
+        monkeypatch,
+        (
+            200,
+            {},
+            '{"errors": [{"message": "invalid credentials"}],'
+            ' "data": {"login": {"token": "body-token-must-not-be-used"}}}',
+        ),
+        seen,
+    )
+    r = _header_executor().run_probe(_me_probe())
+    assert r.verdict == Verdict.INCONCLUSIVE
+    assert r.reason == InconclusiveReason.AUTH
+    assert seen == []
+
+
 def test_refresh_mode_logs_in_then_refreshes_near_expiry(auth_app):
     # TTL 59 s is inside the provider's 60 s proactive-refresh margin,
     # so the second ensure in the same probe run must refresh.

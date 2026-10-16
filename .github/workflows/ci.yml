@@ -107,10 +107,20 @@ jobs:
             while IFS= read -r f; do
               [ -z "$f" ] && continue
               case "$f" in
-                # Load-bearing despite living under docs/: tests read
-                # the registered skill file and check its sha256
-                # (tests/test_leakcheck.py). Never inert.
-                docs/evaluation/*) echo "NON-INERT (test input): $f"; heavy=true ;;
+                # D109 (plan 1.13): only the docs/evaluation files
+                # that tests or code actually reference stay
+                # NON-INERT — the explicit list below, identical in
+                # both gate workflows and guarded by
+                # tests/test_check_test_manifest.py against every
+                # docs/evaluation reference in tests/, proofdeploy/
+                # and scripts/: the run-pair scoring rule cited by
+                # proofdeploy/runpair.py, and the registered skill
+                # source and its generated author copy
+                # (scripts/generate_author_skill.py; the author copy
+                # is sha256-checked in tests/test_leakcheck.py).
+                # Every other docs/evaluation file is inert, like
+                # the rest of docs/.
+                docs/evaluation/scoring-rule-run-pair-2026-10-09.md|docs/evaluation/skill/skill-author.md|docs/evaluation/skill/skill.md) echo "NON-INERT (test input): $f"; heavy=true ;;
                 docs/*) echo "inert: $f" ;;
                 README.md|CONTRIBUTING.md|SECURITY.md|CHANGELOG.md|CODE_OF_CONDUCT.md) echo "inert: $f" ;;
                 LICENSE|LICENSE.*) echo "inert: $f" ;;
