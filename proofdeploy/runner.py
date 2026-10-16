@@ -305,6 +305,34 @@ def _sha256_file(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def host_placeholder_mapping(
+    runtime_bin: str, snap: Path, venv_dir: Path | None = None
+) -> dict[str, str]:
+    """The host executor's placeholder mapping for a plan's steps
+    (plan 1.2(n)): the checkout is the snapshot itself; ProofDeploy's
+    tools live in the snapshot's per-side home sibling
+    (sandbox_home_dir — the same directory the sandbox mounts at
+    /pd-home), never inside the checkout; {venv} is the executor's
+    per-provision venv, when it has created one.
+
+    The one definition: the host executor renders through it, and
+    tests/test_toolstate_guard.py asserts over it — so a regression
+    in this table is caught against the real mapping, not a copy
+    (D82)."""
+    from proofdeploy.sandbox import sandbox_home_dir
+
+    mapping: dict[str, str] = {
+        "{runtime_bin}": runtime_bin,
+        "{checkout}": str(snap),
+        # Plan 1.2(n): ProofDeploy's tools live in the per-side
+        # home sibling, never in the checkout.
+        "{pd_tools}": str(sandbox_home_dir(snap) / ".pd-tools"),
+    }
+    if venv_dir is not None:
+        mapping["{venv}"] = str(venv_dir)
+    return mapping
+
+
 def detect_runtime(snapshot_dir: Path) -> tuple[str, str | None]:
     """Detect the runtime and its declared version from repo manifests.
 
@@ -1730,15 +1758,9 @@ class Provisioner:
         # lock managers install into) and {runtime_bin}, rendered
         # the same way — as are the steps' env values (e.g. the uv
         # plan's UV_PROJECT_ENVIRONMENT={venv}).
-        step_mapping: dict[str, str] = {
-            "{runtime_bin}": runtime_bin,
-            "{checkout}": str(snap),
-            # Plan 1.2(n): ProofDeploy's tools live in the per-side
-            # home sibling, never in the checkout.
-            "{pd_tools}": str(sandbox_home_dir(snap) / ".pd-tools"),
-        }
-        if venv_dir is not None:
-            step_mapping["{venv}"] = str(venv_dir)
+        step_mapping = host_placeholder_mapping(
+            runtime_bin, snap, venv_dir
+        )
 
         def _step_env(step: Any) -> dict[str, str]:
             return {
@@ -1753,14 +1775,7 @@ class Provisioner:
             assert venv_dir is not None
             install_cmd = render_argv(
                 install_step.argv,
-                {
-                    "{runtime_bin}": runtime_bin,
-                    "{venv}": str(venv_dir),
-                    "{checkout}": str(snap),
-                    "{pd_tools}": str(
-                        sandbox_home_dir(snap) / ".pd-tools"
-                    ),
-                },
+                step_mapping,
                 pip_flags(plan, sandbox=False),
             )
         else:

@@ -25,6 +25,11 @@ Plant: leave one tenant at the old path (e.g. render the bun
 bootstrap's tools dir as ``{checkout}/.pd-tools`` again) and this
 guard fails — that direction is exercised in the PR that
 introduced it.
+
+The renderings go through the executors' OWN mapping functions
+(``sandbox_placeholder_mapping`` / ``host_placeholder_mapping``,
+D82): the guard holds no copy of either table, so a plant in an
+executor's real mapping — sandbox or host — fails here.
 """
 import json
 import shutil
@@ -33,8 +38,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from proofdeploy.orchestrator import _sandbox_step_command
+from proofdeploy.orchestrator import (
+    _sandbox_step_command,
+    sandbox_placeholder_mapping,
+)
 from proofdeploy.provisioning import pip_flags, plan_provisioning, render_argv
+from proofdeploy.runner import host_placeholder_mapping
 from proofdeploy.sandbox import sandbox_home_dir
 
 WO81B = Path(__file__).parent / "fixtures" / "wo81b"
@@ -203,48 +212,28 @@ def _plan_strings(plan) -> list[str]:
 
 
 def _rendered_strings(plan, snap: Path) -> list[str]:
-    """Every step argv/env rendered for BOTH executors (through
-    the plan's own runtime's tables), plus the
-    sandbox wrapper's rendering of every shell step."""
+    """Every step argv/env rendered for BOTH executors, through
+    the executors' own mapping functions (D82 — no copied tables
+    here), plus the sandbox wrapper's rendering of every shell
+    step."""
     home = sandbox_home_dir(snap)
+    # Sandbox executor (orchestrator's own mapping).
+    mappings = [sandbox_placeholder_mapping(plan)]
     if plan.runtime == "python":
-        mappings = [
-            # Sandbox executor (orchestrator's table).
-            {
-                "{runtime_bin}": "python3",
-                "{venv}": "/pd-home/.venv",
-                "{pd_tools}": "/pd-home/.pd-tools",
-                "{checkout}": "/checkout",
-            },
-            # Host executor (runner's tables): the per-side home
-            # sibling for {pd_tools} and for the managers' {venv};
-            # pip's per-run venv (outside the tree by construction).
-            {
-                "{runtime_bin}": "python3",
-                "{venv}": str(home / ".venv"),
-                "{pd_tools}": str(home / ".pd-tools"),
-                "{checkout}": str(snap),
-            },
-            {
-                "{runtime_bin}": "python3",
-                "{venv}": str(snap.parent / "venvs" / "run" / ".venv"),
-                "{pd_tools}": str(home / ".pd-tools"),
-                "{checkout}": str(snap),
-            },
-        ]
+        # Host executor: the managers' {venv} in the per-side home
+        # sibling, and pip's per-run venv (a stand-in path of the
+        # executor's workdir/venvs/<run_id> shape — outside the
+        # tree by construction).
+        mappings.append(
+            host_placeholder_mapping("python3", snap, home / ".venv")
+        )
+        mappings.append(
+            host_placeholder_mapping(
+                "python3", snap, snap.parent / "venvs" / "run" / ".venv"
+            )
+        )
     else:
-        mappings = [
-            {
-                "{runtime_bin}": "node",
-                "{pd_tools}": "/pd-home/.pd-tools",
-                "{checkout}": "/checkout",
-            },
-            {
-                "{runtime_bin}": "node",
-                "{pd_tools}": str(home / ".pd-tools"),
-                "{checkout}": str(snap),
-            },
-        ]
+        mappings.append(host_placeholder_mapping("node", snap))
     out: list[str] = []
     for mapping in mappings:
         for step in plan.steps:

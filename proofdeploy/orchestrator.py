@@ -304,6 +304,30 @@ def _sandbox_step_command(
     return f"export PATH=/pd-home/.venv/bin:$PATH; {cmd}"
 
 
+def sandbox_placeholder_mapping(plan: InstallPlan) -> dict[str, str]:
+    """The sandbox executor's placeholder mapping for a plan
+    (plan 1.2(n)): the checkout mounts at /checkout; the app venv
+    and ProofDeploy's tools live in the per-side home at /pd-home,
+    never inside the checkout.
+
+    The one definition: the sandbox executor renders through it,
+    and tests/test_toolstate_guard.py asserts over it — so a
+    regression in this table is caught against the real mapping,
+    not a copy (D82)."""
+    if plan.runtime == "python":
+        return {
+            "{runtime_bin}": "python3",
+            "{venv}": "/pd-home/.venv",
+            "{pd_tools}": "/pd-home/.pd-tools",
+            "{checkout}": "/checkout",
+        }
+    return {
+        "{runtime_bin}": "node",
+        "{pd_tools}": "/pd-home/.pd-tools",
+        "{checkout}": "/checkout",
+    }
+
+
 def _attach_plan(
     provision: ProvisionResult, plan: InstallPlan
 ) -> ProvisionResult:
@@ -1471,20 +1495,7 @@ class Orchestrator:
         # descriptor and, once run, recorded on the provision with its
         # real exit code — the plan alone (placeholders, executor-
         # dependent flags) cannot say what ran.
-        argv_mapping = (
-            {
-                "{runtime_bin}": "python3",
-                "{venv}": "/pd-home/.venv",
-                "{pd_tools}": "/pd-home/.pd-tools",
-                "{checkout}": "/checkout",
-            }
-            if runtime_name == "python"
-            else {
-                "{runtime_bin}": "node",
-                "{pd_tools}": "/pd-home/.pd-tools",
-                "{checkout}": "/checkout",
-            }
-        )
+        argv_mapping = sandbox_placeholder_mapping(plan)
         step_specs: list[dict] = []
         for step in plan.steps:
             if step.phase == "start":
