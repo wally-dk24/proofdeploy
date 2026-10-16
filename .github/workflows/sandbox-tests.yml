@@ -226,7 +226,7 @@ jobs:
         # tests) — a failing install's real error line must survive
         # even where an assertion message would trim it.
         if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pd-logs-${{ matrix.shard }}
           path: pd-logs/
@@ -276,7 +276,7 @@ jobs:
           EOF
 
       - name: Upload coverage data (union audit)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: steps.gate.outputs.proceed == 'true'
         with:
           name: coverage-sandbox-${{ matrix.shard }}
