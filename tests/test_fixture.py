@@ -507,7 +507,7 @@ def test_create_snapshot_feeds_bundle_with_recorded_sha(tmp_path, monkeypatch):
 
 
 def test_create_snapshot_rejects_output_path_is_file(tmp_path):
-    """pr-agent: an output path that exists as a file gets a clean error."""
+    """An output path that exists as a file gets a clean error."""
     repo, sha = _git_repo(tmp_path)
     out = tmp_path / "snap"
     out.write_text("i am a file\n", encoding="utf-8")
