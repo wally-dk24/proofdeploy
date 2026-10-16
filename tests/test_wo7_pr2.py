@@ -241,7 +241,7 @@ def test_node_plan_runtime_selection_from_engines(tmp_path):
     assert plan.image_ref == row.pinned_ref
     assert "@sha256:" in (plan.image_ref or "")
     # node_modules persists inside the checkout (install -> app).
-    assert plan.persisted_dirs == ["node_modules"]
+    assert plan.persisted_dirs == ["checkout:node_modules"]
 
 
 # ---------------------------------------------------------------------------

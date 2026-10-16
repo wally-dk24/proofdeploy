@@ -7,10 +7,10 @@ Each fixture (tests/fixtures/wo81b/<manager>/) is the same stdlib
 app whose only dependency is six==1.17.0, with a lock generated
 by the REAL pinned manager (uv 0.13.0, poetry 2.5.1, pdm 2.29.2)
 at fixture-creation time. The provision runs the plan end to end
-in the sandbox install container: checkout venv, the manager
+in the sandbox install container: the app venv in the home, the manager
 bootstrapped into /pd-home/.pd-tools BY HASH from its committed
 bootstrap requirements file, the freshness check (uv/pdm), the
-frozen install into /checkout/.venv, then the app on the venv.
+frozen install into /pd-home/.venv, then the app on the venv.
 
 Runs in the sandbox-tests CI job (PD_REQUIRE_SANDBOX), like the
 WO-8.1 generated-lock variant. Fail-before: on main every one of
