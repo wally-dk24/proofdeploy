@@ -31,3 +31,9 @@ auth:
     email: "${ADMIN_EMAIL}"
     password: "${ADMIN_PASSWORD}"
   bootstrap_env: [ADMIN_EMAIL, ADMIN_PASSWORD, SECRET]
+fixture:
+  repo_name: "Directus"
+  seed_note: "Directus's own bootstrap, run as the setup step, installed its system tables, ran its own migrations and created exactly one user — an administrator account whose email and password are generated fresh for each run — and exactly one role, 'Administrator', linked to one 'Administrator' policy granting full administrative access. Directus's migrations also created its built-in 'Public' policy, which applies to requests without a token, and its settings record with a generated project id. No content collections, items or files were created, and no other settings were changed."
+  auth_mechanism: "the token is presented in the Authorization header in the form 'Bearer <token>'"
+  auth_scope: "an access token belonging to the single administrator account the bootstrap created, obtained by signing in as that account with its per-run generated email and password and renewed by refresh before it expires; access tokens last 15 minutes and the refresh token 7 days. The token carries the account's full administrative access; the account has no static API token"
+  flags_note: "no feature flags or experimental options were enabled or changed"
