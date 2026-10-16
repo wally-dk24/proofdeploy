@@ -447,9 +447,18 @@ def test_golden_home_outside_checkout(tmp_path, golden, manager):
             ).stdout.split()
         )
         plan = provision.install_plan or {}
+        # Plan 1.2(n) (D77 Q3): persisted_dirs entries are rooted
+        # (checkout:<relpath> / pd_home:<relpath>); the checkout's
+        # top level may only gain the checkout-rooted ones' first
+        # path segments.
+        persisted_top = {
+            entry.split(":", 1)[1].split("/")[0]
+            for entry in (plan.get("persisted_dirs") or [])
+            if entry.startswith("checkout:")
+        }
         allowed = (
             committed
-            | set(plan.get("persisted_dirs") or [])
+            | persisted_top
             | {"app.db", ".pd-bridge.py"}
         )
         actual = {p.name for p in snap.iterdir()}
