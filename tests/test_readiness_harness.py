@@ -1460,7 +1460,7 @@ GHOST_UNIT: dict[str, Any] = {
 
 def test_redactor_scrubs_by_value_then_by_shape() -> None:
     redactor = ap.Redactor()
-    redactor.add("admin_key", _FAKE_ADMIN_KEY)
+    redactor.add("key_file", _FAKE_ADMIN_KEY)
     redactor.add("bootstrap_value", _FAKE_BOOTSTRAP)
     out = redactor.scrub(
         f"key={_FAKE_ADMIN_KEY} pw={_FAKE_BOOTSTRAP} "
@@ -1472,9 +1472,9 @@ def test_redactor_scrubs_by_value_then_by_shape() -> None:
     # The JWT was never registered as a value, so the shape sweep
     # is what caught it — the counts keep the two apart.
     assert redactor.counts == {
-        "admin_key": 2,
+        "key_file": 2,
         "bootstrap_value": 1,
-        "minted_jwt": 0,
+        "acquired_token": 0,
         "jwt_shape": 1,
     }
 
@@ -1627,6 +1627,7 @@ def test_auth_proof_side_proves_auth_through_the_engine(
     # The seed's traces in the snapshot: key file present, and the
     # SQLite file the app side serves from is named.
     assert row["seed"]["key_file_present"] is True
+    assert row["seed"]["key_file"] == ".pd-auth/admin_key"
     assert row["seed"]["sqlite_files"] == [
         "ghost/core/content/data/ghost.db (12 bytes)"
     ]
@@ -1636,10 +1637,16 @@ def test_auth_proof_side_proves_auth_through_the_engine(
     assert auth["status"] == "PROVEN"
     assert auth["endpoint"] == "/ghost/api/admin/tags/"
     assert [r["http_status"] for r in auth["requests"]] == [200, 200, 403]
-    assert [r["mints"] for r in auth["requests"]] == [1, 1, 0]
-    assert auth["mint_count_after_two_authenticated"] == 2
+    assert [r["acquisitions"] for r in auth["requests"]] == [1, 1, 0]
+    assert [r["acquisition_kinds"] for r in auth["requests"]] == [
+        {"mint": 1},
+        {"mint": 1},
+        {},
+    ]
+    assert auth["acquisitions_after_two_authenticated"] == 2
+    assert auth["acquisition_kinds"] == {"mint": 2}
     assert auth["requests"][0]["authorization"] == (
-        "Ghost <redacted:minted_jwt>"
+        "Ghost <redacted:acquired_token>"
     )
     assert auth["requests"][2]["authorization"] is None
     # The probes the executor actually received: two carrying the
@@ -1664,7 +1671,7 @@ def test_auth_proof_side_proves_auth_through_the_engine(
     assert _FAKE_ADMIN_KEY not in blob
     assert _FAKE_JWT not in blob
     assert _FAKE_BOOTSTRAP not in blob
-    assert row["redactions"]["minted_jwt"] == 2
+    assert row["redactions"]["acquired_token"] == 2
     assert row["redactions"]["bootstrap_value"] == 1
     log_text = (
         tmp_path / "pd-logs" / "authproof-checkpoint-bug-ghost-1-fix-a1.log"
@@ -1676,22 +1683,41 @@ def test_auth_proof_side_proves_auth_through_the_engine(
 
 
 def _proof_record(
-    http_status: int, *, verdict: str = "pass", mints: int = 0
+    http_status: int, *, verdict: str = "pass", acquisitions: int = 0
 ) -> dict[str, Any]:
     """One request record as _request_record shapes it, for
     driving the pure verdict directly (D106)."""
-    return {"http_status": http_status, "verdict": verdict, "mints": mints}
+    return {
+        "http_status": http_status,
+        "verdict": verdict,
+        "acquisitions": acquisitions,
+    }
 
 
 def test_auth_proof_verdict_accepts_only_the_exact_proof() -> None:
     records = [
-        _proof_record(200, mints=1),
-        _proof_record(200, mints=1),
+        _proof_record(200, acquisitions=1),
+        _proof_record(200, acquisitions=1),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is True
+    assert ap._proof_passed(True, records, 403) is True
     # The seed's key file missing fails the proof on its own.
-    assert ap._proof_passed(False, records) is False
+    assert ap._proof_passed(False, records, 403) is False
+
+
+def test_auth_proof_verdict_accepts_the_directus_shape() -> None:
+    # Directus (D113/D137): two authenticated 200s, each with its
+    # own fresh login, and the bare request refused with 401. No
+    # key file is declared, so the caller's seed conjunct is True.
+    records = [
+        _proof_record(200, acquisitions=1),
+        _proof_record(200, acquisitions=1),
+        _proof_record(401),
+    ]
+    assert ap._proof_passed(True, records, 401) is True
+    # The same records under Ghost's expected refusal fail: the
+    # expected unauthenticated status is an input, not a constant.
+    assert ap._proof_passed(True, records, 403) is False
 
 
 def test_auth_proof_verdict_fails_when_unauthenticated_accepted() -> None:
@@ -1699,53 +1725,53 @@ def test_auth_proof_verdict_fails_when_unauthenticated_accepted() -> None:
     # request answers 200. Every leg's own verdict still reads
     # "pass" here, so only the status conjunct can fail it.
     records = [
-        _proof_record(200, mints=1),
-        _proof_record(200, mints=1),
+        _proof_record(200, acquisitions=1),
+        _proof_record(200, acquisitions=1),
         _proof_record(200),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, 403) is False
 
 
-def test_auth_proof_verdict_fails_on_mint_count_one() -> None:
+def test_auth_proof_verdict_fails_on_acquisition_count_one() -> None:
     records = [
-        _proof_record(200, mints=1),
-        _proof_record(200, mints=0),
+        _proof_record(200, acquisitions=1),
+        _proof_record(200, acquisitions=0),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, 403) is False
 
 
-def test_auth_proof_verdict_fails_on_mint_count_three() -> None:
+def test_auth_proof_verdict_fails_on_acquisition_count_three() -> None:
     records = [
-        _proof_record(200, mints=2),
-        _proof_record(200, mints=1),
+        _proof_record(200, acquisitions=2),
+        _proof_record(200, acquisitions=1),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, 403) is False
 
 
 def test_auth_proof_verdict_fails_on_authenticated_non_200() -> None:
     records = [
-        _proof_record(500, mints=1),
-        _proof_record(200, mints=1),
+        _proof_record(500, acquisitions=1),
+        _proof_record(200, acquisitions=1),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, 403) is False
     records = [
-        _proof_record(200, mints=1),
-        _proof_record(401, mints=1),
+        _proof_record(200, acquisitions=1),
+        _proof_record(401, acquisitions=1),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, 403) is False
 
 
 class _ScriptedExecutor:
     """The executor's shape with scripted per-leg outcomes:
-    legs are (http_status, mints) in call order. A leg's verdict
-    follows its own assertion exactly as the real executor's
-    does — PASS iff the observed status equals the asserted
-    one — so a wrong status also fails that leg; the composed
-    row must still read FAILED, never PROVEN (D106)."""
+    legs are (http_status, acquisitions) in call order. A leg's
+    verdict follows its own assertion exactly as the real
+    executor's does — PASS iff the observed status equals the
+    asserted one — so a wrong status also fails that leg; the
+    composed row must still read FAILED, never PROVEN (D106)."""
 
     def __init__(self, legs: list[tuple[int, int]]) -> None:
         self.legs = legs
@@ -1753,18 +1779,18 @@ class _ScriptedExecutor:
 
     def run_probe(self, probe: dict[str, Any], index: int = 0) -> ProbeResult:
         self.probes.append(probe)
-        status, mints = self.legs[index]
+        status, acquisitions = self.legs[index]
         expected = probe["assert"][0]["equals"]
         details = [
             "credential provider: minted ghost_jwt (ttl 300s)"
-        ] * mints
+        ] * acquisitions
         details.append(f"act: GET {probe['act']['path']} -> {status}")
         return ProbeResult(
             probe_index=index,
             verdict=Verdict.PASS if status == expected else Verdict.FAIL,
             details=details,
             http_status=status,
-            minted_tokens=[_FAKE_JWT] * mints,
+            minted_tokens=[_FAKE_JWT] * acquisitions,
         )
 
 
@@ -1805,24 +1831,24 @@ def test_auth_proof_side_fails_when_unauthenticated_accepted(
     assert row["auth"]["status"] == "FAILED"
 
 
-def test_auth_proof_side_fails_on_mint_count_one(
+def test_auth_proof_side_fails_on_acquisition_count_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     row = _scripted_proof_row(
         tmp_path, monkeypatch, [(200, 1), (200, 0), (403, 0)]
     )
-    assert row["auth"]["mint_count_after_two_authenticated"] == 1
+    assert row["auth"]["acquisitions_after_two_authenticated"] == 1
     assert row["auth"]["passed"] is False
     assert row["auth"]["status"] == "FAILED"
 
 
-def test_auth_proof_side_fails_on_mint_count_three(
+def test_auth_proof_side_fails_on_acquisition_count_three(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     row = _scripted_proof_row(
         tmp_path, monkeypatch, [(200, 2), (200, 1), (403, 0)]
     )
-    assert row["auth"]["mint_count_after_two_authenticated"] == 3
+    assert row["auth"]["acquisitions_after_two_authenticated"] == 3
     assert row["auth"]["passed"] is False
     assert row["auth"]["status"] == "FAILED"
 
@@ -1836,3 +1862,173 @@ def test_auth_proof_side_fails_on_authenticated_non_200(
     assert row["auth"]["requests"][0]["http_status"] == 500
     assert row["auth"]["passed"] is False
     assert row["auth"]["status"] == "FAILED"
+
+
+# ----------------------------------------------------------------------
+# The generic driver (D137): per-repo inputs are only the endpoint
+# + expected unauthenticated status; the provider and the token
+# presentation come from the repo's committed contract, and
+# acquisitions are counted by kind from the provider's details.
+# ----------------------------------------------------------------------
+
+
+def test_proof_specs_registered_for_the_three_checkpoint_repos() -> None:
+    ghost = ap.spec_for_repo("TryGhost/Ghost")
+    assert (ghost.method, ghost.path, ghost.unauthenticated_status) == (
+        "GET",
+        "/ghost/api/admin/tags/",
+        403,
+    )
+    directus = ap.spec_for_repo("directus/directus")
+    assert (directus.method, directus.path, directus.unauthenticated_status) == (
+        "GET",
+        "/users/me",
+        401,
+    )
+    vendure = ap.spec_for_repo("vendure-ecommerce/vendure")
+    assert vendure.method == "POST"
+    assert vendure.path == "/admin-api"
+    assert vendure.body == {"query": "query { me { id identifier } }"}
+    with pytest.raises(ValueError, match="no auth-proof spec"):
+        ap.spec_for_repo("nestjs/nest")
+
+
+def test_presentation_scheme_comes_from_the_committed_contract() -> None:
+    from proofdeploy.yml import load_contract
+
+    ghost = load_contract(rp.contract_path("TryGhost/Ghost"))
+    assert ap.presentation_scheme(ghost) == "Ghost"
+    directus = load_contract(rp.contract_path("directus/directus"))
+    assert ap.presentation_scheme(directus) == "Bearer"
+
+
+def test_seed_snapshot_files_follow_the_contract_seed_command() -> None:
+    from proofdeploy.yml import load_contract
+
+    ghost = load_contract(rp.contract_path("TryGhost/Ghost"))
+    assert ap.seed_snapshot_files(ghost) == [ap.SEED_SOURCE]
+    # Directus declares no seed script; Vendure's seed names an
+    # in-tree command — neither adds a file to the harness commit.
+    directus = load_contract(rp.contract_path("directus/directus"))
+    assert ap.seed_snapshot_files(directus) == []
+    vendure = load_contract(rp.contract_path("vendure-ecommerce/vendure"))
+    assert ap.seed_snapshot_files(vendure) == []
+
+
+def test_acquisition_kinds_counted_by_kind_from_provider_details() -> None:
+    details = [
+        "credential provider: minted ghost_jwt (ttl 300s)",
+        "credential provider: POST /auth/login (login)",
+        "credential provider: POST /auth/refresh",
+        "credential provider: POST /register (register)",
+        # Not acquisitions: outcomes and failures are not counted.
+        "credential provider: token acquired",
+        "credential provider failed: login endpoint returned 500",
+        "act: GET /users/me -> 200",
+    ]
+    assert ap._acquisition_kinds(details) == {
+        "mint": 1,
+        "login": 1,
+        "refresh": 1,
+        "register": 1,
+    }
+    assert ap._acquisition_kinds([]) == {}
+
+
+_FAKE_DIRECTUS_TOKEN = "directus-fake-token-0123456789"
+
+
+class _LoginScriptedExecutor:
+    """The executor's shape for a login-mode proof (Directus):
+    each authenticated leg acquires by login (the measured path's
+    fresh context per probe) and one detail line echoes the token,
+    to prove the scrub; verdicts follow the legs' assertions."""
+
+    def __init__(self, statuses: list[int]) -> None:
+        self.statuses = statuses
+        self.probes: list[dict[str, Any]] = []
+
+    def run_probe(self, probe: dict[str, Any], index: int = 0) -> ProbeResult:
+        self.probes.append(probe)
+        status = self.statuses[index]
+        expected = probe["assert"][0]["equals"]
+        headers = probe["act"].get("headers") or {}
+        details = [f"act: GET {probe['act']['path']} -> {status}"]
+        minted: list[str] = []
+        if "Authorization" in headers:
+            details = [
+                "credential provider: POST /auth/login (login)",
+                "credential provider: token acquired",
+                f"sent authorization: Bearer {_FAKE_DIRECTUS_TOKEN}",
+            ] + details
+            minted = [_FAKE_DIRECTUS_TOKEN]
+        return ProbeResult(
+            probe_index=index,
+            verdict=Verdict.PASS if status == expected else Verdict.FAIL,
+            details=details,
+            http_status=status,
+            minted_tokens=minted,
+        )
+
+
+def test_auth_proof_side_proves_directus_with_login_acquisitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src, sha = _one_commit_src(tmp_path)
+    clone = _empty_clone(tmp_path, src)
+    side = _fake_auth_side(tmp_path)
+    executor = _LoginScriptedExecutor([200, 200, 401])
+    orch = SimpleNamespace(
+        _provision_side_sandbox=(
+            lambda rev, port, unit_dir, tag: side
+        ),
+        _make_executor=lambda s: executor,
+    )
+    monkeypatch.chdir(tmp_path)  # pd-logs/ land in tmp
+    manifest = rp.load_manifest(rp.DEFAULT_MANIFEST)
+    unit = next(
+        u
+        for u in rp.units_for_repo(manifest, "directus/directus")
+        if u["unit_id"] == "checkpoint-bug-directus-1"
+    )
+    row = ap.auth_proof_side(
+        orch,
+        clone,
+        unit,
+        {"role": "fix", "sha": sha},
+        rp.contract_path("directus/directus"),
+        1,
+        tmp_path / "work",
+        "isolated",
+    )
+    auth = row["auth"]
+    assert auth["passed"] is True
+    assert auth["status"] == "PROVEN"
+    assert auth["endpoint"] == "/users/me"
+    assert [r["http_status"] for r in auth["requests"]] == [200, 200, 401]
+    # Each authenticated request acquired by its own fresh login.
+    assert [r["acquisition_kinds"] for r in auth["requests"]] == [
+        {"login": 1},
+        {"login": 1},
+        {},
+    ]
+    assert auth["acquisitions_after_two_authenticated"] == 2
+    assert auth["acquisition_kinds"] == {"login": 2}
+    # Presentation read from the Directus contract: Bearer.
+    assert auth["requests"][0]["authorization"] == (
+        "Bearer <redacted:acquired_token>"
+    )
+    assert executor.probes[0]["act"]["headers"]["Authorization"] == (
+        "Bearer ${AUTH_TOKEN}"
+    )
+    assert [p["act"]["path"] for p in executor.probes] == ["/users/me"] * 3
+    assert executor.probes[2]["assert"] == [
+        {"type": "status", "equals": 401}
+    ]
+    # No key file is declared by the Directus contract: no seed
+    # conjunct, recorded as None.
+    assert row["seed"]["key_file_present"] is None
+    assert row["seed"]["key_file"] is None
+    # The acquired token's value never reaches the row.
+    assert _FAKE_DIRECTUS_TOKEN not in json.dumps(row)
+    assert side.provision.proc.stopped is True

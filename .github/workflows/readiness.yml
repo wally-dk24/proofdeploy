@@ -22,14 +22,19 @@
 # or pull_request, and no run is dispatched before this PR's
 # review and merge.
 #
-# Auth-proof mode (D87): mode=auth-proof runs readiness/auth_proof
-# instead of the provision pass — the same provisioning path, then
-# three executor probes per side proving the contract's declared
-# auth (authenticated 200, a second authenticated 200 with a fresh
-# mint, unauthenticated 403). The optional `only` input restricts
-# it to comma-separated <unit>:<role> sides (the one-side
-# rehearsal). Auth-proof rows are labelled "auth-proof"; like the
-# provision rows they are evidence, never measured records.
+# Auth-proof mode (D87, generalized D137): mode=auth-proof runs
+# readiness/auth_proof instead of the provision pass — the same
+# provisioning path, then three executor probes per side proving
+# the contract's declared auth (two authenticated 200s, each with
+# its own fresh acquisition counted by kind from the provider's
+# detail lines, and an unauthenticated request refused with the
+# repo's registered status). The driver is contract-driven: the
+# provider and token presentation come from the repo's committed
+# contract; only the endpoint and expected refusal status are
+# registered per repo. The optional `only` input restricts it to
+# comma-separated <unit>:<role> sides (the one-side rehearsal).
+# Auth-proof rows are labelled "auth-proof"; like the provision
+# rows they are evidence, never measured records.
 name: readiness
 
 on:
