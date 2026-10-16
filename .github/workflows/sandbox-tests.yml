@@ -30,6 +30,24 @@
 # records). Same 55 sandbox nodeids, each selected by exactly one
 # shard — proven by scripts/check_test_manifest.py; no test, product
 # code, or per-shard step changed.
+# WO-CI-SPEED task 5 (D53) — shard re-pack to the job budget. PR
+# #112's measurement: a push fanned out to 23 jobs (ci 6 +
+# sandbox-tests 17) against the GitHub Free plan's 20-concurrent-job
+# cap, so ~3 jobs always queued behind finished ones and queue time
+# (medians 599–1047.5s on the late jobs) dominated wall clock. The
+# binding constraint is the job COUNT, not any shard's duration, so
+# the four 5/5 conformance splits above (pnpm, pnpm-monorepo, bun,
+# flask) are merged back into one shard per app: each merged shard
+# is the sum of its halves minus one duplicated module fixture and
+# one job's setup overhead (~950–1100s estimated from the halves'
+# 546–608s medians), still less than the queue delay its second job
+# used to wait out. Same sandbox nodeids, each selected by exactly
+# one shard — proven by scripts/check_test_manifest.py, as before;
+# no test, product code, or per-shard step changed. New totals:
+# sandbox-tests 13 jobs (changes + 12 shards), ci 6 — 19 per push,
+# one under the cap. The cap is enforced mechanically:
+# scripts/check_test_manifest.py fails the ci lint job when the
+# expanded per-push job count of the two gate workflows exceeds 20.
 # Lint/typecheck are NOT repeated here: the ci workflow's identical
 # commands are the gate.
 
@@ -109,25 +127,18 @@ jobs:
             files: "tests/test_orchestrator.py"
           - shard: apps-node-express
             nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-express-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-express-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-express-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-express-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-express-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-express-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-express-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-express-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-express-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-express-sqlite]"
-          - shard: apps-node-pnpm-a
-            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-pnpm-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-pnpm-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-pnpm-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-pnpm-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-pnpm-sqlite]"
-          - shard: apps-node-pnpm-b
-            nodeids: "tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-pnpm-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-pnpm-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-pnpm-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-pnpm-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-pnpm-sqlite]"
-          # Plan 1.2b: the pnpm workspace (monorepo) golden, same
-          # 5/5 case split as the other multi-case apps.
-          - shard: apps-node-monorepo-a
-            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-pnpm-monorepo] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-pnpm-monorepo] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-pnpm-monorepo] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-pnpm-monorepo] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-pnpm-monorepo]"
-          - shard: apps-node-monorepo-b
-            nodeids: "tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-pnpm-monorepo] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-pnpm-monorepo] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-pnpm-monorepo] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-pnpm-monorepo] tests/test_conformance.py::test_case9_no_canary_in_records[node-pnpm-monorepo]"
-          # Plan 1.2e: the bun golden, same 5/5 case split.
-          - shard: apps-node-bun-a
-            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-bun-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-bun-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-bun-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-bun-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-bun-sqlite]"
-          - shard: apps-node-bun-b
-            nodeids: "tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-bun-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-bun-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-bun-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-bun-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-bun-sqlite]"
-          - shard: apps-python-flask-a
-            nodeids: "tests/test_conformance.py::test_case10_record_replays_to_same_verdict[python-flask-sqlite] tests/test_conformance.py::test_case1_frozen_lockfile_honored[python-flask-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[python-flask-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[python-flask-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[python-flask-sqlite]"
-          - shard: apps-python-flask-b
-            nodeids: "tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[python-flask-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[python-flask-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[python-flask-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[python-flask-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[python-flask-sqlite]"
+          - shard: apps-node-pnpm
+            nodeids: "tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-pnpm-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-pnpm-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-pnpm-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-pnpm-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-pnpm-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-pnpm-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-pnpm-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-pnpm-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-pnpm-sqlite] tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-pnpm-sqlite]"
+          # Plan 1.2b: the pnpm workspace (monorepo) golden.
+          # WO-CI-SPEED task 5 merged its 5/5 split (see header).
+          - shard: apps-node-monorepo
+            nodeids: "tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-pnpm-monorepo] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-pnpm-monorepo] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-pnpm-monorepo] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-pnpm-monorepo] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-pnpm-monorepo] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-pnpm-monorepo] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-pnpm-monorepo] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-pnpm-monorepo] tests/test_conformance.py::test_case9_no_canary_in_records[node-pnpm-monorepo] tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-pnpm-monorepo]"
+          # Plan 1.2e: the bun golden. WO-CI-SPEED task 5 merged
+          # its 5/5 split (see header).
+          - shard: apps-node-bun
+            nodeids: "tests/test_conformance.py::test_case1_frozen_lockfile_honored[node-bun-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[node-bun-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[node-bun-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[node-bun-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[node-bun-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[node-bun-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[node-bun-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[node-bun-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[node-bun-sqlite] tests/test_conformance.py::test_case10_record_replays_to_same_verdict[node-bun-sqlite]"
+          - shard: apps-python-flask
+            nodeids: "tests/test_conformance.py::test_case1_frozen_lockfile_honored[python-flask-sqlite] tests/test_conformance.py::test_case2_lockfile_mismatch_commit_refused[python-flask-sqlite] tests/test_conformance.py::test_case3_declared_runtime_selected_and_reported[python-flask-sqlite] tests/test_conformance.py::test_case4_build_migrate_seed_run[python-flask-sqlite] tests/test_conformance.py::test_case5_forced_start_failure_typed_with_error[python-flask-sqlite] tests/test_conformance.py::test_case6_network_cut_and_no_secret_in_container[python-flask-sqlite] tests/test_conformance.py::test_case7_bug_pair_fails_at_parent_passes_at_fix[python-flask-sqlite] tests/test_conformance.py::test_case8_clean_commit_no_fail[python-flask-sqlite] tests/test_conformance.py::test_case9_no_canary_in_records[python-flask-sqlite] tests/test_conformance.py::test_case10_record_replays_to_same_verdict[python-flask-sqlite]"
           - shard: provisions-managers
             files: "tests/test_wo81b_sandbox.py tests/test_wo81_generated_variant.py"
           - shard: provisions-real-apps
@@ -188,30 +199,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Selection counts (WAL-102 partition proof)
-        id: counts
-        if: steps.gate.outputs.proceed == 'true'
-        run: |
-          set -o pipefail
-          python scripts/check_test_manifest.py --counts "sandbox" -- ${{ matrix.files }} ${{ matrix.nodeids }} | tee /tmp/counts-${{ matrix.shard }}.txt
-          grep '^shard_count=' /tmp/counts-${{ matrix.shard }}.txt >> "$GITHUB_OUTPUT"
-          # WAL-109: the file-set partition guard that used to be
-          # embedded here (a hardcoded list of the files holding
-          # sandbox tests) is owned by scripts/check_test_manifest.py
-          # in the ci workflow's lint job: the collected sandbox
-          # selection must equal tests/expected_sandbox_nodeids.txt
-          # and every test must be selected by exactly one shard of
-          # this matrix.
-          # Gate-speed item 0: this step used to run two fresh
-          # pytest collections per shard; importing the suite runs
-          # a real podman capability probe at import time in
-          # several test modules (~110s per collection), so the
-          # counts now come from the generated manifests via the
-          # script's --counts mode. The Verify step below still
-          # compares this shard's REAL run against the derived
-          # count, and the ci lint job proves the manifests equal
-          # real collection on the same commit.
-
       - name: Run sandbox selection (this shard)
         # B3 (Addendum 16): PD_REQUIRE_SANDBOX=1 turns any sandbox
         # test skip into a failure; the Verify step below additionally
@@ -249,12 +236,27 @@ jobs:
         # B3 successor: reads THIS run's JUnit report (the old step
         # re-ran three already-run tests for 393s). Proves the shard's
         # collected sandbox tests all ran and none skipped.
+        # WO-CI-SPEED task 3 (collect once per job): the expected
+        # count is derived HERE, in the step that verifies the run —
+        # from the generated manifests, via the script's --counts
+        # mode — and the ran count comes from THIS run's JUnit
+        # report. There is no separate counts step/process anymore.
+        # WAL-109: the partition proof is owned by
+        # scripts/check_test_manifest.py in the ci workflow's lint
+        # job: the collected sandbox selection must equal
+        # tests/expected_sandbox_nodeids.txt and every test must be
+        # selected by exactly one shard of this matrix. The ci lint
+        # job proves the manifests equal real collection on the same
+        # commit.
         if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
         env:
-          EXPECTED: ${{ steps.counts.outputs.shard_count }}
           SHARD: ${{ matrix.shard }}
         run: |
-          python3 - <<'EOF'
+          set -o pipefail
+          python scripts/check_test_manifest.py --counts "sandbox" -- ${{ matrix.files }} ${{ matrix.nodeids }} | tee /tmp/counts-${{ matrix.shard }}.txt
+          EXPECTED=$(grep '^shard_count=' /tmp/counts-${{ matrix.shard }}.txt | cut -d= -f2)
+          echo "expected for this shard (from the manifest): $EXPECTED"
+          EXPECTED=$EXPECTED SHARD=$SHARD python3 - <<'EOF'
           import os
           import xml.etree.ElementTree as ET
 

@@ -30,6 +30,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -88,6 +89,13 @@ class ProvisionResult:
     # when the install never built the root project (the pip
     # paths) or nothing could be determined.
     build_backend: dict | None = None
+    # Plan 1.2(l) (D46): the git submodules materialized into the
+    # snapshot at their recorded commits, as
+    # [{path, url, commit, tree_sha}] (empty when the tree lists
+    # none). Set by the orchestrator after provisioning — the
+    # materialization happens at snapshot time, before the executor
+    # runs — and recorded here so it lands in the evidence record.
+    submodules: list[dict] = field(default_factory=list)
     # Live process handle on READY. Caller-owned: the caller must terminate
     # it when done and call cleanup_run(run_id). Excluded from to_dict.
     proc: Any = field(default=None, repr=False, compare=False)
@@ -113,6 +121,7 @@ class ProvisionResult:
             "executed_steps": self.executed_steps,
             "generated_lock": self.generated_lock,
             "build_backend": self.build_backend,
+            "submodules": self.submodules,
             "logs": self.logs,
         }
 
@@ -999,6 +1008,106 @@ def _target_log_tail(log_path: Path, n: int = 40) -> str:
     return "\n".join(lines[-n:])
 
 
+def _tree_has_foreign_owner(d: Path) -> bool:
+    """True when any entry in the tree is owned by a uid other than
+    the invoking user's — or the tree cannot be scanned by the
+    invoking user at all.
+
+    Foreign-owned entries are the mark of content written under the
+    sandbox's userns mapping (plan 1.2(g)): the checkout was chowned
+    to the mapped runtime uid, so on the host those files belong to
+    a subordinate uid, in directories the invoking user does not
+    own — a host rmtree cannot unlink inside them.
+    """
+    uid = os.getuid()
+    try:
+        if d.lstat().st_uid != uid:
+            return True
+        for p in d.rglob("*"):
+            try:
+                if p.lstat().st_uid != uid:
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        # Unscannable by the host user: not theirs to remove either.
+        return True
+    return False
+
+
+def _unshare_remove(d: Path, logs: list[str] | None) -> bool:
+    """Remove a tree from inside the rootless user namespace
+    (``podman unshare rm -rf``) — the same namespace coordinates the
+    checkout ownership transfer uses (sandbox.py, plan 1.2(g)): in
+    that namespace the caller holds root over the mapped uids, so
+    files owned by the mapped runtime uid can be unlinked. Never
+    raises; returns True only when the tree is gone afterwards.
+    The sandbox import is lazy (its module imports this one back
+    through provisioning).
+    """
+    from proofdeploy.sandbox import PODMAN
+
+    try:
+        proc = subprocess.run(
+            list(PODMAN) + ["unshare", "rm", "-rf", str(d)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0 and logs is not None:
+        tail = (proc.stderr or proc.stdout or "").strip()[-200:]
+        logs.append(
+            f"cleanup: podman unshare rm -rf {d} failed "
+            f"(exit {proc.returncode}): {tail}"
+        )
+    return not d.exists()
+
+
+def _remove_tree(d: Path, logs: list[str] | None) -> None:
+    """Remove a directory tree, never silently.
+
+    Routing (plan 1.2(g) follow-up): a tree carrying foreign-owned
+    entries — userns-remapped content — is removed via
+    ``podman unshare rm -rf``; the old code's plain
+    ``shutil.rmtree(ignore_errors=True)`` could not unlink inside
+    directories owned by the mapped uid and left those files behind
+    without a word. Any other tree goes through rmtree. If the
+    unshare route fails, rmtree still runs (it clears whatever the
+    host owns). Whatever remains at the end is enumerated into the
+    log: a cleanup that leaks is a recorded fact, not a silent one.
+    A fully removed tree keeps the historical ``cleaned up:`` line.
+    """
+    if not d.exists() and not d.is_symlink():
+        return
+    if _tree_has_foreign_owner(d):
+        _unshare_remove(d, logs)
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)
+    if not d.exists():
+        if logs is not None:
+            logs.append(f"cleaned up: {d}")
+        return
+    try:
+        remaining = sorted(str(p.relative_to(d)) for p in d.rglob("*"))
+    except OSError:
+        remaining = []
+    if remaining:
+        shown = ", ".join(remaining[:5])
+        more = f" (+{len(remaining) - 5} more)" if len(remaining) > 5 else ""
+        line = (
+            f"cleanup incomplete: {d}: {len(remaining)} entries "
+            f"left behind: {shown}{more}"
+        )
+    else:
+        line = f"cleanup incomplete: {d}: the directory itself could not be removed"
+    if logs is not None:
+        logs.append(line)
+    else:
+        print(f"proofdeploy: {line}", file=sys.stderr)
+
+
 @dataclass
 class Provisioner:
     """Builds and starts probe targets from repo contracts."""
@@ -1164,7 +1273,10 @@ class Provisioner:
 
         Called automatically on every failure path. On READY the caller
         owns the target process and must call this when done with it.
-        Tolerates missing dirs.
+        Tolerates missing dirs. Removal goes through _remove_tree:
+        userns-remapped content (plan 1.2(g)) is removed via
+        ``podman unshare``, and anything that cannot be removed is
+        enumerated in the log — never silently left behind.
 
         NOTE: this does NOT stop the target process. Use stop_target()
         first to terminate and reap the process, then cleanup_run() to
@@ -1173,9 +1285,7 @@ class Provisioner:
         for sub in ("venvs", "runs"):
             d = self.workdir / sub / run_id
             if d.is_dir():
-                shutil.rmtree(d, ignore_errors=True)
-                if logs is not None:
-                    logs.append(f"cleaned up: {d}")
+                _remove_tree(d, logs)
 
     def stop_target(self, proc: Any, logs: list[str] | None = None) -> None:
         """Terminate and reap a READY target's process group (O2).

@@ -1,9 +1,11 @@
 # PROVENANCE 2026-10-15: app.path declared "." under the reviewer's app-identification ruling (plan 1.2b follow-up) — the app is named in the contract; the tool never guesses. This contract's commands already run from the repo root, so "." preserves them exactly.
+# PROVENANCE 2026-10-15 (D64): start is upstream's dev:server (cli dev server --server-entry ./index.ts, executed from source via ts-node — the seed's own execution mode, so the template path and the sqlite file resolve as seeded), with --no-reload (packages/cli command-declarations: --no-reload disables watcher restarts); RUN_JOB_QUEUE "1" selects the in-process job queue in packages/dev-server/index.ts, so no separate worker process contends for the sqlite file. Build and seed are unchanged by this ruling.
 app:
   path: "."
 build: "bun run build"
 seed: "cd packages/dev-server && bun run populate"
-start: "cd packages/dev-server && bun run start"
+start: "cd packages/dev-server && bun run dev:server --no-reload"
 readiness: "/health"
 env:
   DB: sqlite
+  RUN_JOB_QUEUE: "1"

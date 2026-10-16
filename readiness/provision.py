@@ -311,6 +311,9 @@ def row_from_provision(
         "install_plan_sha256": prov.install_plan_sha256,
         "network_mode": network_mode,
         "attempt": attempt,
+        # Plan 1.2(l): the submodules materialized into this side's
+        # snapshot at their recorded commits ([] when none).
+        "submodules": list(prov.submodules),
     }
 
 
@@ -352,6 +355,7 @@ def row_from_exception(
         "install_plan_sha256": None,
         "network_mode": network_mode,
         "attempt": attempt,
+        "submodules": [],
     }
 
 
@@ -391,6 +395,7 @@ def _harness_error_row(
         "install_plan_sha256": None,
         "network_mode": network_mode,
         "attempt": attempt,
+        "submodules": [],
     }
 
 

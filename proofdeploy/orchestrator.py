@@ -110,6 +110,7 @@ from proofdeploy.sandbox import (
     resolve_network_mode,
 )
 from proofdeploy.setup_auth import generate_bootstrap_env
+from proofdeploy.submodules import materialize_snapshot_submodules
 from proofdeploy.yml import RepoContract, load_contract
 
 # Fixture keys rendered into the author-facing description by design.
@@ -249,13 +250,22 @@ def _sandbox_step_command(
     Python: the app runs with the venv's python: a step beginning with
     `python`/`python3` is rewritten to the venv binary inside the
     checkout (/checkout/.venv/bin/python); any other step gets the
-    venv's bin first on PATH for that command only. This is the exact
+    venv's bin first on PATH for that step's shell. This is the exact
     rendering the pre-WO-7 sandbox path applied to build/migrate/seed
     and to the start command.
 
     Node (WO-7 PR 2): node_modules lives inside the checkout, so its
-    .bin goes first on PATH for that command only — the Node analog
+    .bin goes first on PATH for that step's shell — the Node analog
     of the venv rendering. The command itself is untouched.
+
+    The PATH prepend is rendered as `export PATH=<dirs>:$PATH; {cmd}`
+    (plan 1.2(m)), never `env PATH=... {cmd}`: `env` cannot exec a
+    shell builtin, so a contract command whose first token is one
+    (`cd`, `export`, `.`, ...) died with exit 127, and `env` set PATH
+    only for the first simple command, so in a compound command the
+    part after `&&` ran without the prepended dirs. The export form
+    applies to the step's whole compound command; it persists only
+    for that step's own `bash -c` invocation.
 
     Corepack-pinned Node plans (plan 1.2f): the plan bootstraps
     corepack into the checkout's .pd-tools (persisted), and the
@@ -276,19 +286,19 @@ def _sandbox_step_command(
     if runtime == "node":
         if corepack_version is not None and manager in ("pnpm", "yarn"):
             return (
-                "env PATH=/checkout/.pd-tools/node_modules/.bin:"
-                f"/checkout/node_modules/.bin:$PATH {cmd}"
+                "export PATH=/checkout/.pd-tools/node_modules/.bin:"
+                f"/checkout/node_modules/.bin:$PATH; {cmd}"
             )
         if manager == "bun":
             return (
-                "env PATH=/checkout/.pd-tools/bin:"
-                f"/checkout/node_modules/.bin:$PATH {cmd}"
+                "export PATH=/checkout/.pd-tools/bin:"
+                f"/checkout/node_modules/.bin:$PATH; {cmd}"
             )
-        return f"env PATH=/checkout/node_modules/.bin:$PATH {cmd}"
+        return f"export PATH=/checkout/node_modules/.bin:$PATH; {cmd}"
     parts = cmd.split(maxsplit=1)
     if parts and parts[0] in ("python", "python3") and len(parts) == 2:
         return f"/checkout/.venv/bin/python {parts[1]}"
-    return f"env PATH=/checkout/.venv/bin:$PATH {cmd}"
+    return f"export PATH=/checkout/.venv/bin:$PATH; {cmd}"
 
 
 def _attach_plan(
@@ -1148,6 +1158,33 @@ class Orchestrator:
         sha = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
         snap_dir = unit_dir / f"snapshot-{tag}"
         snapshot = create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=snap_dir)
+        # Plan 1.2(l) (D46): fill the snapshot's listed gitlinks at
+        # their recorded commits before anything reads the tree. A
+        # typed refusal raises here, exactly as a snapshot failure
+        # does; the records ride on the provision into the evidence.
+        submodules = materialize_snapshot_submodules(
+            repo_dir=repo,
+            sha=sha,
+            snapshot_dir=snapshot.dir,
+            scratch_dir=unit_dir / f"submodule-scratch-{tag}",
+        )
+        side = self._provision_side_impl(
+            runner, rev, port, unit_dir, tag, sha=sha, snapshot=snapshot
+        )
+        side.provision.submodules = submodules
+        return side
+
+    def _provision_side_impl(
+        self,
+        runner: Provisioner,
+        rev: str,
+        port: int,
+        unit_dir: Path,
+        tag: str,
+        *,
+        sha: str,
+        snapshot: Any,
+    ) -> _Side:
         contract = load_contract(snapshot.dir / "proofdeploy.yml")
         # WO-8.3: fresh bootstrap credentials for THIS side and run,
         # generated before any step runs (the seed consumes them).
@@ -1185,13 +1222,47 @@ class Orchestrator:
         container with no external network, only the checkout mounted,
         and no secrets in the container environment (WO-5 brief).
         """
-        import os
-
-        cfg = self.cfg
-        repo = cfg.repo_dir
+        repo = self.cfg.repo_dir
         sha = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
         snap_dir = unit_dir / f"snapshot-{tag}"
         snapshot = create_snapshot(repo_dir=repo, commit_rev=sha, output_dir=snap_dir)
+        # Plan 1.2(l) (D46): fill the snapshot's listed gitlinks at
+        # their recorded commits before anything reads the tree. A
+        # typed refusal raises here, exactly as a snapshot failure
+        # does; the records ride on the provision into the evidence
+        # record and the readiness row.
+        submodules = materialize_snapshot_submodules(
+            repo_dir=repo,
+            sha=sha,
+            snapshot_dir=snapshot.dir,
+            scratch_dir=unit_dir / f"submodule-scratch-{tag}",
+        )
+        if submodules:
+            self._say(
+                f"snapshot submodules ({tag}): "
+                + ", ".join(
+                    f"{r['path']}@{str(r['commit'])[:8]}" for r in submodules
+                )
+            )
+        side = self._provision_side_sandbox_impl(
+            rev, port, unit_dir, tag, sha=sha, snapshot=snapshot
+        )
+        side.provision.submodules = submodules
+        return side
+
+    def _provision_side_sandbox_impl(
+        self,
+        rev: str,
+        port: int,
+        unit_dir: Path,
+        tag: str,
+        *,
+        sha: str,
+        snapshot: Any,
+    ) -> _Side:
+        import os
+
+        cfg = self.cfg
         contract = load_contract(snapshot.dir / "proofdeploy.yml")
         logs: list[str] = [f"sandbox provision {tag} ({sha[:12]})"]
 
