@@ -250,13 +250,22 @@ def _sandbox_step_command(
     Python: the app runs with the venv's python: a step beginning with
     `python`/`python3` is rewritten to the venv binary inside the
     checkout (/checkout/.venv/bin/python); any other step gets the
-    venv's bin first on PATH for that command only. This is the exact
+    venv's bin first on PATH for that step's shell. This is the exact
     rendering the pre-WO-7 sandbox path applied to build/migrate/seed
     and to the start command.
 
     Node (WO-7 PR 2): node_modules lives inside the checkout, so its
-    .bin goes first on PATH for that command only — the Node analog
+    .bin goes first on PATH for that step's shell — the Node analog
     of the venv rendering. The command itself is untouched.
+
+    The PATH prepend is rendered as `export PATH=<dirs>:$PATH; {cmd}`
+    (plan 1.2(m)), never `env PATH=... {cmd}`: `env` cannot exec a
+    shell builtin, so a contract command whose first token is one
+    (`cd`, `export`, `.`, ...) died with exit 127, and `env` set PATH
+    only for the first simple command, so in a compound command the
+    part after `&&` ran without the prepended dirs. The export form
+    applies to the step's whole compound command; it persists only
+    for that step's own `bash -c` invocation.
 
     Corepack-pinned Node plans (plan 1.2f): the plan bootstraps
     corepack into the checkout's .pd-tools (persisted), and the
@@ -277,19 +286,19 @@ def _sandbox_step_command(
     if runtime == "node":
         if corepack_version is not None and manager in ("pnpm", "yarn"):
             return (
-                "env PATH=/checkout/.pd-tools/node_modules/.bin:"
-                f"/checkout/node_modules/.bin:$PATH {cmd}"
+                "export PATH=/checkout/.pd-tools/node_modules/.bin:"
+                f"/checkout/node_modules/.bin:$PATH; {cmd}"
             )
         if manager == "bun":
             return (
-                "env PATH=/checkout/.pd-tools/bin:"
-                f"/checkout/node_modules/.bin:$PATH {cmd}"
+                "export PATH=/checkout/.pd-tools/bin:"
+                f"/checkout/node_modules/.bin:$PATH; {cmd}"
             )
-        return f"env PATH=/checkout/node_modules/.bin:$PATH {cmd}"
+        return f"export PATH=/checkout/node_modules/.bin:$PATH; {cmd}"
     parts = cmd.split(maxsplit=1)
     if parts and parts[0] in ("python", "python3") and len(parts) == 2:
         return f"/checkout/.venv/bin/python {parts[1]}"
-    return f"env PATH=/checkout/.venv/bin:$PATH {cmd}"
+    return f"export PATH=/checkout/.venv/bin:$PATH; {cmd}"
 
 
 def _attach_plan(
