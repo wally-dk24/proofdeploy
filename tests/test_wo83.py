@@ -566,6 +566,213 @@ def test_refresh_mode_logs_in_then_refreshes_near_expiry(auth_app):
     assert "REFRESH_TOKEN" in r.captured_bindings
 
 
+# ----------------------------------------------------------------------
+# expires_in_unit (D137): the value at expires_in_json_path is a
+# lifetime in seconds unless the contract declares milliseconds —
+# Directus's data.expires is 900000 ms for a 15-minute token, and
+# read as seconds it lands ~10 days out, so a provider-issued token
+# would never come near expiry and proactive refresh never fires.
+# The golden app reports expires_in = its TOKEN_TTL_SECONDS number
+# verbatim, so the ttl values below ARE the reported lifetimes, in
+# whichever unit the config declares.
+# ----------------------------------------------------------------------
+
+
+def test_expires_in_unit_validates_login_and_refresh(tmp_path):
+    contract = _contract(
+        tmp_path,
+        "  mode: login\n  path: /login\n  token_json_path: token\n"
+        "  expires_in_json_path: expires_in\n"
+        "  expires_in_unit: milliseconds\n",
+    )
+    assert contract.auth is not None
+    assert contract.auth["expires_in_unit"] == "milliseconds"
+    contract = _contract(
+        tmp_path,
+        "  mode: refresh\n  path: /auth/refresh\n  token_json_path: token\n"
+        "  expires_in_json_path: expires_in\n  expires_in_unit: seconds\n",
+    )
+    assert contract.auth is not None
+    assert contract.auth["expires_in_unit"] == "seconds"
+
+
+def test_expires_in_unit_bad_value_refused(tmp_path):
+    with pytest.raises(ValueError, match="expires_in_unit"):
+        _contract(
+            tmp_path,
+            "  mode: login\n  path: /login\n  token_json_path: token\n"
+            "  expires_in_json_path: expires_in\n"
+            "  expires_in_unit: minutes\n",
+        )
+    with pytest.raises(ValueError, match="expires_in_unit"):
+        _contract(
+            tmp_path,
+            "  mode: refresh\n  path: /auth/refresh\n"
+            "  token_json_path: token\n  expires_in_unit: ms\n",
+        )
+
+
+def test_expires_in_unit_without_expires_path_refused(tmp_path):
+    # A unit with nothing to apply to is a contract error (D137
+    # reviewer minor): without expires_in_json_path the
+    # declaration would sit inert, refused at load in both modes
+    # that read lifetimes.
+    with pytest.raises(ValueError, match="expires_in_unit.*requires"):
+        _contract(
+            tmp_path,
+            "  mode: login\n  path: /login\n  token_json_path: token\n"
+            "  expires_in_unit: milliseconds\n",
+        )
+    with pytest.raises(ValueError, match="expires_in_unit.*requires"):
+        _contract(
+            tmp_path,
+            "  mode: refresh\n  path: /auth/refresh\n"
+            "  token_json_path: token\n  expires_in_unit: seconds\n",
+        )
+
+
+def test_expires_in_unit_refused_in_register_mode(tmp_path):
+    # register mode never reads expires_in_json_path, so the unit
+    # key is unknown there and refused like any other stray key.
+    with pytest.raises(ValueError, match="unknown keys"):
+        _contract(
+            tmp_path,
+            "  mode: register\n  path: /register\n"
+            "  username_field: username\n  password_field: password\n"
+            "  token_json_path: token\n  expires_in_unit: seconds\n",
+        )
+
+
+def _refresh_config(**over):
+    config = {
+        "mode": "refresh",
+        "path": "/auth/refresh",
+        "method": "POST",
+        "body": {"refresh_token": "${REFRESH_TOKEN}"},
+        "token_json_path": "access_token",
+        "refresh_token_json_path": "refresh_token",
+        "expires_in_json_path": "expires_in",
+        "login_path": "/login",
+        "login_body": {"email": "${ADMIN_EMAIL}", "password": "${ADMIN_PASSWORD}"},
+    }
+    config.update(over)
+    return config
+
+
+def _two_request_probe() -> dict:
+    # A setup GET plus the act GET: the provider runs before each
+    # request, so a token that lands inside the proactive-refresh
+    # margin at acquisition is renewed before the second request.
+    return {
+        "setup": [
+            {
+                "type": "http",
+                "act": {
+                    "method": "GET",
+                    "path": "/me",
+                    "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+                },
+            }
+        ],
+        "act": {
+            "method": "GET",
+            "path": "/me",
+            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"},
+        },
+        "assert": [{"type": "status", "equals": 200}],
+    }
+
+
+def test_refresh_expires_in_milliseconds_near_expiry_refreshes(auth_app):
+    # expires_in = 59000 in the declared unit (milliseconds) is a
+    # 59 s lifetime — inside the provider's 60 s margin, so the
+    # second request refreshes. Read as seconds it would look ~16
+    # hours fresh and no refresh would fire.
+    url, _work, bootstrap = auth_app(ttl_seconds="59000")
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config=_refresh_config(expires_in_unit="milliseconds"),
+        bootstrap_env=bootstrap,
+    )
+    r = ex.run_probe(_two_request_probe())
+    assert r.verdict == Verdict.PASS, r.details
+    assert sum("(login)" in d for d in r.details) == 1
+    assert any(
+        d == "credential provider: POST /auth/refresh" for d in r.details
+    ), r.details
+
+
+def test_refresh_expires_in_seconds_near_expiry_refreshes(auth_app):
+    # The same drive with the unit declared explicitly as seconds:
+    # 59 s is inside the margin and refresh fires before request 2.
+    url, _work, bootstrap = auth_app(ttl_seconds="59")
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config=_refresh_config(expires_in_unit="seconds"),
+        bootstrap_env=bootstrap,
+    )
+    r = ex.run_probe(_two_request_probe())
+    assert r.verdict == Verdict.PASS, r.details
+    assert sum("(login)" in d for d in r.details) == 1
+    assert any(
+        d == "credential provider: POST /auth/refresh" for d in r.details
+    ), r.details
+
+
+def test_refresh_expires_in_milliseconds_fresh_token_not_refreshed(auth_app):
+    # 3_600_000 ms = 3600 s: far outside the margin — the unit must
+    # not cause spurious refreshes either. One login, no refresh.
+    url, _work, bootstrap = auth_app(ttl_seconds="3600000")
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config=_refresh_config(expires_in_unit="milliseconds"),
+        bootstrap_env=bootstrap,
+    )
+    r = ex.run_probe(_two_request_probe())
+    assert r.verdict == Verdict.PASS, r.details
+    assert sum("(login)" in d for d in r.details) == 1
+    assert not any(
+        d == "credential provider: POST /auth/refresh" for d in r.details
+    ), r.details
+
+
+def test_login_expires_in_milliseconds_near_expiry_reacquires(auth_app):
+    # The login exchange honors the unit too: a 59000 ms lifetime
+    # lands inside the margin, so the second request re-acquires
+    # (a second login) instead of riding a token it believes fresh
+    # for ~16 hours.
+    url, _work, bootstrap = auth_app(ttl_seconds="59000")
+    config = dict(LOGIN_CONFIG)
+    config["expires_in_unit"] = "milliseconds"
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config=config,
+        bootstrap_env=bootstrap,
+    )
+    r = ex.run_probe(_two_request_probe())
+    assert r.verdict == Verdict.PASS, r.details
+    assert sum("(login)" in d for d in r.details) == 2, r.details
+
+
+def test_login_expires_in_seconds_default_single_acquisition(auth_app):
+    # No unit declared: the lifetime is seconds, unchanged — a
+    # 3600 s token needs no second acquisition across both requests.
+    url, _work, bootstrap = auth_app(ttl_seconds="3600")
+    ex = Executor(
+        target_url=url,
+        provisioned=True,
+        credential_config=dict(LOGIN_CONFIG),
+        bootstrap_env=bootstrap,
+    )
+    r = ex.run_probe(_two_request_probe())
+    assert r.verdict == Verdict.PASS, r.details
+    assert sum("(login)" in d for d in r.details) == 1, r.details
+
+
 def test_ghost_jwt_from_seed_written_key_file(auth_app):
     url, work, _bootstrap = auth_app()
     key_file = work / ".pd-auth" / "admin_key"

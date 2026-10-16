@@ -26,6 +26,7 @@ auth:
   token_json_path: data.access_token
   refresh_token_json_path: data.refresh_token
   expires_in_json_path: data.expires
+  expires_in_unit: milliseconds
   login_path: /auth/login
   login_body:
     email: "${ADMIN_EMAIL}"
