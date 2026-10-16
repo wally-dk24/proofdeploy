@@ -108,6 +108,7 @@ from proofdeploy.sandbox import (
     assert_measurement_gate,
     check_podman,
     resolve_network_mode,
+    sandbox_home_dir,
 )
 from proofdeploy.setup_auth import generate_bootstrap_env
 from proofdeploy.submodules import materialize_snapshot_submodules
@@ -248,8 +249,9 @@ def _sandbox_step_command(
     """Render a contract step for the sandbox (WO-7 plan executor).
 
     Python: the app runs with the venv's python: a step beginning with
-    `python`/`python3` is rewritten to the venv binary inside the
-    checkout (/checkout/.venv/bin/python); any other step gets the
+    `python`/`python3` is rewritten to the venv binary in the
+    per-side home (/pd-home/.venv/bin/python, plan 1.2(n)); any
+    other step gets the
     venv's bin first on PATH for that step's shell. This is the exact
     rendering the pre-WO-7 sandbox path applied to build/migrate/seed
     and to the start command.
@@ -268,7 +270,8 @@ def _sandbox_step_command(
     for that step's own `bash -c` invocation.
 
     Corepack-pinned Node plans (plan 1.2f): the plan bootstraps
-    corepack into the checkout's .pd-tools (persisted), and the
+    corepack into the per-side home's .pd-tools (persisted, plan
+    1.2(n)), and the
     corepack package's own bin dir carries the manager shims
     (pnpm/pnpx/yarn/yarnpkg). A shim resolves the snapshot's
     packageManager pin from the checkout (walking up from the
@@ -278,7 +281,7 @@ def _sandbox_step_command(
     node_modules/.bin, for a corepack-pinned pnpm/yarn plan's steps.
 
     Bun plans (plan 1.2e): the plan's bootstrapped bun lives in the
-    checkout's .pd-tools/bin (persisted), and an app's own contract
+    per-side home's .pd-tools/bin (persisted), and an app's own contract
     steps may call `bun` (its build/start), so that dir goes first
     on PATH for a bun plan's steps — the same treatment, from the
     plan's own fact.
@@ -286,19 +289,43 @@ def _sandbox_step_command(
     if runtime == "node":
         if corepack_version is not None and manager in ("pnpm", "yarn"):
             return (
-                "export PATH=/checkout/.pd-tools/node_modules/.bin:"
+                "export PATH=/pd-home/.pd-tools/node_modules/.bin:"
                 f"/checkout/node_modules/.bin:$PATH; {cmd}"
             )
         if manager == "bun":
             return (
-                "export PATH=/checkout/.pd-tools/bin:"
+                "export PATH=/pd-home/.pd-tools/bin:"
                 f"/checkout/node_modules/.bin:$PATH; {cmd}"
             )
         return f"export PATH=/checkout/node_modules/.bin:$PATH; {cmd}"
     parts = cmd.split(maxsplit=1)
     if parts and parts[0] in ("python", "python3") and len(parts) == 2:
-        return f"/checkout/.venv/bin/python {parts[1]}"
-    return f"export PATH=/checkout/.venv/bin:$PATH; {cmd}"
+        return f"/pd-home/.venv/bin/python {parts[1]}"
+    return f"export PATH=/pd-home/.venv/bin:$PATH; {cmd}"
+
+
+def sandbox_placeholder_mapping(plan: InstallPlan) -> dict[str, str]:
+    """The sandbox executor's placeholder mapping for a plan
+    (plan 1.2(n)): the checkout mounts at /checkout; the app venv
+    and ProofDeploy's tools live in the per-side home at /pd-home,
+    never inside the checkout.
+
+    The one definition: the sandbox executor renders through it,
+    and tests/test_toolstate_guard.py asserts over it — so a
+    regression in this table is caught against the real mapping,
+    not a copy (D82)."""
+    if plan.runtime == "python":
+        return {
+            "{runtime_bin}": "python3",
+            "{venv}": "/pd-home/.venv",
+            "{pd_tools}": "/pd-home/.pd-tools",
+            "{checkout}": "/checkout",
+        }
+    return {
+        "{runtime_bin}": "node",
+        "{pd_tools}": "/pd-home/.pd-tools",
+        "{checkout}": "/checkout",
+    }
 
 
 def _attach_plan(
@@ -1395,10 +1422,13 @@ class Orchestrator:
         # container, installing into that container's own
         # site-packages, which were discarded when it exited; the app
         # container then started without the dependencies and never
-        # became ready. The plan's persisted dirs live INSIDE the
-        # checkout (/checkout/.venv for Python, /checkout/node_modules
-        # for Node), which is a bind mount shared by every container,
-        # so they persist from install to app start.
+        # became ready. The plan's persisted dirs live in the two
+        # bind mounts shared by every container of the side: the
+        # checkout (/checkout/node_modules for Node — the app's own
+        # install product) and the per-side home (/pd-home/.venv and
+        # /pd-home/.pd-tools for Python and for ProofDeploy's tool
+        # state, plan 1.2(n)), so they persist from install to app
+        # start.
         if plan.lockfile_name is None:
             # Name the plan's actual refusal: a generic "no lockfile"
             # line masked a workspaces refusal during WO-8.3's first
@@ -1451,8 +1481,10 @@ class Orchestrator:
             )
 
         # Render the plan's steps for the sandbox executor: argv steps
-        # with the container's paths (checkout at /checkout, the
-        # persisted install dir — venv or node_modules — inside it)
+        # with the container's paths (checkout at /checkout; the
+        # persisted install dirs — node_modules inside it, the venv
+        # and ProofDeploy's tools in the per-side home at /pd-home,
+        # plan 1.2(n))
         # and the sandbox pip flags (--require-hashes --no-deps for a
         # hashed requirements file); contract steps via
         # _sandbox_step_command (venv python / venv first on PATH for
@@ -1463,18 +1495,7 @@ class Orchestrator:
         # descriptor and, once run, recorded on the provision with its
         # real exit code — the plan alone (placeholders, executor-
         # dependent flags) cannot say what ran.
-        argv_mapping = (
-            {
-                "{runtime_bin}": "python3",
-                "{venv}": "/checkout/.venv",
-                "{checkout}": "/checkout",
-            }
-            if runtime_name == "python"
-            else {
-                "{runtime_bin}": "node",
-                "{checkout}": "/checkout",
-            }
-        )
+        argv_mapping = sandbox_placeholder_mapping(plan)
         step_specs: list[dict] = []
         for step in plan.steps:
             if step.phase == "start":
@@ -1484,7 +1505,7 @@ class Orchestrator:
             # WO-8.1b: a step's env values render through the same
             # placeholder mapping as its argv (e.g. the uv plan's
             # UV_PROJECT_ENVIRONMENT={venv} must become
-            # /checkout/.venv here, the snapshot's .venv on the
+            # /pd-home/.venv here, the per-side home's .venv on the
             # host). Values without tokens are unchanged.
             step_env = {
                 key: render_argv([value], argv_mapping, [])[0]
@@ -1573,11 +1594,17 @@ class Orchestrator:
         # WO-8.1c: a committed manager's install built the root
         # project; read the backend that actually built it back
         # for the evidence (the built wheel's Generator, stamped
-        # in the checkout venv). Captured whenever it exists,
-        # like the generated lock; never affects the outcome.
+        # in the app venv — the per-side home's .venv on the host
+        # side of the mount, plan 1.2(n)). Captured whenever it
+        # exists, like the generated lock; never affects the
+        # outcome.
         build_backend_ev: dict | None = None
         if plan.build_backend is not None:
-            build_backend_ev = build_backend_evidence(plan, snapshot.dir)
+            build_backend_ev = build_backend_evidence(
+                plan,
+                snapshot.dir,
+                sandbox_home_dir(snapshot.dir) / ".venv",
+            )
             if build_backend_ev is not None:
                 logs.append(
                     f"build backend: {build_backend_ev['name']} "

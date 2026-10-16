@@ -1,0 +1,4 @@
+build: "node scan-checkout.js"
+start: "node server.js"
+readiness: "/health"
+env: {}

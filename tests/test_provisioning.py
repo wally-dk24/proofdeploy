@@ -188,8 +188,9 @@ def test_python_plan_for_hashed_requirements(tmp_path):
         HASHED_REQ.encode()
     ).hexdigest()
     assert plan.package_manager == "pip"
-    # The venv lives in the checkout (persisted across install/start).
-    assert plan.persisted_dirs == [".venv"]
+    # The venv lives in the per-side home (persisted across
+    # install/start; plan 1.2(n)).
+    assert plan.persisted_dirs == ["pd_home:.venv"]
     # Ordered steps: venv, install, then the contract steps, then start.
     phases = [s.phase for s in plan.steps]
     assert phases[0] == "venv"
@@ -365,8 +366,8 @@ def test_node_plan_npm_ci(tmp_path):
     install = next(s for s in plan.steps if s.phase == "install")
     assert install.argv is not None
     assert install.argv[:2] == ["npm", "ci"]
-    # node_modules lives in the checkout.
-    assert plan.persisted_dirs == ["node_modules"]
+    # node_modules lives in the checkout (the app's own product).
+    assert plan.persisted_dirs == ["checkout:node_modules"]
 
 
 def test_node_plan_package_manager_version_recorded(tmp_path):
@@ -411,7 +412,7 @@ def test_plan_provisioning_unknown_snapshot_raises(tmp_path):
 
 # ---------------------------------------------------------------------------
 # Bun (plan 1.2e, D22): the frozen install runs through a bun the
-# plan itself bootstraps into .pd-tools, pinned BY DIGEST — the
+# plan itself bootstraps into the home's .pd-tools, pinned BY DIGEST — the
 # version from the app's packageManager when declared, else the
 # pin table's default, recorded on the plan either way. bun.lockb
 # and unpinned bun versions are typed refusals.
@@ -448,14 +449,14 @@ def test_node_plan_bun_digest_pinned_from_package_manager(tmp_path):
     script = bootstrap.argv[2]
     assert "bun-v1.3.14" in script and artifact in script
     assert digest in script and "sha256sum -c" in script
-    assert "{checkout}/.pd-tools" in script
+    assert "{pd_tools}" in script
     # Plant 2's guard: the frozen install's argv is EXACTLY the
     # persisted bun + install + --frozen-lockfile — drop the flag
     # in the adapter and this fails.
     assert frozen.argv == [
-        "{checkout}/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+        "{pd_tools}/bin/bun", "install", "--frozen-lockfile",
     ]
-    assert plan.persisted_dirs == ["node_modules", ".pd-tools"]
+    assert plan.persisted_dirs == ["checkout:node_modules", "pd_home:.pd-tools"]
 
 
 def test_node_plan_bun_1_2_20_digest_pinned_from_package_manager(
@@ -508,7 +509,7 @@ def test_node_plan_bun_1_2_20_digest_pinned_from_package_manager(
     assert "bun-v1.2.20" in script and artifact in script
     assert digest in script and "sha256sum -c" in script
     assert frozen.argv == [
-        "{checkout}/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+        "{pd_tools}/bin/bun", "install", "--frozen-lockfile",
     ]
 
 
@@ -538,7 +539,7 @@ def test_node_plan_bun_without_pin_uses_recorded_default(tmp_path):
     assert plan.bun_sha256 == digest
     install = [s for s in plan.steps if s.phase == "install"]
     assert install[-1].argv == [
-        "{checkout}/.pd-tools/bin/bun", "install", "--frozen-lockfile",
+        "{pd_tools}/bin/bun", "install", "--frozen-lockfile",
     ]
 
 
@@ -597,11 +598,11 @@ def test_bun_workspace_plan_scopes_contract_steps(tmp_path):
     ]
     assert len(frozen) == 1
     assert frozen[0].argv is not None
-    assert frozen[0].argv[0] == "{checkout}/.pd-tools/bin/bun"
+    assert frozen[0].argv[0] == "{pd_tools}/bin/bun"
     scoped = {s.phase: s.cwd for s in plan.steps if s.shell}
     assert scoped == {"build": "packages/app", "start": "packages/app"}
-    assert "packages/app/node_modules" in plan.persisted_dirs
-    assert ".pd-tools" in plan.persisted_dirs
+    assert "checkout:packages/app/node_modules" in plan.persisted_dirs
+    assert "pd_home:.pd-tools" in plan.persisted_dirs
 
 
 # ---------------------------------------------------------------------------
@@ -725,8 +726,8 @@ def test_pnpm_workspace_plan_scopes_contract_steps(tmp_path):
     assert frozen, [s.argv for s in installs]
     scoped = {s.phase: s.cwd for s in plan.steps if s.shell}
     assert scoped == {"build": "packages/app", "start": "packages/app"}
-    assert "packages/app/node_modules" in plan.persisted_dirs
-    assert "node_modules" in plan.persisted_dirs
+    assert "checkout:packages/app/node_modules" in plan.persisted_dirs
+    assert "checkout:node_modules" in plan.persisted_dirs
 
 
 def test_workspace_single_member_needs_no_declaration(tmp_path):

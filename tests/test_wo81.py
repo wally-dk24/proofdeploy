@@ -9,7 +9,7 @@ The rule (docs/registration/python-lock-rule.md items 1-6):
 2. Otherwise the runner GENERATES a lock: the declared
    dependencies (pyproject.toml, or the requirements file's pins as
    constraints) are resolved with uv 0.13.0 — pinned, bootstrapped
-   into the checkout's .pd-tools — ``--generate-hashes``, for the
+   into the per-side home's .pd-tools — ``--generate-hashes``, for the
    selected Python version and linux/x86_64, against
    https://pypi.org/simple, with ``--exclude-newer`` set to ONE
    cutoff per unit (the fix commit's committer time for a bug pair,
@@ -181,7 +181,7 @@ def test_option_lines_are_not_spec_entries(tmp_path):
             "uv.lock",
             "uv",
             [
-                "{checkout}/.pd-tools/bin/uv",
+                "{pd_tools}/bin/uv",
                 "sync",
                 "--frozen",
                 "--python",
@@ -191,9 +191,9 @@ def test_option_lines_are_not_spec_entries(tmp_path):
         (
             "poetry.lock",
             "poetry",
-            ["{checkout}/.pd-tools/bin/poetry", "install", "--sync"],
+            ["{pd_tools}/bin/poetry", "install", "--sync"],
         ),
-        ("pdm.lock", "pdm", ["{checkout}/.pd-tools/bin/pdm", "sync"]),
+        ("pdm.lock", "pdm", ["{pd_tools}/bin/pdm", "sync"]),
     ],
 )
 def test_committed_lockfile_plans_frozen(tmp_path, lockfile, manager, argv):
@@ -210,7 +210,7 @@ def test_committed_lockfile_plans_frozen(tmp_path, lockfile, manager, argv):
     assert plan.package_manager == manager
     installs = _steps(plan)
     # WO-8.1b: the frozen install is the LAST install step, run by
-    # the manager the plan bootstrapped into .pd-tools by hash —
+    # the manager the plan bootstrapped into {pd_tools} by hash —
     # never a bare manager binary off PATH. (Pre-WO-8.1b the plan
     # was the single bare argv and the sandbox refused it.)
     assert installs[-1].argv == argv
@@ -233,7 +233,7 @@ def test_hashed_requirements_plans_committed_pip(tmp_path):
     assert plan.pip_require_hashes is True
     # No generation machinery on a committed plan.
     assert all("compile" not in (s.argv or []) for s in plan.steps)
-    assert all(".pd-tools" not in " ".join(s.argv or []) for s in plan.steps)
+    assert all("{pd_tools}" not in " ".join(s.argv or []) for s in plan.steps)
 
 
 # ---------------------------------------------------------------------------
@@ -269,33 +269,33 @@ def test_generated_plan_carries_every_registered_flag(tmp_path):
     assert plan.lockfile_sha256 == hashlib.sha256(
         b"flask==3.1.0\n"
     ).hexdigest()
-    assert plan.persisted_dirs == [".venv", ".pd-tools"]
+    assert plan.persisted_dirs == ["pd_home:.venv", "pd_home:.pd-tools"]
 
     installs = _steps(plan)
     # Order: tools venv, bootstrap writer, hash-checked bootstrap
     # install, resolve, frozen install.
     joined = [" ".join(s.argv or []) for s in installs]
-    assert "{checkout}/.pd-tools" in joined[0] and "venv" in joined[0]
+    assert "{pd_tools}" in joined[0] and "venv" in joined[0]
     # Addendum 46: the resolver is installed BY HASH from the
     # committed bootstrap requirements file — never a bare version
     # install, never a global install. The writer step materializes
-    # the committed file into .pd-tools; the bootstrap installs
+    # the committed file into {pd_tools}; the bootstrap installs
     # from it in hash-checking mode. (tests/test_wo81_addendum46.py
     # pins the file's contents and the recorded sha256.)
     bootstrap = installs[2].argv or []
-    assert bootstrap[0] == "{checkout}/.pd-tools/bin/pip"
+    assert bootstrap[0] == "{pd_tools}/bin/pip"
     assert "--require-hashes" in bootstrap
     assert "--no-deps" in bootstrap
     assert "--only-binary" in bootstrap and ":all:" in bootstrap
     assert bootstrap[bootstrap.index("-r") + 1] == (
-        "{checkout}/.pd-tools/uv-requirements.txt"
+        "{pd_tools}/uv-requirements.txt"
     )
     assert "-g" not in bootstrap and "--global" not in bootstrap
     assert plan.lock_resolver_bootstrap_sha256 is not None
 
     resolve = _resolve_step(plan)
     argv = resolve.argv or []
-    assert argv[0] == "{checkout}/.pd-tools/bin/uv"
+    assert argv[0] == "{pd_tools}/bin/uv"
     assert argv[1:3] == ["pip", "compile"]
     assert "{checkout}/requirements.txt" in argv
     assert "--generate-hashes" in argv
@@ -316,13 +316,13 @@ def test_generated_plan_carries_every_registered_flag(tmp_path):
     install = installs[-1]
     rendered = render_argv(
         install.argv or [],
-        {"{venv}": "/checkout/.venv", "{checkout}": "/checkout"},
+        {"{venv}": "/pd-home/.venv", "{pd_tools}": "/pd-home/.pd-tools", "{checkout}": "/checkout"},
         pip_flags(plan, sandbox=True),
     )
     assert "--require-hashes" in rendered
     assert "--no-deps" in rendered
     assert f"/checkout/{GENERATED_LOCKFILE_NAME}" in rendered
-    assert rendered[0] == "/checkout/.venv/bin/pip"
+    assert rendered[0] == "/pd-home/.venv/bin/pip"
 
 
 def test_generated_plan_from_pyproject_only(tmp_path):

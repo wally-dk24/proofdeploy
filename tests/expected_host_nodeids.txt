@@ -439,6 +439,7 @@ tests/test_runner.py::test_check_requirements_frozen_unpinned_fails
 tests/test_runner.py::test_cleanup_run_is_idempotent
 tests/test_runner.py::test_cleanup_run_logs_leftovers_when_removal_fails
 tests/test_runner.py::test_cleanup_run_plain_tree_never_touches_podman
+tests/test_runner.py::test_cleanup_run_removes_pd_home_sibling_with_relocated_tools
 tests/test_runner.py::test_cleanup_run_routes_userns_remapped_tree_through_unshare
 tests/test_runner.py::test_detect_runtime_node_no_engines
 tests/test_runner.py::test_detect_runtime_node_version_from_engines
@@ -651,9 +652,9 @@ tests/test_sandbox.py::test_wait_ready_true
 tests/test_sandbox_addendum18.py::test_bridge_socket_dir_cleaned_up
 tests/test_sandbox_addendum18.py::test_bridge_socket_mount_is_short_and_outside_checkout
 tests/test_sandbox_addendum18.py::test_sandbox_install_uses_require_hashes
-tests/test_sandbox_addendum18.py::test_sandbox_provisions_manager_lockfile[pdm.lock-/checkout/.pd-tools/bin/pdm sync]
-tests/test_sandbox_addendum18.py::test_sandbox_provisions_manager_lockfile[poetry.lock-/checkout/.pd-tools/bin/poetry install --sync]
-tests/test_sandbox_addendum18.py::test_sandbox_provisions_manager_lockfile[uv.lock-/checkout/.pd-tools/bin/uv sync --frozen --python python3]
+tests/test_sandbox_addendum18.py::test_sandbox_provisions_manager_lockfile[pdm.lock-/pd-home/.pd-tools/bin/pdm sync]
+tests/test_sandbox_addendum18.py::test_sandbox_provisions_manager_lockfile[poetry.lock-/pd-home/.pd-tools/bin/poetry install --sync]
+tests/test_sandbox_addendum18.py::test_sandbox_provisions_manager_lockfile[uv.lock-/pd-home/.pd-tools/bin/uv sync --frozen --python python3]
 tests/test_sandbox_addendum18.py::test_sandboxed_tampered_hash_fails_install
 tests/test_sandbox_addendum18.py::test_start_reports_concrete_socket_error
 tests/test_setup_auth.py::test_auth_token_precedence
@@ -711,6 +712,15 @@ tests/test_submodules.py::test_sandbox_wrapper_attaches_records_to_the_provision
 tests/test_submodules.py::test_symlinked_parent_is_refused
 tests/test_submodules.py::test_transient_fetch_failure_is_not_typed
 tests/test_submodules.py::test_unserved_commit_is_typed_not_supported
+tests/test_toolstate_guard.py::test_no_in_tree_tool_state_anywhere[node-bun]
+tests/test_toolstate_guard.py::test_no_in_tree_tool_state_anywhere[node-corepack-pnpm]
+tests/test_toolstate_guard.py::test_no_in_tree_tool_state_anywhere[node-npm]
+tests/test_toolstate_guard.py::test_no_in_tree_tool_state_anywhere[node-pnpm-workspace]
+tests/test_toolstate_guard.py::test_no_in_tree_tool_state_anywhere[python-generated]
+tests/test_toolstate_guard.py::test_no_in_tree_tool_state_anywhere[python-pdm]
+tests/test_toolstate_guard.py::test_no_in_tree_tool_state_anywhere[python-pip]
+tests/test_toolstate_guard.py::test_no_in_tree_tool_state_anywhere[python-poetry]
+tests/test_toolstate_guard.py::test_no_in_tree_tool_state_anywhere[python-uv]
 tests/test_wo73.py::test_clean_run_records_write_grant
 tests/test_wo73.py::test_mixed_mode_run_refused_with_no_score_record
 tests/test_wo73.py::test_mode_resolved_once_and_passed_to_both_sides
