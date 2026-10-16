@@ -55,6 +55,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from proofdeploy.fixture import (
+    REGISTERED_TEMPLATE_SHA256,
+    render_description,
+    template_filename,
+    template_path,
+)
 from proofdeploy.orchestrator import MeasureConfig, Orchestrator, _free_port
 from proofdeploy.sandbox import assert_measurement_gate
 from proofdeploy.yml import load_contract
@@ -228,6 +234,58 @@ def _last_log_line(logs: list[str]) -> str | None:
     return None
 
 
+def fixture_render_fields(repo: str) -> dict[str, Any]:
+    """REG-E item 6 (WO-1.14): render the repo's author text from
+    its committed store contract, with the engine's own renderer
+    and the REG-B template choice, and report the outcome for the
+    row: the template name, the rendered text's sha256, and — on
+    failure — the typed error.
+
+    The render is per repo (one contract serves every side), but it
+    is RECORDED per side, on every row. A render failure is our
+    gap — the store and its texts are ProofDeploy's own authoring —
+    and it is data on the row, never a harness crash: provisioning
+    proceeds and reports exactly as before. The frozen template is
+    hash-verified before rendering, exactly as bundle assembly
+    verifies it."""
+    fields: dict[str, Any] = {
+        "fixture_template": None,
+        "fixture_render_sha256": None,
+        "fixture_render_error": None,
+    }
+    try:
+        contract = load_contract(contract_path(repo))
+    except (FileNotFoundError, ValueError) as exc:
+        fields["fixture_render_error"] = (
+            f"contract cannot be loaded for the fixture render: "
+            f"{exc} (our gap)"
+        )
+        return fields
+    selected = template_filename(contract.auth is not None)
+    fields["fixture_template"] = selected
+    tpath = template_path(selected)
+    digest = hashlib.sha256(tpath.read_bytes()).hexdigest()
+    if digest != REGISTERED_TEMPLATE_SHA256[selected]:
+        fields["fixture_render_error"] = (
+            f"fixture template {selected} hash mismatch: the "
+            f"frozen template changed (our gap)"
+        )
+        return fields
+    try:
+        rendered = render_description(
+            tpath.read_text(encoding="utf-8"), contract.fixture
+        )
+    except ValueError as exc:
+        fields["fixture_render_error"] = (
+            f"fixture render failed: {exc} (our gap)"
+        )
+        return fields
+    fields["fixture_render_sha256"] = hashlib.sha256(
+        rendered.encode("utf-8")
+    ).hexdigest()
+    return fields
+
+
 def _regd_row(plan_regd: Any) -> dict[str, Any]:
     """The REG-D D4 block of a readiness row: the plan's dated-
     resolution facts (sample path, the unit cutoff rendered, the
@@ -314,6 +372,9 @@ def row_from_provision(
         # Plan 1.2(l): the submodules materialized into this side's
         # snapshot at their recorded commits ([] when none).
         "submodules": list(prov.submodules),
+        # REG-E item 6 (WO-1.14): the author-text render for this
+        # side's repo contract, recorded per side.
+        **fixture_render_fields(str(unit["repo"])),
     }
 
 
@@ -356,6 +417,9 @@ def row_from_exception(
         "network_mode": network_mode,
         "attempt": attempt,
         "submodules": [],
+        # REG-E item 6 (WO-1.14): the author-text render outcome,
+        # recorded per side on every row shape.
+        **fixture_render_fields(str(unit["repo"])),
     }
 
 
@@ -396,6 +460,9 @@ def _harness_error_row(
         "network_mode": network_mode,
         "attempt": attempt,
         "submodules": [],
+        # REG-E item 6 (WO-1.14): the author-text render outcome,
+        # recorded per side on every row shape.
+        **fixture_render_fields(str(unit["repo"])),
     }
 
 

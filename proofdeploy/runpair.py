@@ -681,6 +681,13 @@ def build_evidence_record(
     inconclusive_error: str | None = None,
     crash_provisioning: dict[str, Any] | None = None,
     crash_probe_results: Any | None = None,
+    # WO-1.14 (REG-E, schema 1.6.0): where the measured unit's
+    # contract came from — {"store_path": the committed contract
+    # store path relative to the ProofDeploy tree, "sha256": the
+    # contract file's sha256}. sha256 is None when the store file
+    # could not be read (a contract refusal record). None on paths
+    # that do not load a contract from the store.
+    contract_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the evidence record for a run pair (before scoring).
 
@@ -806,6 +813,8 @@ def build_evidence_record(
         "inconclusive_error": inconclusive_error,
         "crash_provisioning": crash_provisioning or {},
         "crash_probe_results": crash_probe_results,
+        # WO-1.14 (REG-E): the contract store source, as above.
+        "contract_source": contract_source,
         "verdict": None,
     }
     return record

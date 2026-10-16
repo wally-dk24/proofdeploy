@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from proofdeploy.executor import (
     Executor,
     HarnessAppConfig,
@@ -56,6 +58,7 @@ from proofdeploy.fixture import (
     REGISTERED_TEMPLATE_SHA256,
     assemble_author_bundle,
     create_snapshot,
+    render_description,
     template_filename,
     template_path,
 )
@@ -112,7 +115,12 @@ from proofdeploy.sandbox import (
 )
 from proofdeploy.setup_auth import generate_bootstrap_env
 from proofdeploy.submodules import materialize_snapshot_submodules
-from proofdeploy.yml import RepoContract, load_contract
+from proofdeploy.yml import (
+    RepoContract,
+    contract_store_path,
+    load_contract,
+    proofdeploy_tree_root,
+)
 
 # Fixture keys rendered into the author-facing description by design.
 # Every other fixture value is secret-collected and leak-checked.
@@ -128,6 +136,34 @@ class MixedNetworkModeError(OrchestratorError):
     run reported different app network modes. The run is REFUSED —
     no evidence and no score record — because a pair measured under
     two different network setups is not one measurement."""
+
+
+class ContractRefusal(OrchestratorError):
+    """Typed refusal: the measured unit's contract cannot be loaded
+    from the committed contract store (WO-1.14, REG-E).
+
+    Our gap, always: the store and its texts are ProofDeploy's own
+    authoring, so a missing store file, an unloadable one, or
+    fixture text that does not render is recorded as an
+    INCONCLUSIVE run carrying this refusal (evidence + score,
+    ``measured_result`` False) — never an untyped exit and never a
+    ``not supported:`` string. ``cause`` is the machine token
+    (``contract_missing`` / ``contract_invalid`` /
+    ``contract_unrenderable``); the message names the store file.
+    """
+
+    def __init__(
+        self,
+        cause: str,
+        message: str,
+        *,
+        store_path: str | None,
+        contract_sha256: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.cause = cause
+        self.store_path = store_path
+        self.contract_sha256 = contract_sha256
 
 
 def _git(repo_dir: Path, *args: str) -> str:
@@ -384,6 +420,26 @@ class MeasureConfig:
     provenance_run_id: str | None = None
     provenance_runner_image: str | None = None
     note: str = ""
+    # WO-1.14 (REG-E): measured runs load the unit's contract from
+    # the committed contract store (readiness/contracts/ in the
+    # ProofDeploy tree the run executes from), never from the
+    # measured repo's own tree. Set by the measure CLI for every
+    # measured run. Other paths leave it off by design: verify's
+    # contract is the target repo's own proofdeploy.yml (plan
+    # 1.10), and the readiness harness commits the store contract
+    # into its own harness trees.
+    use_contract_store: bool = False
+    # The measured unit's repo as "owner/repo": the store file is
+    # readiness/contracts/<owner>__<repo>.yml. When None, the slug
+    # is derived from the target repo's origin remote.
+    unit_repo: str | None = None
+    # An explicit contract store file (dev/tests). Wins over the
+    # slug resolution when set.
+    contract_path: Path | None = None
+    # Stop after the bundle is assembled and answer-key checked,
+    # immediately before the model call (no spend, no provisioning,
+    # no records). Set by `measure --dry-run-before-model`.
+    dry_run_before_model: bool = False
 
     @property
     def run_kind(self) -> str:
@@ -438,6 +494,23 @@ class Orchestrator:
         # provisions fall back to the side's own commit — a lone
         # side is its own unit).
         self._run_lock_cutoff: str | None = None
+        # The unit's ONE contract, loaded from the committed store
+        # (WO-1.14, REG-E): the identical object serves the author
+        # bundle and every side. Loaded once by
+        # _load_unit_contract; None until then and on paths that
+        # do not use the store.
+        self._unit_contract: RepoContract | None = None
+        # The record's contract_source for the loaded unit
+        # contract: {"store_path", "sha256"}; None until loaded.
+        self._unit_contract_source: dict[str, Any] | None = None
+        # sha256 of the unit contract's rendered fixture text,
+        # rendered once at load (the render IS the load's
+        # renderability check).
+        self._unit_contract_rendered_sha256: str | None = None
+        # The contract the most recent _build_bundle assembled
+        # from; _check_answer_key verifies against this same
+        # object, never a second load.
+        self._last_bundle_contract: RepoContract | None = None
 
     def _say(self, msg: str) -> None:
         self.log.append(msg)
@@ -580,6 +653,286 @@ class Orchestrator:
         return values
 
     # ------------------------------------------------------------------
+    # The unit contract (WO-1.14, REG-E).
+    # ------------------------------------------------------------------
+
+    def _repo_slug(self) -> str | None:
+        """The measured unit's "owner/repo": the configured slug,
+        or derived from the target repo's origin remote (the
+        measured path clones the target from its GitHub URL, so
+        origin names the repo the store file is keyed by). None
+        when neither names one."""
+        if self.cfg.unit_repo:
+            return self.cfg.unit_repo
+        proc = subprocess.run(
+            ["git", "-C", str(self.cfg.repo_dir), "remote", "get-url", "origin"],
+            capture_output=True, text=True, check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        url = proc.stdout.strip()
+        marker = "github.com"
+        idx = url.find(marker)
+        if idx < 0:
+            return None
+        rest = url[idx + len(marker):].lstrip(":/")
+        if rest.endswith(".git"):
+            rest = rest[:-4]
+        parts = rest.split("/")
+        if len(parts) != 2 or not all(parts):
+            return None
+        return f"{parts[0]}/{parts[1]}"
+
+    @staticmethod
+    def _store_display_path(path: Path) -> str:
+        """The store path as recorded in evidence: relative to the
+        ProofDeploy tree when the file lives under it (the normal
+        case — records then name the committed store path, e.g.
+        ``readiness/contracts/directus__directus.yml``), else the
+        path as given."""
+        try:
+            return str(path.resolve().relative_to(proofdeploy_tree_root()))
+        except ValueError:
+            return str(path)
+
+    def _load_unit_contract(self) -> RepoContract:
+        """Load the unit's ONE contract from the committed store
+        (REG-E item 1), resolved against the ProofDeploy tree this
+        run executes from. The returned object is the identical
+        object the bundle and every side use — there is no second
+        load to diverge through.
+
+        The load also renders the fixture text once, from this
+        same contract, so a contract whose text cannot render
+        refuses HERE — before any snapshot, bundle, or model call
+        — instead of escaping bundle assembly untyped.
+
+        Raises ContractRefusal (typed, our gap) when the store
+        file cannot be named, is missing/unreadable, does not
+        parse or validate, or its fixture text does not render.
+        """
+        if self._unit_contract is not None:
+            return self._unit_contract
+        cfg = self.cfg
+        if cfg.contract_path is not None:
+            path = Path(cfg.contract_path)
+        else:
+            slug = self._repo_slug()
+            if slug is None:
+                raise ContractRefusal(
+                    "contract_missing",
+                    "no contract store file can be named for this "
+                    "unit: unit_repo is unset and the target repo's "
+                    "origin remote does not name a GitHub owner/repo "
+                    "(our gap)",
+                    store_path=None,
+                )
+            try:
+                path = contract_store_path(slug)
+            except ValueError as exc:
+                raise ContractRefusal(
+                    "contract_missing",
+                    "no contract store file can be named for this "
+                    f"unit: {exc} (our gap)",
+                    store_path=None,
+                ) from exc
+        display = self._store_display_path(path)
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            raise ContractRefusal(
+                "contract_missing",
+                f"contract store file not found: {display} (our gap)",
+                store_path=display,
+            ) from None
+        except OSError as exc:
+            raise ContractRefusal(
+                "contract_missing",
+                f"contract store file unreadable: {display}: {exc} "
+                "(our gap)",
+                store_path=display,
+            ) from exc
+        sha = hashlib.sha256(raw).hexdigest()
+        try:
+            data = yaml.safe_load(raw.decode("utf-8"))
+            contract = RepoContract.from_dict(data)
+        except Exception as exc:
+            raise ContractRefusal(
+                "contract_invalid",
+                f"contract store file {display} does not load: "
+                f"{exc} (our gap)",
+                store_path=display,
+                contract_sha256=sha,
+            ) from exc
+        # REG-E items 2+6: the fixture text must render from this
+        # contract. The template choice is the engine's own (REG-B),
+        # and the frozen template is hash-verified before rendering,
+        # exactly as bundle assembly verifies it.
+        selected_name = template_filename(contract.auth is not None)
+        selected_template = template_path(selected_name)
+        actual_hash = hashlib.sha256(
+            selected_template.read_bytes()
+        ).hexdigest()
+        if actual_hash != REGISTERED_TEMPLATE_SHA256[selected_name]:
+            raise OrchestratorError(
+                "fixture template hash mismatch: the frozen template "
+                "changed; prior author runs are invalidated"
+            )
+        try:
+            rendered = render_description(
+                selected_template.read_text(encoding="utf-8"),
+                contract.fixture,
+            )
+        except ValueError as exc:
+            raise ContractRefusal(
+                "contract_unrenderable",
+                f"contract store file {display} cannot render its "
+                f"fixture text: {exc} (our gap)",
+                store_path=display,
+                contract_sha256=sha,
+            ) from exc
+        self._unit_contract = contract
+        self._unit_contract_source = {"store_path": display, "sha256": sha}
+        self._unit_contract_rendered_sha256 = hashlib.sha256(
+            rendered.encode("utf-8")
+        ).hexdigest()
+        self._say(
+            f"unit contract loaded from the store: {display} "
+            f"(sha256 {sha[:12]}...)"
+        )
+        return contract
+
+    def _bundle_contract(self, snapshot: Any) -> RepoContract:
+        """The contract the author bundle is built from: the
+        unit's store contract on the measured path; the snapshot's
+        own proofdeploy.yml on every other path (verify, dev)."""
+        if self.cfg.use_contract_store:
+            return self._load_unit_contract()
+        return load_contract(snapshot.dir / "proofdeploy.yml")
+
+    def _side_contract(self, snapshot: Any) -> RepoContract:
+        """The contract a side provisions with. On the measured
+        path this is the unit's ONE store contract — the identical
+        object the bundle was built from, asserted here so a side
+        loading any other file is a code error, not a divergence
+        a run could silently record."""
+        if self.cfg.use_contract_store:
+            contract = self._load_unit_contract()
+            assert contract is self._unit_contract
+            return contract
+        return load_contract(snapshot.dir / "proofdeploy.yml")
+
+    def _contract_source_record(self) -> dict[str, Any] | None:
+        """The evidence record's contract_source for this run: the
+        store path + sha256 once the unit contract is loaded, else
+        None (paths that do not load from the store)."""
+        if self._unit_contract_source is not None:
+            return dict(self._unit_contract_source)
+        return None
+
+    def _record_contract_refusal(
+        self,
+        cfg: MeasureConfig,
+        repo: Path,
+        *,
+        run_kind: str,
+        use_sandbox: bool,
+        capability_probe: dict[str, Any],
+        refusal: ContractRefusal,
+    ) -> dict[str, Any]:
+        """Record a contract-store refusal (WO-1.14 item 4).
+
+        Evidence + score, INCONCLUSIVE, our-gap class named in the
+        score note and in the record's inconclusive fields — the
+        run is typed and replayable, never an untyped exit. It is
+        NOT a measured result (``measured_result`` False): the unit
+        was never measured; our own contract store stopped it, and
+        it must be re-run once the store is fixed.
+        """
+        self._say(f"contract refusal ({refusal.cause}): {refusal}")
+        record = build_evidence_record(
+            run_kind=run_kind,
+            bug_id=cfg.bug_id if run_kind == "bug" else None,
+            clean_id=cfg.clean_id if run_kind == "clean" else None,
+            sandboxed=use_sandbox,
+            measured_result=False,
+            provenance=self._provenance(capability_probe),
+            runner_log=list(self.log),
+            inconclusive_cause=refusal.cause,
+            inconclusive_error=str(refusal),
+            contract_source={
+                "store_path": refusal.store_path,
+                "sha256": refusal.contract_sha256,
+            },
+        )
+        record_id, _, evidence_sha = write_evidence_record(
+            record, repo, repo, secret_values=self.cfg.extra_secrets,
+        )
+        self._say(f"evidence committed: {evidence_sha[:12]}")
+        write_score_record(
+            output_dir=repo,
+            repo=repo,
+            evidence_record_id=record_id,
+            run_kind=run_kind,
+            bug_id=cfg.bug_id if run_kind == "bug" else None,
+            clean_id=cfg.clean_id if run_kind == "clean" else None,
+            verdict=RunPairVerdict.INCONCLUSIVE,
+            note=f"our gap: {refusal.cause}",
+            secret_values=self.cfg.extra_secrets,
+        )
+        score_sha = commit_records(
+            repo, repo,
+            f"score: {run_kind} {(cfg.bug_id or cfg.clean_id)} "
+            f"({record_id[:8]})",
+        )
+        self._say(f"score committed: {score_sha[:12]}")
+        return {
+            "run_kind": run_kind,
+            "bug_id": cfg.bug_id if run_kind == "bug" else None,
+            "clean_id": cfg.clean_id if run_kind == "clean" else None,
+            "evidence_record_id": record_id,
+            "evidence_commit": evidence_sha,
+            "score_commit": score_sha,
+            "verdict": "inconclusive",
+            "reason_class": "our gap",
+            "cause": refusal.cause,
+            "measured_result": False,
+        }
+
+    def _dry_run_summary(
+        self,
+        *,
+        run_kind: str,
+        bundle: Any,
+        manifest: dict[str, Any],
+        manifest_sha: str,
+    ) -> dict[str, Any]:
+        """The dry-run report (--dry-run-before-model): the bundle
+        was assembled and answer-key checked, and the run stops
+        here — no model call, no provisioning, no records. The
+        rendered fixture text's sha256 and the bundle manifest are
+        the report."""
+        rendered_sha = hashlib.sha256(
+            bundle.description.read_bytes()
+        ).hexdigest()
+        self._say(
+            "dry run: stopping before the model call; rendered "
+            f"fixture sha256 {rendered_sha[:12]}..., bundle "
+            f"manifest {manifest_sha[:12]}..."
+        )
+        return {
+            "run_kind": run_kind,
+            "bug_id": self.cfg.bug_id if run_kind == "bug" else None,
+            "clean_id": self.cfg.clean_id if run_kind == "clean" else None,
+            "dry_run": True,
+            "stopped_before_model_call": True,
+            "contract_source": self._contract_source_record(),
+            "rendered_fixture_sha256": rendered_sha,
+            "bundle_manifest_sha256": manifest_sha,
+            "bundle_manifest": manifest,
+        }
+
+    # ------------------------------------------------------------------
     # Bundle and authoring (steps a-c).
     # ------------------------------------------------------------------
 
@@ -619,7 +972,12 @@ class Orchestrator:
         snapshot = create_snapshot(
             repo_dir=repo, commit_rev=tip_sha, output_dir=snap_dir
         )
-        contract = load_contract(snapshot.dir / "proofdeploy.yml")
+        # WO-1.14 (REG-E item 1): on the measured path the contract
+        # is the unit's ONE store contract — never a file read from
+        # inside this snapshot (the snapshot is upstream's tree,
+        # copied byte-for-byte; no contract is written into it).
+        contract = self._bundle_contract(snapshot)
+        self._last_bundle_contract = contract
 
         bundle_dir = unit_dir / "author-bundle"
         # REG-B: the template choice is mechanical, made here from the
@@ -699,6 +1057,10 @@ class Orchestrator:
             fix_subject=fix_subject,
             expected_skill_hash=EXPECTED_SKILL_HASH,
             no_skill=self.cfg.no_skill,
+            # WO-1.14: verify against the very contract the bundle
+            # was built from (the store contract on the measured
+            # path) — never a second load from the measured tree.
+            contract=self._last_bundle_contract,
         )
         self._say(f"answer-key check passed; bundle manifest {manifest_sha[:12]}")
         return manifest_sha
@@ -762,6 +1124,7 @@ class Orchestrator:
             measured_result=use_sandbox,
             provenance=self._provenance(capability_probe),
             model_call_attempts=attempts,
+            contract_source=self._contract_source_record(),
         )
         record_id, _, evidence_sha = write_evidence_record(
             record, repo, repo, secret_values=self.cfg.extra_secrets,
@@ -874,6 +1237,7 @@ class Orchestrator:
             measured_result=use_sandbox,
             provenance=self._provenance(capability_probe),
             model_request=raw.request_record,
+            contract_source=self._contract_source_record(),
             # O3: keep the reason, the runner log, and everything gathered
             # before the crash.
             inconclusive_cause=cause,
@@ -1025,6 +1389,7 @@ class Orchestrator:
             measured_result=use_sandbox,
             provenance=self._provenance(capability_probe),
             runner_log=list(self.log),
+            contract_source=self._contract_source_record(),
             inconclusive_cause=cause,
             inconclusive_error=(
                 f"author output contained no valid probe "
@@ -1212,7 +1577,7 @@ class Orchestrator:
         sha: str,
         snapshot: Any,
     ) -> _Side:
-        contract = load_contract(snapshot.dir / "proofdeploy.yml")
+        contract = self._side_contract(snapshot)
         # WO-8.3: fresh bootstrap credentials for THIS side and run,
         # generated before any step runs (the seed consumes them).
         bootstrap = self._side_bootstrap(contract)
@@ -1290,7 +1655,7 @@ class Orchestrator:
         import os
 
         cfg = self.cfg
-        contract = load_contract(snapshot.dir / "proofdeploy.yml")
+        contract = self._side_contract(snapshot)
         logs: list[str] = [f"sandbox provision {tag} ({sha[:12]})"]
 
         ok, msg = check_podman()
@@ -2041,6 +2406,20 @@ class Orchestrator:
         unit_dir.mkdir(parents=True, exist_ok=True)
         repo = self._init_records_repo()
 
+        # WO-1.14 (REG-E): the unit's contract comes from the
+        # committed store, loaded once here; a refusal is recorded
+        # (typed, our gap), never an untyped exit.
+        if cfg.use_contract_store:
+            try:
+                self._load_unit_contract()
+            except ContractRefusal as refusal:
+                return self._record_contract_refusal(
+                    cfg, repo,
+                    run_kind="bug",
+                    use_sandbox=use_sandbox,
+                    capability_probe=capability_probe,
+                    refusal=refusal,
+                )
         bundle, manifest, prompt, _, base_sha, tip_sha, truncation_flags = (
             self._build_bundle(
                 unit_dir,
@@ -2052,6 +2431,13 @@ class Orchestrator:
         manifest_sha = self._check_answer_key(
             bundle, prompt, base_sha, tip_sha, fix_rev=cfg.rev_fix
         )
+        if cfg.dry_run_before_model:
+            return self._dry_run_summary(
+                run_kind="bug",
+                bundle=bundle,
+                manifest=manifest,
+                manifest_sha=manifest_sha,
+            )
         # Model call with retry per the registered rule:
         # - model_transport: exactly one retry, both attempts in evidence.
         # - model_overflow: no retry.
@@ -2227,6 +2613,7 @@ class Orchestrator:
                 sandboxed=use_sandbox,
                 measured_result=use_sandbox,
                 provenance=self._provenance(capability_probe),
+                contract_source=self._contract_source_record(),
                 fix_parent_provision=parent.provision.to_dict(),
                 fix_provision=fix.provision.to_dict(),
                 fix_parent_results=parent_results,
@@ -2359,6 +2746,20 @@ class Orchestrator:
         unit_dir.mkdir(parents=True, exist_ok=True)
         repo = self._init_records_repo()
 
+        # WO-1.14 (REG-E): the unit's contract comes from the
+        # committed store, loaded once here; a refusal is recorded
+        # (typed, our gap), never an untyped exit.
+        if cfg.use_contract_store:
+            try:
+                self._load_unit_contract()
+            except ContractRefusal as refusal:
+                return self._record_contract_refusal(
+                    cfg, repo,
+                    run_kind="clean",
+                    use_sandbox=use_sandbox,
+                    capability_probe=capability_probe,
+                    refusal=refusal,
+                )
         # The clean author bundle: C^->C diff + C snapshot.
         bundle, manifest, prompt, _, base_sha, tip_sha, truncation_flags = (
             self._build_bundle(
@@ -2371,6 +2772,13 @@ class Orchestrator:
         manifest_sha = self._check_answer_key(
             bundle, prompt, base_sha, tip_sha, fix_rev=None
         )
+        if cfg.dry_run_before_model:
+            return self._dry_run_summary(
+                run_kind="clean",
+                bundle=bundle,
+                manifest=manifest,
+                manifest_sha=manifest_sha,
+            )
         # Model call with retry per the registered rule:
         # - model_transport: exactly one retry, both attempts in evidence.
         # - model_overflow: no retry.
@@ -2498,6 +2906,7 @@ class Orchestrator:
                 sandboxed=use_sandbox,
                 measured_result=use_sandbox,
                 provenance=self._provenance(capability_probe),
+                contract_source=self._contract_source_record(),
                 runner_log=list(self.log),
                 fixture=dict(side.contract.fixture),
                 contract_env=dict(side.contract.env),

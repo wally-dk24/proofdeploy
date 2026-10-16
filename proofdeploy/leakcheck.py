@@ -92,6 +92,7 @@ def check_bundle_answer_key(
     fix_subject: str | None,
     expected_skill_hash: str,
     no_skill: bool = False,
+    contract: Any = None,
 ) -> str:
     """Fail-closed allowlist-by-equality check on the author bundle.
 
@@ -231,14 +232,22 @@ def check_bundle_answer_key(
             )
         skill_text = skill_path.read_text(encoding="utf-8")
 
-    # 5. The fixture description matches the approved template for B's
-    #    contract (REG-B). The template choice is mechanical: a top-level
-    #    auth: mapping in B's proofdeploy.yml selects the credential
+    # 5. The fixture description matches the approved template for the
+    #    unit's contract (REG-B). The template choice is mechanical: a
+    #    top-level auth: mapping in the contract selects the credential
     #    template, anything else the no-credential template. Re-derive
-    #    the selection from B's contract (never from the manifest),
+    #    the selection from the contract (never from the manifest),
     #    verify the selected template against its registered sha256,
     #    verify the manifest's fixture_template record against the
     #    recomputation, re-render, and byte-compare.
+    #
+    #    WO-1.14 (REG-E): the caller passes the ONE contract the run
+    #    loaded — under the contract store, that is the committed
+    #    store file, and B's tree is never consulted for a contract
+    #    (its proofdeploy.yml, if any, is snapshot content, not the
+    #    unit's contract). Without a passed contract (direct callers,
+    #    legacy in-tree path), the contract is read from B's tree as
+    #    before.
     from proofdeploy.fixture import (
         REGISTERED_TEMPLATE_SHA256,
         render_description,
@@ -247,13 +256,14 @@ def check_bundle_answer_key(
     )
     from proofdeploy.yml import RepoContract
 
-    try:
-        yml_text = _git_text(repo_dir, "show", f"{bug_sha}:proofdeploy.yml")
-        contract = RepoContract.from_dict(yaml.safe_load(yml_text))
-    except Exception as e:
-        raise AnswerKeyLeakError(
-            f"answer-key check: cannot load B's contract: {e}"
-        ) from e
+    if contract is None:
+        try:
+            yml_text = _git_text(repo_dir, "show", f"{bug_sha}:proofdeploy.yml")
+            contract = RepoContract.from_dict(yaml.safe_load(yml_text))
+        except Exception as e:
+            raise AnswerKeyLeakError(
+                f"answer-key check: cannot load B's contract: {e}"
+            ) from e
     selected_name = template_filename(contract.auth is not None)
     selected_path = template_path(selected_name)
     selected_hash = hashlib.sha256(selected_path.read_bytes()).hexdigest()
