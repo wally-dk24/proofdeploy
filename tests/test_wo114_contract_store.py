@@ -46,8 +46,10 @@ from proofdeploy.orchestrator import (
     ContractRefusal,
     MeasureConfig,
     Orchestrator,
+    OrchestratorError,
 )
 from proofdeploy.runpair import read_records
+from proofdeploy.yml import load_contract
 from readiness import provision as rp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -305,6 +307,33 @@ def test_one_contract_object_serves_bundle_and_sides(tmp_path):
     assert orch._unit_contract_rendered_sha256 == hashlib.sha256(
         rendered.encode("utf-8")
     ).hexdigest()
+
+
+def test_side_contract_identity_violation_raises(tmp_path, monkeypatch):
+    """D123: the one-contract identity guard is an explicit
+    raise, not a bare assert (which `python -O` would strip).
+    Break the identity — the loader starts returning a DIFFERENT
+    contract object (the decoy, loaded from its own file) after
+    the unit contract was loaded — and _side_contract must raise
+    OrchestratorError naming BOTH sources: the expected store
+    path + sha256, and the offending contract's own build."""
+    info = make_mini_repo(tmp_path, in_tree=None)
+    contract = store_file(tmp_path)
+    orch = Orchestrator(store_cfg(tmp_path, info, contract))
+    orch._load_unit_contract()
+    decoy_path = tmp_path / "decoy.yml"
+    decoy_path.write_text(DECOY_YML, encoding="utf-8")
+    decoy = load_contract(decoy_path)
+    monkeypatch.setattr(
+        Orchestrator, "_load_unit_contract", lambda self: decoy
+    )
+    stub = SimpleNamespace(dir=tmp_path / "no-such-snapshot")
+    with pytest.raises(OrchestratorError) as excinfo:
+        orch._side_contract(stub)
+    message = str(excinfo.value)
+    assert str(contract) in message
+    assert hashlib.sha256(contract.read_bytes()).hexdigest() in message
+    assert "no_such_decoy_file.py" in message
 
 
 def test_contract_never_written_into_author_snapshot(tmp_path):

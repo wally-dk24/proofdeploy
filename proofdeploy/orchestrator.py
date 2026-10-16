@@ -813,12 +813,27 @@ class Orchestrator:
     def _side_contract(self, snapshot: Any) -> RepoContract:
         """The contract a side provisions with. On the measured
         path this is the unit's ONE store contract — the identical
-        object the bundle was built from, asserted here so a side
-        loading any other file is a code error, not a divergence
-        a run could silently record."""
+        object the bundle was built from, checked explicitly here
+        (never a bare assert: `python -O` strips those, and a
+        guard that can switch itself off is not a guard) so a
+        side loading any other file is a code error, not a
+        divergence a run could silently record."""
         if self.cfg.use_contract_store:
             contract = self._load_unit_contract()
-            assert contract is self._unit_contract
+            if contract is not self._unit_contract:
+                source = self._unit_contract_source or {}
+                raise OrchestratorError(
+                    "contract identity violated on the measured "
+                    "path: a side was handed a contract that is "
+                    "not the unit's one store contract (expected: "
+                    f"store contract {source.get('store_path')} "
+                    f"sha256 {source.get('sha256')}; got: a "
+                    "different RepoContract object with "
+                    f"build={contract.build!r}, "
+                    f"start={contract.start!r}, "
+                    f"readiness={contract.readiness!r} that did "
+                    "not come from the store load)"
+                )
             return contract
         return load_contract(snapshot.dir / "proofdeploy.yml")
 
