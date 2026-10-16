@@ -164,3 +164,36 @@ The fixed script has a new sha256 and is accepted on its own before
 the run; on the reviewer's acceptance the run goes ahead from current
 main without a further authorization (D74). Its record will extend
 this document.
+
+## Third execution — journal events (2026-10-16)
+
+The third execution runs under the D74 journal mechanics, journal at
+`wo6-scratch/regc-add2-journal-2026-10-16/`. Journal header
+(`header.json`, quoted verbatim):
+
+- script sha256: `b80013adf2056165733d8a90fbc4c0f73fd4608737f5b2ebce3c998ecfeee636`
+- main SHA: `29045fbee500ab4700c97fe661a5717bdc6b138e`
+- snapshot date: `2026-10-16`
+
+Start events recorded in the journal's `events.jsonl`: initial start
+2026-10-16T12:02:26Z (`resumed: false`); resumes at
+2026-10-16T12:19:00Z, 2026-10-16T15:00:59Z, 2026-10-16T15:57:29Z and
+2026-10-16T17:37:09Z, each carrying `previous_exit_cause`: "not
+recorded: the previous session ended without an exit record".
+
+Journal event — death in the runtime restart, 2026-10-16 ~19:04Z:
+
+- The instance resumed at 2026-10-16T17:37:09Z died in the
+  runtime/VM restart at ~19:04Z (the same restart killed other
+  sessions on this VM at ~19:04Z). It wrote no exit record.
+- Its last journal write was 2026-10-16T19:04:00Z, at 1,822 entries
+  in `entries.jsonl`; the journal itself was not damaged.
+- Resumed: 2026-10-16T19:20:13Z from the same journal (the resume
+  start event is recorded in `events.jsonl`, with
+  `previous_exit_cause`: "not recorded: the previous session ended
+  without an exit record").
+- Header values on resume unchanged — verified against
+  `header.json`: script sha256
+  `b80013adf2056165733d8a90fbc4c0f73fd4608737f5b2ebce3c998ecfeee636`,
+  main SHA `29045fbee500ab4700c97fe661a5717bdc6b138e`, snapshot date
+  `2026-10-16`. The run continues from the journal.
