@@ -433,11 +433,33 @@ def test_unrenderable_fixture_refuses_with_record(tmp_path):
     assert "fixture mapping missing fields" in evidence["inconclusive_error"]
 
 
-def test_slug_resolution_names_the_committed_store_file(tmp_path):
-    """unit_repo resolves against the real committed store in THIS
-    tree: directus/directus names readiness/contracts/
-    directus__directus.yml — and its contract carries no fixture,
-    so the run refuses as unrenderable, naming that file."""
+def test_slug_resolution_names_the_committed_store_file(
+    tmp_path, monkeypatch
+):
+    """unit_repo resolves through the contract store's slug rule:
+    directus/directus names readiness/contracts/
+    directus__directus.yml in the store tree the run executes
+    from. The store here is the test's OWN temporary tree,
+    holding a fixture-less contract of the test's own authoring
+    — so the run refuses as unrenderable, and the evidence
+    record names that store file (its store-relative path and
+    its sha256). The slug rule must not be exercised against a
+    real repo's committed contract: a signed fixture landing in
+    the real store (PR #129 added directus's) changes that file,
+    not this test's premise."""
+    store_root = tmp_path / "store-tree"
+    committed = (
+        store_root / "readiness" / "contracts" / "directus__directus.yml"
+    )
+    committed.parent.mkdir(parents=True)
+    committed.write_text(STORE_YML.split("fixture:")[0], encoding="utf-8")
+    monkeypatch.setattr(
+        "proofdeploy.yml.proofdeploy_tree_root", lambda: store_root
+    )
+    monkeypatch.setattr(
+        "proofdeploy.orchestrator.proofdeploy_tree_root",
+        lambda: store_root,
+    )
     cfg = MeasureConfig(
         repo_dir=tmp_path / "unused",
         output_dir=tmp_path / "records",
@@ -458,9 +480,8 @@ def test_slug_resolution_names_the_committed_store_file(tmp_path):
     assert evidence["contract_source"]["store_path"] == (
         "readiness/contracts/directus__directus.yml"
     )
-    real = REPO_ROOT / "readiness" / "contracts" / "directus__directus.yml"
     assert evidence["contract_source"]["sha256"] == hashlib.sha256(
-        real.read_bytes()
+        committed.read_bytes()
     ).hexdigest()
 
 
