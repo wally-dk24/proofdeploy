@@ -323,7 +323,7 @@ class _FakeSandbox:
                 break
         return results
 
-    def start(self, checkout, command, env, port, name):
+    def start(self, checkout, command, env, port, name, app_port=None):
         from proofdeploy.sandbox import SandboxApp
 
         app = SandboxApp(name=name, sandbox=self, target_url=_FakeSandbox.app_url)

@@ -195,6 +195,61 @@ def test_row_from_provision_carries_plan_workspace_facts() -> None:
     assert row["workspace_root"] == "."
 
 
+def test_row_from_provision_carries_declared_app_port() -> None:
+    """Plan 1.2(o): the row records the contract's declared
+    app.port, read from the side's own loaded contract (the
+    snapshot's proofdeploy.yml). A contract declaring none — and
+    a side with no contract at all — records None."""
+    from proofdeploy.yml import RepoContract
+
+    side = _fake_side(plan={})
+    side.contract = RepoContract(
+        build="b", start="s", readiness="/", app_port=3000
+    )
+    row = rp.row_from_provision(
+        BUG_UNIT, BUG_UNIT["sides"][1], "h" * 40, 1, "isolated", side
+    )
+    assert row["app_port"] == 3000
+
+    side_default = _fake_side(plan={})
+    row_default = rp.row_from_provision(
+        BUG_UNIT, BUG_UNIT["sides"][1], "h" * 40, 1, "isolated",
+        side_default,
+    )
+    assert row_default["app_port"] is None
+
+
+def test_exception_and_harness_rows_carry_app_port() -> None:
+    """Plan 1.2(o): EVERY readiness row carries app_port — the
+    exception and harness-error rows take the repo contract's
+    declared value (threaded through by the harness), defaulting
+    to None."""
+    exc = ValueError("cannot detect runtime in /snap")
+    row = rp.row_from_exception(
+        BUG_UNIT, BUG_UNIT["sides"][0], "h" * 40, 1, None, exc,
+        app_port=3000,
+    )
+    assert row["app_port"] == 3000
+    row_none = rp.row_from_exception(
+        BUG_UNIT, BUG_UNIT["sides"][0], "h" * 40, 1, None, exc
+    )
+    assert row_none["app_port"] is None
+
+    hrow = rp._harness_error_row(
+        BUG_UNIT, BUG_UNIT["sides"][0], 1, None,
+        RuntimeError("fetch failed"), app_port=3000,
+    )
+    assert hrow["app_port"] == 3000
+
+
+def test_contract_app_port_reads_the_repo_contract() -> None:
+    """The harness's app_port source is the repo's committed
+    contract in readiness/contracts/: nest declares 3000 (plan
+    1.2(o), D98); bottle declares none."""
+    assert rp.contract_app_port("nestjs/nest") == 3000
+    assert rp.contract_app_port("bottlepy/bottle") is None
+
+
 def test_row_from_provision_build_failed_plan_refusal() -> None:
     plan = {"declared_range": None, "refusal": "workspaces not yet supported"}
     side = _fake_side(

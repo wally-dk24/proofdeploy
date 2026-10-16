@@ -594,3 +594,129 @@ def test_sandboxed_tampered_hash_fails_install(monkeypatch, tmp_path):
     # And the flag that arms pip's check was in the command.
     assert "--require-hashes" in _pip_install_cmd(fake.commands).split()
 
+
+
+# ---------------------------------------------------------------------------
+# Plan 1.2(o): a contract-declared app.port is the bridge's target.
+# The app still gets the assigned PORT in its environment; only the
+# port the bridge/executor forwards to changes. Default (no
+# app.port) is byte-for-byte the old behaviour.
+# ---------------------------------------------------------------------------
+
+
+def _env_args(args: list[str]) -> list[str]:
+    """The `-e KEY=value` values in a podman arg list."""
+    return [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+
+
+def test_bridge_targets_declared_app_port_none_socket(monkeypatch, tmp_path):
+    """none+socket mode: with app.port declared, the in-container
+    bridge is told to forward the Unix socket to the DECLARED port
+    (3000 — where the app actually listens), while the app's PORT
+    env stays the sandbox-assigned port.
+
+    Plant: Sandbox.start ignoring app.port (always passing the
+    assigned port as the bridge target) -> the wrapped command
+    names the assigned port instead -> FAIL.
+    """
+    from proofdeploy import sandbox as sandbox_mod
+
+    _patch_caps(monkeypatch)  # isolated_network=False -> none+socket
+    monkeypatch.setattr(
+        Sandbox, "_own_checkout_for_sandbox", lambda self, checkout: None
+    )
+    cap = _CapturingRun()
+    monkeypatch.setattr(sandbox_mod, "_run", cap)
+
+    sb = Sandbox(SandboxConfig(image="python:3.12-slim"))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    with pytest.raises(_StopAfterCapture):
+        sb.start(
+            checkout, "python3 app.py", {}, 49152, "pd-port",
+            app_port=3000,
+        )
+    assert len(cap.calls) == 1, f"expected one podman run, got {cap.calls}"
+    args = cap.calls[0]
+    try:
+        cmd = _bash_command(args)
+        assert "/pd-sock/app.sock 3000" in cmd, (
+            f"bridge not told to target the declared app.port: {cmd}"
+        )
+        assert "/pd-sock/app.sock 49152" not in cmd, (
+            f"bridge still targets the assigned PORT: {cmd}"
+        )
+        # PORT is still exported to the app, as assigned.
+        assert "PORT=49152" in _env_args(args), (
+            f"app env lost the assigned PORT: {args}"
+        )
+    finally:
+        sock_dir = _volumes(args).get("/pd-sock")
+        if sock_dir:
+            shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def test_bridge_targets_assigned_port_by_default_none_socket(
+    monkeypatch, tmp_path
+):
+    """Default behaviour, unchanged: no app.port declared -> the
+    bridge forwards to the sandbox-assigned port, which is also
+    the exported PORT."""
+    from proofdeploy import sandbox as sandbox_mod
+
+    _patch_caps(monkeypatch)  # isolated_network=False -> none+socket
+    monkeypatch.setattr(
+        Sandbox, "_own_checkout_for_sandbox", lambda self, checkout: None
+    )
+    cap = _CapturingRun()
+    monkeypatch.setattr(sandbox_mod, "_run", cap)
+
+    sb = Sandbox(SandboxConfig(image="python:3.12-slim"))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    with pytest.raises(_StopAfterCapture):
+        sb.start(checkout, "python3 app.py", {}, 49152, "pd-port")
+    assert len(cap.calls) == 1, f"expected one podman run, got {cap.calls}"
+    args = cap.calls[0]
+    try:
+        cmd = _bash_command(args)
+        assert "/pd-sock/app.sock 49152" in cmd, (
+            f"bridge not targeting the assigned port by default: {cmd}"
+        )
+        assert "PORT=49152" in _env_args(args)
+    finally:
+        sock_dir = _volumes(args).get("/pd-sock")
+        if sock_dir:
+            shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def test_bridge_targets_declared_app_port_isolated(monkeypatch, tmp_path):
+    """isolated mode: the executor's target URL names the declared
+    app.port when one is set, and the assigned port when none is —
+    the app env carries the assigned PORT in both cases."""
+    from proofdeploy import sandbox as sandbox_mod
+
+    _patch_caps(monkeypatch, isolated_network=True)
+    monkeypatch.setattr(
+        Sandbox, "_own_checkout_for_sandbox", lambda self, checkout: None
+    )
+    ok = _OkRun()
+    monkeypatch.setattr(sandbox_mod, "_run", ok)
+    monkeypatch.setattr(
+        sandbox_mod, "_container_ip", lambda name, network: "10.89.0.7"
+    )
+
+    sb = Sandbox(SandboxConfig(image="python:3.12-slim"))
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+
+    app = sb.start(
+        checkout, "python3 app.py", {}, 49152, "pd-port", app_port=3000
+    )
+    assert app.target_url == "http://10.89.0.7:3000", app.target_url
+    run_args = [c for c in ok.calls if "bash" in c]
+    assert run_args, f"no container run recorded: {ok.calls}"
+    assert "PORT=49152" in _env_args(run_args[-1])
+
+    app2 = sb.start(checkout, "python3 app.py", {}, 49153, "pd-port2")
+    assert app2.target_url == "http://10.89.0.7:49153", app2.target_url

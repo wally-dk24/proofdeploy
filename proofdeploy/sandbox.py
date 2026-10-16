@@ -1217,6 +1217,8 @@ class Sandbox:
         env: dict[str, str],
         port: int,
         name: str,
+        *,
+        app_port: int | None = None,
     ) -> SandboxApp:
         """Start the app with the network cut.
 
@@ -1226,6 +1228,13 @@ class Sandbox:
         socket bridge (executor reaches it via a host-side TCP proxy).
         No proxy variables are set: the app has no external network.
         Returns a SandboxApp; the caller must stop() it.
+
+        ``app_port`` (plan 1.2(o)) is the contract's declared
+        ``app.port``: the app's own fixed listen port, for apps that
+        bind a hardcoded port and ignore the assigned ``PORT``. The
+        bridge targets it instead of ``port``; ``PORT`` itself is
+        still exported to the app environment unchanged. When it is
+        None the bridge targets ``port``, exactly as before.
         """
         self._prepare_checkout(checkout)
         mode = self._resolve_network_mode()
@@ -1237,11 +1246,21 @@ class Sandbox:
         env = {k: v for k, v in env.items() if "proxy" not in k.lower()}
         run_env = dict(env)
         run_env["PORT"] = str(port)
+        target_port = port if app_port is None else app_port
+        if app_port is not None:
+            self.log.append(
+                f"app.port declared (plan 1.2(o)): bridge targets "
+                f"{target_port}; PORT env stays {port}"
+            )
 
         if mode == "isolated":
-            app = self._start_isolated(checkout, command, run_env, name)
+            app = self._start_isolated(
+                checkout, command, run_env, name, target_port=target_port
+            )
         else:
-            app = self._start_none_socket(checkout, command, run_env, port, name)
+            app = self._start_none_socket(
+                checkout, command, run_env, target_port, name
+            )
         app.sandbox_evidence = self._isolation_evidence(mode)
         return app
 
@@ -1295,6 +1314,8 @@ class Sandbox:
         command: str,
         run_env: dict[str, str],
         name: str,
+        *,
+        target_port: int | None = None,
     ) -> SandboxApp:
         # S2: no --rm (see _common_args): the container must persist so
         # a crash can be diagnosed from its logs; stop() removes it.
@@ -1313,7 +1334,10 @@ class Sandbox:
             self.stop(name)
             raise SandboxError("sandbox start: no container IP on isolated network")
         self.log.append(f"sandbox app container IP: {ip} (isolated network)")
-        port = int(run_env["PORT"])
+        # The executor reaches the app at the bridge target port:
+        # the contract's declared app.port when one was passed
+        # (plan 1.2(o)), else the PORT exported to the app.
+        port = int(run_env["PORT"]) if target_port is None else target_port
         return SandboxApp(
             name=name,
             sandbox=self,
@@ -1356,7 +1380,10 @@ class Sandbox:
             pass
         # The app binds to the container's own loopback (isolated).
         # The bridge forwards the Unix socket at /pd-sock/app.sock
-        # to it.
+        # to it. `port` here is the bridge TARGET: the caller passes
+        # the contract's declared app.port when one is set (plan
+        # 1.2(o)), else the assigned PORT — the app still gets the
+        # assigned PORT in its environment either way (run_env).
         wrapped = (
             f"(python3 /checkout/{_BRIDGE_SCRIPT_NAME} "
             f"/pd-sock/app.sock {port} &); "
