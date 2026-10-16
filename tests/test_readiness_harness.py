@@ -1618,3 +1618,166 @@ def test_auth_proof_side_proves_auth_through_the_engine(
     assert _FAKE_ADMIN_KEY not in log_text
     # The live side was stopped.
     assert side.provision.proc.stopped is True
+
+
+def _proof_record(
+    http_status: int, *, verdict: str = "pass", mints: int = 0
+) -> dict[str, Any]:
+    """One request record as _request_record shapes it, for
+    driving the pure verdict directly (D106)."""
+    return {"http_status": http_status, "verdict": verdict, "mints": mints}
+
+
+def test_auth_proof_verdict_accepts_only_the_exact_proof() -> None:
+    records = [
+        _proof_record(200, mints=1),
+        _proof_record(200, mints=1),
+        _proof_record(403),
+    ]
+    assert ap._proof_passed(True, records) is True
+    # The seed's key file missing fails the proof on its own.
+    assert ap._proof_passed(False, records) is False
+
+
+def test_auth_proof_verdict_fails_when_unauthenticated_accepted() -> None:
+    # The /site/ failure the proof exists to catch: the bare
+    # request answers 200. Every leg's own verdict still reads
+    # "pass" here, so only the status conjunct can fail it.
+    records = [
+        _proof_record(200, mints=1),
+        _proof_record(200, mints=1),
+        _proof_record(200),
+    ]
+    assert ap._proof_passed(True, records) is False
+
+
+def test_auth_proof_verdict_fails_on_mint_count_one() -> None:
+    records = [
+        _proof_record(200, mints=1),
+        _proof_record(200, mints=0),
+        _proof_record(403),
+    ]
+    assert ap._proof_passed(True, records) is False
+
+
+def test_auth_proof_verdict_fails_on_mint_count_three() -> None:
+    records = [
+        _proof_record(200, mints=2),
+        _proof_record(200, mints=1),
+        _proof_record(403),
+    ]
+    assert ap._proof_passed(True, records) is False
+
+
+def test_auth_proof_verdict_fails_on_authenticated_non_200() -> None:
+    records = [
+        _proof_record(500, mints=1),
+        _proof_record(200, mints=1),
+        _proof_record(403),
+    ]
+    assert ap._proof_passed(True, records) is False
+    records = [
+        _proof_record(200, mints=1),
+        _proof_record(401, mints=1),
+        _proof_record(403),
+    ]
+    assert ap._proof_passed(True, records) is False
+
+
+class _ScriptedExecutor:
+    """The executor's shape with scripted per-leg outcomes:
+    legs are (http_status, mints) in call order. A leg's verdict
+    follows its own assertion exactly as the real executor's
+    does — PASS iff the observed status equals the asserted
+    one — so a wrong status also fails that leg; the composed
+    row must still read FAILED, never PROVEN (D106)."""
+
+    def __init__(self, legs: list[tuple[int, int]]) -> None:
+        self.legs = legs
+        self.probes: list[dict[str, Any]] = []
+
+    def run_probe(self, probe: dict[str, Any], index: int = 0) -> ProbeResult:
+        self.probes.append(probe)
+        status, mints = self.legs[index]
+        expected = probe["assert"][0]["equals"]
+        details = [
+            "credential provider: minted ghost_jwt (ttl 300s)"
+        ] * mints
+        details.append(f"act: GET {probe['act']['path']} -> {status}")
+        return ProbeResult(
+            probe_index=index,
+            verdict=Verdict.PASS if status == expected else Verdict.FAIL,
+            details=details,
+            http_status=status,
+            minted_tokens=[_FAKE_JWT] * mints,
+        )
+
+
+def _scripted_proof_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legs: list[tuple[int, int]],
+) -> dict[str, Any]:
+    src, sha = _one_commit_src(tmp_path)
+    clone = _empty_clone(tmp_path, src)
+    side = _fake_auth_side(tmp_path)
+    executor = _ScriptedExecutor(legs)
+    orch = SimpleNamespace(
+        _provision_side_sandbox=(lambda rev, port, unit_dir, tag: side),
+        _make_executor=lambda s: executor,
+    )
+    monkeypatch.chdir(tmp_path)  # pd-logs/ land in tmp
+    return ap.auth_proof_side(
+        orch,
+        clone,
+        GHOST_UNIT,
+        {"role": "fix", "sha": sha},
+        rp.contract_path("TryGhost/Ghost"),
+        1,
+        tmp_path / "work",
+        "isolated",
+    )
+
+
+def test_auth_proof_side_fails_when_unauthenticated_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _scripted_proof_row(
+        tmp_path, monkeypatch, [(200, 1), (200, 1), (200, 0)]
+    )
+    assert row["auth"]["requests"][2]["http_status"] == 200
+    assert row["auth"]["passed"] is False
+    assert row["auth"]["status"] == "FAILED"
+
+
+def test_auth_proof_side_fails_on_mint_count_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _scripted_proof_row(
+        tmp_path, monkeypatch, [(200, 1), (200, 0), (403, 0)]
+    )
+    assert row["auth"]["mint_count_after_two_authenticated"] == 1
+    assert row["auth"]["passed"] is False
+    assert row["auth"]["status"] == "FAILED"
+
+
+def test_auth_proof_side_fails_on_mint_count_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _scripted_proof_row(
+        tmp_path, monkeypatch, [(200, 2), (200, 1), (403, 0)]
+    )
+    assert row["auth"]["mint_count_after_two_authenticated"] == 3
+    assert row["auth"]["passed"] is False
+    assert row["auth"]["status"] == "FAILED"
+
+
+def test_auth_proof_side_fails_on_authenticated_non_200(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _scripted_proof_row(
+        tmp_path, monkeypatch, [(500, 1), (200, 1), (403, 0)]
+    )
+    assert row["auth"]["requests"][0]["http_status"] == 500
+    assert row["auth"]["passed"] is False
+    assert row["auth"]["status"] == "FAILED"

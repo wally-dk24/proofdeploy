@@ -258,6 +258,26 @@ def _register_result_secrets(redactor: Redactor, result: Any) -> None:
             redactor.add("bootstrap_value", value)
 
 
+def _proof_passed(
+    key_file_present: bool, records: list[dict[str, Any]]
+) -> bool:
+    """The proof verdict, composed from the seed evidence and the
+    three request records: the seed's key file is present, both
+    authenticated requests were accepted (200) with exactly one
+    fresh mint each (two in total), the unauthenticated request
+    was refused (403), and every leg's own verdict is a pass.
+    Pure over its inputs so every conjunct is testable (D106)."""
+    mint_total = records[0]["mints"] + records[1]["mints"]
+    return (
+        key_file_present
+        and records[0]["http_status"] == 200
+        and records[1]["http_status"] == 200
+        and records[2]["http_status"] == 403
+        and mint_total == 2
+        and all(r["verdict"] == "pass" for r in records)
+    )
+
+
 def auth_proof_side(
     orch: Any,
     clone: Path,
@@ -335,14 +355,7 @@ def auth_proof_side(
                 ),
             ]
             mint_total = records[0]["mints"] + records[1]["mints"]
-            passed = (
-                seed_evidence["key_file_present"]
-                and records[0]["http_status"] == 200
-                and records[1]["http_status"] == 200
-                and records[2]["http_status"] == 403
-                and mint_total == 2
-                and all(r["verdict"] == "pass" for r in records)
-            )
+            passed = _proof_passed(seed_evidence["key_file_present"], records)
             row["seed"] = seed_evidence
             row["auth"] = {
                 "endpoint": ADMIN_PATH,
