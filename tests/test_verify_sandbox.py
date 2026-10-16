@@ -165,7 +165,9 @@ def test_verify_sandbox_node_good_change_passes(tmp_path):
     assert output["verdict"] == "PASS"
     assert output["exit_code"] == 0
     record = _assert_clean_records(output, out_dir, "node-express-sqlite")
-    assert [r["verdict"] for r in record["c_results"]] == ["PASS"]
+    # Records store the Verdict enum's value ("pass"/"fail"); the
+    # verify OUTPUT renders the name ("PASS"/"FAIL"), asserted above.
+    assert [r["verdict"] for r in record["c_results"]] == ["pass"]
     _assert_tool_state_outside_tree(workdir)
 
 
@@ -177,7 +179,7 @@ def test_verify_sandbox_node_planted_defect_fails(tmp_path):
     assert output["verdict"] == "FAIL"
     assert output["exit_code"] == 1
     record = _assert_clean_records(output, out_dir, "node-express-sqlite")
-    assert [r["verdict"] for r in record["c_results"]] == ["FAIL"]
+    assert [r["verdict"] for r in record["c_results"]] == ["fail"]
     _assert_tool_state_outside_tree(workdir)
 
 
@@ -188,7 +190,7 @@ def test_verify_sandbox_python_good_change_passes(tmp_path):
     assert code == 0
     assert output["verdict"] == "PASS"
     record = _assert_clean_records(output, out_dir, "python-flask-sqlite")
-    assert [r["verdict"] for r in record["c_results"]] == ["PASS"]
+    assert [r["verdict"] for r in record["c_results"]] == ["pass"]
     _assert_tool_state_outside_tree(workdir)
 
 
@@ -199,7 +201,7 @@ def test_verify_sandbox_python_planted_defect_fails(tmp_path):
     assert code == 1
     assert output["verdict"] == "FAIL"
     record = _assert_clean_records(output, out_dir, "python-flask-sqlite")
-    assert [r["verdict"] for r in record["c_results"]] == ["FAIL"]
+    assert [r["verdict"] for r in record["c_results"]] == ["fail"]
     _assert_tool_state_outside_tree(workdir)
 
 
