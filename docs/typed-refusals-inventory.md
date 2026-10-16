@@ -138,6 +138,58 @@ were classed directly by the ruling (no separate proposal).
 | 60 | `REG-D: the contract declares dated sample resolution ({token}) but no ISO 8601 UTC lock cutoff is available for this unit; refusing to run an undated sample install (REG-D D6)` | provisioning.py:557 | **harness or environment** — the analogue of #5: the run failed to supply the unit's cutoff. |
 | 61 | `REG-D: the contract declares dated sample resolution ({token}) but the unit's lock cutoff could not be read ({error}); refusing to run an undated sample install (REG-D D6)` | provisioning.py:549 | **harness or environment** — same D6 family as #60. |
 
+## 7. Submodule materialization — `proofdeploy/submodules.py` (plan 1.2(l), PR #109)
+
+Every string the submodule step can raise, with the classes the
+reviewer ruled in R4 of the #109 changes round (relay
+2026-10-15T2215Z, D48/D50). Submodule URLs and contents come
+from the repo under test, so they are untrusted input. Four
+rulings shape the table:
+
+- the recorded commit is unavailable → **not supported** (D46),
+  carried by `SubmoduleUnavailableError`; the materialize layer
+  re-raises every such refusal in the one wrapper form (#62), so
+  the detail strings (#63–#68) are what varies;
+- `.gitmodules` paths refused by the path rules, and links
+  escaping a fetched tree, take **the class `create_snapshot`
+  already gives an ADR 0012 refusal** — a plain `ValueError`
+  (fixture.py:359, `archive member escapes snapshot dir:
+  {member.name}`) or the `SnapshotLinkError` itself
+  (fixture.py:157, message at fixture.py:164) — **neither
+  carries the `not supported:` prefix**, so neither is
+  mechanically terminal today: the side is retried and H5 must
+  judge it by its string;
+- a tree over the size cap, and submodule nesting past the
+  depth limit, are **our gap** (both limits are ours); their
+  strings must not start with `not supported:`;
+- a relative URL whose superproject origin is missing or
+  scp-style, and transient fetch failures, are **harness or
+  environment** (`SubmoduleFetchError`, a `RuntimeError` — the
+  harness's retry class, never a typed row).
+
+| # | String (verbatim; `{…}` = interpolated) | Site | Proposed class |
+|---|---|---|---|
+| 62 | `not supported: submodule {path} at {sha} unavailable from {url}: {detail}` — the wrapper every typed submodule refusal surfaces in; the detail is one of #63–#68 | submodules.py:137 (`_typed`); re-raise at :719 | **not supported** — carries the prefix (D46). |
+| 63 | detail: git's first error line, when the fetch's stderr matches a "remote does not serve this" marker (transport refused by the protocol rules, `couldn't find remote ref`, repository not found, private repo with no credentials sent, …); the fetch layer's own form is `not supported: submodule at {sha} unavailable from {url}: {first line}` | submodules.py:228 | **not supported** — the recorded commit is unavailable (D46/R4). |
+| 64 | detail: `the remote did not serve the recorded commit` (the fetch reported success but the object did not arrive) | submodules.py:243 | **not supported** (D46/R4). |
+| 65 | detail: `submodule URL is not a clean https URL: {url!r}` — the R1 pre-fetch validation: after resolution the URL must match `^https://` with no whitespace or control characters and no leading `-`, refused before any git process runs (the fetch layer's own message is `not supported: submodule URL refused before fetch: {url!r}`) | submodules.py:281 | **not supported** — non-https by the protocol rules (R1/R4). |
+| 66 | detail: `recorded commit is not a 40-character lowercase hex SHA: {sha!r}` — the R1 pre-fetch validation of the recorded SHA, likewise before any git process runs (fetch layer's own message: `not supported: submodule commit refused before fetch: {sha!r}`) | submodules.py:286 | **not supported** (R1/R4). |
+| 67 | `submodule {path}: its submodules nest past the depth limit of {MAX_DEPTH} that ProofDeploy sets for nested submodules (our gap)` (MAX_DEPTH = 5; {path} is the parent submodule whose listed gitlinks would nest one level past the limit) | submodules.py:693 | **our gap** — the depth limit is our limit (D62, applying D48 R1/R3); plain `ValueError` in the #77 style, no `not supported:` prefix. One of the two strings flagged at the R4 round: D62 rules this one our gap and leaves the other (#68) not supported (D46). |
+| 68 | `not supported: submodule {path} at {sha} unavailable from (no url in .gitmodules): submodule has no url in .gitmodules` (a listed gitlink whose `.gitmodules` entry has no URL) | submodules.py:702 | **not supported** — carries the prefix via #62. ⚠ Flagged for the reviewer: carried unchanged from the accepted build; the R4 ruling does not name this string. |
+| 69 | `submodule path does not normalize inside the checkout: {path!r}` (absolute path or a `..` component in a `.gitmodules` path, paired with a gitlink or not) | submodules.py:402 / 419 | **ADR 0012 plain `ValueError`** — the class `create_snapshot` gives the same refusal (fixture.py:359). No `not supported:` prefix (R4). |
+| 70 | `submodule path does not name a directory: {path!r}` | submodules.py:425 | **ADR 0012 plain `ValueError`** (as #69). |
+| 71 | `submodule path has a symlinked parent: {walked}` | submodules.py:435 | **ADR 0012 plain `ValueError`** (as #69). |
+| 72 | `submodule path's parent is not a directory: {walked}` | submodules.py:439 | **ADR 0012 plain `ValueError`** (as #69). |
+| 73 | `submodule path is a symlink in the snapshot: {path!r}` | submodules.py:445 | **ADR 0012 plain `ValueError`** (as #69). |
+| 74 | `submodule path exists in the snapshot and is not a directory: {path!r}` | submodules.py:449 | **ADR 0012 plain `ValueError`** (as #69). |
+| 75 | `submodule tree entry escapes the submodule directory: {rel!r}` (defensive: an absolute or `..` entry name inside a fetched tree; git forbids these by construction) | submodules.py:503 | **ADR 0012 plain `ValueError`** (as #69). |
+| 76 | `snapshot symlink refused ({reason}): {path} -> {target}` — a symlink inside a fetched tree that is absolute or escapes its tree (the WO-8.4b rule), validated as one map before any link is created; the `SnapshotLinkError` itself, re-based at the raise so `{path}` names the path from the snapshot root | submodules.py:597; class fixture.py:157, message fixture.py:164 | **`SnapshotLinkError`** — the class `create_snapshot` gives an ADR 0012 link refusal. No `not supported:` prefix (R4). |
+| 77 | `submodule {full_path}: its tree is {total} bytes, over the {MAX_TREE_BYTES}-byte limit ProofDeploy sets for one submodule (our gap)` (MAX_TREE_BYTES = 512 MiB; the cap is summed from the tree listing and enforced before anything is written, R3) | submodules.py:522 | **our gap** — the cap is our limit (R3/R4); plain `ValueError`, no `not supported:` prefix. |
+| 78 | `harness or environment: relative submodule URL {raw_url!r} for submodule {path} cannot be resolved: the superproject origin is missing or not an https URL ({base_url!r}); the origin is this checkout's configuration, not the repo's` | submodules.py:382 | **harness or environment** — the origin is our checkout's configuration, not the repo's (R4); `SubmoduleFetchError`, retried. |
+| 79 | `submodule fetch of {url} at {sha} failed: {first error line}` — every fetch failure whose stderr matches no #63 marker (network and registry errors land here and stay untyped) | submodules.py:233 | **harness or environment** — retried by design. |
+| 80 | `submodule fetch of {url} at {sha} timed out after {FETCH_TIMEOUT_SECONDS}s` (300 s) | submodules.py:220 | **harness or environment**. |
+| 81 | The remaining `SubmoduleFetchError` strings, each naming the git operation that failed on this host (`git init --bare failed for submodule fetch of {url}: {stderr}` :192; `cannot read the tree of fetched submodule commit {sha} from {url}: {stderr}` :253; `git ls-tree … failed …` :320 / :479; `cannot parse {gitmodules}: {stderr}` :350; `unparseable ls-tree entry/size for {sha}: …` :492 / :513; `git cat-file --batch cannot serve {oid} …` / `… stream ended early …` / `… exited {code} …` :548 / :565 / :585) | submodules.py (as cited) | **harness or environment** — our git plumbing failed; retried, never a typed row. |
+
 ## Scope notes
 
 - `readiness/container_spike.py` (plan 1.12, frozen) emits its
@@ -151,6 +203,10 @@ were classed directly by the ruling (no separate proposal).
   `not supported: ` prefix, remainder byte-identical. The ⚠
   rows were surfaced for the reviewer's ruling, not silently
   fixed; the ruling is recorded at the end of this document.
+- Submodule materialization strings (plan 1.2(l)) are
+  §7 (#62–#81), added by PR #109's changes round with
+  the classes the reviewer ruled in R4 (relay
+  2026-10-15T2215Z).
 - Part 2 (this PR) applies that ruling: the Ruling section
   below, the §6 REG-D rows, the #8 prefix (D50), the #10
   rewording, and the #56 message fix. Site line numbers are
@@ -268,6 +324,46 @@ byte-identical.
 | 59 | our gap |
 | 60 | harness or environment |
 | 61 | harness or environment |
+
+**Submodule rows (§7, PR #109) — ruled in R4 of the #109
+changes round (reviewer, relay 2026-10-15T2215Z):** #62–#66
+and #68 are the D46 not-supported family. #69–#76 are ruled by R4 to
+the ADR 0012 class `create_snapshot` already gives (a plain
+`ValueError` / the `SnapshotLinkError` itself, §7) — a class
+outside the three above; they are entered here as **harness
+or environment** per R2's default (the mechanical treatment
+they share: retried, never skipped, never terminal), with §7
+carrying the class in force. The reviewer to confirm the
+mapping at the #109 review. #77 is the R3/R4 our-gap row.
+**D62 (reviewer, 2026-10-15):** #67 moves from the D46
+family to **our gap** — MAX_DEPTH is ProofDeploy's own
+limit (D48 R1/R3), so its string is a plain `ValueError`
+in the #77 style and no longer surfaces through #62's
+wrapper. #68 stays not supported (D46: unavailable by the
+repo's own declaration).
+
+| # | Ruled class |
+|---|---|
+| 62 | not supported |
+| 63 | not supported |
+| 64 | not supported |
+| 65 | not supported |
+| 66 | not supported |
+| 67 | our gap |
+| 68 | not supported |
+| 69 | harness or environment |
+| 70 | harness or environment |
+| 71 | harness or environment |
+| 72 | harness or environment |
+| 73 | harness or environment |
+| 74 | harness or environment |
+| 75 | harness or environment |
+| 76 | harness or environment |
+| 77 | our gap |
+| 78 | harness or environment |
+| 79 | harness or environment |
+| 80 | harness or environment |
+| 81 | harness or environment |
 
 The prefix-coverage test
 (`tests/test_lockfile_drift.py::test_typed_refusal_prefix_coverage`)
