@@ -141,3 +141,26 @@ Traceback (most recent call last):
     raise IncompleteRead(data, amt - len(data))
 http.client.IncompleteRead: IncompleteRead(382279 bytes read, 50180 more expected)
 ```
+
+## Third execution — PENDING: fetcher fix and resume (D74)
+
+Master's decision D74 (Option A, 2026-10-16): fetcher fix and resume
+(D74); A1–A6 unchanged; the two prior executions recorded. Only the
+script's fetch layer and run mechanics change:
+
+- every request gets a timeout (120 s);
+- `http.client.HTTPException` (including `IncompleteRead`) is retried
+  exactly like `OSError`, with the same backoff; an exception left
+  after retries for one repo becomes that repo's
+  `harness or environment: <error>` row and never kills the run;
+- the run journals as it goes (`--journal <dir>`): the collected pool
+  and search metadata are written before any screening, one line is
+  appended per screened repo, and the final outputs are built only
+  from the journal. A death resumes the same journal; the journal
+  header carries the script sha256, main SHA and snapshot date, and a
+  resume with any of them different refuses.
+
+The fixed script has a new sha256 and is accepted on its own before
+the run; on the reviewer's acceptance the run goes ahead from current
+main without a further authorization (D74). Its record will extend
+this document.
