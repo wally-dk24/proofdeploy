@@ -1,10 +1,19 @@
 # PROVENANCE 2026-10-15: app.path declared "." under the reviewer's app-identification ruling (plan 1.2b follow-up) — the app is named in the contract; the tool never guesses. This contract's commands already run from the repo root, so "." preserves them exactly.
 app:
   path: "."
-build: "true"
-start: "directus start"
+# PROVENANCE 2026-10-16 (D98): build/migrate/start rewritten to upstream's own
+# flow, verified by the reviewer at all 4 registered SHAs: Dockerfile blob
+# b900f41b, directus/cli.js blob 50b5ead7, root build "pnpm --recursive run
+# build", pnpm@10.27.0 — upstream's image builds the workspace with
+# workspace concurrency 2, then runs node cli.js bootstrap and node cli.js
+# start from the directus package. The old contract (build: "true", migrate
+# "directus bootstrap") died in the 2026-10-16 re-run (run 38919702236) with
+# "directus: command not found": nothing ever built the workspace, so no
+# directus bin existed. Class: our gap, contract shape.
+build: "npm_config_workspace_concurrency=2 pnpm run build"
+start: "cd directus && node cli.js start"
 readiness: "/server/ping"
-migrate: "directus bootstrap"
+migrate: "cd directus && node cli.js bootstrap"
 env:
   DB_CLIENT: sqlite3
   DB_FILENAME: /checkout/data.db
