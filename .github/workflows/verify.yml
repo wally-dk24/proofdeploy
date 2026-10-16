@@ -1,0 +1,134 @@
+# ProofDeploy verify, real-model dispatch (plan 1.10, WO-1.10 / D81).
+#
+# Manual dispatch only. Runs ONE `proofdeploy verify` over a golden
+# app's canned change with the PINNED model (no stub): the good
+# change (fix-parent..fix) or the planted-defect change (base..bug).
+# This is the D61 evidence path for verify: the verify-output JSON,
+# the evidence records dir and the run log are uploaded as one
+# artifact; the workflow's own exit code is verify's exit code,
+# propagated AFTER the upload so a FAIL or INCONCLUSIVE verdict
+# still leaves its evidence behind (and shows as a failed run —
+# the verdict is the failure).
+#
+# Modeled on readiness.yml (dispatch shape, pinned actions, the
+# fail-closed measurement gate) and measure.yml (secrets handling):
+# GROQ_API_KEY lives in the `measurement` environment, Master is
+# its required reviewer, so a dispatch WAITS for his approval
+# before the job starts. The key is present only in the verify
+# step's environment, on the host; it never enters a container, a
+# prompt, or a record (verify redacts it by value).
+#
+# DO NOT TRIGGER before the reviewer has seen the exact contents.
+# Any change to this workflow goes back to review.
+name: verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Golden app to verify"
+        required: true
+        type: choice
+        options:
+          - node-express-sqlite
+          - python-flask-sqlite
+          - node-pnpm-sqlite
+          - node-pnpm-monorepo
+          - node-bun-sqlite
+      change:
+        description: "fix = the good change (fix-parent..fix); bug = the planted defect (base..bug)"
+        required: true
+        default: "fix"
+        type: choice
+        options:
+          - fix
+          - bug
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # The environment gate: Master must approve before this runs.
+    # GROQ_API_KEY lives in the `measurement` environment.
+    environment: measurement
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Measurement gate (fail closed on an incapable host)
+        run: |
+          python -c "from proofdeploy.sandbox import assert_measurement_gate; assert_measurement_gate(); print('measurement gate: capable')"
+      - name: Verify (${{ inputs.app }}, ${{ inputs.change }} change, pinned model)
+        id: verify
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          APP: ${{ inputs.app }}
+          CHANGE: ${{ inputs.change }}
+        run: |
+          set +e
+          python - <<'PYEOF' 2>&1 | tee verify-run.log
+          import json
+          import os
+          from pathlib import Path
+
+          from conformance import kit
+          from proofdeploy.cli import build_parser, cmd_verify
+
+          app = os.environ["APP"]
+          change = os.environ["CHANGE"]
+          repo = Path("/tmp/verify-repo")
+          shas = kit.materialize_golden(app, repo)
+          pair = ("fix-parent", "fix") if change == "fix" else ("base", "bug")
+          args = build_parser().parse_args(
+              [
+                  "verify",
+                  "--repo", str(repo),
+                  "--from", shas[pair[0]],
+                  "--to", shas[pair[1]],
+                  "--format", "json",
+                  "--output", "verify-output.json",
+                  "--output-dir", "verify-records",
+                  "--workdir", "/tmp/verify-work",
+              ]
+          )
+          # No model_runner: the pinned model client, for real.
+          code = cmd_verify(args)
+          Path("verify-exit-code.txt").write_text(f"{code}\n", encoding="utf-8")
+          print(Path("verify-output.json").read_text(encoding="utf-8"))
+          print(f"verify exit code: {code}")
+          PYEOF
+          # The step itself never fails here: the artifact upload
+          # runs first, and the final step propagates verify's code.
+          true
+      - name: Upload verify output, records and log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-${{ inputs.app }}-${{ inputs.change }}-${{ github.run_id }}
+          path: |
+            verify-output.json
+            verify-records/
+            verify-run.log
+            verify-exit-code.txt
+          retention-days: 14
+      - name: Propagate verify's exit code
+        if: always()
+        run: |
+          code=$(cat verify-exit-code.txt 2>/dev/null || echo 5)
+          echo "verify exit code: $code"
+          exit "$code"

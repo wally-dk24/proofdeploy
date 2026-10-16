@@ -1,6 +1,10 @@
 """CLI entry point (PRD FR-6).
 
-Exit codes: 0 = all claims PASS; 1 = any FAIL/INCONCLUSIVE; 2 = tool error.
+``verify`` exit codes (plan 1.10, registered): 0 = PASS; 1 = FAIL;
+2 = INCONCLUSIVE; 3 = not supported (typed); 4 = usage/config
+error; 5 = internal error (our gap; traceback logged).
+``measure`` keeps its own codes: 0 = ran; 1 = measure failed;
+2 = tool error.
 """
 
 from __future__ import annotations
@@ -8,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Any
 
 from proofdeploy import __version__
 
@@ -20,36 +25,50 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
-    v = sub.add_parser("verify", help="Verify a diff by probing a provisioned instance.")
-    v.add_argument("--repo", default=None, help="Repo URL to clone (default: current directory).")
+    v = sub.add_parser(
+        "verify",
+        help="Verify a diff by probing a sandboxed instance of the target ref.",
+    )
+    v.add_argument(
+        "--repo",
+        default=None,
+        help="Git checkout to verify (default: current directory).",
+    )
     v.add_argument(
         "--from",
         dest="from_ref",
         default=None,
-        help="Base ref for the diff (default: merge-base with main).",
+        help="Base ref for the diff (default: merge-base with the default branch).",
     )
     v.add_argument("--to", dest="to_ref", default="HEAD", help="Target ref (default: HEAD).")
     v.add_argument(
         "--target-url",
         default=None,
-        help="Probe this URL instead of provisioning (loopback only unless --allow-remote-target).",
-    )
-    v.add_argument(
-        "--allow-remote-target",
-        action="store_true",
         help=(
-            "Permit a non-loopback --target-url; forces all probes read-only, "
-            "HTTP GET/HEAD only, no DB probes."
+            "Not supported in Stage 1: verify always provisions its own "
+            "sandboxed instance; passing this is a typed refusal (exit 3)."
         ),
     )
     v.add_argument("--format", choices=["term", "html", "json"], default="term")
     v.add_argument(
         "--output",
         default=None,
-        help="Write the report here (default: stdout / ./proofdeploy-report.html).",
+        help="Write the report here (default: stdout).",
     )
     v.add_argument(
-        "--model", default=None, help="Model for the probe author (default: $PROOFDEPLOY_MODEL)."
+        "--output-dir",
+        default=None,
+        help="Evidence records dir (default: <repo>/.proofdeploy/records).",
+    )
+    v.add_argument(
+        "--workdir",
+        default=None,
+        help="Scratch dir for bundles and snapshots (default: <repo>/.proofdeploy/work).",
+    )
+    v.add_argument(
+        "--model",
+        default=None,
+        help="Probe-author model (default: the pinned model; another value refuses, exit 3).",
     )
 
     m = sub.add_parser(
@@ -126,10 +145,124 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def cmd_verify(args: argparse.Namespace) -> int:
-    # Stages land per tickets #55 (diff reader), #57 (probe author),
-    # #58 (provisioner/runner), #59 (verdict renderer).
-    raise NotImplementedError("verify is not implemented yet (ticket #55 and on)")
+def _render_verify_output(output: dict, fmt: str) -> str:
+    """Render a verify output object in the requested format."""
+    import json
+
+    if fmt == "json":
+        return json.dumps(output, indent=2) + "\n"
+    lines = []
+    verdict = output.get("verdict")
+    if verdict is None:
+        lines.append(
+            f"proofdeploy verify: {output.get('typed_reason')} "
+            f"(exit {output.get('exit_code')})"
+        )
+    else:
+        lines.append(f"verdict: {verdict} (exit {output.get('exit_code')})")
+        if output.get("typed_reason"):
+            lines.append(f"typed reason: {output['typed_reason']}")
+        if output.get("cause"):
+            lines.append(f"cause: {output['cause']}")
+    refs = output.get("refs") or {}
+    if refs.get("from_sha") or refs.get("to_sha"):
+        lines.append(
+            f"refs: {refs.get('repo')} "
+            f"{(refs.get('from_sha') or '?')[:12]}..{(refs.get('to_sha') or '?')[:12]}"
+        )
+    probes = output.get("probes") or []
+    if probes:
+        counts: dict[str, int] = {}
+        for p in probes:
+            counts[p["verdict"]] = counts.get(p["verdict"], 0) + 1
+        summary = ", ".join(f"{n} {v}" for v, n in sorted(counts.items()))
+        lines.append(f"probes: {len(probes)} ({summary})")
+        for p in probes:
+            reason = f" ({p['reason']})" if p.get("reason") else ""
+            lines.append(f"  [{p['probe_index']}] {p['verdict']}{reason}")
+    record = output.get("evidence_record")
+    if record:
+        lines.append(
+            f"evidence record: {record['path']} (record {record['record_id']})"
+        )
+    if output.get("detail"):
+        lines.append(f"detail: {output['detail']}")
+    return "\n".join(lines) + "\n"
+
+
+def _emit_verify_output(output: dict, args: argparse.Namespace) -> None:
+    text = _render_verify_output(output, args.format)
+    if args.output:
+        from pathlib import Path
+
+        Path(args.output).write_text(text, encoding="utf-8")
+    else:
+        print(text, end="")
+
+
+def cmd_verify(
+    args: argparse.Namespace, model_runner: Any = None
+) -> int:
+    """Run one verify (plan 1.10). ``model_runner`` is the test seam:
+    the pinned model client is used when it is None."""
+    import traceback
+    from pathlib import Path
+
+    from proofdeploy import verify as verify_mod
+    from proofdeploy.model_client import MODEL_ID
+
+    fmt = args.format
+    # Stage 1 typed refusals that need no engine work (exit 3).
+    stop = None
+    if args.target_url:
+        stop = verify_mod.stop_output(
+            exit_code=verify_mod.EXIT_NOT_SUPPORTED,
+            typed_reason=verify_mod.NOT_SUPPORTED_TARGET_URL,
+        )
+    elif fmt == "html":
+        stop = verify_mod.stop_output(
+            exit_code=verify_mod.EXIT_NOT_SUPPORTED,
+            typed_reason=verify_mod.NOT_SUPPORTED_HTML,
+        )
+    elif args.model and args.model != MODEL_ID:
+        stop = verify_mod.stop_output(
+            exit_code=verify_mod.EXIT_NOT_SUPPORTED,
+            typed_reason=verify_mod.NOT_SUPPORTED_MODEL,
+        )
+    if stop is not None:
+        _emit_verify_output(stop, args)
+        return verify_mod.EXIT_NOT_SUPPORTED
+
+    repo = Path(args.repo) if args.repo else Path.cwd()
+    # The model key (when provided via env) joins the redaction pool:
+    # it never enters a prompt or a container, and no output may
+    # carry it (defense in depth, as in cmd_measure).
+    extra_secrets = [v for v in [os.environ.get("GROQ_API_KEY")] if v]
+    try:
+        output, code = verify_mod.run_verify(
+            repo_dir=repo,
+            from_ref=args.from_ref,
+            to_ref=args.to_ref,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+            workdir=Path(args.workdir) if args.workdir else None,
+            model_runner=model_runner,
+            extra_secrets=extra_secrets,
+        )
+    except Exception:
+        # Internal error (exit 5): our gap. The traceback is logged,
+        # never swallowed; the output stays machine-readable.
+        traceback.print_exc()
+        output = verify_mod.stop_output(
+            exit_code=verify_mod.EXIT_INTERNAL,
+            typed_reason=(
+                "internal error: verify failed inside ProofDeploy "
+                "(our gap); traceback logged"
+            ),
+        )
+        _emit_verify_output(output, args)
+        return verify_mod.EXIT_INTERNAL
+    _emit_verify_output(output, args)
+    return code
 
 
 def cmd_measure(args: argparse.Namespace) -> int:
@@ -203,14 +336,9 @@ def cmd_measure(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "verify":
-        try:
-            return cmd_verify(args)
-        except NotImplementedError as exc:
-            print(f"proofdeploy: {exc}", file=sys.stderr)
-            return 2
-        except Exception as exc:  # loud failures, never silent
-            print(f"proofdeploy: error: {exc}", file=sys.stderr)
-            return 2
+        # cmd_verify maps every outcome onto the registered exit
+        # codes itself (including internal errors, as exit 5).
+        return cmd_verify(args)
     if args.command == "measure":
         try:
             return cmd_measure(args)
