@@ -433,6 +433,9 @@ tests/test_runner.py::test_build_env_never_empty
 tests/test_runner.py::test_check_requirements_frozen_pinned_ok
 tests/test_runner.py::test_check_requirements_frozen_unpinned_fails
 tests/test_runner.py::test_cleanup_run_is_idempotent
+tests/test_runner.py::test_cleanup_run_logs_leftovers_when_removal_fails
+tests/test_runner.py::test_cleanup_run_plain_tree_never_touches_podman
+tests/test_runner.py::test_cleanup_run_routes_userns_remapped_tree_through_unshare
 tests/test_runner.py::test_detect_runtime_node_no_engines
 tests/test_runner.py::test_detect_runtime_node_version_from_engines
 tests/test_runner.py::test_detect_runtime_python_no_pyproject
@@ -670,6 +673,7 @@ tests/test_setup_auth.py::test_substitute_strict_known
 tests/test_setup_auth.py::test_substitute_strict_missing_capture_raises
 tests/test_setup_auth.py::test_substitute_strict_unknown_raises
 tests/test_setup_auth.py::test_token_near_expiry_unknown_is_false
+tests/test_submodules.py::test_chain_past_max_depth_is_plain_value_error_our_gap
 tests/test_submodules.py::test_extracted_tree_creates_internal_relative_symlinks_verbatim
 tests/test_submodules.py::test_extracted_tree_refuses_absolute_symlink
 tests/test_submodules.py::test_extracted_tree_refuses_escaping_symlink

@@ -30,6 +30,7 @@ from proofdeploy.fixture import SnapshotLinkError, create_snapshot
 from proofdeploy.orchestrator import _Side
 from proofdeploy.runner import ProvisionResult, ProvisionStatus
 from proofdeploy.submodules import (
+    MAX_DEPTH,
     HttpsSubmoduleTransport,
     SubmoduleFetchError,
     SubmoduleUnavailableError,
@@ -263,6 +264,65 @@ def test_nested_submodule_materializes_recursively(tmp_path: Path) -> None:
     assert (snap / "libs" / "middle" / "vendor" / "inner" / "deep.txt").read_text(
         encoding="utf-8"
     ) == "deep\n"
+
+
+def test_chain_past_max_depth_is_plain_value_error_our_gap(
+    tmp_path: Path,
+) -> None:
+    """Plan 1.2(l) / D62: a submodule chain nested past MAX_DEPTH is
+    refused with a PLAIN ValueError naming the submodule at the
+    limit — the depth limit is ProofDeploy's own, so the message
+    says "(our gap)" and must NOT be the typed family: not a
+    SubmoduleUnavailableError and no "not supported:" prefix (that
+    prefix belongs to the D46 recorded-commit-unavailable rows).
+    The chain is built bottom-up, each repo listing the next at
+    path "sub": super -> s1 -> ... -> s6 (six deep). The refusal
+    fires when the tree of s5 — nested exactly MAX_DEPTH deep —
+    lists s6."""
+    child_repo: Path | None = None
+    child_sha: str | None = None
+    for level in range(MAX_DEPTH + 1, 0, -1):
+        repo = _init_repo(tmp_path / f"chain{level}")
+        if child_repo is None or child_sha is None:
+            sha = _commit(repo, {"leaf.txt": f"level {level}\n"})
+        else:
+            gitmodules = (
+                '[submodule "sub"]\n'
+                "\tpath = sub\n"
+                f"\turl = {child_repo}\n"
+            )
+            sha = _commit(
+                repo, {f"level{level}.txt": "x\n"}, gitmodules=gitmodules,
+                gitlinks={"sub": child_sha},
+            )
+        child_repo, child_sha = repo, sha
+    assert child_repo is not None and child_sha is not None
+    repo = _init_repo(tmp_path / "super")
+    gitmodules = (
+        '[submodule "sub"]\n'
+        "\tpath = sub\n"
+        f"\turl = {child_repo}\n"
+    )
+    sha = _commit(
+        repo, {"app.py": "x\n"}, gitmodules=gitmodules,
+        gitlinks={"sub": child_sha},
+    )
+    snap = _snapshot_of(repo, sha, tmp_path / "snap")
+    with pytest.raises(ValueError) as excinfo:
+        _materialize(repo, sha, snap, tmp_path)
+    exc = excinfo.value
+    # Exactly a plain ValueError — SubmoduleUnavailableError IS a
+    # ValueError subclass, so the type check is the discriminating
+    # assertion, not the raises() above.
+    assert type(exc) is ValueError
+    assert not isinstance(exc, SubmoduleUnavailableError)
+    at_limit = "/".join(["sub"] * MAX_DEPTH)
+    assert str(exc) == (
+        f"submodule {at_limit}: its submodules nest past the depth "
+        f"limit of {MAX_DEPTH} that ProofDeploy sets for nested "
+        "submodules (our gap)"
+    )
+    assert not str(exc).startswith("not supported:")
 
 
 # --- failure typing ----------------------------------------------------
