@@ -1,0 +1,12 @@
+{
+  "name": "checkout-scan",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "bun@1.4.3",
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "dependencies": {
+    "scan-dep": "file:./scan-dep-0.1.0.tgz"
+  }
+}

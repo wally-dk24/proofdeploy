@@ -221,9 +221,9 @@ def _stub_provision_side(monkeypatch, snap: Path, install=None):
 @pytest.mark.parametrize(
     "lockfile,frozen_cmd",
     [
-        ("uv.lock", "/checkout/.pd-tools/bin/uv sync --frozen --python python3"),
-        ("poetry.lock", "/checkout/.pd-tools/bin/poetry install --sync"),
-        ("pdm.lock", "/checkout/.pd-tools/bin/pdm sync"),
+        ("uv.lock", "/pd-home/.pd-tools/bin/uv sync --frozen --python python3"),
+        ("poetry.lock", "/pd-home/.pd-tools/bin/poetry install --sync"),
+        ("pdm.lock", "/pd-home/.pd-tools/bin/pdm sync"),
     ],
 )
 def test_sandbox_provisions_manager_lockfile(

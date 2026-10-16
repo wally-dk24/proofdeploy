@@ -35,7 +35,7 @@ requirements file where every spec entry carries ``--hash`` —
 installs frozen; anything else (an ``==``-only or unpinned
 requirements file, or a bare ``pyproject.toml``) goes through lock
 GENERATION: the pinned resolver (uv 0.13.0, bootstrapped into the
-checkout's ``.pd-tools``) compiles the declared dependencies with
+per-side home's ``.pd-tools``, plan 1.2(n)) compiles the declared dependencies with
 ``--generate-hashes`` against the registered index, with
 ``--exclude-newer`` set to the unit's one cutoff (the fix commit's
 committer time for a bug pair, C's for a clean diff — supplied by
@@ -46,15 +46,17 @@ cutoff is not the registered artifact. The plan records the lock
 source (committed / generated) and, for a generated lock, the
 resolver and its version, the cutoff, and the index URL; the
 executors read the generated lock back into the evidence. The
-hashed-requirements flow is otherwise unchanged: venv in the
-checkout at ``/checkout/.venv`` (the sandbox executor renders it
-there; the host executor renders the same step at its per-run venv
-dir), ``PIP_NO_CACHE_DIR=1``, the venv first on PATH for
+hashed-requirements flow is otherwise unchanged: the app venv
+lives OUTSIDE the checkout in the per-side home (plan 1.2(n);
+the sandbox executor renders it at ``/pd-home/.venv``; the host
+executor renders the same step at its per-run venv dir),
+``PIP_NO_CACHE_DIR=1``, the venv first on PATH for
 build/migrate/seed/start, the lockfile sha256 recorded and
 verified, and seed runs. A committed ``uv.lock`` / ``poetry.lock``
 / ``pdm.lock`` plans the same way for both executors (WO-8.1b):
-the checkout venv created from the selected interpreter, the
-manager bootstrapped into ``.pd-tools`` by hash from its committed
+the app venv created from the selected interpreter in the
+per-side home, the
+manager bootstrapped into the home's ``.pd-tools`` by hash from its committed
 bootstrap file at its pinned version (uv 0.13.0, poetry 2.5.1,
 pdm 2.29.2), the tool's own lock-freshness check where its install
 command does not refuse a stale lock itself, and the frozen
@@ -86,7 +88,7 @@ carries a compatible wheel), so the case does not arise for
 them. The pip paths never install the root
 project, so they carry none of this. The executors complete the
 evidence by reading the built project's dist-info back from the
-checkout venv (``build_backend_evidence``): the backend name and
+app venv (``build_backend_evidence``): the backend name and
 version that ACTUALLY built the project, as stamped by the tool
 in the wheel's ``Generator``. The Node adapter
 plans frozen installs from the lockfile for both executors: npm ci /
@@ -146,8 +148,14 @@ DEFAULT_IMAGE_LINES = {"python": "3.12", "node": "22"}
 # Placeholder tokens in plan step argv, rendered by each executor:
 #   {runtime_bin}  the runtime executable (host: the selected binary;
 #                  sandbox: python3 in the pinned image)
-#   {venv}         the venv dir (host: per-run workdir venv; sandbox:
-#                  /checkout/.venv)
+#   {venv}         the venv dir (host: per-run workdir venv for pip,
+#                  the per-side home's .venv for the lock managers;
+#                  sandbox: /pd-home/.venv) — plan 1.2(n): the app
+#                  venv lives OUTSIDE the checkout, in the per-side
+#                  home (plan 1.2(k)'s /pd-home), never in the tree
+#   {pd_tools}     ProofDeploy's own tools dir (plan 1.2(n)): host:
+#                  the per-side home's .pd-tools; sandbox:
+#                  /pd-home/.pd-tools. Never inside the checkout.
 #   {checkout}     the checkout root (host: snapshot dir; sandbox:
 #                  /checkout)
 #   {pip_flags}    expands to the executor's pip flag list (or nothing)
@@ -367,6 +375,12 @@ class InstallPlan:
     app_path: str | None = None
     pip_require_hashes: bool = False
     steps: list[PlanStep] = field(default_factory=list)
+    # Plan 1.2(n) (D77 Q3): every entry is ROOTED — "checkout:<rel>"
+    # for state that is the app's own (node_modules) and stays in
+    # the tree, "pd_home:<rel>" for ProofDeploy's tool state and
+    # the app venv, which live in the per-side home (plan 1.2(k)),
+    # never in the checkout. Recorded plan data (it feeds sha256()
+    # above); no executor consumes it at runtime.
     persisted_dirs: list[str] = field(default_factory=list)
     refusal: str | None = None
 
@@ -757,11 +771,12 @@ GENERATED_LOCKFILE_NAME = ".pd-generated-requirements.txt"
 # alone. The committed bootstrap requirements file (kept next to
 # this module) pins uv==0.13.0 with the sha256 of its manylinux
 # x86_64 wheel; a generated plan materializes that file verbatim
-# into the checkout's .pd-tools, installs from it with
+# into the per-side home's .pd-tools (plan 1.2(n): {pd_tools}),
+# installs from it with
 # --require-hashes, and records the file's sha256 on the plan
 # (lock_resolver_bootstrap_sha256).
 UV_BOOTSTRAP_REQUIREMENTS_FILE = "uv_bootstrap_requirements.txt"
-UV_BOOTSTRAP_CHECKOUT_PATH = ".pd-tools/uv-requirements.txt"
+UV_BOOTSTRAP_PD_TOOLS_PATH = "uv-requirements.txt"
 
 # Writes argv[1]'s file with argv[2]'s exact bytes: a plan step
 # ([python, -c, THIS, <path>, <content>]) that materializes a
@@ -801,25 +816,25 @@ POETRY_VERSION = "2.5.1"
 PDM_VERSION = "2.29.2"
 POETRY_BOOTSTRAP_REQUIREMENTS_FILE = "poetry_bootstrap_requirements.txt"
 PDM_BOOTSTRAP_REQUIREMENTS_FILE = "pdm_bootstrap_requirements.txt"
-POETRY_BOOTSTRAP_CHECKOUT_PATH = ".pd-tools/poetry-requirements.txt"
-PDM_BOOTSTRAP_CHECKOUT_PATH = ".pd-tools/pdm-requirements.txt"
+POETRY_BOOTSTRAP_PD_TOOLS_PATH = "poetry-requirements.txt"
+PDM_BOOTSTRAP_PD_TOOLS_PATH = "pdm-requirements.txt"
 
 _LOCK_MANAGERS: dict[str, tuple[str, str, str]] = {
-    # manager -> (bootstrap file, its path inside the checkout,
+    # manager -> (bootstrap file, its path inside {pd_tools},
     #             pinned version)
     "uv": (
         UV_BOOTSTRAP_REQUIREMENTS_FILE,
-        UV_BOOTSTRAP_CHECKOUT_PATH,
+        UV_BOOTSTRAP_PD_TOOLS_PATH,
         UV_VERSION,
     ),
     "poetry": (
         POETRY_BOOTSTRAP_REQUIREMENTS_FILE,
-        POETRY_BOOTSTRAP_CHECKOUT_PATH,
+        POETRY_BOOTSTRAP_PD_TOOLS_PATH,
         POETRY_VERSION,
     ),
     "pdm": (
         PDM_BOOTSTRAP_REQUIREMENTS_FILE,
-        PDM_BOOTSTRAP_CHECKOUT_PATH,
+        PDM_BOOTSTRAP_PD_TOOLS_PATH,
         PDM_VERSION,
     ),
 }
@@ -1138,14 +1153,20 @@ def _parse_wheel_generator(text: str) -> tuple[str, str] | None:
 
 
 def build_backend_evidence(
-    plan: InstallPlan, checkout_dir: Path
+    plan: InstallPlan,
+    checkout_dir: Path,
+    venv_dir: Path | None = None,
 ) -> dict[str, str] | None:
     """WO-8.1c executor evidence: the build backend that
     ACTUALLY built the root project for this plan, as
     {"name": ..., "version": ...} — read back from the built
-    project's dist-info WHEEL in the checkout's .venv (its
+    project's dist-info WHEEL in the app venv (its
     Generator line is stamped by the tool that ran the build,
-    at the version it resolved). Falls back to the plan's own
+    at the version it resolved). ``venv_dir`` is the venv the
+    executor's plan rendering targeted (plan 1.2(n): the
+    per-side home's .venv, outside the checkout); it defaults
+    to the historical in-checkout location for callers that
+    built one there. Falls back to the plan's own
     pinned fact when no build artifact exists but the plan
     determines the backend (poetry: no root build happens for a
     package-mode = false project, yet the backend that WOULD
@@ -1155,12 +1176,14 @@ def build_backend_evidence(
     affects the provision's outcome."""
     if plan.build_backend is None:
         return None
+    if venv_dir is None:
+        venv_dir = checkout_dir / ".venv"
     found: tuple[str, str] | None = None
     try:
         project = _project_name_declared(checkout_dir / "pyproject.toml")
         if project:
             want = re.sub(r"[-_.]+", "_", project).lower()
-            venv_lib = checkout_dir / ".venv" / "lib"
+            venv_lib = venv_dir / "lib"
             for site_packages in sorted(
                 venv_lib.glob("python*/site-packages")
             ):
@@ -1192,19 +1215,20 @@ def build_backend_evidence(
 
 
 def _manager_bootstrap_steps(manager: str) -> list[PlanStep]:
-    """Bootstrap a pinned lock manager into the checkout's
-    .pd-tools, BY HASH from its committed bootstrap requirements
+    """Bootstrap a pinned lock manager into the per-side home's
+    .pd-tools ({pd_tools}, plan 1.2(n)), BY HASH from its committed
+    bootstrap requirements
     file (the Addendum 46 resolver pattern, generalized): a tools
     venv, the file materialized verbatim into it, then a
     hash-checking binaries-only install. A wrong or substituted
     wheel fails the install step. The binary lands at
-    {checkout}/.pd-tools/bin/<manager> on every executor."""
-    file_name, checkout_path, _version = _LOCK_MANAGERS[manager]
+    {pd_tools}/bin/<manager> on every executor."""
+    file_name, pd_tools_path, _version = _LOCK_MANAGERS[manager]
     bootstrap_text, _sha256 = _bootstrap_requirements(file_name)
     return [
         PlanStep(
             phase="install",
-            argv=["{runtime_bin}", "-m", "venv", "{checkout}/.pd-tools"],
+            argv=["{runtime_bin}", "-m", "venv", "{pd_tools}"],
         ),
         PlanStep(
             phase="install",
@@ -1212,21 +1236,21 @@ def _manager_bootstrap_steps(manager: str) -> list[PlanStep]:
                 "{runtime_bin}",
                 "-c",
                 _WRITE_FILE_CODE,
-                f"{{checkout}}/{checkout_path}",
+                f"{{pd_tools}}/{pd_tools_path}",
                 bootstrap_text,
             ],
         ),
         PlanStep(
             phase="install",
             argv=[
-                "{checkout}/.pd-tools/bin/pip",
+                "{pd_tools}/bin/pip",
                 "install",
                 "--require-hashes",
                 "--no-deps",
                 "--only-binary",
                 ":all:",
                 "-r",
-                f"{{checkout}}/{checkout_path}",
+                f"{{pd_tools}}/{pd_tools_path}",
             ],
         ),
     ]
@@ -1262,7 +1286,7 @@ def _manager_frozen_steps(
     isolation; the lock's own files install regardless (both
     verified against uv 0.13.0, 2026-10-13).
     """
-    mgr_bin = f"{{checkout}}/.pd-tools/bin/{manager}"
+    mgr_bin = f"{{pd_tools}}/bin/{manager}"
     if manager == "uv":
         sync_env = {"UV_PROJECT_ENVIRONMENT": "{venv}"}
         if build_cutoff is not None:
@@ -1282,8 +1306,9 @@ def _manager_frozen_steps(
                     "--python",
                     "{runtime_bin}",
                 ],
-                # The venv is the checkout's .venv (created by the
-                # plan's venv step), named explicitly so the
+                # The venv is the per-side home's .venv (created
+                # by the plan's venv step, plan 1.2(n)), named
+                # explicitly so the
                 # install target cannot drift with the tool's
                 # project discovery.
                 env=sync_env,
@@ -1294,18 +1319,37 @@ def _manager_frozen_steps(
             PlanStep(
                 phase="install",
                 argv=[mgr_bin, "install", "--sync"],
-                # In-project venvs: the plan's venv step has
-                # already created {checkout}/.venv from the
-                # selected interpreter, and poetry adopts an
-                # existing in-project .venv; the env var states
-                # the same intent in poetry's own configuration.
-                env={"POETRY_VIRTUALENVS_IN_PROJECT": "true"},
+                # Plan 1.2(n) (D77 Q2): the app venv lives OUTSIDE
+                # the project, in the per-side home; poetry is
+                # pointed at it through the ACTIVATED environment:
+                # VIRTUAL_ENV names the plan's venv (created by the
+                # venv step from the selected interpreter), and
+                # in-project creation is disabled in poetry's own
+                # configuration. Verified against the pinned
+                # poetry 2.5.1 (2026-10-16): the dependencies and
+                # the project land in {venv}; no in-project .venv
+                # is created.
+                env={
+                    "POETRY_VIRTUALENVS_IN_PROJECT": "false",
+                    "VIRTUAL_ENV": "{venv}",
+                },
             ),
         ]
     if manager == "pdm":
         return [
             PlanStep(phase="install", argv=[mgr_bin, "lock", "--check"]),
-            PlanStep(phase="install", argv=[mgr_bin, "sync"]),
+            PlanStep(
+                phase="install",
+                argv=[mgr_bin, "sync"],
+                # Plan 1.2(n) (D77 Q2): as poetry — the plan's
+                # out-of-project venv, used through the activated
+                # environment. Verified against the pinned pdm
+                # 2.29.2 (2026-10-16): pdm reports "Inside an
+                # active virtualenv <{venv}>, reusing it", the
+                # dependencies and the project land in {venv},
+                # and no in-project .venv is created.
+                env={"VIRTUAL_ENV": "{venv}"},
+            ),
         ]
     raise ValueError(f"unsupported lock manager: {manager}")
 
@@ -1317,8 +1361,10 @@ class PythonAdapter:
     by the pinned uv at the unit's cutoff, then installed frozen.
 
     A committed manager lock (uv/poetry/pdm) plans its full frozen
-    install (WO-8.1b): checkout venv from the selected interpreter,
-    the pinned manager bootstrapped by hash into .pd-tools, the
+    install (WO-8.1b): the app venv from the selected interpreter
+    in the per-side home (plan 1.2(n)),
+    the pinned manager bootstrapped by hash into the home's
+    .pd-tools, the
     freshness check where the tool needs one, the frozen install.
     """
 
@@ -1363,10 +1409,12 @@ class PythonAdapter:
             # WO-8.1b: a committed uv.lock / poetry.lock / pdm.lock
             # installs frozen IN BOTH EXECUTORS. The plan carries
             # the whole mechanism (never a bare manager binary off
-            # PATH): the checkout venv created from the selected
-            # interpreter (uv is pointed at it, poetry and pdm
-            # adopt an existing in-project .venv), the manager
-            # bootstrapped into .pd-tools BY HASH from its
+            # PATH): the app venv created from the selected
+            # interpreter in the per-side home (plan 1.2(n); uv is
+            # pointed at it, poetry and pdm use it through the
+            # activated environment — D77 Q2), the manager
+            # bootstrapped into the home's .pd-tools BY HASH from
+            # its
             # committed bootstrap file at its pinned version, the
             # freshness check where the tool's install command
             # does not refuse a stale lock itself, the frozen
@@ -1396,7 +1444,7 @@ class PythonAdapter:
                 PlanStep(
                     phase="verify",
                     argv=[
-                        "/checkout/.venv/bin/python",
+                        "{venv}/bin/python",
                         "-c",
                         "import sys; print(sys.prefix)",
                     ],
@@ -1421,7 +1469,7 @@ class PythonAdapter:
                 build_cutoff=build["build_cutoff"],
                 build_limitations=build["build_limitations"],
                 steps=steps,
-                persisted_dirs=[".venv", ".pd-tools"],
+                persisted_dirs=["pd_home:.venv", "pd_home:.pd-tools"],
             )
         if found is not None and check_requirements_frozen(
             snapshot_dir / "requirements.txt"
@@ -1452,7 +1500,7 @@ class PythonAdapter:
                 PlanStep(
                     phase="verify",
                     argv=[
-                        "/checkout/.venv/bin/python",
+                        "{venv}/bin/python",
                         "-c",
                         "import sys; print(sys.prefix)",
                     ],
@@ -1471,7 +1519,7 @@ class PythonAdapter:
                 package_manager="pip",
                 pip_require_hashes="--hash" in req_text,
                 steps=steps,
-                persisted_dirs=[".venv"],
+                persisted_dirs=["pd_home:.venv"],
             )
         # REG-A item 2: no complete lock — GENERATE one. The declared
         # source is the requirements file when one is present (its
@@ -1529,14 +1577,15 @@ class PythonAdapter:
         python_version = (
             image["selected_version"] or DEFAULT_IMAGE_LINES["python"]
         )
-        uv_bin = "{checkout}/.pd-tools/bin/uv"
+        uv_bin = "{pd_tools}/bin/uv"
         steps = [
             PlanStep(
                 phase="venv",
                 argv=["{runtime_bin}", "-m", "venv", "{venv}"],
             ),
-            # The pinned resolver, bootstrapped into the checkout's
-            # .pd-tools (persisted across the sandbox's per-step
+            # The pinned resolver, bootstrapped into the per-side
+            # home's .pd-tools (persisted across the sandbox's
+            # per-step
             # containers — the corepack pattern, Addendum 35; never
             # a global install). A dedicated venv keeps the layout
             # identical on every pip: <prefix>/bin/uv.
@@ -1544,13 +1593,14 @@ class PythonAdapter:
                 phase="install",
                 argv=[
                     "{runtime_bin}", "-m", "venv",
-                    "{checkout}/.pd-tools",
+                    "{pd_tools}",
                 ],
             ),
             # Addendum 46: the resolver is installed BY HASH from
             # the committed bootstrap requirements file. The file
-            # is materialized verbatim into .pd-tools first (the
-            # install container mounts only the checkout), then
+            # is materialized verbatim into {pd_tools} first (the
+            # install container mounts only the checkout and the
+            # per-side home), then
             # installed in hash-checking mode, binaries only: a
             # wrong or substituted wheel fails this step.
             PlanStep(
@@ -1559,21 +1609,21 @@ class PythonAdapter:
                     "{runtime_bin}",
                     "-c",
                     _WRITE_FILE_CODE,
-                    f"{{checkout}}/{UV_BOOTSTRAP_CHECKOUT_PATH}",
+                    f"{{pd_tools}}/{UV_BOOTSTRAP_PD_TOOLS_PATH}",
                     bootstrap_text,
                 ],
             ),
             PlanStep(
                 phase="install",
                 argv=[
-                    "{checkout}/.pd-tools/bin/pip",
+                    "{pd_tools}/bin/pip",
                     "install",
                     "--require-hashes",
                     "--no-deps",
                     "--only-binary",
                     ":all:",
                     "-r",
-                    f"{{checkout}}/{UV_BOOTSTRAP_CHECKOUT_PATH}",
+                    f"{{pd_tools}}/{UV_BOOTSTRAP_PD_TOOLS_PATH}",
                 ],
             ),
             # REG-A item 2: resolve the declared dependencies with
@@ -1624,7 +1674,7 @@ class PythonAdapter:
             PlanStep(
                 phase="verify",
                 argv=[
-                    "/checkout/.venv/bin/python",
+                    "{venv}/bin/python",
                     "-c",
                     "import sys; print(sys.prefix)",
                 ],
@@ -1638,7 +1688,7 @@ class PythonAdapter:
             package_manager="pip",
             pip_require_hashes=True,
             steps=steps,
-            persisted_dirs=[".venv", ".pd-tools"],
+            persisted_dirs=["pd_home:.venv", "pd_home:.pd-tools"],
         )
 
     def plan_workspace(
@@ -1669,14 +1719,16 @@ class PythonAdapter:
 
 
 # The pinned corepack a packageManager-pinned Node plan bootstraps
-# into the checkout's .pd-tools (Addendum 35). Persisted form on
+# into the per-side home's .pd-tools ({pd_tools}, plan 1.2(n);
+# Addendum 35). Persisted form on
 # every row: each sandbox step is its own --rm container and only
-# the checkout survives between steps, so a global (-g) install
+# the checkout and the per-side home survive between steps, so a
+# global (-g) install
 # would die with the install container — and corepack is not even
 # bundled from Node 25 onward (verified against the pinned
 # node:26.11.1 image: `corepack: command not found`).
 COREPACK_BOOTSTRAP_VERSION = "0.36.0"
-COREPACK_BIN = "{checkout}/.pd-tools/node_modules/.bin/corepack"
+COREPACK_BIN = "{pd_tools}/node_modules/.bin/corepack"
 
 # Addendum 37: every Node install step renders with this env. The
 # official Node images ship the exact runtime's headers in
@@ -1695,7 +1747,7 @@ NODE_INSTALL_ENV = {"npm_config_nodedir": "/usr/local"}
 # -> (release artifact, sha256 of that artifact) — resolved from
 # the release's own SHASUMS256.txt and verified against the
 # downloaded artifacts when the rows were added (ADR-0014). The
-# bootstrap step downloads the artifact into the checkout's
+# bootstrap step downloads the artifact into the per-side home's
 # .pd-tools, verifies the sha256 before unpacking, and installs
 # the binary at BUN_BIN: the Addendum 35 persisted-tools pattern,
 # like the corepack bootstrap above and the Python managers'
@@ -1749,7 +1801,7 @@ BUN_RELEASE_SHA256: dict[str, dict[str, tuple[str, str]]] = {
 # field does not pin one: the newest row of the pin table. The
 # selected version is recorded on the plan either way (D22).
 BUN_DEFAULT_VERSION = "1.4.3"
-BUN_BIN = "{checkout}/.pd-tools/bin/bun"
+BUN_BIN = "{pd_tools}/bin/bun"
 _BUN_RELEASE_URL = (
     "https://github.com/oven-sh/bun/releases/download/"
     "bun-v{version}/{artifact}"
@@ -1762,7 +1814,7 @@ def _bun_bootstrap_step(
     """The persisted bun bootstrap (plan 1.2e): one ``bash -c``
     argv step (the shape of the Python managers' ``-c`` code
     steps) that downloads the pinned release zip into the
-    checkout's .pd-tools, verifies its sha256 against the
+    per-side home's .pd-tools ({pd_tools}), verifies its sha256 against the
     committed pin, and unpacks the binary to BUN_BIN. Any failure
     (download, digest mismatch, unpack) fails the step: the
     frozen install never runs against an unverified bun.
@@ -1776,7 +1828,7 @@ def _bun_bootstrap_step(
     bindir = artifact.removesuffix(".zip")
     script = (
         "set -e; "
-        "d={checkout}/.pd-tools; "
+        "d={pd_tools}; "
         "mkdir -p $d/bin $d/.bun-dist; "
         'cacert=""; '
         'if [ -n "${SSL_CERT_FILE:-}" ] && [ -f "$SSL_CERT_FILE" ]; '
@@ -1807,7 +1859,7 @@ class NodeAdapter:
       (berry), via runner.select_package_manager.
     - ``bun.lock`` -> ``bun install --frozen-lockfile`` (plan
       1.2e, D22), run by a bun binary the plan itself bootstraps
-      into the checkout's .pd-tools, pinned BY DIGEST
+      into the per-side home's .pd-tools, pinned BY DIGEST
       (BUN_RELEASE_SHA256): the version comes from the app's
       ``packageManager`` pin when declared, else the pin table's
       default, and the selected version + artifact digest are
@@ -2058,7 +2110,7 @@ class NodeAdapter:
         if manager == "bun":
             # Plan 1.2e (D22): bun is not on the pinned Node image
             # and is not corepack-distributed, so the plan
-            # bootstraps it into the checkout's .pd-tools, pinned
+            # bootstraps it into the per-side home's .pd-tools, pinned
             # by digest. The version aligns to the app: its own
             # packageManager pin when declared, else the pin
             # table's default. No digest pin for the selected
@@ -2118,7 +2170,8 @@ class NodeAdapter:
         if pinned:
             # Addendum 35: the bootstrap is part of the pinned
             # rendering on EVERY row, in persisted form — corepack
-            # is installed into the checkout's .pd-tools (which
+            # is installed into the per-side home's .pd-tools
+            # ({pd_tools}, plan 1.2(n); which
             # persists across the per-step --rm containers), never
             # -g. COREPACK_HOME rides on HOME (the sandbox's
             # per-side /pd-home since plan 1.2(k); the host's own
@@ -2130,7 +2183,7 @@ class NodeAdapter:
                     phase="install",
                     argv=[
                         "npm", "install", "--prefix",
-                        "{checkout}/.pd-tools",
+                        "{pd_tools}",
                         "--no-save", "--no-audit", "--no-fund",
                         f"corepack@{COREPACK_BOOTSTRAP_VERSION}",
                     ],
@@ -2139,7 +2192,8 @@ class NodeAdapter:
             )
         if bun_bootstrap is not None:
             # Plan 1.2e: the digest-pinned bun bootstrap precedes
-            # the frozen install, in persisted (.pd-tools) form,
+            # the frozen install, in persisted (pd_home:.pd-tools)
+            # form,
             # exactly like the corepack bootstrap above.
             steps.append(bun_bootstrap)
         steps.append(PlanStep(phase="install", argv=argv, env=step_env))
@@ -2175,14 +2229,14 @@ class NodeAdapter:
                         ),
                     )
         steps.extend(contract_steps)
-        persisted = ["node_modules"]
+        persisted = ["checkout:node_modules"]
         if step_cwd is not None:
             # The member's own node_modules (pnpm links the
             # member's dependencies there) persists alongside the
             # root's.
-            persisted.append(f"{step_cwd}/node_modules")
+            persisted.append(f"checkout:{step_cwd}/node_modules")
         if corepack_version or bun_bootstrap is not None:
-            persisted.append(".pd-tools")
+            persisted.append("pd_home:.pd-tools")
         return InstallPlan(
             **base,
             lockfile_name=lockfile_name,

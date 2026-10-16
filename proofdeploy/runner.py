@@ -1599,8 +1599,9 @@ class Provisioner:
         # (workdir/venvs/<run_id>): one venv per provision call, never
         # reused across runs, so fix^ and fix cannot share installed
         # packages (finding 5). The sandbox executor renders the same
-        # step at /checkout/.venv.
+        # step at /pd-home/.venv (plan 1.2(n)).
         from proofdeploy.provisioning import pip_flags, render_argv
+        from proofdeploy.sandbox import sandbox_home_dir
 
         venv_bin: str | None = None
         venv_dir: Path | None = None
@@ -1631,17 +1632,22 @@ class Provisioner:
             venv_bin = str(venv_dir / "bin")
             logs.append(f"venv: {venv_dir} (bin first on PATH)")
         elif package_manager in ("uv", "poetry", "pdm"):
-            # WO-8.1b: the manager installs into the CHECKOUT venv
-            # (snap/.venv) — the venv the plan's steps target
-            # ({venv} renders to it below). It is created here,
+            # WO-8.1b: the manager installs into the app venv —
+            # the venv the plan's steps target ({venv} renders to
+            # it below). Plan 1.2(n): that venv lives OUTSIDE the
+            # checkout, in the snapshot's per-side home sibling
+            # (sandbox_home_dir — the same directory the sandbox
+            # mounts at /pd-home). It is created here,
             # from the selected runtime: uv is pointed at it by
             # the plan (UV_PROJECT_ENVIRONMENT + --python), poetry
-            # and pdm adopt an existing in-project .venv. From here
+            # and pdm use it through the activated environment the
+            # plan's step env declares (VIRTUAL_ENV, D77 Q2). From
+            # here
             # on it is treated exactly like the pip venv: its bin
             # goes first on PATH for install/build/migrate/seed/
             # start, so the app and the contract steps run against
             # the manager-installed environment.
-            venv_dir = snap / ".venv"
+            venv_dir = sandbox_home_dir(snap) / ".venv"
             ok, venv_reason = _run_step(
                 [runtime_bin, "-m", "venv", str(venv_dir)],
                 snap,
@@ -1667,7 +1673,8 @@ class Provisioner:
             and package_manager in ("pnpm", "yarn")
         ):
             # Plan 1.2(f): a corepack-pinned plan bootstraps corepack
-            # into the checkout's .pd-tools (persisted); the corepack
+            # into the per-side home's .pd-tools (persisted, plan
+            # 1.2(n)); the corepack
             # package's own bin dir carries the manager shims
             # (pnpm/pnpx/yarn/yarnpkg), which resolve the snapshot's
             # packageManager pin — so contract steps (and the start)
@@ -1675,7 +1682,9 @@ class Provisioner:
             # version, never a PATH fallback. The manager's bin goes
             # first on PATH — the host rendering of the sandbox's
             # corepack PATH treatment.
-            manager_bin = str(snap / ".pd-tools" / "node_modules" / ".bin")
+            manager_bin = str(
+                sandbox_home_dir(snap) / ".pd-tools" / "node_modules" / ".bin"
+            )
             first_on_path = (
                 manager_bin + os.pathsep + first_on_path
                 if first_on_path
@@ -1683,11 +1692,11 @@ class Provisioner:
             )
         if package_manager == "bun":
             # Plan 1.2e: the plan's bootstrapped bun lives in the
-            # checkout's .pd-tools/bin; an app's own contract steps
+            # per-side home's .pd-tools/bin; an app's own contract steps
             # may call `bun` (its build/start), so that dir goes
             # first on PATH for every step — the host rendering of
             # the sandbox's bun PATH treatment.
-            bun_bin = str(snap / ".pd-tools" / "bin")
+            bun_bin = str(sandbox_home_dir(snap) / ".pd-tools" / "bin")
             first_on_path = (
                 bun_bin + os.pathsep + first_on_path
                 if first_on_path
@@ -1715,14 +1724,18 @@ class Provisioner:
 
         # Render the plan's install steps for this executor. pip's
         # argv is a template (venv/checkout/flags placeholders);
-        # other managers' argv may carry {checkout} (the persisted
-        # corepack paths), {venv} (WO-8.1b: the checkout venv the
+        # other managers' argv may carry {pd_tools} (the persisted
+        # corepack / manager paths), {venv} (WO-8.1b: the app venv
+        # the
         # lock managers install into) and {runtime_bin}, rendered
         # the same way — as are the steps' env values (e.g. the uv
         # plan's UV_PROJECT_ENVIRONMENT={venv}).
         step_mapping: dict[str, str] = {
             "{runtime_bin}": runtime_bin,
             "{checkout}": str(snap),
+            # Plan 1.2(n): ProofDeploy's tools live in the per-side
+            # home sibling, never in the checkout.
+            "{pd_tools}": str(sandbox_home_dir(snap) / ".pd-tools"),
         }
         if venv_dir is not None:
             step_mapping["{venv}"] = str(venv_dir)
@@ -1744,6 +1757,9 @@ class Provisioner:
                     "{runtime_bin}": runtime_bin,
                     "{venv}": str(venv_dir),
                     "{checkout}": str(snap),
+                    "{pd_tools}": str(
+                        sandbox_home_dir(snap) / ".pd-tools"
+                    ),
                 },
                 pip_flags(plan, sandbox=False),
             )
@@ -1755,7 +1771,7 @@ class Provisioner:
         # Tools that choose their own Python use the selected one
         # BY PLAN (WO-8.1b): the uv plan's install step carries
         # --python {runtime_bin} itself, and the poetry/pdm plans
-        # install into the checkout venv created above from the
+        # install into the app venv created above from the
         # selected runtime. (Pre-WO-8.1b the host executor appended
         # --python for uv and ran a bare `poetry env use` with a
         # system poetry here — the sandbox could do neither, which
@@ -1763,10 +1779,11 @@ class Provisioner:
 
         # 7. Install (frozen). Python pip installs into the per-run
         # venv, never the host environment; the WO-8.1b managers
-        # install into the checkout venv. The plan step's own env
+        # install into the per-side home's venv. The plan step's own env
         # rides along (e.g. COREPACK_ENABLE_DOWNLOAD_PROMPT=0 for a
         # packageManager-pinned Node install). Bootstrap steps
-        # (the persisted corepack install; WO-8.1b: the .pd-tools
+        # (the persisted corepack install; WO-8.1b: the home's
+        # .pd-tools
         # manager bootstrap and the lock-freshness check) run
         # first, in plan order. A failed step's reason carries the
         # step output's first error line when it has one — the
@@ -1871,10 +1888,11 @@ class Provisioner:
         # WO-8.1c: a committed manager's install built the root
         # project; read the backend that actually built it back
         # for the evidence (the built wheel's Generator, stamped
-        # in the checkout venv the managers install into). Never
+        # in the app venv the managers install into — the per-side
+        # home's .venv, plan 1.2(n)). Never
         # affects the outcome — evidence only.
         if plan.build_backend is not None:
-            build_backend_ev = build_backend_evidence(plan, snap)
+            build_backend_ev = build_backend_evidence(plan, snap, venv_dir)
             if build_backend_ev is not None:
                 logs.append(
                     f"build backend: {build_backend_ev['name']} "

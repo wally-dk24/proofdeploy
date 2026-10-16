@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "checkout-scan",
+      "dependencies": {
+        "scan-dep": "file:./scan-dep-0.1.0.tgz",
+      },
+    },
+  },
+  "packages": {
+    "scan-dep": ["scan-dep@./scan-dep-0.1.0.tgz", {}, "sha512-pv1j3iJnUSDb7I5gOGlIrWuq8U4wFH5IXf3lwh1LZnIFBn2bMuJT9qwuHYlAKmNmn8hAj1mUEOaKrIkMyUzX3A=="],
+  }
+}

@@ -8,7 +8,7 @@ app whose only dependency is six==1.17.0, with a lock generated
 by the REAL pinned manager (uv 0.13.0, poetry 2.5.1, pdm 2.29.2)
 at fixture-creation time. The provision runs the plan end to end
 in the sandbox install container: checkout venv, the manager
-bootstrapped into /checkout/.pd-tools BY HASH from its committed
+bootstrapped into /pd-home/.pd-tools BY HASH from its committed
 bootstrap requirements file, the freshness check (uv/pdm), the
 frozen install into /checkout/.venv, then the app on the venv.
 
@@ -118,7 +118,7 @@ def test_manager_lock_variant_ready_in_sandbox(tmp_path, manager):
             s["exit_code"] == 0 for s in installs
         ), installs
         frozen = installs[-1]["argv_rendered"]
-        assert frozen[0] == f"/checkout/.pd-tools/bin/{manager}"
+        assert frozen[0] == f"/pd-home/.pd-tools/bin/{manager}"
         for token in FROZEN_TOKENS[manager]:
             assert token in frozen, frozen
         # The bootstrap install was hash-checked.
