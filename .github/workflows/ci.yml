@@ -354,7 +354,7 @@ jobs:
         if: steps.gate.outputs.proceed == 'true'
       - name: Download shard coverage data
         # actions/download-artifact v4
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         if: steps.gate.outputs.proceed == 'true'
         with:
           pattern: coverage-host-*
