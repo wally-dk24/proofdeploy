@@ -22,7 +22,7 @@ auth:
   path: /admin-api
   method: POST
   body:
-    query: 'mutation { login(username: \"superadmin\", password: \"superadmin\") { ... on CurrentUser { id identifier } } }'
+    query: 'mutation { login(username: "superadmin", password: "superadmin") { ... on CurrentUser { id identifier } } }'
   token_header: vendure-auth-token
 fixture:
   repo_name: "Vendure"

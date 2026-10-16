@@ -583,6 +583,22 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
             assert "auth" not in data, path.name
 
 
+def test_vendure_login_query_loads_with_plain_quotes() -> None:
+    # PR #133 (reviewer): the committed Vendure login query sits in a
+    # YAML single-quoted string, which does not process backslash
+    # escapes — a \" in the source would load as a literal backslash,
+    # the GraphQL parser rejects it ("Unexpected character: '\'"),
+    # and every Vendure login would fail. Pin the LOADED string
+    # character-for-character so the quoting cannot regress.
+    contract = load_contract(rp.CONTRACTS_DIR / "vendure-ecommerce__vendure.yml")
+    query = contract.auth["body"]["query"]
+    assert "\\" not in query
+    assert query == (
+        'mutation { login(username: "superadmin", password: "superadmin") '
+        "{ ... on CurrentUser { id identifier } } }"
+    )
+
+
 # --- the real-git path -------------------------------------------------
 #
 # The run-38575200339 failure (cutoff resolved before any fetch, in a
