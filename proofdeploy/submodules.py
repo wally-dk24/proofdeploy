@@ -70,9 +70,9 @@ Failure typing (classes per the reviewer's R4 ruling, D48/D50):
   refusal: a plain ``ValueError`` (fixture.py:359) or the
   ``SnapshotLinkError`` itself (fixture.py:157) — NEITHER
   carries the ``not supported:`` prefix;
-* a tree over the size cap is OUR gap — the cap is our limit —
-  and raises a plain ``ValueError`` whose message says so
-  (``(our gap)``), never ``not supported:``;
+* a tree over the size cap, or nesting past the depth limit,
+  is OUR gap — both limits are ours — and raises a plain
+  ``ValueError`` saying so (``(our gap)``), never ``not supported:``;
 * a relative URL whose superproject origin is missing or not an
   https URL (scp-style, a local path) is harness or environment
   — the origin is this checkout's configuration, not the
@@ -684,10 +684,15 @@ def materialize_snapshot_submodules(
         if depth >= MAX_DEPTH:
             # This level's tree is a submodule nested MAX_DEPTH
             # deep; ITS listed gitlinks would nest one level more.
+            # The depth limit is OUR limit, so this is our gap
+            # (D62, applying D48 R1/R3): a plain ValueError whose
+            # message says so — it must NOT start with
+            # "not supported:" (that prefix, via _typed, belongs
+            # to the D46 recorded-commit-unavailable family).
             assert via is not None  # only a parent submodule recurses
-            raise _typed(
-                via[0], via[1], via[2],
-                f"nested submodules exceed the depth limit of {MAX_DEPTH}",
+            raise ValueError(
+                f"submodule {via[0]}: its submodules nest past the depth limit of "
+                f"{MAX_DEPTH} that ProofDeploy sets for nested submodules (our gap)"
             )
         for entry in entries:
             rel_path = entry["path"]

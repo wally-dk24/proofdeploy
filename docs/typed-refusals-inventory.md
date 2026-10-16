@@ -159,8 +159,9 @@ rulings shape the table:
   carries the `not supported:` prefix**, so neither is
   mechanically terminal today: the side is retried and H5 must
   judge it by its string;
-- a tree over the size cap is **our gap** (the cap is our
-  limit); its string must not start with `not supported:`;
+- a tree over the size cap, and submodule nesting past the
+  depth limit, are **our gap** (both limits are ours); their
+  strings must not start with `not supported:`;
 - a relative URL whose superproject origin is missing or
   scp-style, and transient fetch failures, are **harness or
   environment** (`SubmoduleFetchError`, a `RuntimeError` — the
@@ -173,7 +174,7 @@ rulings shape the table:
 | 64 | detail: `the remote did not serve the recorded commit` (the fetch reported success but the object did not arrive) | submodules.py:243 | **not supported** (D46/R4). |
 | 65 | detail: `submodule URL is not a clean https URL: {url!r}` — the R1 pre-fetch validation: after resolution the URL must match `^https://` with no whitespace or control characters and no leading `-`, refused before any git process runs (the fetch layer's own message is `not supported: submodule URL refused before fetch: {url!r}`) | submodules.py:281 | **not supported** — non-https by the protocol rules (R1/R4). |
 | 66 | detail: `recorded commit is not a 40-character lowercase hex SHA: {sha!r}` — the R1 pre-fetch validation of the recorded SHA, likewise before any git process runs (fetch layer's own message: `not supported: submodule commit refused before fetch: {sha!r}`) | submodules.py:286 | **not supported** (R1/R4). |
-| 67 | detail: `nested submodules exceed the depth limit of {MAX_DEPTH}` (MAX_DEPTH = 5) | submodules.py:692 | **not supported** — carries the prefix via #62. ⚠ Flagged for the reviewer: carried unchanged from the accepted build; the R4 ruling does not name this string. |
+| 67 | `submodule {path}: its submodules nest past the depth limit of {MAX_DEPTH} that ProofDeploy sets for nested submodules (our gap)` (MAX_DEPTH = 5; {path} is the parent submodule whose listed gitlinks would nest one level past the limit) | submodules.py:693 | **our gap** — the depth limit is our limit (D62, applying D48 R1/R3); plain `ValueError` in the #77 style, no `not supported:` prefix. One of the two strings flagged at the R4 round: D62 rules this one our gap and leaves the other (#68) not supported (D46). |
 | 68 | `not supported: submodule {path} at {sha} unavailable from (no url in .gitmodules): submodule has no url in .gitmodules` (a listed gitlink whose `.gitmodules` entry has no URL) | submodules.py:702 | **not supported** — carries the prefix via #62. ⚠ Flagged for the reviewer: carried unchanged from the accepted build; the R4 ruling does not name this string. |
 | 69 | `submodule path does not normalize inside the checkout: {path!r}` (absolute path or a `..` component in a `.gitmodules` path, paired with a gitlink or not) | submodules.py:402 / 419 | **ADR 0012 plain `ValueError`** — the class `create_snapshot` gives the same refusal (fixture.py:359). No `not supported:` prefix (R4). |
 | 70 | `submodule path does not name a directory: {path!r}` | submodules.py:425 | **ADR 0012 plain `ValueError`** (as #69). |
@@ -325,8 +326,8 @@ byte-identical.
 | 61 | harness or environment |
 
 **Submodule rows (§7, PR #109) — ruled in R4 of the #109
-changes round (reviewer, relay 2026-10-15T2215Z):** #62–#68
-are the D46 not-supported family. #69–#76 are ruled by R4 to
+changes round (reviewer, relay 2026-10-15T2215Z):** #62–#66
+and #68 are the D46 not-supported family. #69–#76 are ruled by R4 to
 the ADR 0012 class `create_snapshot` already gives (a plain
 `ValueError` / the `SnapshotLinkError` itself, §7) — a class
 outside the three above; they are entered here as **harness
@@ -334,6 +335,12 @@ or environment** per R2's default (the mechanical treatment
 they share: retried, never skipped, never terminal), with §7
 carrying the class in force. The reviewer to confirm the
 mapping at the #109 review. #77 is the R3/R4 our-gap row.
+**D62 (reviewer, 2026-10-15):** #67 moves from the D46
+family to **our gap** — MAX_DEPTH is ProofDeploy's own
+limit (D48 R1/R3), so its string is a plain `ValueError`
+in the #77 style and no longer surfaces through #62's
+wrapper. #68 stays not supported (D46: unavailable by the
+repo's own declaration).
 
 | # | Ruled class |
 |---|---|
@@ -342,7 +349,7 @@ mapping at the #109 review. #77 is the R3/R4 our-gap row.
 | 64 | not supported |
 | 65 | not supported |
 | 66 | not supported |
-| 67 | not supported |
+| 67 | our gap |
 | 68 | not supported |
 | 69 | harness or environment |
 | 70 | harness or environment |

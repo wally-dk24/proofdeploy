@@ -593,9 +593,11 @@ _REFUSAL_ROW_OVERRIDES: dict[int, dict[str, object]] = {
     66: {
         "template": "not supported: submodule commit refused before fetch: {sha!r}"
     },
-    # #67/#68 surface as #62's wrapper string with the detail
-    # inlined by _typed; the wrapper is checked at #62.
-    67: {"template_from": 62},
+    # #68 surfaces as #62's wrapper string with the detail
+    # inlined by _typed; the wrapper is checked at #62. (#67
+    # left the wrapper family at D62: the depth limit is our
+    # gap, emitted as its own plain-ValueError literal and
+    # checked against its own row.)
     68: {"template_from": 62},
     # #81 is the family of git-operation failure strings; its
     # first member stands for the family.
