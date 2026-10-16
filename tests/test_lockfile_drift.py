@@ -573,6 +573,33 @@ _REFUSAL_ROW_OVERRIDES: dict[int, dict[str, object]] = {
     # #57 is the row_from_exception passthrough mechanism; the
     # ruling classes its named instance, emitted by yml.py.
     57: {"template": "proofdeploy.yml missing required keys: {keys}"},
+    # §7 (PR #109) rows whose inventory entry leads with the
+    # refusal DETAIL: the emitted literal is the fetch layer's
+    # own full form, which the materialize layer re-raises
+    # inside #62's wrapper.
+    63: {
+        "template": (
+            "not supported: submodule at {sha} unavailable "
+            "from {url}: {first line}"
+        )
+    },
+    64: {
+        "template": (
+            "not supported: submodule at {sha} unavailable "
+            "from {url}: the remote did not serve the recorded commit"
+        )
+    },
+    65: {"template": "not supported: submodule URL refused before fetch: {url!r}"},
+    66: {
+        "template": "not supported: submodule commit refused before fetch: {sha!r}"
+    },
+    # #67/#68 surface as #62's wrapper string with the detail
+    # inlined by _typed; the wrapper is checked at #62.
+    67: {"template_from": 62},
+    68: {"template_from": 62},
+    # #81 is the family of git-operation failure strings; its
+    # first member stands for the family.
+    81: {"template": "git init --bare failed for submodule fetch of {url}: {stderr}"},
 }
 
 _SITE_FILE_BY_BASENAME = {
@@ -582,6 +609,8 @@ _SITE_FILE_BY_BASENAME = {
     "sandbox.py": "proofdeploy/sandbox.py",
     "yml.py": "proofdeploy/yml.py",
     "provision.py": "readiness/provision.py",
+    "submodules.py": "proofdeploy/submodules.py",
+    "fixture.py": "proofdeploy/fixture.py",
 }
 
 

@@ -226,8 +226,8 @@ def _git_fetch(
         first_line = stderr.splitlines()[0] if stderr else "git fetch failed"
         if any(m in stderr.lower() for m in _TYPED_FETCH_MARKERS):
             raise SubmoduleUnavailableError(
-                f"not supported: submodule at {sha} unavailable "
-                f"from {url}: {first_line}",
+                f"not supported: submodule at {sha} unavailable from "
+                f"{url}: {first_line}",
                 detail=first_line,
             )
         raise SubmoduleFetchError(
@@ -381,10 +381,9 @@ def _resolve_url(raw_url: str, base_url: str | None, path: str) -> str:
         if base_url is None or "://" not in base_url:
             raise SubmoduleFetchError(
                 f"harness or environment: relative submodule URL "
-                f"{raw_url!r} for submodule {path} cannot be resolved: "
-                f"the superproject origin is missing or not an https "
-                f"URL ({base_url!r}); the origin is this checkout's "
-                f"configuration, not the repo's"
+                f"{raw_url!r} for submodule {path}"
+                f" cannot be resolved: the superproject origin is missing or not an https URL ("
+                f"{base_url!r}); the origin is this checkout's configuration, not the repo's"
             )
         return urllib.parse.urljoin(base_url, raw_url)
     return raw_url
@@ -447,8 +446,7 @@ def _validate_path(snapshot_dir: Path, full_rel: str) -> str:
         )
     if dest.exists() and not dest.is_dir():
         raise ValueError(
-            "submodule path exists in the snapshot and is not a "
-            f"directory: {full_rel!r}"
+            f"submodule path exists in the snapshot and is not a directory: {full_rel!r}"
         )
     return normalized
 
@@ -501,8 +499,7 @@ def _extract_tree(
         # refusal class of create_snapshot (fixture.py:359).
         if posixpath.isabs(rel) or any(p == ".." for p in rel.split("/")):
             raise ValueError(
-                f"submodule tree entry escapes the submodule "
-                f"directory: {rel!r}"
+                f"submodule tree entry escapes the submodule directory: {rel!r}"
             )
         if mode == "160000":
             entries.append((mode, oid, 0, rel))
@@ -520,9 +517,8 @@ def _extract_tree(
         # a plain ValueError whose message says so — it must NOT
         # start with "not supported:".
         raise ValueError(
-            f"submodule {full_path}: its tree is {total} bytes, over "
-            f"the {MAX_TREE_BYTES}-byte limit ProofDeploy sets for "
-            f"one submodule (our gap)"
+            f"submodule {full_path}: its tree is {total} bytes, over the "
+            f"{MAX_TREE_BYTES}-byte limit ProofDeploy sets for one submodule (our gap)"
         )
     dest.mkdir(parents=True, exist_ok=True)
     links: dict[str, str] = {}

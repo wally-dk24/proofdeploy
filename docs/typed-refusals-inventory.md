@@ -182,7 +182,7 @@ rulings shape the table:
 | 73 | `submodule path is a symlink in the snapshot: {path!r}` | submodules.py:445 | **ADR 0012 plain `ValueError`** (as #69). |
 | 74 | `submodule path exists in the snapshot and is not a directory: {path!r}` | submodules.py:449 | **ADR 0012 plain `ValueError`** (as #69). |
 | 75 | `submodule tree entry escapes the submodule directory: {rel!r}` (defensive: an absolute or `..` entry name inside a fetched tree; git forbids these by construction) | submodules.py:503 | **ADR 0012 plain `ValueError`** (as #69). |
-| 76 | `snapshot symlink refused ({reason}): {full_path}/{path} -> {target}` — a symlink inside a fetched tree that is absolute or escapes its tree (the WO-8.4b rule), validated as one map before any link is created; the `SnapshotLinkError` itself, re-based to name the path from the snapshot root | submodules.py:597; class fixture.py:157, message fixture.py:164 | **`SnapshotLinkError`** — the class `create_snapshot` gives an ADR 0012 link refusal. No `not supported:` prefix (R4). |
+| 76 | `snapshot symlink refused ({reason}): {path} -> {target}` — a symlink inside a fetched tree that is absolute or escapes its tree (the WO-8.4b rule), validated as one map before any link is created; the `SnapshotLinkError` itself, re-based at the raise so `{path}` names the path from the snapshot root | submodules.py:597; class fixture.py:157, message fixture.py:164 | **`SnapshotLinkError`** — the class `create_snapshot` gives an ADR 0012 link refusal. No `not supported:` prefix (R4). |
 | 77 | `submodule {full_path}: its tree is {total} bytes, over the {MAX_TREE_BYTES}-byte limit ProofDeploy sets for one submodule (our gap)` (MAX_TREE_BYTES = 512 MiB; the cap is summed from the tree listing and enforced before anything is written, R3) | submodules.py:522 | **our gap** — the cap is our limit (R3/R4); plain `ValueError`, no `not supported:` prefix. |
 | 78 | `harness or environment: relative submodule URL {raw_url!r} for submodule {path} cannot be resolved: the superproject origin is missing or not an https URL ({base_url!r}); the origin is this checkout's configuration, not the repo's` | submodules.py:382 | **harness or environment** — the origin is our checkout's configuration, not the repo's (R4); `SubmoduleFetchError`, retried. |
 | 79 | `submodule fetch of {url} at {sha} failed: {first error line}` — every fetch failure whose stderr matches no #63 marker (network and registry errors land here and stay untyped) | submodules.py:233 | **harness or environment** — retried by design. |
@@ -323,6 +323,40 @@ byte-identical.
 | 59 | our gap |
 | 60 | harness or environment |
 | 61 | harness or environment |
+
+**Submodule rows (§7, PR #109) — ruled in R4 of the #109
+changes round (reviewer, relay 2026-10-15T2215Z):** #62–#68
+are the D46 not-supported family. #69–#76 are ruled by R4 to
+the ADR 0012 class `create_snapshot` already gives (a plain
+`ValueError` / the `SnapshotLinkError` itself, §7) — a class
+outside the three above; they are entered here as **harness
+or environment** per R2's default (the mechanical treatment
+they share: retried, never skipped, never terminal), with §7
+carrying the class in force. The reviewer to confirm the
+mapping at the #109 review. #77 is the R3/R4 our-gap row.
+
+| # | Ruled class |
+|---|---|
+| 62 | not supported |
+| 63 | not supported |
+| 64 | not supported |
+| 65 | not supported |
+| 66 | not supported |
+| 67 | not supported |
+| 68 | not supported |
+| 69 | harness or environment |
+| 70 | harness or environment |
+| 71 | harness or environment |
+| 72 | harness or environment |
+| 73 | harness or environment |
+| 74 | harness or environment |
+| 75 | harness or environment |
+| 76 | harness or environment |
+| 77 | our gap |
+| 78 | harness or environment |
+| 79 | harness or environment |
+| 80 | harness or environment |
+| 81 | harness or environment |
 
 The prefix-coverage test
 (`tests/test_lockfile_drift.py::test_typed_refusal_prefix_coverage`)
