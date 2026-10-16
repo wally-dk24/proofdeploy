@@ -1383,6 +1383,9 @@ def test_no_auth_app_model_failure(tmp_path):
     assert summary["verdict"] == "inconclusive"
 
 
+_SANDBOX_CAPS: dict[str, dict[str, object]] = {}
+
+
 def _sandbox_caps():
     """Capability probe for sandbox tests (cached).
 
@@ -1390,20 +1393,28 @@ def _sandbox_caps():
     unexpected exception (e.g. a broken import) raises instead of
     silently returning {} (which would cause a silent skip, hiding
     real bugs — the T1 miss).
+
+    WO-CI-SPEED task 2: the probe starts real containers (~20s),
+    so it runs lazily — on first use, never at import/collection
+    time. The skipif below carries its condition as a string,
+    which pytest evaluates at test setup; this memo keeps that
+    to one probe per process.
     """
     import os
 
-    try:
-        from proofdeploy.sandbox import sandbox_evidence
-        return sandbox_evidence()
-    except ImportError:
-        # Import errors are always loud: a broken import must never
-        # cause a silent skip.
-        raise
-    except Exception:
-        if os.environ.get("PD_REQUIRE_SANDBOX") == "1":
+    if "value" not in _SANDBOX_CAPS:
+        try:
+            from proofdeploy.sandbox import sandbox_evidence
+            _SANDBOX_CAPS["value"] = sandbox_evidence()
+        except ImportError:
+            # Import errors are always loud: a broken import must never
+            # cause a silent skip.
             raise
-        return {}
+        except Exception:
+            if os.environ.get("PD_REQUIRE_SANDBOX") == "1":
+                raise
+            _SANDBOX_CAPS["value"] = {}
+    return _SANDBOX_CAPS["value"]
 
 
 def _sandbox_usable() -> bool:
@@ -1419,7 +1430,7 @@ def _sandbox_usable() -> bool:
 
 
 requires_sandbox = pytest.mark.skipif(
-    not _sandbox_usable(),
+    "not _sandbox_usable()",
     reason=(
         "sandbox not usable on this host: needs podman, userns remapping, "
         "and a build network (runs in the sandbox-tests CI job)"
