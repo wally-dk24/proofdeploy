@@ -282,6 +282,108 @@ def test_sandbox_executor_runs_bun_plan(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Plan 1.2(o) / D114: the ORCHESTRATOR's handoff of the contract's
+# declared app.port into the sandbox start. The bridge tests in
+# test_sandbox_addendum18 drive Sandbox.start directly and never see
+# this handoff; the reviewer's plant (dropping
+# `app_port=contract.app_port` from the orchestrator's start call)
+# survived them. These drive the real provisioning path
+# (Orchestrator._provision_side_sandbox) with a recording fake
+# Sandbox.start and assert what actually arrives.
+# ---------------------------------------------------------------------------
+
+
+class _FakeStartedApp:
+    """The SandboxApp surface the provisioning path touches after a
+    successful start: readiness, name, URL, evidence, stop."""
+
+    def __init__(self, name):
+        self.name = name
+        self.target_url = "http://127.0.0.1:9/fake-app"
+        self.sandbox_evidence: dict = {}
+
+    def wait_ready(self, path, timeout=120):
+        return True
+
+    def stop(self):
+        pass
+
+
+class _RecordingStart:
+    """Fake Sandbox.start: records every call's app_port kwarg (with
+    a sentinel default, so a handoff that drops the kwarg entirely
+    records "UNSET" instead of raising) and returns a ready app."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def __call__(self, checkout, command, env, port, name=None,
+                 app_port="UNSET"):
+        # Set on the Sandbox CLASS, this instance is not a descriptor:
+        # sb.start(...) reaches __call__ with start's own arguments.
+        self.calls.append({"port": port, "name": name, "app_port": app_port})
+        return _FakeStartedApp(name)
+
+
+def _drive_provision_with_recording_start(monkeypatch, tmp_path, app_port):
+    """Run the real _provision_side_sandbox path (the Addendum 18
+    scaffolding) with a contract declaring the given app.port and a
+    recording Sandbox.start; the side comes back READY."""
+    from proofdeploy.runner import ProvisionStatus
+    from proofdeploy.sandbox import Sandbox
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "requirements.txt").write_text(
+        "six==1.17.0 \\\n"
+        "    --hash=sha256:ff703d0fc3e08526949441584fca3fc209d20cf45a3f54c0fb84f79a80d0d95b1\n"
+    )
+    cap = _CaptureInstall()
+    orch, orch_mod = _stub_sandbox_side(monkeypatch, snap, cap)
+    contract = RepoContract(
+        build="", start="python app.py", readiness="/health", env={},
+        app_port=app_port,
+    )
+    monkeypatch.setattr(orch_mod, "load_contract", lambda p: contract)
+    recorder = _RecordingStart()
+    monkeypatch.setattr(Sandbox, "start", recorder)
+    monkeypatch.setattr(Sandbox, "app_logs", lambda self, name: "")
+    side = orch._provision_side_sandbox(
+        "fakerev", 18093 if app_port is not None else 18094,
+        snap / "unit", "t",
+    )
+    assert side.provision.status == ProvisionStatus.READY
+    assert len(recorder.calls) == 1
+    return recorder.calls[0]
+
+
+def test_orchestrator_hands_declared_app_port_to_sandbox_start(
+    monkeypatch, tmp_path
+):
+    """A contract declaring app.port: 3000 must arrive at the sandbox
+    start call as app_port == 3000, through the real orchestrator
+    provisioning path (readiness and measured runs share it).
+
+    Planted bug (D114): the orchestrator's start call stops passing
+    app_port=contract.app_port (or passes None) -> the recording fake
+    sees None/"UNSET" -> FAIL.
+    """
+    call = _drive_provision_with_recording_start(monkeypatch, tmp_path, 3000)
+    assert call["app_port"] == 3000
+
+
+def test_orchestrator_hands_none_app_port_when_contract_declares_none(
+    monkeypatch, tmp_path
+):
+    """A contract declaring no app.port must arrive as app_port is
+    None — the default stays exactly as before, never an inferred
+    port."""
+    call = _drive_provision_with_recording_start(monkeypatch, tmp_path, None)
+    assert call["app_port"] is None
+
+
+# ---------------------------------------------------------------------------
 # The evidence records the plan (host executor, real dev run).
 # ---------------------------------------------------------------------------
 
