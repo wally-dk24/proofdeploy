@@ -19,3 +19,4 @@ H6. Order of work. The completed list (all 10 and 10, with every skipped candida
 H7. Fallback (stated before any result). If the walk exhausts the five repositories before reaching 10 and 10, no unit is chosen by hand. Master decides between (i) widening the repository list by a further registered mechanical rule, and (ii) recording the smaller denominators, with the floors scaled proportionally and stated as such.
 
 H8. Reporting. The repository spread of the final set is reported alongside the dev-set numbers. It is not tuned.
+
