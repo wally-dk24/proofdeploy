@@ -864,3 +864,104 @@ def test_cleanup_run_is_idempotent(tmp_path):
     assert not (tmp_path / "venvs" / "abc").exists()
     assert not (tmp_path / "runs" / "abc").exists()
     assert len(logs) == 2
+
+
+def test_cleanup_run_routes_userns_remapped_tree_through_unshare(
+    tmp_path, monkeypatch
+):
+    """Plan 1.2(g) follow-up: a run dir holding foreign-owned entries
+    (content written under the sandbox's userns mapping — on the host
+    it belongs to the mapped runtime uid, in directories the host
+    user does not own) cannot be removed by a host rmtree: unlink
+    needs write on the containing directory. cleanup_run must route
+    it through `podman unshare rm -rf`, the namespace coordinates of
+    the ownership transfer. Simulated at the house seams: the
+    ownership probe reports the remap, the host rmtree leaves the
+    tree standing (its EPERMs are what ignore_errors used to
+    swallow), and the fake podman's unshare rm removes it the way
+    in-namespace root would."""
+    prov = Provisioner(workdir=tmp_path)
+    d = tmp_path / "venvs" / "abc"
+    d.mkdir(parents=True)
+    (d / "written-by-the-runtime-uid.txt").write_text("x\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "proofdeploy.runner._tree_has_foreign_owner", lambda p: True
+    )
+    real_rmtree = shutil.rmtree
+    monkeypatch.setattr(
+        shutil, "rmtree", lambda p, **kw: None  # host EPERM, swallowed
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if "unshare" in cmd:
+            real_rmtree(cmd[-1], ignore_errors=True)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    logs: list[str] = []
+    prov.cleanup_run("abc", logs)
+    assert not d.exists(), "userns-remapped tree survived cleanup_run"
+    unshare_calls = [c for c in calls if "unshare" in c]
+    assert len(unshare_calls) == 1, calls
+    call = unshare_calls[0]
+    assert call[0] == "podman"
+    assert call[call.index("unshare") + 1 : call.index("unshare") + 3] == [
+        "rm",
+        "-rf",
+    ]
+    assert call[-1] == str(d)
+    assert logs == [f"cleaned up: {d}"]
+
+
+def test_cleanup_run_logs_leftovers_when_removal_fails(tmp_path, monkeypatch):
+    """Never silent: when neither the unshare route nor the host
+    rmtree can remove a tree, cleanup_run enumerates what is left
+    behind in the log instead of the old ignore_errors shrug."""
+    prov = Provisioner(workdir=tmp_path)
+    d = tmp_path / "venvs" / "abc"
+    d.mkdir(parents=True)
+    (d / "stuck.txt").write_text("x\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "proofdeploy.runner._tree_has_foreign_owner", lambda p: True
+    )
+    monkeypatch.setattr(shutil, "rmtree", lambda p, **kw: None)
+
+    def failing_run(cmd, **kwargs):
+        return SimpleNamespace(
+            returncode=1, stdout="", stderr="unshare blew up"
+        )
+
+    monkeypatch.setattr(subprocess, "run", failing_run)
+    logs: list[str] = []
+    prov.cleanup_run("abc", logs)
+    assert d.exists()
+    assert not any(line.startswith("cleaned up:") for line in logs), logs
+    incomplete = [line for line in logs if line.startswith("cleanup incomplete:")]
+    assert len(incomplete) == 1, logs
+    assert str(d) in incomplete[0] and "stuck.txt" in incomplete[0], logs
+
+
+def test_cleanup_run_plain_tree_never_touches_podman(tmp_path, monkeypatch):
+    """The fallback: a tree owned by the invoking user (no remap)
+    is removed by rmtree exactly as before, with no podman call."""
+    prov = Provisioner(workdir=tmp_path)
+    d = tmp_path / "venvs" / "abc"
+    d.mkdir(parents=True)
+    (d / "plain.txt").write_text("x\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def recording_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    logs: list[str] = []
+    prov.cleanup_run("abc", logs)
+    assert not d.exists()
+    assert calls == [], calls
+    assert logs == [f"cleaned up: {d}"]
