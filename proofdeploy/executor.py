@@ -75,6 +75,7 @@ from proofdeploy.setup_auth import (
     capture_bindings,
     mint_ghost_jwt,
 )
+from proofdeploy.versions import check_schema_version
 
 
 class Verdict(Enum):
@@ -189,6 +190,10 @@ class ProbeResult:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ProbeResult:
         """Rebuild a ProbeResult from a stored record dict."""
+        # Reader-side version check (plan 1.10): a per-probe result
+        # stamped with an unknown schema major is refused, not
+        # defaulted. A missing stamp keeps the legacy defaults below.
+        check_schema_version(d.get("schema_version"), kind="per-probe result")
         verdict = Verdict(d["verdict"])
         reason_raw = d.get("reason")
         reason = InconclusiveReason(reason_raw) if reason_raw else None
