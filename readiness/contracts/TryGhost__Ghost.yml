@@ -2,8 +2,21 @@
 # PROVENANCE 2026-10-15 (plan 1.2f): build drops "pnpm run bootstrap &&" — bootstrap is a non-frozen pnpm install reinstall plus git submodule update --init --recursive, which a history-less snapshot cannot fetch; the adapter's frozen install is the only install.
 # PROVENANCE 2026-10-16 (D71): migrate removed — Ghost initializes and migrates its own SQLite DB on boot (ghost/core/core/boot.js awaits DatabaseStateManager.makeReady(), ghost/core/core/server/data/db/database-state-manager.js, which runs knexMigrator init/migrate; verified at all 3 registered SHAs). The removed "pnpm run migrate:db" shelled out to `docker exec`, which does not exist in the sandbox. start is upstream's ghost/core dev entry without the watcher: package.json "dev" is "nodemon index.js" and ghost/core/nodemon.json's exec is "node --conditions=source --import=tsx" (exec identical at all 3 SHAs), with server__host/server__port set by env as the previous start did. Build and readiness unchanged.
 # PROVENANCE 2026-10-16 (D83): build gains "pnpm --filter ghost run build:assets" after "pnpm run build" — with D71's start, Ghost boots past its DB setup and then dies on the missing build product ghost/core/core/frontend/public/cards.manifest.json (ENOENT; Ghost's own log: "run `pnpm build:assets` when running from source"). Root "build" is "pnpm nx run-many -t build" and ghost core has no "build" target, only "build:assets"; upstream's own CI ("Build TS code" then "Build assets") and Dockerfile.production both run "pnpm --filter ghost run build:assets" after building, verified at all 3 registered SHAs. Class: our gap (incomplete build). migrate stays removed; start and readiness unchanged.
+# PROVENANCE 2026-10-16 (D87): seed + auth added — until now the contract never told ProofDeploy how to log in, so the checkpoint's Ghost unit could not have authenticated in a measured run either. seed runs readiness/seeds/ghost-seed.js (committed into the side's snapshot by the harness next to this contract): the WO-8.3 proof seed adapted in layout only — it temp-boots Ghost from ghost/core in the D71 start form, runs owner setup with the side's generated bootstrap credentials, creates ONE integration, and writes the Admin API key to .pd-auth/admin_key; generic only (rule 2): the owner and one integration, nothing else. auth is the registered ghost_jwt provider over that key file: the host mints a fresh JWT per request. Build, start and readiness unchanged.
 app:
   path: "."
 build: "pnpm run build && pnpm --filter ghost run build:assets"
+seed: "node ghost-seed.js"
 start: "cd ghost/core && server__host=0.0.0.0 server__port=$PORT node --conditions=source --import=tsx index.js"
 readiness: "/"
+auth:
+  mode: ghost_jwt
+  key_file: .pd-auth/admin_key
+  ttl_seconds: 300
+  bootstrap_env: [ADMIN_EMAIL, ADMIN_PASSWORD]
+fixture:
+  repo_name: "Ghost"
+  seed_note: "Ghost's own first boot and first-run setup created one owner account (the site title was set to 'ProofDeploy'), Ghost's built-in roles, its built-in integrations (some with their own API keys) and its default content; ProofDeploy's setup signed in as the owner once and added one custom integration. Nothing else was created or changed."
+  auth_mechanism: "the token is presented in the Authorization header in the form 'Ghost <token>'"
+  auth_scope: "a JWT signed with the custom integration's Admin API key (Ghost's 'Admin Integration' role), minted fresh for each request; it is not a staff user's session"
+  flags_note: "Labs feature flags are at this Ghost version's defaults; none were changed"

@@ -1734,6 +1734,10 @@ class Orchestrator:
                 {**secret_free_env, **bootstrap},
                 port,
                 name=app_name,
+                # Plan 1.2(o): the contract's declared app.port, when
+                # it sets one — the bridge targets the app's own fixed
+                # listen port; PORT is still exported as assigned.
+                app_port=contract.app_port,
             )
             logs.extend(sb.log)
             sb.log.clear()
