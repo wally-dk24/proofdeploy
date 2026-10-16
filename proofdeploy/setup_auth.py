@@ -394,8 +394,11 @@ class CredentialProvider:
     - `login` (WO-8.3): POST the declared login path with the declared
       body template — its `${NAME}` placeholders resolve from the
       run's bindings, which is how the per-run bootstrap values feed
-      it — and extract the token at `token_json_path`. Config:
-      {"mode": "login", "path": "/auth/login", "method": "POST",
+      it — and extract the token from exactly one declared place
+      (D120): the JSON body at `token_json_path`, or the response
+      header named by `token_header` (case-insensitive) for APIs that
+      deliver the session token in a header instead of the body.
+      Config: {"mode": "login", "path": "/auth/login", "method": "POST",
       "body": {"email": "${ADMIN_EMAIL}", "password": "${ADMIN_PASSWORD}"},
       "token_json_path": "data.access_token",
       "expires_in_json_path": "data.expires"}.

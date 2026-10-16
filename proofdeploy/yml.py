@@ -67,7 +67,7 @@ _AUTH_MODE_KEYS: dict[str, set[str]] = {
         "token_json_path",
     },
     "login": {
-        "mode", "path", "method", "body", "token_json_path",
+        "mode", "path", "method", "body", "token_json_path", "token_header",
         "expires_in_json_path",
     },
     "refresh": {
@@ -396,7 +396,20 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
             out[key] = _auth_str(auth, key)
     elif mode == "login":
         out["path"] = _auth_path(auth, "path")
-        out["token_json_path"] = _auth_str(auth, "token_json_path")
+        # D120: the login response carries the token in exactly one
+        # place — the JSON body at `token_json_path`, or a response
+        # header named by `token_header`. Both or neither is refused.
+        token_json_path = _auth_str(auth, "token_json_path", required=False)
+        token_header = _auth_str(auth, "token_header", required=False)
+        if (token_json_path is None) == (token_header is None):
+            raise ValueError(
+                "proofdeploy.yml 'auth' login mode needs exactly one of "
+                "'token_json_path' or 'token_header'"
+            )
+        if token_json_path is not None:
+            out["token_json_path"] = token_json_path
+        if token_header is not None:
+            out["token_header"] = token_header
         method = _auth_str(auth, "method", required=False)
         if method is not None:
             out["method"] = method
