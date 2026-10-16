@@ -142,6 +142,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="CI runner image recorded in the evidence provenance.",
     )
     m.add_argument("--note", default="", help="Free-text note stored in the run log.")
+    m.add_argument(
+        "--unit-repo",
+        default=None,
+        help=(
+            "The measured unit's repo as owner/repo (WO-1.14, REG-E): "
+            "its contract is loaded from the committed contract store "
+            "(readiness/contracts/<owner>__<repo>.yml in the "
+            "ProofDeploy tree), never from the target repo's tree. "
+            "Default: derived from the target repo's origin remote."
+        ),
+    )
+    m.add_argument(
+        "--contract",
+        default=None,
+        help=(
+            "Explicit contract store file to load for this unit "
+            "(dev/tests; wins over --unit-repo). The file is still a "
+            "store contract: it is loaded by path and its sha256 is "
+            "recorded, and it is never read from the target tree."
+        ),
+    )
+    m.add_argument(
+        "--dry-run-before-model",
+        action="store_true",
+        help=(
+            "Assemble and answer-key check the author bundle, then "
+            "stop immediately before the model call: no spend, no "
+            "provisioning, no records. Prints the rendered fixture "
+            "sha256 and the bundle manifest."
+        ),
+    )
     return p
 
 
@@ -320,6 +351,17 @@ def cmd_measure(args: argparse.Namespace) -> int:
         provenance_run_id=args.provenance_run_id,
         provenance_runner_image=args.provenance_runner_image,
         note=args.note,
+        # WO-1.14 (REG-E): a measured run ALWAYS loads its contract
+        # from the committed contract store. getattr keeps older
+        # argument namespaces (tests) working.
+        use_contract_store=True,
+        unit_repo=getattr(args, "unit_repo", None),
+        contract_path=(
+            Path(args.contract) if getattr(args, "contract", None) else None
+        ),
+        dry_run_before_model=bool(
+            getattr(args, "dry_run_before_model", False)
+        ),
     )
     orch = Orchestrator(cfg)
     try:

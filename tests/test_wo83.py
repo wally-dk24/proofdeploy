@@ -816,7 +816,7 @@ def test_record_names_bootstrap_generated_never_values(tmp_path):
         clean_id="c1",
         auth_bootstrap={"c": {"generated": sorted(bootstrap)}},
     )
-    assert record["schema_version"] == "1.5.0"
+    assert record["schema_version"] == "1.6.0"
     assert record["auth_bootstrap"] == {
         "c": {"generated": ["ADMIN_EMAIL", "ADMIN_PASSWORD"]}
     }
@@ -856,7 +856,7 @@ def test_older_records_still_load(tmp_path):
     records = read_records(tmp_path)
     assert records[0]["record_id"] == "old1"
     assert records[0].get("auth_bootstrap") is None
-    assert SCHEMA_VERSION == "1.5.0"
+    assert SCHEMA_VERSION == "1.6.0"
 
 
 # ── Addendum 62: an auth path must not be able to rewrite the target ──

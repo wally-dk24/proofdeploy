@@ -512,6 +512,46 @@ def load_contract(path: str | Path) -> RepoContract:
     return RepoContract.from_dict(data)
 
 
+def proofdeploy_tree_root() -> Path:
+    """The root of the ProofDeploy tree this code executes from.
+
+    Measured runs execute from a checkout of the ProofDeploy repo
+    (CI checks it out and installs it editable), so the package's
+    parent directory is that tree's root — the tree of the main SHA
+    the run was dispatched from (REG-E item 1).
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+def contract_store_path(
+    repo_slug: str, *, tree_root: Path | None = None
+) -> Path:
+    """The committed contract-store file for a measured unit's repo.
+
+    REG-E item 1 (WO-1.14): a measured unit's contract is its repo's
+    file in the committed contract store, ``readiness/contracts/
+    <owner>__<repo>.yml``, resolved against the ProofDeploy tree the
+    run executes from — never a file inside the measured repo's own
+    tree. ``repo_slug`` is ``owner/repo``; anything else is refused
+    here, before a path is built from it (the slug becomes a file
+    name, so it must carry no separators or traversal).
+    """
+    owner, sep, name = repo_slug.partition("/")
+    if (
+        not sep
+        or not owner
+        or not name
+        or "/" in name
+        or owner in (".", "..")
+        or name in (".", "..")
+    ):
+        raise ValueError(
+            f"repo slug must be 'owner/repo', got: {repo_slug!r}"
+        )
+    root = tree_root if tree_root is not None else proofdeploy_tree_root()
+    return root / "readiness" / "contracts" / f"{owner}__{name}.yml"
+
+
 def find_contract(repo_root: str | Path) -> Path | None:
     """Locate proofdeploy.yml at the repo root; None if absent."""
     p = Path(repo_root) / "proofdeploy.yml"

@@ -1,4 +1,4 @@
-# The versioned result contract — record format at `SCHEMA_VERSION` 1.5.0
+# The versioned result contract — record format at `SCHEMA_VERSION` 1.6.0
 
 Plan line 1.4(a) (D23). This document is the prose contract for the
 records ProofDeploy writes for every measured run. The machine-readable
@@ -8,7 +8,7 @@ it; the validation test in `tests/test_runpair.py`
 the code's own builders produce conform to it.
 
 Everything here describes what the code **does today** at
-`SCHEMA_VERSION = "1.5.0"` (`proofdeploy/probe.py`), as implemented by
+`SCHEMA_VERSION = "1.6.0"` (`proofdeploy/probe.py`), as implemented by
 `proofdeploy/runpair.py` (record builders, redaction, log writes) and
 `proofdeploy/executor.py` (per-probe results). Where the code is
 ambiguous, this document says so under
@@ -56,7 +56,7 @@ Every record carries:
 | `record_id` | string (32 hex) | Unique id minted by the builder. |
 | `timestamp` | string | UTC ISO-8601, `datetime.now(timezone.utc).isoformat()`. |
 | `record_type` | string | `"evidence"`, `"score"`, or `"judgment"`. |
-| `schema_version` | string | The record format version; `"1.5.0"` at this contract. Also stamped on every per-probe result. |
+| `schema_version` | string | The record format version; `"1.6.0"` at this contract. Also stamped on every per-probe result. |
 | `run_kind` | string | `"bug"` or `"clean"`. |
 | `bug_id` | string \| null | Set on bug runs, null on clean runs. |
 | `clean_id` | string \| null | Set on clean runs, null on bug runs. |
@@ -161,6 +161,7 @@ score and judgment records.
 | Field | Meaning |
 |---|---|
 | `fixture`, `contract_env` | The fixture and contract-env values used by the run. |
+| `contract_source` | Where the measured unit's contract was loaded from (WO-1.14 / REG-E): `{store_path, sha256}` — the committed contract store path relative to the ProofDeploy tree and that file's sha256. `sha256` is null when the store file could not be read (a contract refusal record); the whole field is null on paths that do not load a contract from the store. |
 | `public_fixture_keys`, `public_contract_env_keys` | The keys explicitly declared public; every other fixture/env value is treated as a secret for redaction (fail-closed). |
 | `captured_values` | Values captured during the run. A name bound once maps to its value; a name bound more than once (several probes, both sides, a re-login) maps to the **list of its distinct values**, so no value is dropped before redaction. Captures keep their JSON type; numeric captures are collected in text form. |
 | `minted_tokens` | Every token minted by the credential provider during the run. |
@@ -314,7 +315,7 @@ handled under D8's five conditions; in record terms:
   format changes.** `HARNESS_VERSION` (probe schema) and
   `SCORING_VERSION` (scoring rule) are separate versions with their own
   bump rules; neither is the record version.
-- A reader may assume a record stamped `1.5.0` has exactly the field
+- A reader may assume a record stamped `1.6.0` has exactly the field
   sets in the JSON Schema: builders emit fixed key sets, and fields
   that do not apply are null/empty rather than absent.
 - **History** (from the comments at the constant; all changes were
@@ -328,11 +329,12 @@ handled under D8's five conditions; in record terms:
   | 1.3.0 | Evidence records carry `write_grants` and the resolved network mode in provenance (WO-7.3 / Addendum 40). |
   | 1.4.0 | Two additions under one minor: the Python lock facts in each side's provision (WO-8.1 / REG-A) and `auth_bootstrap` (WO-8.3). |
   | 1.5.0 | **No field changes** (Addendum 62): the bump separates the field sets that accumulated under 1.4.0 (lock facts, build-backend facts, `auth_bootstrap`), so one version number never covers two sets again. |
+  | 1.6.0 | Evidence records carry `contract_source` (WO-1.14 / REG-E): the committed contract store path the measured unit's contract was loaded from and that file's sha256. Non-scoring provenance. |
 
 - **Reader compatibility, as the code behaves today:** readers default
   absent keys (`ProbeResult.from_dict` defaults `sent` to true and
   `assertions_evaluated` to false, and the loaders default the rest),
-  so records at 1.0.0–1.4.0 still load and re-score. A format change
+  so records at 1.0.0–1.5.0 still load and re-score. A format change
   that alters the **meaning** of an existing field, rather than adding
   fields with defaults, is the kind of change this defaulting cannot
   absorb — it needs a bump and, per the registered-rule discipline, a
@@ -440,7 +442,7 @@ run records it).
 ## The schema and its test
 
 - [`result-record.schema.json`](result-record.schema.json) — JSON
-  Schema (draft 2020-12) for the three record types at 1.5.0. Where a
+  Schema (draft 2020-12) for the three record types at 1.6.0. Where a
   builder guarantees a value by construction, the schema pins it:
   `record_id` is 32 lowercase hex chars (uuid4 hex);
   `prompt_sha256`/`parsed_probes_sha256` are 64-hex digests computed

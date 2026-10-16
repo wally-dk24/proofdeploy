@@ -2,7 +2,7 @@
   "$defs": {
     "evidence_record": {
       "additionalProperties": false,
-      "description": "Built by build_evidence_record() and written BEFORE any scoring. All 55 keys are always present; fields that do not apply to the run are null or empty, never absent.",
+      "description": "Built by build_evidence_record() and written BEFORE any scoring. All 56 keys are always present; fields that do not apply to the run are null or empty, never absent.",
       "properties": {
         "auth_bootstrap": {
           "additionalProperties": {
@@ -60,6 +60,13 @@
         "contract_env": {
           "description": "Contract env values used by the run; same redaction rule as fixture, via public_contract_env_keys.",
           "type": "object"
+        },
+        "contract_source": {
+          "description": "WO-1.14 (REG-E): where the measured unit's contract was loaded from — {store_path, sha256}: the committed contract store path relative to the ProofDeploy tree and that file's sha256. sha256 is null when the store file could not be read (a contract refusal record); the whole field is null on paths that do not load a contract from the store.",
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "crash_probe_results": {
           "description": "Crash records only: whatever per-probe results were gathered before the crash. The builder types this Any; no single shape is guaranteed."
@@ -224,7 +231,7 @@
           "type": "boolean"
         },
         "schema_version": {
-          "const": "1.5.0"
+          "const": "1.6.0"
         },
         "scoring_version": {
           "description": "The scoring rule version; the only value the code produces is v2-per-probe.",
@@ -306,6 +313,7 @@
         "inconclusive_error",
         "crash_provisioning",
         "crash_probe_results",
+        "contract_source",
         "verdict"
       ],
       "type": "object"
@@ -399,7 +407,7 @@
           ]
         },
         "schema_version": {
-          "const": "1.5.0"
+          "const": "1.6.0"
         },
         "score_record_id": {
           "$ref": "#/$defs/record_id"
@@ -495,7 +503,7 @@
           "description": "The act request actually sent; null when no request was sent."
         },
         "schema_version": {
-          "const": "1.5.0"
+          "const": "1.6.0"
         },
         "sent": {
           "description": "Whether the probe was actually sent to the target.",
@@ -623,7 +631,7 @@
           ]
         },
         "schema_version": {
-          "const": "1.5.0"
+          "const": "1.6.0"
         },
         "scoring_version": {
           "type": "string"
@@ -674,7 +682,7 @@
   },
   "$id": "proofdeploy/docs/contract/result-record.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The record format written to runs.jsonl by proofdeploy/runpair.py at SCHEMA_VERSION 1.5.0 (proofdeploy/probe.py). One JSON object per line; exactly three record types: evidence, score, judgment. This schema uses only the keyword subset enforced by the stdlib validator in tests/test_runpair.py (type, enum, const, required, properties, additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref); every other keyword is annotation only. See docs/contract/result-contract.md for the prose contract.",
+  "description": "The record format written to runs.jsonl by proofdeploy/runpair.py at SCHEMA_VERSION 1.6.0 (proofdeploy/probe.py). One JSON object per line; exactly three record types: evidence, score, judgment. This schema uses only the keyword subset enforced by the stdlib validator in tests/test_runpair.py (type, enum, const, required, properties, additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref); every other keyword is annotation only. See docs/contract/result-contract.md for the prose contract.",
   "oneOf": [
     {
       "$ref": "#/$defs/evidence_record"
@@ -686,5 +694,5 @@
       "$ref": "#/$defs/judgment_record"
     }
   ],
-  "title": "ProofDeploy result record, schema_version 1.5.0"
+  "title": "ProofDeploy result record, schema_version 1.6.0"
 }
