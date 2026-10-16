@@ -863,7 +863,8 @@ class Executor:
         path: str,
         method: str,
         body_template: Any,
-        token_path: str,
+        token_path: str | None,
+        token_header: str | None = None,
         cfg: dict[str, Any],
     ) -> InconclusiveReason | None:
         """POST a login and provide the token from the response (WO-8.3).
@@ -872,6 +873,14 @@ class Executor:
         the run's bindings, which is how the per-run bootstrap values
         (and only they) reach the login. A declared refresh token in
         the response is bound as ${REFRESH_TOKEN} for later renewals.
+
+        The token itself comes from exactly one declared place
+        (D120): the JSON body at `token_path`, or — when `token_header`
+        is declared — the named response header (matched
+        case-insensitively). In header mode the body is never the
+        token carrier: a 2xx without the header (e.g. an API that
+        reports login errors as 200 with an error body) is an auth
+        failure, never a token.
         """
         if not path:
             details.append(
@@ -900,7 +909,7 @@ class Executor:
             details.append(f"credential provider refused: {detail}")
             return InconclusiveReason.AUTH
         details.append(f"credential provider: {method} {path} (login)")
-        status, _, resp_body, req_logs = _do_http(
+        status, resp_headers, resp_body, req_logs = _do_http(
             method, url, None, body, self.http_timeout
         )
         details.extend(req_logs)
@@ -909,17 +918,36 @@ class Executor:
         if status is None or not (200 <= status < 300):
             details.append(f"credential provider failed: login endpoint returned {status}")
             return InconclusiveReason.AUTH
-        try:
-            data = json.loads(resp_body)
-        except json.JSONDecodeError:
-            details.append("credential provider failed: login response is not JSON")
-            return InconclusiveReason.AUTH
-        token = _dig_json_path(data, token_path)
-        if not isinstance(token, str) or not token:
-            details.append(
-                f"credential provider failed: no token at '{token_path}' in login response"
-            )
-            return InconclusiveReason.AUTH
+        data: Any = None
+        if token_header is not None:
+            header_values = {k.lower(): v for k, v in resp_headers.items()}
+            raw_token = header_values.get(token_header.strip().lower())
+            token = raw_token.strip() if isinstance(raw_token, str) else None
+            if not token:
+                details.append(
+                    "credential provider failed: no token in "
+                    f"'{token_header}' response header of login response"
+                )
+                return InconclusiveReason.AUTH
+            # The body is not the token carrier in header mode; parse
+            # it only for the optional extras below (expiry, refresh
+            # token capture). A non-JSON body is not a failure here.
+            try:
+                data = json.loads(resp_body)
+            except json.JSONDecodeError:
+                data = None
+        else:
+            try:
+                data = json.loads(resp_body)
+            except json.JSONDecodeError:
+                details.append("credential provider failed: login response is not JSON")
+                return InconclusiveReason.AUTH
+            token = _dig_json_path(data, str(token_path))
+            if not isinstance(token, str) or not token:
+                details.append(
+                    f"credential provider failed: no token at '{token_path}' in login response"
+                )
+                return InconclusiveReason.AUTH
         expires_in: float | None = None
         expires_path = cfg.get("expires_in_json_path")
         if isinstance(expires_path, str) and expires_path:
@@ -942,13 +970,21 @@ class Executor:
         cfg = provider.config
         path = cfg.get("path")
         token_path = cfg.get("token_json_path")
+        token_header = cfg.get("token_header")
         if not isinstance(path, str) or not path:
             details.append(
                 "credential provider failed: credential_config needs a non-empty 'path'"
             )
             return InconclusiveReason.AUTH
-        if not isinstance(token_path, str) or not token_path:
-            details.append("credential provider failed: credential_config needs 'token_json_path'")
+        # D120: exactly one token source — the body at
+        # 'token_json_path' or the 'token_header' response header.
+        has_path = isinstance(token_path, str) and bool(token_path)
+        has_header = isinstance(token_header, str) and bool(token_header)
+        if has_path == has_header:
+            details.append(
+                "credential provider failed: login mode needs exactly one of "
+                "'token_json_path' or 'token_header'"
+            )
             return InconclusiveReason.AUTH
         return self._login_exchange(
             ctx,
@@ -957,7 +993,8 @@ class Executor:
             path=path,
             method=str(cfg.get("method", "POST")),
             body_template=cfg.get("body"),
-            token_path=token_path,
+            token_path=token_path if has_path else None,
+            token_header=token_header if has_header else None,
             cfg=cfg,
         )
 
