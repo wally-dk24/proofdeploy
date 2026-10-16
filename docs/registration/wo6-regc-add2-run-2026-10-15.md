@@ -197,3 +197,88 @@ Journal event — death in the runtime restart, 2026-10-16 ~19:04Z:
   `b80013adf2056165733d8a90fbc4c0f73fd4608737f5b2ebce3c998ecfeee636`,
   main SHA `29045fbee500ab4700c97fe661a5717bdc6b138e`, snapshot date
   `2026-10-16`. The run continues from the journal.
+
+## Run 3 — death causes, journal integrity, and the D140 single-writer lock (2026-10-16)
+
+### The four earlier death causes (as reported; accepted by the reviewer, D140)
+
+- Death 1 (instance started 2026-10-16T12:02:26Z): VM/runtime restart
+  at ~12:18:34Z. The twilio watchdog logged podman wiped at
+  12:18:34Z; death window: last journal entry 12:17:35Z → process
+  found gone 12:18:49Z.
+- Death 2 (instance resumed 2026-10-16T12:19:00Z): runtime-layer
+  interruption ~13:43–13:46Z, NOT a VM reset. PID verified gone at
+  13:46:48Z (kill -0 failed), entries frozen at 578; twilio watchdog
+  receipt gap 13:43:21Z → 13:50:45Z (444 s); podman was not wiped; no
+  finer mechanism survives in the records.
+- Death 3 (instance resumed 2026-10-16T15:00:59Z): cause unknown —
+  accepted as the honest record. Entries froze at 622 from 15:05:09Z
+  and a resume replaced the instance at 15:57:29Z; there is no
+  liveness check, podman event, or receipt gap in the window, and the
+  frozen-entries symptom is non-diagnostic: instance 4 showed the
+  identical symptom while verified alive 16:29–17:31Z during a
+  rate-limit sleep. Reviewer finding (D140): a resume may have
+  started while the previous instance was still alive (asleep in a
+  rate-limit pause) — two writers on one journal is a defect even
+  though the integrity check shows no damage; it is made impossible
+  by the lock below.
+- Death 4 (instance resumed 2026-10-16T15:57:29Z): VM reset at
+  17:33:54Z. Instance verified alive at 17:31:32Z; podman wiped
+  17:33:54Z and reinstalled 17:35:03Z; watchdog receipt gap 457 s.
+
+### Death 6
+
+- The instance resumed at 2026-10-16T19:20:13Z died in the ~20:10Z VM
+  restart (system boot began 20:10:40Z). It wrote no exit record. Its
+  last journal write was 2026-10-16T20:11:01Z, at 2,094 entries in
+  `entries.jsonl`.
+- Resumed: 2026-10-16T20:39:48Z from the same journal (start event
+  recorded in `events.jsonl`).
+
+### Journal integrity (verified 2026-10-16T20:37Z)
+
+- `header.json` intact, never modified since creation: script sha256
+  `b80013adf2056165733d8a90fbc4c0f73fd4608737f5b2ebce3c998ecfeee636`,
+  main SHA `29045fbee500ab4700c97fe661a5717bdc6b138e`, snapshot date
+  `2026-10-16`.
+- `events.jsonl`: 6 lines at check time, every line valid JSON,
+  timestamps strictly monotonic, no exit event anywhere in the file.
+- `entries.jsonl`: 2,094 lines, every line valid JSON; 2,094 unique
+  `full_name` values, 0 duplicates; the file ends with a newline —
+  no partial or torn trailing line.
+- `pool.json` holds the full pool: 3,000 names (progress
+  2,094 / 3,000, consistent with the last reported count).
+- All six run-3 console logs are 0 bytes — no traceback or script
+  error was ever written by any instance; consistent with external
+  kills, not script crashes.
+
+### D140 single-writer lock + restart event
+
+- From 2026-10-16T20:43:18Z the run runs under an exclusive,
+  non-blocking lock on the journal directory, applied OUTSIDE the
+  script so its sha256 stays
+  `b80013adf2056165733d8a90fbc4c0f73fd4608737f5b2ebce3c998ecfeee636`:
+
+  `flock -n <journal-dir>/.run.lock python3 scripts/wo6/regc_add2_run.py …`
+
+  The lock is held for the life of the process; a second start exits
+  immediately without touching the journal; the kernel releases the
+  lock when the process dies, so a VM reset never leaves a stale
+  lock.
+- Restart event: the live instance was restarted under the lock;
+  cause recorded: "restart under single-writer lock, D140". Killing
+  the previous instance mid-repo is safe: the torn-line handling and
+  the latest-line-wins rule cover it.
+- Starts recorded in `events.jsonl` after death 6 (each carrying
+  `previous_exit_cause`: "not recorded: the previous session ended
+  without an exit record"): 2026-10-16T20:39:48Z — the post-death-6
+  resume (console log `regc-add2-console-run3-resume5.log`);
+  2026-10-16T20:41:43Z (console log
+  `regc-add2-console-run3-resume6.log`); 2026-10-16T20:43:18Z
+  (console log `regc-add2-console-run3-resume7.log`) — the lock
+  transition. The 20:43:18Z instance is the current live process,
+  running under the `flock` wrapper (verified in the process list).
+- Proof (run 2026-10-16T21:14Z): a second launch under the same lock
+  while the run was live exited immediately — exit code 1, no
+  output; `events.jsonl` unchanged (9 lines); the journal was
+  untouched.
