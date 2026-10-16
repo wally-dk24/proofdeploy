@@ -31,8 +31,10 @@ from typing import Any
 import pytest
 import yaml
 
+import readiness.auth_proof as ap
 import readiness.provision as rp
 from proofdeploy import orchestrator as orch_mod
+from proofdeploy.executor import ProbeResult, Verdict
 from proofdeploy.orchestrator import MeasureConfig, Orchestrator
 from proofdeploy.provisioning import NodeAdapter
 from proofdeploy.runner import ProvisionResult, ProvisionStatus
@@ -506,13 +508,17 @@ def test_every_contract_validates() -> None:
 
 def test_contracts_carry_no_unapproved_credentials() -> None:
     # Addendum 65 (5): no credential beyond the approved fixtures'
-    # own env; Ghost's readiness contract has NO auth at all. The
-    # one provider declaration is Directus's, from its approved
-    # fixture (env NAMES only — values are generated per run).
+    # own env. The approved provider declarations are Directus's,
+    # from its approved fixture, and Ghost's (ghost_jwt, approved
+    # D87: without it the checkpoint's Ghost unit could not have
+    # authenticated in a measured run either). Both name env NAMES
+    # only — values are generated per run.
     for path in sorted(rp.CONTRACTS_DIR.glob("*.yml")):
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         if path.name == "directus__directus.yml":
             assert data.get("auth", {}).get("mode") == "refresh"
+        elif path.name == "TryGhost__Ghost.yml":
+            assert data.get("auth", {}).get("mode") == "ghost_jwt"
         else:
             assert "auth" not in data, path.name
 
@@ -1375,3 +1381,231 @@ def test_capture_regd_tree_failure_is_recorded_not_silent(
     assert row["regd"]["tree_sha256"] is None
     assert row["regd"]["tree_artifact"] is None
     assert row["regd"]["tree_error"]
+
+
+# --- auth proof harness (D87) ------------------------------------------
+
+_FAKE_ADMIN_KEY = "0123456789abcdef01234567:" + "ab" * 32
+_FAKE_JWT = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJzdWIiOiIxMjM0NTY3ODkwIn0.fake-signature_part"
+)
+_FAKE_BOOTSTRAP = "generated-bootstrap-password"
+
+GHOST_UNIT: dict[str, Any] = {
+    "unit_id": "checkpoint-bug-ghost-1",
+    "repo": "TryGhost/Ghost",
+    "class": "heldout-bug",
+    "sides": [
+        {"role": "fix^", "sha": "a" * 40},
+        {"role": "fix", "sha": "b" * 40},
+    ],
+}
+
+
+def test_redactor_scrubs_by_value_then_by_shape() -> None:
+    redactor = ap.Redactor()
+    redactor.add("admin_key", _FAKE_ADMIN_KEY)
+    redactor.add("bootstrap_value", _FAKE_BOOTSTRAP)
+    out = redactor.scrub(
+        f"key={_FAKE_ADMIN_KEY} pw={_FAKE_BOOTSTRAP} "
+        f"tok={_FAKE_JWT} again={_FAKE_ADMIN_KEY}"
+    )
+    assert _FAKE_ADMIN_KEY not in out
+    assert _FAKE_BOOTSTRAP not in out
+    assert _FAKE_JWT not in out
+    # The JWT was never registered as a value, so the shape sweep
+    # is what caught it — the counts keep the two apart.
+    assert redactor.counts == {
+        "admin_key": 2,
+        "bootstrap_value": 1,
+        "minted_jwt": 0,
+        "jwt_shape": 1,
+    }
+
+
+def test_parse_only() -> None:
+    assert ap._parse_only(None) is None
+    assert ap._parse_only(["checkpoint-bug-ghost-1:fix"]) == [
+        ("checkpoint-bug-ghost-1", "fix")
+    ]
+    with pytest.raises(ValueError, match="--only expects"):
+        ap._parse_only(["no-role-separator"])
+
+
+def _one_commit_src(tmp_path: Path) -> tuple[Path, str]:
+    src = tmp_path / "src"
+    src.mkdir()
+    _git(src, "init", "-q")
+    _git(src, "config", "user.name", "auth-proof-test")
+    _git(src, "config", "user.email", "test@proofdeploy.invalid")
+    _git(src, "config", "uploadpack.allowAnySHA1InWant", "true")
+    (src / "app.txt").write_text("v1\n", encoding="utf-8")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-q", "-m", "base")
+    return src, _git(src, "rev-parse", "HEAD")
+
+
+def _empty_clone(tmp_path: Path, src: Path) -> Path:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    _git(clone, "init", "-q")
+    _git(clone, "remote", "add", "origin", src.as_uri())
+    return clone
+
+
+def test_commit_contract_and_seed_delta_is_exactly_two_files(
+    tmp_path: Path,
+) -> None:
+    src, sha = _one_commit_src(tmp_path)
+    clone = _empty_clone(tmp_path, src)
+    rp.fetch_sha(clone, sha)
+    harness = ap.commit_contract_and_seed(
+        clone, sha, rp.contract_path("TryGhost/Ghost"), ap.SEED_SOURCE
+    )
+    assert _git(clone, "show", "-s", "--format=%P", harness) == sha
+    changed = _git(
+        clone, "diff-tree", "--no-commit-id", "--name-only", "-r", harness
+    )
+    assert changed.splitlines() == ["ghost-seed.js", "proofdeploy.yml"]
+    assert _git(clone, "show", f"{harness}:ghost-seed.js") == (
+        ap.SEED_SOURCE.read_text(encoding="utf-8").strip()
+    )
+    assert _git(clone, "show", f"{harness}:proofdeploy.yml") == (
+        rp.contract_path("TryGhost/Ghost").read_text(encoding="utf-8").strip()
+    )
+
+
+class _FakeExecutor:
+    """The executor's shape for the proof: an authenticated probe
+    PASSes at 200 with one mint (and, to prove the scrub, a detail
+    line carrying the minted token); the bare probe PASSes at 401
+    (its assertion is the refusal)."""
+
+    def __init__(self) -> None:
+        self.probes: list[dict[str, Any]] = []
+
+    def run_probe(self, probe: dict[str, Any], index: int = 0) -> ProbeResult:
+        self.probes.append(probe)
+        headers = probe["act"].get("headers") or {}
+        if "Authorization" in headers:
+            return ProbeResult(
+                probe_index=index,
+                verdict=Verdict.PASS,
+                details=[
+                    "credential provider: minted ghost_jwt (ttl 300s)",
+                    "act: GET /ghost/api/admin/site/ -> 200",
+                    f"sent authorization: Ghost {_FAKE_JWT}",
+                ],
+                http_status=200,
+                minted_tokens=[_FAKE_JWT],
+            )
+        return ProbeResult(
+            probe_index=index,
+            verdict=Verdict.PASS,
+            details=["act: GET /ghost/api/admin/site/ -> 401"],
+            http_status=401,
+        )
+
+
+def _fake_auth_side(tmp_path: Path) -> SimpleNamespace:
+    snapshot = tmp_path / "snapshot"
+    (snapshot / ".pd-auth").mkdir(parents=True)
+    (snapshot / ".pd-auth" / "admin_key").write_text(
+        _FAKE_ADMIN_KEY + "\n", encoding="utf-8"
+    )
+    data_dir = snapshot / "ghost" / "core" / "content" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "ghost.db").write_bytes(b"sqlite-bytes")
+    prov = ProvisionResult(
+        status=ProvisionStatus.READY,
+        reason=None,
+        runtime="node",
+        runtime_version="22.11.0",
+        package_manager="pnpm",
+        install_plan={},
+        install_plan_sha256="ab" * 32,
+        logs=[f"seed ran with ADMIN_PASSWORD={_FAKE_BOOTSTRAP}", "ready"],
+        proc=_FakeProc(),
+    )
+    return SimpleNamespace(
+        sha="h" * 40,
+        provision=prov,
+        sandbox_evidence={"app_network_mode": "none+socket"},
+        contract=None,
+        snapshot_dir=snapshot,
+        bootstrap_env={
+            "ADMIN_EMAIL": "boot@proofdeploy.invalid",
+            "ADMIN_PASSWORD": _FAKE_BOOTSTRAP,
+        },
+        generated_secrets=[_FAKE_BOOTSTRAP, _FAKE_ADMIN_KEY],
+    )
+
+
+def test_auth_proof_side_proves_auth_through_the_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src, sha = _one_commit_src(tmp_path)
+    clone = _empty_clone(tmp_path, src)
+    side = _fake_auth_side(tmp_path)
+    executor = _FakeExecutor()
+    orch = SimpleNamespace(
+        _provision_side_sandbox=(
+            lambda rev, port, unit_dir, tag: side
+        ),
+        _make_executor=lambda s: executor,
+    )
+    monkeypatch.chdir(tmp_path)  # pd-logs/ land in tmp
+    row = ap.auth_proof_side(
+        orch,
+        clone,
+        GHOST_UNIT,
+        {"role": "fix", "sha": sha},
+        rp.contract_path("TryGhost/Ghost"),
+        1,
+        tmp_path / "work",
+        "isolated",
+    )
+    assert row["kind"] == "auth-proof"
+    assert row["status"] == "READY"
+    assert row["registered_sha"] == sha
+    # The seed's traces in the snapshot: key file present, and the
+    # SQLite file the app side serves from is named.
+    assert row["seed"]["key_file_present"] is True
+    assert row["seed"]["sqlite_files"] == [
+        "ghost/core/content/data/ghost.db (12 bytes)"
+    ]
+    # The proof itself: 200, 200 with a second mint, 401 bare.
+    auth = row["auth"]
+    assert auth["passed"] is True
+    assert auth["status"] == "PROVEN"
+    assert [r["http_status"] for r in auth["requests"]] == [200, 200, 401]
+    assert [r["mints"] for r in auth["requests"]] == [1, 1, 0]
+    assert auth["mint_count_after_two_authenticated"] == 2
+    assert auth["requests"][0]["authorization"] == (
+        "Ghost <redacted:minted_jwt>"
+    )
+    assert auth["requests"][2]["authorization"] is None
+    # The probes the executor actually received: two carrying the
+    # ${AUTH_TOKEN} header for the provider to fill, one bare.
+    assert len(executor.probes) == 3
+    assert executor.probes[0]["act"]["headers"]["Authorization"] == (
+        "Ghost ${AUTH_TOKEN}"
+    )
+    assert "headers" not in executor.probes[2]["act"]
+    # No secret value reaches the row or the dumped log; the counts
+    # say what was scrubbed (the JWT detail line twice, the
+    # bootstrap password in the provision log once).
+    blob = json.dumps(row)
+    assert _FAKE_ADMIN_KEY not in blob
+    assert _FAKE_JWT not in blob
+    assert _FAKE_BOOTSTRAP not in blob
+    assert row["redactions"]["minted_jwt"] == 2
+    assert row["redactions"]["bootstrap_value"] == 1
+    log_text = (
+        tmp_path / "pd-logs" / "authproof-checkpoint-bug-ghost-1-fix-a1.log"
+    ).read_text(encoding="utf-8")
+    assert _FAKE_BOOTSTRAP not in log_text
+    assert _FAKE_ADMIN_KEY not in log_text
+    # The live side was stopped.
+    assert side.provision.proc.stopped is True
