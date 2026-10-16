@@ -11,7 +11,7 @@ actually works end to end:
 2. the same authenticated request again — expected 200, with a
    SECOND mint (one mint per request, counted from the provider's
    own detail lines);
-3. the same path with no Authorization header — expected 401
+3. the same path with no Authorization header — expected 403
    (auth is really enforced, not merely accepted).
 
 The proof exists because a READY side proves build + start only:
@@ -69,9 +69,17 @@ from proofdeploy.sandbox import assert_measurement_gate
 ROOT = Path(__file__).resolve().parent
 SEEDS_DIR = ROOT / "seeds"
 
-# The one endpoint the proof exercises: Ghost's Admin API site
-# endpoint — the same endpoint the WO-8.3 sandbox proof used.
-ADMIN_PATH = "/ghost/api/admin/site/"
+# The one endpoint the proof exercises (D91): Ghost's Admin API
+# tags endpoint. Its browse requires permission (permissions:
+# true) and the seeded integration's "Admin Integration" role
+# covers it, so an authenticated read answers 200 while a
+# request with no credentials is refused with 403
+# (authorizeAdminApi raises NoPermissionError). The site
+# endpoint the WO-8.3 proof used cannot serve here: its read
+# is permissions: false — public by design — so it answers
+# 200 with or without auth and proves nothing about whether
+# Ghost accepted the token.
+ADMIN_PATH = "/ghost/api/admin/tags/"
 
 # The contract seed's script, by the name the contract's `seed:`
 # command invokes it and the seeds directory it is committed from.
@@ -187,7 +195,7 @@ def _authenticated_probe() -> dict[str, Any]:
 def _unauthenticated_probe() -> dict[str, Any]:
     return {
         "act": {"method": "GET", "path": ADMIN_PATH},
-        "assert": [{"type": "status", "equals": 401}],
+        "assert": [{"type": "status", "equals": 403}],
     }
 
 
@@ -331,7 +339,7 @@ def auth_proof_side(
                 seed_evidence["key_file_present"]
                 and records[0]["http_status"] == 200
                 and records[1]["http_status"] == 200
-                and records[2]["http_status"] == 401
+                and records[2]["http_status"] == 403
                 and mint_total == 2
                 and all(r["verdict"] == "pass" for r in records)
             )

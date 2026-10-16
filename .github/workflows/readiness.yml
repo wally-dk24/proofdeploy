@@ -26,7 +26,7 @@
 # instead of the provision pass — the same provisioning path, then
 # three executor probes per side proving the contract's declared
 # auth (authenticated 200, a second authenticated 200 with a fresh
-# mint, unauthenticated 401). The optional `only` input restricts
+# mint, unauthenticated 403). The optional `only` input restricts
 # it to comma-separated <unit>:<role> sides (the one-side
 # rehearsal). Auth-proof rows are labelled "auth-proof"; like the
 # provision rows they are evidence, never measured records.

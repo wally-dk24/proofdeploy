@@ -1479,7 +1479,7 @@ def test_commit_contract_and_seed_delta_is_exactly_two_files(
 class _FakeExecutor:
     """The executor's shape for the proof: an authenticated probe
     PASSes at 200 with one mint (and, to prove the scrub, a detail
-    line carrying the minted token); the bare probe PASSes at 401
+    line carrying the minted token); the bare probe PASSes at 403
     (its assertion is the refusal)."""
 
     def __init__(self) -> None:
@@ -1494,7 +1494,7 @@ class _FakeExecutor:
                 verdict=Verdict.PASS,
                 details=[
                     "credential provider: minted ghost_jwt (ttl 300s)",
-                    "act: GET /ghost/api/admin/site/ -> 200",
+                    "act: GET /ghost/api/admin/tags/ -> 200",
                     f"sent authorization: Ghost {_FAKE_JWT}",
                 ],
                 http_status=200,
@@ -1503,8 +1503,8 @@ class _FakeExecutor:
         return ProbeResult(
             probe_index=index,
             verdict=Verdict.PASS,
-            details=["act: GET /ghost/api/admin/site/ -> 401"],
-            http_status=401,
+            details=["act: GET /ghost/api/admin/tags/ -> 403"],
+            http_status=403,
         )
 
 
@@ -1575,11 +1575,12 @@ def test_auth_proof_side_proves_auth_through_the_engine(
     assert row["seed"]["sqlite_files"] == [
         "ghost/core/content/data/ghost.db (12 bytes)"
     ]
-    # The proof itself: 200, 200 with a second mint, 401 bare.
+    # The proof itself: 200, 200 with a second mint, 403 bare.
     auth = row["auth"]
     assert auth["passed"] is True
     assert auth["status"] == "PROVEN"
-    assert [r["http_status"] for r in auth["requests"]] == [200, 200, 401]
+    assert auth["endpoint"] == "/ghost/api/admin/tags/"
+    assert [r["http_status"] for r in auth["requests"]] == [200, 200, 403]
     assert [r["mints"] for r in auth["requests"]] == [1, 1, 0]
     assert auth["mint_count_after_two_authenticated"] == 2
     assert auth["requests"][0]["authorization"] == (
@@ -1593,6 +1594,14 @@ def test_auth_proof_side_proves_auth_through_the_engine(
         "Ghost ${AUTH_TOKEN}"
     )
     assert "headers" not in executor.probes[2]["act"]
+    # All three probes target the D91 endpoint, and the bare
+    # probe's assertion is the 403 refusal.
+    assert [p["act"]["path"] for p in executor.probes] == [
+        "/ghost/api/admin/tags/"
+    ] * 3
+    assert executor.probes[2]["assert"] == [
+        {"type": "status", "equals": 403}
+    ]
     # No secret value reaches the row or the dumped log; the counts
     # say what was scrubbed (the JWT detail line twice, the
     # bootstrap password in the provision log once).

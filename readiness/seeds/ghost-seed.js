@@ -62,9 +62,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitUp(child) {
   // "Up" means the app answers like a running Ghost, not the 503
   // maintenance page it serves for every route during boot
-  // (migrations). A fresh (not yet set up) Ghost answers the site
-  // endpoint 200; after setup it answers 401 without auth. Both
-  // mean the API is live; 503 means still booting.
+  // (migrations). The poll target is the site endpoint, whose
+  // read is public by design (permissions: false in Ghost's
+  // core/server/api/endpoints/site.js), so it answers 200 with
+  // or without auth, before and after setup; only 503 means
+  // still booting. Auth enforcement is proven separately
+  // against /ghost/api/admin/tags/, whose browse requires
+  // permission (permissions: true).
   for (let i = 0; i < 150; i++) {
     if (child.exitCode !== null) {
       throw new Error(`temporary Ghost exited early with ${child.exitCode}`);
