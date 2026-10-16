@@ -46,8 +46,10 @@ The real-install E2E tests need network (registry access for
 npm; the corepack bootstrap + pnpm download for pnpm); like
 WO-8.1b's real-tool tests they fail rather than skip offline.
 """
+import ast
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -537,3 +539,193 @@ def test_d18_no_lockfile_refusal_is_prefixed_and_never_retried(
     # failure still is.
     assert rp._rerun_targets(prior) == [("T-generic", "fix")]
     assert not rp._is_not_supported_row(generic)
+
+
+# ------------------------------------------------------------------
+# Part 2 of the 1.2(j) follow-up: the reviewer's typed-refusal
+# ruling (reviewer, 2026-10-15) as a standing guard. The ruled
+# classes live in docs/typed-refusals-inventory.md, "Ruling
+# (reviewer, 2026-10-15)"; R1 keeps the mechanical test as
+# typed_reason.startswith("not supported:") and allows the
+# prefix ONLY on Master-approved not-supported classes (D18,
+# D33, D50). This test reads the inventory's ruled classes and
+# asserts, for every ruled row, that the string the code
+# actually emits starts with the prefix iff the row is ruled
+# "not supported" — both directions, so a prefix can never
+# creep onto an our-gap or harness string (which would
+# silently skip a side H5 must judge) and a ruled
+# not-supported string can never lose it.
+
+_INVENTORY = (
+    Path(__file__).resolve().parent.parent
+    / "docs"
+    / "typed-refusals-inventory.md"
+)
+
+# Rows whose inventory entry is a mechanism or a cross-reference
+# rather than its own emitted literal:
+_REFUSAL_ROW_OVERRIDES: dict[int, dict[str, object]] = {
+    # #36 emits the plan's image_refusal verbatim -> row 1's string.
+    36: {"template_from": 1},
+    # #40's reason is a §4 SandboxError text truncated to 200
+    # chars; those texts are rows 43-55, each checked on its own.
+    40: {"skip": True},
+    # #57 is the row_from_exception passthrough mechanism; the
+    # ruling classes its named instance, emitted by yml.py.
+    57: {"template": "proofdeploy.yml missing required keys: {keys}"},
+}
+
+_SITE_FILE_BY_BASENAME = {
+    "provisioning.py": "proofdeploy/provisioning.py",
+    "runner.py": "proofdeploy/runner.py",
+    "orchestrator.py": "proofdeploy/orchestrator.py",
+    "sandbox.py": "proofdeploy/sandbox.py",
+    "yml.py": "proofdeploy/yml.py",
+    "provision.py": "readiness/provision.py",
+}
+
+
+def _inventory_rows() -> tuple[dict[int, dict[str, object]], dict[int, str]]:
+    text = _INVENTORY.read_text(encoding="utf-8")
+    main, _, ruling = text.partition("## Ruling (reviewer, 2026-10-15)")
+    assert ruling, "inventory has no Ruling section"
+    rows: dict[int, dict[str, object]] = {}
+    for line in main.splitlines():
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 5 or not cells[1].isdigit():
+            continue
+        span = re.search(r"`([^`]+)`", cells[2])
+        if span is None:
+            continue
+        files: list[str] = []
+        for name in re.findall(r"[\w./-]+\.py", cells[3]):
+            rel = name if "/" in name else _SITE_FILE_BY_BASENAME[name]
+            if rel not in files:
+                files.append(rel)
+        rows[int(cells[1])] = {"template": span.group(1), "files": files}
+    ruled: dict[int, str] = {}
+    for line in ruling.splitlines():
+        m = re.match(
+            r"\| (\d+) \| (not supported|our gap|harness or environment)",
+            line,
+        )
+        if m:
+            ruled[int(m.group(1))] = m.group(2)
+    return rows, ruled
+
+
+def _literal_part_lists(path: Path) -> list[list[str]]:
+    """Every string literal in a source file, as its list of
+    literal parts (one part for a plain string; the constant
+    segments, in order, for an f-string)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    lists: list[list[str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value:
+                lists.append([node.value])
+        elif isinstance(node, ast.JoinedStr):
+            # Empty segments (an f-string's edge padding around a
+            # placeholder) carry no text; dropping them keeps the
+            # first real segment as the literal's anchor.
+            parts = [
+                v.value
+                for v in node.values
+                if isinstance(v, ast.Constant)
+                and isinstance(v.value, str)
+                and v.value
+            ]
+            if parts:
+                lists.append(parts)
+    return lists
+
+
+def _segments(template: str) -> list[str]:
+    return [
+        seg.replace("\\n", "\n") for seg in re.split(r"\{[^}]*\}", template)
+    ]
+
+
+def _prefix_compatible(a: str, b: str) -> bool:
+    # "" is a prefix of everything, so it is compatible only
+    # with itself; otherwise any short literal could anchor a
+    # match on an empty segment.
+    if not a or not b:
+        return a == b
+    return a.startswith(b) or b.startswith(a)
+
+
+def _matches(template: str, parts: list[str]) -> bool:
+    segments = _segments(template)
+    # The lists may differ in length only by trailing empty
+    # segments (a template or a literal ending at a placeholder).
+    width = max(len(segments), len(parts))
+    segs = segments + [""] * (width - len(segments))
+    pts = parts + [""] * (width - len(parts))
+    # The anchor segment must match exactly: a shorter literal
+    # that merely prefixes it (e.g. the constant "workspaces")
+    # is a different string, not this row's emission.
+    if not segs[0] or segs[0] != pts[0]:
+        return False
+    return all(
+        _prefix_compatible(seg, part)
+        for seg, part in zip(segs, pts, strict=True)
+    )
+
+
+def test_typed_refusal_prefix_coverage() -> None:
+    rows, ruled = _inventory_rows()
+    assert set(rows) == set(ruled), (
+        "inventory rows and ruling rows disagree: "
+        f"unruled={sorted(set(rows) - set(ruled))} "
+        f"unknown={sorted(set(ruled) - set(rows))}"
+    )
+    root = Path(__file__).resolve().parent.parent
+    candidates_by_file: dict[str, list[list[str]]] = {}
+    failures: list[str] = []
+    for number in sorted(rows):
+        info = rows[number]
+        override = _REFUSAL_ROW_OVERRIDES.get(number, {})
+        if override.get("skip"):
+            continue
+        if "template_from" in override:
+            info = rows[int(override["template_from"])]  # type: ignore[arg-type]
+        template = str(override.get("template", info["template"]))
+        files = list(info["files"])  # type: ignore[arg-type]
+        want_prefix = ruled[number] == "not supported"
+        # Doc side: the documented string carries the prefix iff
+        # the row is ruled not supported.
+        if template.startswith("not supported: ") != want_prefix:
+            failures.append(
+                f"#{number}: inventory string {template!r} "
+                f"{'carries' if template.startswith('not supported: ') else 'lacks'} "
+                f"the prefix but is ruled {ruled[number]!r}"
+            )
+            continue
+        # Code side: an emitted literal in the row's site file(s)
+        # must correspond to the documented template, and every
+        # corresponding literal must agree on the prefix.
+        matched: list[bool] = []
+        for rel in files:
+            if rel not in candidates_by_file:
+                candidates_by_file[rel] = _literal_part_lists(root / rel)
+            for parts in candidates_by_file[rel]:
+                if _matches(template, parts):
+                    matched.append(parts[0].startswith("not supported: "))
+        if not matched:
+            failures.append(
+                f"#{number}: no emitted literal in {files} matches "
+                f"the inventory string {template!r}"
+            )
+        elif len(set(matched)) > 1:
+            failures.append(
+                f"#{number}: emitted literals disagree on the prefix "
+                f"for {template!r}"
+            )
+        elif matched[0] != want_prefix:
+            failures.append(
+                f"#{number}: emitted string for {template!r} "
+                f"{'carries' if matched[0] else 'lacks'} the prefix "
+                f"but is ruled {ruled[number]!r}"
+            )
+    assert not failures, "\n".join(failures)

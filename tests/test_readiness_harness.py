@@ -172,6 +172,29 @@ def test_row_from_provision_ready() -> None:
     assert row["attempt"] == 1
 
 
+def test_row_from_provision_carries_plan_workspace_facts() -> None:
+    """Plan 1.2(k) trace fix: the row's app_path / workspace_root
+    come from the plan, like every other plan fact on the row. A
+    workspace plan that resolved the root app (Vendure's shape)
+    shows "." on its row; before this fix the row carried no
+    app_path field at all, so any reader saw a phantom None that
+    no code had written and that contradicted the plan."""
+    plan = {
+        "declared_range": ">=20",
+        "selected_version": "22.11.0",
+        "package_manager": "bun",
+        "app_path": ".",
+        "workspace_root": ".",
+        "refusal": None,
+    }
+    side = _fake_side(plan=plan)
+    row = rp.row_from_provision(
+        BUG_UNIT, BUG_UNIT["sides"][1], "h" * 40, 1, "isolated", side
+    )
+    assert row["app_path"] == "."
+    assert row["workspace_root"] == "."
+
+
 def test_row_from_provision_build_failed_plan_refusal() -> None:
     plan = {"declared_range": None, "refusal": "workspaces not yet supported"}
     side = _fake_side(
@@ -323,7 +346,8 @@ def test_provision_side_row_agrees_with_its_log_on_both_refusals(
 
 def test_row_from_exception_types_runtime_detection() -> None:
     exc = ValueError(
-        "cannot detect runtime in /snap: no package.json or pyproject.toml"
+        "cannot detect runtime in /snap: no package.json, "
+        "pyproject.toml or requirements.txt"
     )
     row = rp.row_from_exception(
         BUG_UNIT, BUG_UNIT["sides"][0], "h" * 40, 1, "isolated", exc
@@ -393,7 +417,8 @@ def test_provision_side_types_a_raising_path(
         self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
     ) -> SimpleNamespace:
         raise ValueError(
-            "cannot detect runtime in /snap: no package.json or pyproject.toml"
+            "cannot detect runtime in /snap: no package.json, "
+            "pyproject.toml or requirements.txt"
         )
 
     monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", raising_method)

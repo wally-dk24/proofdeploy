@@ -335,7 +335,8 @@ def detect_runtime(snapshot_dir: Path) -> tuple[str, str | None]:
     if requirements.is_file():
         return "python", None
     raise ValueError(
-        f"cannot detect runtime in {snapshot_dir}: no package.json or pyproject.toml"
+        f"cannot detect runtime in {snapshot_dir}: no package.json, "
+        "pyproject.toml or requirements.txt"
     )
 
 
