@@ -3,10 +3,13 @@
 No live API: a FakeFetcher serves recorded-style responses built from
 per-repo file maps, and the Fetcher's retry logic is exercised with an
 injected raw_fetch. Each filter test pins one A2/A3 branch; the
-changes-round tests pin the reviewer's F1-F6 findings on PR #108.
+changes-round tests pin the reviewer's F1-F6 findings on PR #108; the
+D74 tests pin the fetcher fix (timeout, HTTPException retries, per-repo
+error rows) and the journal/resume mechanics.
 """
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import io
 import json
@@ -830,3 +833,310 @@ def test_run_records_error_count_and_errored_repos(tmp_path: Path) -> None:
     errored = [e for e in result["entries"] if "error" in e]
     assert errored[0]["full_name"] == "acme/flaky"
     assert errored[0]["error"].startswith("harness or environment:")
+
+
+# ------------------------------------------- D74 fetcher fix (plan 1.5(b))
+
+
+def test_incomplete_read_mid_body_is_retried_and_succeeds() -> None:
+    # The two Phase B deaths (D74): a connection break mid-body raises
+    # http.client.IncompleteRead inside the fetch. It subclasses
+    # HTTPException, not OSError; it must be retried like one.
+    calls: list[str] = []
+
+    def raw_fetch(url: str, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
+        calls.append(url)
+        if len(calls) == 1:
+            raise http.client.IncompleteRead(b"partial-body", 1234)
+        return 200, {}, b"full-body"
+
+    fetcher = mod.Fetcher(sleep=NO_SLEEP, raw_fetch=raw_fetch)
+    assert fetcher.get_bytes("https://api.github.com/x") == b"full-body"
+    assert len(calls) == 2
+
+
+def test_http_exception_other_than_incomplete_read_is_retried() -> None:
+    calls: list[str] = []
+
+    def raw_fetch(url: str, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
+        calls.append(url)
+        if len(calls) == 1:
+            raise http.client.RemoteDisconnected("remote end closed")
+        return 200, {}, b"ok"
+
+    fetcher = mod.Fetcher(sleep=NO_SLEEP, raw_fetch=raw_fetch)
+    assert fetcher.get_bytes("https://api.github.com/x") == b"ok"
+    assert len(calls) == 2
+
+
+def test_timeout_is_retried() -> None:
+    calls: list[str] = []
+
+    def raw_fetch(url: str, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
+        calls.append(url)
+        if len(calls) == 1:
+            raise TimeoutError("read timed out")
+        return 200, {}, b"ok"
+
+    fetcher = mod.Fetcher(sleep=NO_SLEEP, raw_fetch=raw_fetch)
+    assert fetcher.get_bytes("https://api.github.com/x") == b"ok"
+    assert len(calls) == 2
+
+
+def test_every_request_carries_the_d74_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    timeouts: list[float | None] = []
+
+    class FakeResponse:
+        status = 200
+        headers: dict[str, str] = {}
+
+        def read(self) -> bytes:
+            return b"{}"
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    def fake_urlopen(req: object, timeout: float | None = None) -> FakeResponse:
+        timeouts.append(timeout)
+        return FakeResponse()
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    fetcher = mod.Fetcher(sleep=NO_SLEEP)  # the default urllib fetch
+    assert fetcher.get_bytes("https://api.github.com/x") == b"{}"
+    assert timeouts == [mod.REQUEST_TIMEOUT]
+    assert mod.REQUEST_TIMEOUT == 120
+
+
+def test_persistent_incomplete_read_becomes_harness_error() -> None:
+    calls: list[str] = []
+
+    def raw_fetch(url: str, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
+        calls.append(url)
+        raise http.client.IncompleteRead(b"part", 10)
+
+    fetcher = mod.Fetcher(sleep=NO_SLEEP, raw_fetch=raw_fetch, max_retries=2)
+    with pytest.raises(mod.HarnessError) as excinfo:
+        fetcher.get_bytes("https://api.github.com/x")
+    assert len(calls) == 3  # first attempt + 2 retries, then it gives up
+    # Same final shape as the OSError path (D74: exactly like OSError).
+    assert str(excinfo.value) == (
+        "GET https://api.github.com/x -> HTTP 0 (after 2 retries)"
+    )
+
+
+def test_persistent_fetch_failure_is_a_row_and_the_run_continues(
+    tmp_path: Path,
+) -> None:
+    # One repo's every request breaks mid-body forever; the other repo
+    # is healthy. The run must complete with the broken repo recorded
+    # as a harness-or-environment row (the WO-6 brief's requirement),
+    # never die the way both Phase B executions did.
+    good_pkg = json.dumps({
+        "scripts": {"start": "node index.js"},
+        "dependencies": {"sqlite3": "^5.1.0"},
+    })
+
+    def raw_fetch(url: str, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
+        if "/repos/acme/flaky/" in url:
+            raise http.client.IncompleteRead(b"part", 10)
+        if "/search/repositories" in url:
+            if "language%3AJavaScript" in url:
+                payload: dict[str, Any] = {
+                    "total_count": 2,
+                    "incomplete_results": False,
+                    "items": [item("acme/flaky", 9000), item("acme/good", 2000)],
+                }
+            else:
+                payload = {"total_count": 0, "incomplete_results": False, "items": []}
+            return 200, {}, json.dumps(payload).encode()
+        if "/repos/acme/good/branches/" in url:
+            return 200, {}, json.dumps({"commit": {"sha": SHA}}).encode()
+        if "/repos/acme/good/git/trees/" in url:
+            tree = {"tree": [
+                {"path": "package.json", "type": "blob"},
+                {"path": "package-lock.json", "type": "blob"},
+            ], "truncated": False}
+            return 200, {}, json.dumps(tree).encode()
+        if "/repos/acme/good/contents/package.json" in url:
+            return 200, {}, good_pkg.encode()
+        raise AssertionError(f"unexpected URL: {url}")
+
+    fetcher = mod.Fetcher(sleep=NO_SLEEP, raw_fetch=raw_fetch, max_retries=2)
+    result = mod.run(fetcher, "2026-10-15", tmp_path, sleep=NO_SLEEP)
+    assert result["error_count"] == 1
+    assert result["errored_repos"] == [{"full_name": "acme/flaky", "stars": 9000}]
+    assert result["survivor_count"] == 1
+    assert result["survivors"][0]["full_name"] == "acme/good"
+    errored = [e for e in result["entries"] if "error" in e]
+    assert errored[0]["error"].startswith("harness or environment:")
+
+
+# ------------------------------------------- D74 journal and resume
+
+
+def _four_app_fetcher() -> FakeFetcher:
+    repos = {
+        f"acme/app{i}": {"files": {
+            "package.json": json.dumps({
+                "scripts": {"start": "node index.js"},
+                "dependencies": {"sqlite3": "^5.1.0"},
+            }),
+            "package-lock.json": "{}",
+        }}
+        for i in range(1, 5)
+    }
+    pages = [[
+        item("acme/app1", 4000), item("acme/app2", 3000),
+        item("acme/app3", 2000), item("acme/app4", 1000),
+    ]]
+    return FakeFetcher(repos=repos, search_pages={"JavaScript": pages})
+
+
+class KillAfterNFetcher(FakeFetcher):
+    """A hard kill between repos: the (n+1)-th repo's screening raises
+    KeyboardInterrupt (a BaseException, so nothing in the run catches
+    it — the process dies, as both Phase B executions did)."""
+
+    def __init__(self, *args: Any, kill_after: int, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._kill_after = kill_after
+        self._screened = 0
+
+    def get_json(self, url: str) -> Any:
+        if "/branches/" in url:
+            self._screened += 1
+            if self._screened > self._kill_after:
+                raise KeyboardInterrupt
+        return super().get_json(url)
+
+
+IDENTITY = {"script_sha256": "s" * 64, "main_sha": "m" * 40}
+
+
+def test_journaled_run_killed_and_resumed_is_byte_identical(
+    tmp_path: Path,
+) -> None:
+    ref_journal = tmp_path / "ref-journal"
+    ref_out = tmp_path / "ref-out"
+    mod.run(
+        _four_app_fetcher(), "2026-10-15", ref_out, sleep=NO_SLEEP,
+        journal_dir=ref_journal, **IDENTITY,
+    )
+    ref_raw = (ref_out / "regc-add2-raw.json").read_bytes()
+    ref_survivors = (ref_out / "regc-add2-survivors.json").read_bytes()
+
+    journal_dir = tmp_path / "journal"
+    out_dir = tmp_path / "out"
+    base = _four_app_fetcher()
+    killer = KillAfterNFetcher(
+        repos=base.repos, search_pages=base.search_pages, kill_after=2
+    )
+    with pytest.raises(KeyboardInterrupt):
+        mod.run(
+            killer, "2026-10-15", out_dir, sleep=NO_SLEEP,
+            journal_dir=journal_dir, **IDENTITY,
+        )
+    # The pool and search metadata were on disk before any screening,
+    # and exactly the two completed repos were appended, one line each.
+    header = json.loads((journal_dir / "header.json").read_text())
+    assert header["script_sha256"] == IDENTITY["script_sha256"]
+    assert header["main_sha"] == IDENTITY["main_sha"]
+    assert header["snapshot_date"] == "2026-10-15"
+    stored_pool = json.loads((journal_dir / "pool.json").read_text())
+    assert stored_pool["query_counts"]["JavaScript"] == 4
+    assert len(stored_pool["pool"]) == 4
+    entry_lines = (journal_dir / "entries.jsonl").read_text().splitlines()
+    assert len(entry_lines) == 2
+    assert not (out_dir / "regc-add2-raw.json").exists()
+
+    resumed_fetcher = _four_app_fetcher()
+    result = mod.run(
+        resumed_fetcher, "2026-10-15", out_dir, sleep=NO_SLEEP,
+        journal_dir=journal_dir, **IDENTITY,
+    )
+    assert result["survivor_count"] == 4
+    # The resume screened exactly the unrecorded repos: the recorded
+    # two were not re-screened, the unrecorded two were not skipped.
+    screened = {
+        c.split("/repos/", 1)[1].split("/branches/")[0]
+        for c in resumed_fetcher.calls if "/branches/" in c
+    }
+    assert screened == {"acme/app3", "acme/app4"}
+    # Final outputs built from the journal: byte-identical to the
+    # uninterrupted journaled run.
+    assert (out_dir / "regc-add2-raw.json").read_bytes() == ref_raw
+    assert (out_dir / "regc-add2-survivors.json").read_bytes() == ref_survivors
+    # Every start is recorded; the resume names the previous exit cause.
+    events = [
+        json.loads(ln) for ln in (journal_dir / "events.jsonl").read_text().splitlines()
+    ]
+    starts = [e for e in events if e["type"] == "start"]
+    assert len(starts) == 2
+    assert starts[0]["resumed"] is False
+    assert starts[1]["resumed"] is True
+    assert starts[1]["previous_exit_cause"].startswith("not recorded")
+    assert events[-1] == {
+        "type": "exit", "at": events[-1]["at"], "cause": "completed",
+    }
+
+
+def test_journal_resume_after_completion_makes_no_calls(tmp_path: Path) -> None:
+    journal_dir = tmp_path / "journal"
+    out_dir = tmp_path / "out"
+    mod.run(
+        _four_app_fetcher(), "2026-10-15", out_dir, sleep=NO_SLEEP,
+        journal_dir=journal_dir, **IDENTITY,
+    )
+    raw_before = (out_dir / "regc-add2-raw.json").read_bytes()
+
+    class ExplodingFetcher(FakeFetcher):
+        def get_json(self, url: str) -> Any:
+            raise AssertionError("a completed journal needs no fetching")
+
+        def get_text(self, url: str) -> str:
+            raise AssertionError("a completed journal needs no fetching")
+
+        def get_bytes(self, url: str) -> bytes:
+            raise AssertionError("a completed journal needs no fetching")
+
+    result = mod.run(
+        ExplodingFetcher(), "2026-10-15", out_dir, sleep=NO_SLEEP,
+        journal_dir=journal_dir, **IDENTITY,
+    )
+    assert result["survivor_count"] == 4
+    assert (out_dir / "regc-add2-raw.json").read_bytes() == raw_before
+
+
+def test_journal_resume_refuses_on_identity_mismatch(tmp_path: Path) -> None:
+    journal_dir = tmp_path / "journal"
+    out_dir = tmp_path / "out"
+    mod.run(
+        _four_app_fetcher(), "2026-10-15", out_dir, sleep=NO_SLEEP,
+        journal_dir=journal_dir, **IDENTITY,
+    )
+    entries_before = (journal_dir / "entries.jsonl").read_text()
+    events_before = (journal_dir / "events.jsonl").read_text()
+
+    with pytest.raises(mod.JournalMismatch):
+        mod.run(
+            _four_app_fetcher(), "2026-10-15", out_dir, sleep=NO_SLEEP,
+            journal_dir=journal_dir,
+            script_sha256="x" * 64, main_sha=IDENTITY["main_sha"],
+        )
+    with pytest.raises(mod.JournalMismatch):
+        mod.run(
+            _four_app_fetcher(), "2026-10-15", out_dir, sleep=NO_SLEEP,
+            journal_dir=journal_dir,
+            script_sha256=IDENTITY["script_sha256"], main_sha="n" * 40,
+        )
+    with pytest.raises(mod.JournalMismatch):
+        mod.run(
+            _four_app_fetcher(), "2026-10-16", out_dir, sleep=NO_SLEEP,
+            journal_dir=journal_dir, **IDENTITY,
+        )
+    # A refused resume writes nothing: no start event, no new entries.
+    assert (journal_dir / "entries.jsonl").read_text() == entries_before
+    assert (journal_dir / "events.jsonl").read_text() == events_before

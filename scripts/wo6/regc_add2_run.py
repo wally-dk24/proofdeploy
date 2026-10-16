@@ -29,22 +29,39 @@ never written to any output; the record carries only
 `authenticated: true/false`. Rate limits are handled by waiting and
 retrying; a repo whose checks still fail after retries is recorded as
 "harness or environment: <error>", never as excluded.
+
+D74 (2026-10-16) changes only the fetch layer and run mechanics; the
+selection rules A1-A6 above are unchanged. Every request now carries
+a timeout, and `http.client.HTTPException` (including `IncompleteRead`,
+a mid-body connection break) is retried exactly like `OSError`; an
+exception left after retries for one repo becomes that repo's
+"harness or environment: <error>" row, never a dead run. A run with
+`--journal <dir>` journals as it goes: the pool and search metadata
+are written before any screening, one line is appended per screened
+repo, and the final outputs are built only from the journal. A death
+resumes the same journal; the journal header carries this script's
+sha256, the main SHA and the snapshot date, and a resume with any of
+them different refuses. One journal is one run (A5).
 """
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
+import http.client
 import io
 import json
 import os
 import re
+import subprocess
+import sys
 import tarfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +70,7 @@ USER_AGENT = "proofdeploy-regc-add2-runner"
 LANGUAGES = ("JavaScript", "TypeScript", "Python")
 PER_PAGE = 100
 MAX_PAGES = 10  # A1: 10 pages x 100 = the first 1000 results per query.
+REQUEST_TIMEOUT = 120.0  # D74: every request gets a timeout (seconds).
 
 NODE_LOCKFILES = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock")
 NODE_MONOREPO_FILES = ("pnpm-workspace.yaml", "lerna.json", "nx.json", "turbo.json")
@@ -117,11 +135,13 @@ class Fetcher:
     """GitHub API GETs with rate-limit waiting and retries.
 
     raw_fetch(url, headers) -> (status, headers, body) is injectable for
-    offline tests; the default implementation uses urllib. A retryable
-    failure (403/429 rate limiting, 5xx, network error) is retried after
-    the server-provided wait (Retry-After, else X-RateLimit-Reset, else
-    exponential backoff); after max_retries the call raises HarnessError.
-    A 404 raises NotFound immediately (F3: typed, never substring-matched).
+    offline tests; the default implementation uses urllib with a
+    per-request timeout (D74). A retryable failure (403/429 rate
+    limiting, 5xx, network error, or an http.client.HTTPException such
+    as IncompleteRead) is retried after the server-provided wait
+    (Retry-After, else X-RateLimit-Reset, else exponential backoff);
+    after max_retries the call raises HarnessError. A 404 raises
+    NotFound immediately (F3: typed, never substring-matched).
     """
 
     def __init__(
@@ -146,7 +166,7 @@ class Fetcher:
     ) -> tuple[int, dict[str, str], bytes]:
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req) as r:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
                 return r.status, dict(r.headers.items()), r.read()
         except urllib.error.HTTPError as e:
             return e.code, dict(e.headers.items()) if e.headers else {}, e.read() or b""
@@ -177,6 +197,11 @@ class Fetcher:
             except OSError as e:
                 status, resp_headers, body = 0, {}, b""
                 last = f"network error: {e}"
+            except http.client.HTTPException as e:
+                # D74: a mid-body break (IncompleteRead) or any other
+                # http.client failure is retried exactly like OSError.
+                status, resp_headers, body = 0, {}, b""
+                last = f"http error: {e}"
             if status == 200:
                 return body
             if status == 404:
@@ -745,6 +770,14 @@ def check_repo(
     except HarnessError as e:
         entry["error"] = f"harness or environment: {e}"
         entry["survivor"] = False
+    except Exception as e:
+        # D74: any other failure left after the fetcher's retries (a
+        # corrupt tarball, a malformed response body, ...) is recorded
+        # the same way; a single repo never kills the run. A hard kill
+        # (KeyboardInterrupt / SystemExit) is a BaseException and still
+        # ends the process, to be resumed from the journal.
+        entry["error"] = f"harness or environment: {type(e).__name__}: {e}"
+        entry["survivor"] = False
     return entry
 
 
@@ -753,15 +786,201 @@ def item4_key(entry: dict[str, Any]) -> tuple[int, str]:
     return (-int(entry["stars"]), str(entry["full_name"]).lower())
 
 
-def run(
-    fetcher: Fetcher,
+class JournalMismatch(Exception):
+    """A resume was attempted against a journal whose header names a
+    different script, main SHA or snapshot date. The resume refuses:
+    one journal is one run (A5), under one identity."""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _script_sha256() -> str:
+    return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+
+
+def _detect_main_sha() -> str | None:
+    """HEAD of the checkout containing this script (the run record
+    names it); None when it cannot be determined."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = proc.stdout.strip()
+    return sha if proc.returncode == 0 and sha else None
+
+
+class Journal:
+    """The D74 run journal: one directory is one run (A5).
+
+    header.json identifies the run (script sha256, main SHA, snapshot
+    date). pool.json — the collected pool in order, the per-query
+    counts and the search metadata — is written before any screening.
+    entries.jsonl gains one line per screened repo, as it completes.
+    events.jsonl records every start and resume (UTC time and the
+    previous exit cause) and the exit of a completed session. The
+    final outputs are built only from these files, so a process death
+    loses nothing already screened and a resume re-screens nothing
+    already recorded.
+    """
+
+    def __init__(self, dir_path: Path, header: dict[str, Any]) -> None:
+        self.dir = dir_path
+        self.header = header
+
+    @classmethod
+    def open(
+        cls,
+        dir_path: Path,
+        *,
+        script_sha256: str,
+        main_sha: str,
+        snapshot_date: str,
+    ) -> tuple[Journal, bool, str | None]:
+        """(journal, resumed, previous exit cause).
+
+        A directory without a header starts a new run. A directory
+        with one resumes it — after verifying the header names this
+        exact script, main SHA and snapshot date; any difference
+        raises JournalMismatch before anything is written.
+        """
+        header_path = dir_path / "header.json"
+        if not header_path.exists():
+            dir_path.mkdir(parents=True, exist_ok=True)
+            journal = cls(dir_path, {
+                "format": 1,
+                "script_sha256": script_sha256,
+                "main_sha": main_sha,
+                "snapshot_date": snapshot_date,
+            })
+            journal._write_atomic("header.json", journal.header)
+            return journal, False, None
+        header = json.loads(header_path.read_text())
+        for field, expected in (
+            ("script_sha256", script_sha256),
+            ("main_sha", main_sha),
+            ("snapshot_date", snapshot_date),
+        ):
+            if header.get(field) != expected:
+                raise JournalMismatch(
+                    f"journal {field} is {header.get(field)!r}, "
+                    f"this run has {expected!r}; refusing to resume"
+                )
+        journal = cls(dir_path, header)
+        return journal, True, journal._previous_exit_cause()
+
+    def _previous_exit_cause(self) -> str:
+        events = self._read_events()
+        if events and events[-1].get("type") == "exit":
+            return str(events[-1].get("cause", "completed"))
+        if events:
+            return "not recorded: the previous session ended without an exit record"
+        return "not recorded: no prior session events"
+
+    def _read_events(self) -> list[dict[str, Any]]:
+        path = self.dir / "events.jsonl"
+        if not path.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        for line in path.read_text().splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+        return events
+
+    def _write_atomic(self, name: str, payload: dict[str, Any]) -> None:
+        tmp = self.dir / f".{name}.tmp"
+        tmp.write_text(json.dumps(payload, indent=1))
+        os.replace(tmp, self.dir / name)
+
+    def _append_line(self, name: str, payload: dict[str, Any]) -> None:
+        with (self.dir / name).open("a") as f:
+            f.write(json.dumps(payload) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def record_start(self, *, resumed: bool, previous_exit_cause: str | None) -> None:
+        self._append_line("events.jsonl", {
+            "type": "start",
+            "at": _utc_now(),
+            "resumed": resumed,
+            "previous_exit_cause": previous_exit_cause,
+        })
+
+    def record_exit(self, cause: str) -> None:
+        self._append_line("events.jsonl", {
+            "type": "exit",
+            "at": _utc_now(),
+            "cause": cause,
+        })
+
+    def write_pool(
+        self,
+        pool: list[dict[str, Any]],
+        counts: dict[str, int],
+        search_meta: dict[str, Any],
+    ) -> None:
+        self._write_atomic("pool.json", {
+            "pool": pool,
+            "query_counts": counts,
+            "search_meta": search_meta,
+        })
+
+    def read_pool(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]] | None:
+        path = self.dir / "pool.json"
+        if not path.exists():
+            return None
+        stored = json.loads(path.read_text())
+        return stored["pool"], stored["query_counts"], stored["search_meta"]
+
+    def append_entry(self, entry: dict[str, Any]) -> None:
+        self._append_line("entries.jsonl", entry)
+
+    def read_entries(self) -> list[dict[str, Any]]:
+        """Screened-repo entries in completion order.
+
+        A torn final line (a death mid-append) is dropped: that repo
+        was never durably recorded and is re-screened on resume. A
+        corrupt line anywhere else raises.
+        """
+        path = self.dir / "entries.jsonl"
+        if not path.exists():
+            return []
+        lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+        entries: list[dict[str, Any]] = []
+        for i, line in enumerate(lines):
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                if i == len(lines) - 1:
+                    break
+                raise
+        return entries
+
+
+def _finalize(
+    entries: list[dict[str, Any]],
+    *,
     snapshot_date: str,
+    counts: dict[str, int],
+    search_meta: dict[str, Any],
+    pool_size: int,
+    authenticated: bool,
     out_dir: Path,
-    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    pool, counts, search_meta = collect_pool(fetcher, snapshot_date, sleep=sleep)
-    entries = [check_repo(fetcher, rec) for rec in pool.values()]
-    entries.sort(key=item4_key)
+    """Item 4 ordering and the accepted output files, from entries in
+    pool order (the same objects appear in entries and survivors, so
+    the assigned order shows in both, as the format has always been).
+    """
+    entries = sorted(entries, key=item4_key)
     survivors = [e for e in entries if e.get("survivor")]
     for i, e in enumerate(survivors):
         e["order"] = i + 1
@@ -773,10 +992,10 @@ def run(
         "rule": "REG-C as amended by Addendum 2 (A1-A3); items 2 and 4 unchanged",
         "snapshot_date": snapshot_date,
         "pushed_since": pushed_since(snapshot_date),
-        "authenticated": bool(getattr(fetcher, "authenticated", False)),
+        "authenticated": authenticated,
         "query_counts": counts,
         "search_pages": search_meta,
-        "pool_size": len(pool),
+        "pool_size": pool_size,
         "survivor_count": len(survivors),
         "error_count": len(errored),
         "errored_repos": errored,
@@ -791,6 +1010,68 @@ def run(
     return result
 
 
+def run(
+    fetcher: Fetcher,
+    snapshot_date: str,
+    out_dir: Path,
+    sleep: Callable[[float], None] = time.sleep,
+    *,
+    journal_dir: Path | None = None,
+    script_sha256: str | None = None,
+    main_sha: str | None = None,
+) -> dict[str, Any]:
+    authenticated = bool(getattr(fetcher, "authenticated", False))
+    if journal_dir is None:
+        pool, counts, search_meta = collect_pool(fetcher, snapshot_date, sleep=sleep)
+        entries = [check_repo(fetcher, rec) for rec in pool.values()]
+        return _finalize(
+            entries,
+            snapshot_date=snapshot_date,
+            counts=counts,
+            search_meta=search_meta,
+            pool_size=len(pool),
+            authenticated=authenticated,
+            out_dir=out_dir,
+        )
+    # D74 journaled run: the pool and every screened entry reach disk
+    # before the outputs are built, and the outputs are built only
+    # from the journal.
+    journal, resumed, previous_cause = Journal.open(
+        journal_dir,
+        script_sha256=(
+            script_sha256 if script_sha256 is not None else _script_sha256()
+        ),
+        main_sha=main_sha if main_sha is not None else (_detect_main_sha() or ""),
+        snapshot_date=snapshot_date,
+    )
+    journal.record_start(resumed=resumed, previous_exit_cause=previous_cause)
+    stored = journal.read_pool()
+    if stored is None:
+        pool, counts, search_meta = collect_pool(fetcher, snapshot_date, sleep=sleep)
+        journal.write_pool(list(pool.values()), counts, search_meta)
+        stored = journal.read_pool()
+    assert stored is not None  # write_pool just landed (or was already there)
+    pool_list, counts, search_meta = stored
+    done = {e["full_name"] for e in journal.read_entries()}
+    for rec in pool_list:
+        if rec["full_name"] in done:
+            continue  # recorded in a previous session; never re-screened
+        journal.append_entry(check_repo(fetcher, rec))
+    journaled = {e["full_name"]: e for e in journal.read_entries()}
+    entries = [journaled[rec["full_name"]] for rec in pool_list]
+    result = _finalize(
+        entries,
+        snapshot_date=snapshot_date,
+        counts=counts,
+        search_meta=search_meta,
+        pool_size=len(pool_list),
+        authenticated=authenticated,
+        out_dir=out_dir,
+    )
+    journal.record_exit("completed")
+    return result
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--snapshot-date", default=date.today().isoformat())
@@ -799,10 +1080,46 @@ def main() -> None:
         type=Path,
         default=Path.home() / "workspace" / "wo6-scratch" / "regc-add2-raw",
     )
+    ap.add_argument(
+        "--journal",
+        type=Path,
+        default=None,
+        help="run journal directory (D74); defaults to <out>-journal",
+    )
+    ap.add_argument(
+        "--main-sha",
+        default=None,
+        help="the main SHA this run is from (recorded in the journal "
+        "header); defaults to the checkout's HEAD",
+    )
     args = ap.parse_args()
     token = os.environ.get("GITHUB_TOKEN") or None
     fetcher = Fetcher(token=token)
-    result = run(fetcher, args.snapshot_date, args.out)
+    journal_dir = (
+        args.journal
+        if args.journal is not None
+        else args.out.parent / f"{args.out.name}-journal"
+    )
+    main_sha = args.main_sha or _detect_main_sha()
+    if not main_sha:
+        print(
+            "error: the main SHA could not be determined; pass --main-sha",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    resumed = (journal_dir / "header.json").exists()
+    try:
+        result = run(
+            fetcher,
+            args.snapshot_date,
+            args.out,
+            journal_dir=journal_dir,
+            main_sha=main_sha,
+        )
+    except JournalMismatch as err:
+        print(f"error: {err}", file=sys.stderr)
+        raise SystemExit(2) from err
+    print(f"journal: {journal_dir} ({'resumed' if resumed else 'new run'})")
     print(f"snapshot date: {result['snapshot_date']} (pushed_since {result['pushed_since']})")
     for lang in LANGUAGES:
         print(f"query language:{lang}: returned={result['query_counts'][lang]}")
