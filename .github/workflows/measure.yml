@@ -73,7 +73,7 @@ jobs:
     # GROQ_API_KEY lives in the `measurement` environment.
     environment: measurement
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 

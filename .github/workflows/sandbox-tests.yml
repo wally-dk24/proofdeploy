@@ -72,7 +72,7 @@ jobs:
     outputs:
       run_heavy: ${{ steps.decide.outputs.run_heavy }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Decide heavy steps
@@ -176,7 +176,7 @@ jobs:
       - name: Inert change — heavy steps skipped (WAL-101)
         if: steps.gate.outputs.proceed == 'false'
         run: echo "Every changed file is inert (documentation/text only); the sandbox selection does not run for this PR."
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.gate.outputs.proceed == 'true'
 
       - name: Set up Python
