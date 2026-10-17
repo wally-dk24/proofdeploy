@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -89,19 +90,65 @@ def add_tag(repo: Path, name: str, when: int, target: str = "HEAD") -> None:
     )
 
 
+def side_outcome(
+    *,
+    ready: bool = False,
+    status: str | None = None,
+    typed_reason: str | None = None,
+    last_error: str | None = None,
+) -> dict[str, Any]:
+    """One injected check-(d) side outcome, in the real checker's
+    shape: the readiness row's fields plus the run's evidence."""
+    return {
+        "ready": ready,
+        "status": status
+        if status is not None
+        else ("READY" if ready else "BUILD_FAILED"),
+        "typed_reason": typed_reason,
+        "last_error": last_error,
+        "engine": "podman (fake)",
+        "isolation_mode": "userns-remap (fake)",
+        "network_mode": "none+socket",
+        "network_none_evidence": "fake: app container ran with --net=none",
+        "contract_store_sha256": "c" * 64,
+    }
+
+
 class FakeReady:
-    """Injected check (d): the named shas are READY, nothing else is."""
+    """Injected check (d), in the real checker's protocol.
 
-    def __init__(self, ready: Any = ()) -> None:
+    A sha in `ready` provisions READY. A sha in `scripted` yields
+    its outcomes in order, one per provisioning attempt of that
+    side (the last one repeats). Any other sha yields a typed
+    `not supported:` outcome — a genuine (d) failure — so tests
+    that are not about classification see plain rejections."""
+
+    def __init__(
+        self,
+        ready: Any = (),
+        scripted: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
         self.ready = set(ready)
-        self.calls: list[tuple[str, str]] = []
+        self.scripted = {k: list(v) for k, v in (scripted or {}).items()}
+        self.calls: list[tuple[str, str, tuple[str, ...]]] = []
 
-    def __call__(self, parent_sha: str, fix_sha: str) -> dict[str, bool]:
-        self.calls.append((parent_sha, fix_sha))
-        return {
-            "parent_ready": parent_sha in self.ready,
-            "fix_ready": fix_sha in self.ready,
-        }
+    def __call__(
+        self, parent_sha: str, fix_sha: str, roles: tuple[str, ...]
+    ) -> dict[str, dict[str, Any]]:
+        self.calls.append((parent_sha, fix_sha, roles))
+        out: dict[str, dict[str, Any]] = {}
+        for role in roles:
+            sha = parent_sha if role == "fix^" else fix_sha
+            seq = self.scripted.get(sha)
+            if seq:
+                out[role] = seq.pop(0) if len(seq) > 1 else seq[0]
+            elif sha in self.ready:
+                out[role] = side_outcome(ready=True)
+            else:
+                out[role] = side_outcome(
+                    typed_reason="not supported: fake refusal (test default)"
+                )
+        return out
 
 
 def app_dict(head: str) -> dict[str, Any]:
@@ -406,6 +453,12 @@ def test_check_d_requires_both_sides_ready(tmp_path: Path) -> None:
     assert entry["failed_check"] == "d"
     assert entry["reason"] == "fix^ is not READY"
     assert entry["parent_ready"] is False and entry["fix_ready"] is True
+    # The default fake failure is a typed `not supported:` — a
+    # genuine (d) failure, classified and recorded per side (D177).
+    assert entry["readiness"]["fix_parent"]["class"] == "not_supported"
+    assert entry["readiness"]["fix"]["class"] == "ready"
+    assert entry["readiness"]["fix"]["engine"] == "podman (fake)"
+    assert entry["readiness"]["fix"]["contract_store_sha256"] == "c" * 64
 
     record = select(repo, fix, FakeReady({mid}))
     entry = record["walked"][-1]
@@ -416,6 +469,224 @@ def test_check_d_requires_both_sides_ready(tmp_path: Path) -> None:
     entry = record["walked"][-1]
     assert entry["failed_check"] == "d"
     assert entry["reason"] == "fix^ and fix are not READY"
+
+
+# ---------------------------------------------------------------------
+# Check (d) classification (D48, per D177).
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "outcome,expected",
+    [
+        (side_outcome(ready=True), "ready"),
+        (side_outcome(typed_reason="not supported: no frozen lockfile"),
+         "not_supported"),
+        (side_outcome(typed_reason="runtime not supported"), "not_supported"),
+        (side_outcome(typed_reason="harness error: git fetch failed"),
+         "harness"),
+        (side_outcome(
+            typed_reason=(
+                "SandboxError: measured run refused: no bridge "
+                "network for the install phase"
+            )),
+         "environment"),
+        (side_outcome(
+            typed_reason="RuntimeError: git fetch failed",
+            last_error="Could not resolve host github.com"),
+         "environment"),
+        (side_outcome(
+            typed_reason="submodules nest past the depth limit (our gap)"),
+         "our_gap"),
+        (side_outcome(typed_reason="the frobnicate refused the widget"),
+         "unruled"),
+        (side_outcome(), "unruled"),
+    ],
+)
+def test_classify_side(outcome: dict[str, Any], expected: str) -> None:
+    assert mod.classify_side(outcome) == expected
+
+
+def test_check_d_not_supported_moves_to_next_candidate(
+    tmp_path: Path,
+) -> None:
+    """D177 (2): a typed `not supported:` side is a genuine (d)
+    failure — recorded with its class, never retried — and the
+    walk moves on to the next candidate, which is selected."""
+    repo = init_repo(tmp_path)
+    commit(repo, "Initial commit", ts(2026, 1, 10),
+           {"src/app.py": "l1\nl2\nl3\n"})
+    commit(repo, "Introduce the counter", ts(2026, 2, 1),
+           {"src/app.py": "l1\nl2-bug\nl3\n"})
+    add_tag(repo, "v1.0", ts(2026, 2, 2))
+    bad_parent = commit(repo, "Introduce the meter", ts(2026, 3, 1),
+                        {"src/app.py": "l1\nl2-bug\nl3-bug\n"})
+    fix1 = commit(repo, "Fix the counter", ts(2026, 8, 10),
+                  {"src/app.py": "l1\nl2-fixed\nl3-bug\n"})
+    add_tag(repo, "v2.0", ts(2026, 8, 12), target=fix1)
+    # fix2 changes the line fix1 wrote, so its B is fix1 itself.
+    fix2 = commit(repo, "Fix the counter properly", ts(2026, 8, 20),
+                  {"src/app.py": "l1\nl2-fixed2\nl3-bug\n"})
+    fake = FakeReady(
+        ready={fix1, fix2},
+        scripted={
+            bad_parent: [
+                side_outcome(
+                    typed_reason="not supported: stub runtime refused"
+                )
+            ]
+        },
+    )
+    record = select(repo, fix2, fake)
+    assert record["outcome"] == "selected"
+    assert record["selected"]["fix"] == fix2
+    assert record["selected"]["b"] == fix1
+    walked = {e["sha"]: e for e in record["walked"]}
+    entry1 = walked[fix1]
+    assert entry1["failed_check"] == "d"
+    assert entry1["readiness"]["fix_parent"]["class"] == "not_supported"
+    assert entry1["readiness"]["fix"]["class"] == "ready"
+    assert len(entry1["readiness"]["fix_parent"]["attempts"]) == 1
+    # The not-supported side was provisioned exactly once: a typed
+    # refusal is never retried.
+    assert [c for c in fake.calls if c[0] == bad_parent] == [
+        (bad_parent, fix1, ("fix^", "fix"))
+    ]
+
+
+@pytest.mark.parametrize(
+    "typed_reason,expected_class",
+    [
+        ("harness error: git fetch failed in the clone: stub", "harness"),
+        (
+            "SandboxError: measured run refused: no bridge network "
+            "for the install phase",
+            "environment",
+        ),
+    ],
+)
+def test_check_d_retryable_failure_retries_then_selects(
+    tmp_path: Path, typed_reason: str, expected_class: str
+) -> None:
+    """D177 (2): a harness/environment failure is retried per
+    side (up to 2 further attempts); READY on a retry selects, and
+    every attempt is journaled."""
+    repo, _base, _b, mid, fix = standard_history(tmp_path)
+    journal, _, _ = _open_journal(tmp_path, fix)
+    fake = FakeReady(
+        ready={mid},
+        scripted={
+            fix: [side_outcome(typed_reason=typed_reason),
+                  side_outcome(ready=True)]
+        },
+    )
+    record = select(repo, fix, fake, journal=journal)
+    assert record["outcome"] == "selected"
+    entry = record["walked"][-1]
+    fix_side = entry["readiness"]["fix"]
+    assert [a["class"] for a in fix_side["attempts"]] == [
+        expected_class, "ready",
+    ]
+    assert fix_side["class"] == "ready"
+    # The retry provisioned only the failing side.
+    assert fake.calls[0] == (mid, fix, ("fix^", "fix"))
+    assert fake.calls[1] == (mid, fix, ("fix",))
+    # Every attempt journaled, per side, in order.
+    journaled = journal.read_attempts()
+    assert [(a["role"], a["class"]) for a in journaled] == [
+        ("fix^", "ready"), ("fix", expected_class), ("fix", "ready"),
+    ]
+    assert all(a["commit"] == fix for a in journaled)
+
+
+def test_check_d_our_gap_stops_run_not_rejected(tmp_path: Path) -> None:
+    """D177 (2): an our-gap side stops the run for a ruling. The
+    record's outcome is "stopped", the commit gains NO walk entry
+    (it is not marked rejected — in the record or the journal),
+    the stop is journaled as an event, and a resume with the gap
+    fixed re-evaluates the same commit and selects it."""
+    repo, _base, _b, mid, fix = standard_history(tmp_path)
+    journal, _, _ = _open_journal(tmp_path, fix)
+    fake = FakeReady(
+        ready={mid},
+        scripted={
+            fix: [side_outcome(
+                typed_reason="fixture render failed: boom (our gap)"
+            )]
+        },
+    )
+    record = select(repo, fix, fake, journal=journal)
+    assert record["outcome"] == "stopped"
+    assert record["stopped"]["sha"] == fix
+    assert record["stopped"]["check"] == "d"
+    assert record["stopped"]["role"] == "fix"
+    assert record["stopped"]["class"] == "our_gap"
+    assert record["stopped"]["retries_exhausted"] is False
+    assert fix not in [e["sha"] for e in record["walked"]]
+    assert fix not in [e["sha"] for e in journal.read_walk()]
+    events = [
+        json.loads(ln)
+        for ln in (journal.dir / "events.jsonl").read_text().splitlines()
+        if ln.strip()
+    ]
+    assert any(
+        e.get("type") == "stop" and e.get("class") == "our_gap"
+        and e.get("sha") == fix
+        for e in events
+    )
+    # The stop's attempts were journaled too.
+    assert [a["class"] for a in journal.read_attempts()
+            if a["role"] == "fix"] == ["our_gap"]
+
+    # Resume with the gap fixed: the same commit is re-evaluated
+    # (nothing was rejected) and selected.
+    journal2, resumed2, _ = _open_journal(tmp_path, fix)
+    assert resumed2 is True
+    record2 = select(repo, fix, FakeReady({mid, fix}), journal=journal2)
+    assert record2["outcome"] == "selected"
+    assert record2["selected"]["fix"] == fix
+
+
+def test_check_d_unruled_class_stops_run(tmp_path: Path) -> None:
+    """D177 (2): a failure matching no ruled class is unruled and
+    stops the run the same way — it never steers the selection."""
+    repo, _base, _b, mid, fix = standard_history(tmp_path)
+    fake = FakeReady(
+        ready={mid},
+        scripted={
+            fix: [side_outcome(
+                typed_reason="the frobnicate refused the widget"
+            )]
+        },
+    )
+    record = select(repo, fix, fake)
+    assert record["outcome"] == "stopped"
+    assert record["stopped"]["class"] == "unruled"
+    assert record["stopped"]["role"] == "fix"
+    assert fix not in [e["sha"] for e in record["walked"]]
+
+
+def test_check_d_retries_exhausted_stops_run(tmp_path: Path) -> None:
+    """D177 (2): a harness/environment side still failing after
+    its 3 attempts stops the run instead of being rejected — the
+    environment must not steer the selection."""
+    repo, _base, _b, mid, fix = standard_history(tmp_path)
+    fake = FakeReady(
+        ready={mid},
+        scripted={
+            fix: [side_outcome(
+                typed_reason="harness error: git fetch failed: stub"
+            )]
+        },
+    )
+    record = select(repo, fix, fake)
+    assert record["outcome"] == "stopped"
+    assert record["stopped"]["class"] == "harness"
+    assert record["stopped"]["retries_exhausted"] is True
+    attempts = record["stopped"]["readiness"]["fix"]["attempts"]
+    assert [a["class"] for a in attempts] == ["harness"] * 3
+    assert [a["attempt"] for a in attempts] == [1, 2, 3]
+    assert fix not in [e["sha"] for e in record["walked"]]
 
 
 # ---------------------------------------------------------------------
@@ -509,6 +780,7 @@ def test_record_carries_identity_and_full_walk(tmp_path: Path) -> None:
     record = select(repo, fix, FakeReady({mid, fix}))
     assert record["kind"] == "wo6-bug-select"
     assert record["main_sha"] == "f" * 40
+    assert record["merge_base_with_main"] is None
     assert record["app"]["head_sha"] == fix
     assert record["app"]["app_path"] == "src"
     assert record["boundary"] == "2026-07-01T00:00:00Z"

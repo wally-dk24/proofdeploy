@@ -55,9 +55,48 @@ The checks, in order (the record names the FIRST failing one):
   d. fix^ and fix both reach READY through the real sandboxed
      runner (provisioning-only readiness, readiness/provision.py —
      the measured path's own Orchestrator._provision_side_sandbox,
-     driven exactly as readiness.yml drives it). The run executing
-     this script is launched from a checkout of current main (the
-     record carries that main SHA), per D155.
+     driven exactly as readiness.yml drives it).
+
+Check (d) failure classification (D48, per D177 — ProofDeploy's
+own defects must not steer the selection). Each not-READY side is
+classified from its readiness row (classify_side):
+
+- `not supported:` — a typed refusal (D18's mechanism, including
+  the exact typed reason "runtime not supported"): the app
+  genuinely cannot be provisioned as committed. A genuine (d)
+  failure: recorded, and the walk moves on.
+- `harness error:` rows, and rows whose reason carries an
+  environment marker (a host/runner/network fact: the measurement
+  gate's refusals, sandbox start failures, name-resolution and
+  connection failures): retried, per side, up to 2 further
+  attempts (3 total), every attempt journaled in attempts.jsonl.
+  A side still failing after its retries stops the run too: an
+  environment that cannot provision must not be allowed to reject
+  candidates on its way through the walk.
+- Our gap (a reason carrying "(our gap)" — ProofDeploy's own
+  limits and defects, per D48) or ANY class not ruled above: the
+  run STOPS for the reviewer's ruling. The stop is journaled (a
+  stop event plus the attempts), the commit is NOT marked
+  rejected, and a resume re-evaluates it. A stop raised in the
+  same attempt round as a `not supported:` rejection takes
+  precedence: the rejection is not recorded until our own defect
+  has been ruled on.
+- Fail closed: if no sandbox engine is available on the host, the
+  run refuses before provisioning anything. There is no host
+  (unsandboxed) fallback anywhere in this script.
+
+The record carries, per side: the engine, the isolation mode, the
+network evidence (the side's resolved app network mode; in
+none+socket mode the app container ran with --net=none), the
+contract-store sha256 of the app's readiness/contracts entry, and
+every attempt with its class.
+
+Where the live run executes (D155): on Wally's VM — the host that
+ran the Phase B add2 run — launched by the coordinator from a
+checkout of this repo whose HEAD contains current main; check
+(d)'s READY runs execute in-process on that host through the
+sandboxed runner. The record carries the launch HEAD (main_sha)
+and its merge-base with main (merge_base_with_main).
 
 CONTAMINATION GUARD: this script records commit metadata and check
 outcomes only. It never prints or writes the fix's diff, any file
@@ -79,7 +118,10 @@ this PR does):
   (script sha256, main SHA, app repo, app HEAD SHA from the
   committed ordered list); walk.jsonl gains one line per examined
   commit as it completes; events.jsonl records starts, resumes and
-  the completed exit. A death loses nothing already examined; a
+  the completed exit. attempts.jsonl gains one line per check-(d)
+  provisioning attempt as it happens, and a D48 stop is recorded
+  as a stop event in events.jsonl — the stopped commit gains NO
+  walk line, so a resume re-evaluates it. A death loses nothing already examined; a
   resume re-examines nothing already recorded and refuses when
   the header names a different script, main SHA or app HEAD. The
   output record is built only from the journal.
@@ -92,7 +134,10 @@ this PR does):
 
 Exit status: 0 when the run completed (a selection and an
 exhaustion are both results); 2 when the run itself failed
-(journal identity mismatch, lock held, clone/harness errors).
+(journal identity mismatch, lock held, clone/harness errors) or
+stopped for a ruling under the D48 classification (D177) — a stop
+is journaled and resumable, and the stopped commit is not marked
+rejected.
 """
 from __future__ import annotations
 
@@ -175,6 +220,29 @@ def _detect_main_sha() -> str | None:
         return None
     sha = proc.stdout.strip()
     return sha if proc.returncode == 0 and sha else None
+
+
+def _detect_merge_base() -> str | None:
+    """The merge-base of this checkout's HEAD with main (D155:
+    the live run is launched from a ref containing current main,
+    and the record states the merge-base). None when it cannot be
+    determined."""
+    root = Path(__file__).resolve().parents[2]
+    for ref in ("origin/main", "main"):
+        try:
+            proc = subprocess.run(
+                ["git", "merge-base", "HEAD", ref],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        sha = proc.stdout.strip()
+        if proc.returncode == 0 and sha:
+            return sha
+    return None
 
 
 # ---------------------------------------------------------------------
@@ -478,14 +546,233 @@ class AppRepo:
 # the record names the FIRST failing check.
 # ---------------------------------------------------------------------
 
-# A readiness pair check: (fix^ sha, fix sha) -> {"parent_ready":
-# bool, "fix_ready": bool}. Tests inject a fake; the live run wires
-# readiness.provision (make_provision_pair_checker below).
-ReadyPairCheck = Callable[[str, str], dict[str, bool]]
+# A readiness pair check: (fix^ sha, fix sha, roles to provision)
+# -> {role: side outcome}. A side outcome carries the readiness
+# row's own fields (ready, status, typed_reason, last_error) and
+# the run's evidence (engine, isolation_mode, network_mode,
+# network_none_evidence, contract_store_sha256). Tests inject a
+# fake; the live run wires readiness.provision
+# (make_provision_pair_checker below).
+ReadyPairCheck = Callable[
+    [str, str, tuple[str, ...]], dict[str, dict[str, Any]]
+]
+
+# Check (d) attempts per side: the first attempt plus up to 2
+# retries of a harness/environment-class failure (D177).
+MAX_READY_ATTEMPTS = 3
+
+# Environment markers (D48/D177): substrings of the readiness
+# path's own environment messages — the measurement gate's host
+# refusals (proofdeploy/sandbox.py's assert_measurement_gate),
+# sandbox start failures, and network transients in fetch/install
+# output. A reason matching no ruled class is unruled and stops
+# the run: the table grows by ruling, never by guessing.
+ENVIRONMENT_MARKERS = (
+    "measured run refused:",
+    "sandbox start failed",
+    "no container IP",
+    "no container runtime",
+    "unavailable on this host",
+    "the host cannot",
+    "no bridge network",
+    "Could not resolve host",
+    "Temporary failure in name resolution",
+    "Network is unreachable",
+    "Connection refused",
+    "Connection reset",
+    "timed out",
+)
+
+
+def classify_side(outcome: dict[str, Any]) -> str:
+    """The D48 class of one side's readiness outcome (D177):
+    "ready", "not_supported", "harness", "environment", "our_gap"
+    or "unruled". Classification reads the outcome's status and
+    typed reason — the readiness row's own fields on the real
+    path — and fails closed: anything not matching a ruled class
+    is "unruled", which stops the run for a ruling."""
+    if outcome.get("ready"):
+        return "ready"
+    typed = outcome.get("typed_reason") or ""
+    if typed.startswith("not supported:") or typed == "runtime not supported":
+        return "not_supported"
+    if typed.startswith("harness error:"):
+        return "harness"
+    if "(our gap)" in typed:
+        return "our_gap"
+    haystack = f"{typed}\n{outcome.get('last_error') or ''}"
+    if any(marker in haystack for marker in ENVIRONMENT_MARKERS):
+        return "environment"
+    return "unruled"
+
+
+class StopForRuling(Exception):
+    """Check (d) stopped the run for the reviewer's ruling (D48 /
+    D177): a not-READY side classified as our gap or an unruled
+    class, or a harness/environment side whose retries are
+    exhausted. The commit is NOT rejected; the stop is journaled
+    and a resume re-evaluates the commit."""
+
+    def __init__(
+        self,
+        *,
+        commit_sha: str,
+        role: str,
+        klass: str,
+        reason: str | None,
+        exhausted: bool,
+        sides: dict[str, Any],
+    ) -> None:
+        super().__init__(
+            f"check (d) stopped at {commit_sha[:12]}: {klass} on "
+            f"{role} ({reason})"
+        )
+        self.commit_sha = commit_sha
+        self.role = role
+        self.klass = klass
+        self.reason = reason
+        self.exhausted = exhausted
+        self.sides = sides
+
+
+def _side_records(
+    final: dict[str, tuple[dict[str, Any], str]],
+    attempts: dict[str, list[dict[str, Any]]],
+    shas: dict[str, str],
+) -> dict[str, Any]:
+    """The record's per-side readiness block: the side's final
+    outcome, its D48 class, the run's evidence for the side, and
+    every attempt made for it."""
+    sides: dict[str, Any] = {}
+    for role, key in (("fix^", "fix_parent"), ("fix", "fix")):
+        outcome, klass = final[role]
+        sides[key] = {
+            "sha": shas[role],
+            "ready": klass == "ready",
+            "status": outcome.get("status"),
+            "class": klass,
+            "reason": outcome.get("typed_reason")
+            or outcome.get("last_error"),
+            "engine": outcome.get("engine"),
+            "isolation_mode": outcome.get("isolation_mode"),
+            "network_mode": outcome.get("network_mode"),
+            "network_none_evidence": outcome.get("network_none_evidence"),
+            "contract_store_sha256": outcome.get("contract_store_sha256"),
+            "attempts": attempts[role],
+        }
+    return sides
+
+
+def _run_check_d(
+    parent: str,
+    fix: str,
+    ready_pair: ReadyPairCheck,
+    *,
+    journal: Journal | None,
+    commit_sha: str,
+) -> dict[str, Any]:
+    """Provision fix^ and fix under the D48 classification (D177).
+
+    Returns the per-side records {"fix_parent": ..., "fix": ...}.
+    A genuine `not supported:` failure returns normally with that
+    side not ready; our-gap / unruled classes and exhausted
+    harness/environment retries raise StopForRuling."""
+    roles = ("fix^", "fix")
+    shas = {"fix^": parent, "fix": fix}
+    attempts: dict[str, list[dict[str, Any]]] = {r: [] for r in roles}
+    final: dict[str, tuple[dict[str, Any], str]] = {}
+    pending = list(roles)
+    while pending:
+        outcomes = ready_pair(parent, fix, tuple(pending))
+        for role in pending:
+            outcome = outcomes.get(role)
+            if outcome is None:
+                # The checker broke its own contract: an unruled
+                # class (it carries the "(our gap)" marker below),
+                # so the run stops for a ruling rather than
+                # steering on a missing outcome.
+                outcome = {
+                    "ready": False,
+                    "status": None,
+                    "typed_reason": (
+                        "the readiness checker returned no "
+                        "outcome for this side (our gap)"
+                    ),
+                    "last_error": None,
+                }
+            klass = classify_side(outcome)
+            attempt_rec = {
+                "attempt": len(attempts[role]) + 1,
+                "status": outcome.get("status"),
+                "class": klass,
+                "reason": outcome.get("typed_reason")
+                or outcome.get("last_error"),
+            }
+            attempts[role].append(attempt_rec)
+            if journal is not None:
+                journal.append_attempt({
+                    "commit": commit_sha,
+                    "role": role,
+                    "sha": shas[role],
+                    **attempt_rec,
+                    "engine": outcome.get("engine"),
+                    "isolation_mode": outcome.get("isolation_mode"),
+                    "network_mode": outcome.get("network_mode"),
+                    "contract_store_sha256": outcome.get(
+                        "contract_store_sha256"
+                    ),
+                    "at": datetime.now(timezone.utc).isoformat(),
+                })
+            final[role] = (outcome, klass)
+        # Stop classes first (see the module docstring): our own
+        # defect is ruled on before any rejection is recorded.
+        for role in pending:
+            outcome, klass = final[role]
+            if klass in ("our_gap", "unruled"):
+                raise StopForRuling(
+                    commit_sha=commit_sha,
+                    role=role,
+                    klass=klass,
+                    reason=outcome.get("typed_reason")
+                    or outcome.get("last_error"),
+                    exhausted=False,
+                    sides=_side_records(final, attempts, shas),
+                )
+        if any(final[r][1] == "not_supported" for r in pending):
+            # A genuine (d) failure settles the candidate: no
+            # retry of the other side can change it.
+            pending = []
+        else:
+            pending = [
+                r
+                for r in pending
+                if final[r][1] in ("harness", "environment")
+                and len(attempts[r]) < MAX_READY_ATTEMPTS
+            ]
+    if not any(final[r][1] == "not_supported" for r in roles):
+        # Retries exhausted on a harness/environment class: stop,
+        # do not reject — the environment must not steer the
+        # selection by rejecting candidates on its way through.
+        for role in roles:
+            outcome, klass = final[role]
+            if klass in ("harness", "environment"):
+                raise StopForRuling(
+                    commit_sha=commit_sha,
+                    role=role,
+                    klass=klass,
+                    reason=outcome.get("typed_reason")
+                    or outcome.get("last_error"),
+                    exhausted=True,
+                    sides=_side_records(final, attempts, shas),
+                )
+    return _side_records(final, attempts, shas)
 
 
 def evaluate_commit(
-    repo: AppRepo, meta: CommitMeta, ready_pair: ReadyPairCheck
+    repo: AppRepo,
+    meta: CommitMeta,
+    ready_pair: ReadyPairCheck,
+    journal: Journal | None = None,
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
         "sha": meta.sha,
@@ -551,10 +838,17 @@ def evaluate_commit(
     entry["tag"] = tag_name
     entry["tag_created"] = _iso(tag_ts)
 
-    # (d) fix^ and fix both READY (provisioning-only).
-    readiness = ready_pair(parent, meta.sha)
-    entry["parent_ready"] = bool(readiness["parent_ready"])
-    entry["fix_ready"] = bool(readiness["fix_ready"])
+    # (d) fix^ and fix both READY (provisioning-only), under the
+    # D48 classification (D177): _run_check_d retries harness /
+    # environment sides, returns genuine `not supported:` failures
+    # as not-ready sides, and raises StopForRuling for our-gap /
+    # unruled classes and exhausted retries.
+    readiness = _run_check_d(
+        parent, meta.sha, ready_pair, journal=journal, commit_sha=meta.sha
+    )
+    entry["readiness"] = readiness
+    entry["parent_ready"] = readiness["fix_parent"]["ready"]
+    entry["fix_ready"] = readiness["fix"]["ready"]
     if not (entry["parent_ready"] and entry["fix_ready"]):
         if not entry["parent_ready"] and not entry["fix_ready"]:
             reason = "fix^ and fix are not READY"
@@ -671,15 +965,30 @@ class Journal:
             "cause": cause,
         })
 
+    def record_stop(self, stop: dict[str, Any]) -> None:
+        """A D48 stop (D177) in events.jsonl: the run halted for
+        a ruling at this commit. The commit gains NO walk line,
+        so a resume re-evaluates it — it was never rejected."""
+        self._append_line("events.jsonl", {
+            "type": "stop",
+            "at": datetime.now(timezone.utc).isoformat(),
+            **stop,
+        })
+
     def append_walk(self, entry: dict[str, Any]) -> None:
         self._append_line("walk.jsonl", entry)
 
-    def read_walk(self) -> list[dict[str, Any]]:
-        """Examined-commit entries in walk order. A torn final
-        line (a death mid-append) is dropped: that commit was
-        never durably recorded and is re-examined on resume. A
-        corrupt line anywhere else raises."""
-        path = self.dir / "walk.jsonl"
+    def append_attempt(self, payload: dict[str, Any]) -> None:
+        """One check-(d) provisioning attempt (D177), appended as
+        it happens: a death or a D48 stop loses no attempt."""
+        self._append_line("attempts.jsonl", payload)
+
+    def _read_jsonl(self, name: str) -> list[dict[str, Any]]:
+        """A journal jsonl file's entries. A torn final line (a
+        death mid-append) is dropped: whatever it carried was
+        never durably recorded. A corrupt line anywhere else
+        raises."""
+        path = self.dir / name
         if not path.exists():
             return []
         lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
@@ -692,6 +1001,16 @@ class Journal:
                     break
                 raise
         return entries
+
+    def read_walk(self) -> list[dict[str, Any]]:
+        """Examined-commit entries in walk order (a torn final
+        line's commit was never durably recorded and is
+        re-examined on resume)."""
+        return self._read_jsonl("walk.jsonl")
+
+    def read_attempts(self) -> list[dict[str, Any]]:
+        """Every journaled check-(d) attempt, in order."""
+        return self._read_jsonl("attempts.jsonl")
 
 
 class SingleWriterLock:
@@ -737,24 +1056,45 @@ def select_fix(
     main_sha: str | None,
     script_sha256: str,
     limit: int = MAX_WALKED,
+    merge_base: str | None = None,
 ) -> dict[str, Any]:
     """Walk in the registered order and build the output record.
 
     With a journal, already-recorded entries are reused verbatim
     (a resume re-examines nothing); the record is built only from
-    the journal's entries, as in regc_add2_run.py's finalize."""
+    the journal's entries, as in regc_add2_run.py's finalize. A
+    D48 stop (StopForRuling from check (d)) ends the walk with
+    outcome "stopped": the stopped commit is journaled as a stop
+    event, gains no walk entry, and is re-evaluated on resume."""
     ordered = repo.walk_order(str(app["head_sha"]))
     prior: dict[str, dict[str, Any]] = {}
     if journal is not None:
         prior = {e["sha"]: e for e in journal.read_walk()}
     entries: list[dict[str, Any]] = []
     selected: dict[str, Any] | None = None
+    stopped: dict[str, Any] | None = None
     for meta in ordered:
         if len(entries) >= limit:
             break
         entry = prior.get(meta.sha)
         if entry is None:
-            entry = evaluate_commit(repo, meta, ready_pair)
+            try:
+                entry = evaluate_commit(
+                    repo, meta, ready_pair, journal=journal
+                )
+            except StopForRuling as stop_exc:
+                stopped = {
+                    "sha": stop_exc.commit_sha,
+                    "check": "d",
+                    "role": stop_exc.role,
+                    "class": stop_exc.klass,
+                    "reason": stop_exc.reason,
+                    "retries_exhausted": stop_exc.exhausted,
+                    "readiness": stop_exc.sides,
+                }
+                if journal is not None:
+                    journal.record_stop(stopped)
+                break
             if journal is not None:
                 journal.append_walk(entry)
         entries.append(entry)
@@ -774,11 +1114,18 @@ def select_fix(
             "app_path": app["app_path"],
         },
         "main_sha": main_sha,
+        "merge_base_with_main": merge_base,
         "script_sha256": script_sha256,
         "boundary": BOUNDARY_ISO,
         "walk": "first-parent",
         "walked_count": len(entries),
-        "outcome": "selected" if selected is not None else "exhausted",
+        "outcome": (
+            "stopped"
+            if stopped is not None
+            else "selected"
+            if selected is not None
+            else "exhausted"
+        ),
         "walked": entries,
         "selected": None,
     }
@@ -791,6 +1138,14 @@ def select_fix(
             "tag": selected["tag"],
             "tag_created": selected["tag_created"],
         }
+    elif stopped is not None:
+        record["stopped"] = stopped
+        record["next"] = (
+            "stopped for a ruling (D48/D177): the stopped commit "
+            "was not rejected; rule on the recorded class, fix the "
+            "cause if it is ours, then resume the same journal to "
+            "re-evaluate it"
+        )
     else:
         record["next"] = (
             "exhausted: the next READY candidate from the ordered "
@@ -836,6 +1191,27 @@ def load_candidate(survivors_path: Path, repo_name: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
+def _network_none_evidence(network_mode: str | None) -> str:
+    """What the record can honestly say about an app side's
+    network, in the sandbox module's own terms
+    (proofdeploy/sandbox.py): the resolved app network mode, and
+    — for none+socket — the --net=none fact behind it."""
+    if network_mode == "none+socket":
+        return (
+            "app container ran with --net=none (no network "
+            "interfaces); the executor reached it over a "
+            "Unix-socket bridge"
+        )
+    if network_mode == "isolated":
+        return (
+            "app container ran on an isolated bridge network "
+            "(app_network_mode=isolated)"
+        )
+    if network_mode is None:
+        return "not recorded: the side produced no provision result"
+    return f"app_network_mode={network_mode}"
+
+
 def make_provision_pair_checker(
     *, repo_name: str, workdir: Path
 ) -> ReadyPairCheck:
@@ -844,12 +1220,55 @@ def make_provision_pair_checker(
     readiness.provision.provision_repo — the same
     Orchestrator._provision_side_sandbox path readiness.yml drives
     (provisioning-only; no model call, no probes, no measured
-    records). READY is the readiness row's own status."""
-    from readiness.provision import provision_repo
+    records). A side's outcome is its readiness row's own status
+    and typed reason, plus the run's evidence (engine, isolation
+    mode, network mode, contract-store sha256). A retry provisions
+    only the roles it is asked for (provision_repo's `only`).
 
-    def check(parent_sha: str, fix_sha: str) -> dict[str, bool]:
+    FAILS CLOSED (D177): the sandbox engine is probed before
+    anything is provisioned; with no engine available the checker
+    raises HarnessError and the run refuses. There is no host
+    (unsandboxed) fallback anywhere in this path."""
+    from proofdeploy.sandbox import check_sandbox_capabilities
+    from readiness.provision import contract_path, provision_repo
+
+    caps = check_sandbox_capabilities()
+    if not caps.podman:
+        raise HarnessError(
+            "check (d) refused: no sandbox engine is available "
+            f"on this host ({caps.reason}); the selection never "
+            "falls back to an unsandboxed host run (D177)"
+        )
+    engine = (
+        f"podman {caps.podman_version}" if caps.podman_version else "podman"
+    )
+    isolation_mode = (
+        "userns-remap" if caps.userns_remap else "no-userns-remap"
+    )
+    store = contract_path(repo_name)
+    contract_store_sha256 = (
+        hashlib.sha256(store.read_bytes()).hexdigest()
+        if store.exists()
+        else None
+    )
+
+    def evidence(network_mode: str | None) -> dict[str, Any]:
+        return {
+            "engine": engine,
+            "isolation_mode": isolation_mode,
+            "network_mode": network_mode,
+            "network_none_evidence": _network_none_evidence(network_mode),
+            "contract_store_sha256": contract_store_sha256,
+        }
+
+    calls: dict[str, int] = {}
+
+    def check(
+        parent_sha: str, fix_sha: str, roles: tuple[str, ...]
+    ) -> dict[str, dict[str, Any]]:
+        unit_id = f"WO6-BUGSEL-{fix_sha[:8]}"
         unit = {
-            "unit_id": f"WO6-BUGSEL-{fix_sha[:8]}",
+            "unit_id": unit_id,
             "repo": repo_name,
             "class": "wo6-bug-select",
             "sides": [
@@ -857,14 +1276,56 @@ def make_provision_pair_checker(
                 {"role": "fix", "sha": fix_sha, "source": "regc-bug-select"},
             ],
         }
-        result = provision_repo(
-            {"units": [unit]}, repo_name, workdir, attempt=1
-        )
+        calls[fix_sha] = calls.get(fix_sha, 0) + 1
+        try:
+            result = provision_repo(
+                {"units": [unit]},
+                repo_name,
+                workdir,
+                attempt=calls[fix_sha],
+                only=[(unit_id, role) for role in roles],
+            )
+        except Exception as exc:
+            # The readiness path itself raised (the measurement
+            # gate, the clone, a sandbox refusal): one outcome for
+            # every requested side, classified from the
+            # exception's own text like any other row.
+            return {
+                role: {
+                    "ready": False,
+                    "status": None,
+                    "typed_reason": f"{type(exc).__name__}: {exc}",
+                    "last_error": str(exc),
+                    **evidence(None),
+                }
+                for role in roles
+            }
         rows = {row["role"]: row for row in result["rows"]}
-        return {
-            "parent_ready": rows["fix^"]["status"] == "READY",
-            "fix_ready": rows["fix"]["status"] == "READY",
-        }
+        outcomes: dict[str, dict[str, Any]] = {}
+        for role in roles:
+            row = rows.get(role)
+            if row is None:
+                outcomes[role] = {
+                    "ready": False,
+                    "status": None,
+                    "typed_reason": (
+                        "the readiness harness wrote no row for "
+                        "this side (our gap)"
+                    ),
+                    "last_error": None,
+                    **evidence(result.get("network_mode")),
+                }
+                continue
+            outcomes[role] = {
+                "ready": row["status"] == "READY",
+                "status": row["status"],
+                "typed_reason": row.get("typed_reason"),
+                "last_error": row.get("last_error"),
+                **evidence(
+                    row.get("network_mode") or result.get("network_mode")
+                ),
+            }
+        return outcomes
 
     return check
 
@@ -979,12 +1440,21 @@ def main(argv: list[str] | None = None) -> int:
                 journal=journal,
                 main_sha=main_sha,
                 script_sha256=script_sha256,
+                merge_base=_detect_merge_base(),
             )
             args.out.parent.mkdir(parents=True, exist_ok=True)
             tmp = args.out.with_suffix(".tmp")
             tmp.write_text(json.dumps(record, indent=1))
             os.replace(tmp, args.out)
-            journal.record_exit("completed")
+            if record["outcome"] == "stopped":
+                stop = record["stopped"]
+                journal.record_exit(
+                    f"stopped: ruling required at check (d) for "
+                    f"{stop['sha'][:12]} ({stop['class']} on "
+                    f"{stop['role']})"
+                )
+            else:
+                journal.record_exit("completed")
         finally:
             lock.release()
     except (HarnessError, JournalMismatch, SingleWriterError) as exc:
@@ -1007,6 +1477,15 @@ def main(argv: list[str] | None = None) -> int:
             f"SELECTED fix={sel['fix']} fix^={sel['fix_parent']} "
             f"B={sel['b']} tag={sel['tag']}"
         )
+    elif record["outcome"] == "stopped":
+        stop = record["stopped"]
+        print(
+            f"STOPPED at {stop['sha'][:12]} check (d): "
+            f"{stop['class']} on {stop['role']} — ruling required; "
+            f"the commit was not rejected (journaled, resumable)"
+        )
+        print(f"record written to {args.out}")
+        return 2
     else:
         print(f"EXHAUSTED after {record['walked_count']} walked")
     print(f"record written to {args.out}")

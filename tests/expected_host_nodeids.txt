@@ -997,7 +997,13 @@ tests/test_wo6_bug_select.py::test_check_c_b_in_no_tag_rejected
 tests/test_wo6_bug_select.py::test_check_c_b_is_the_most_recent_blamed_commit_tagged
 tests/test_wo6_bug_select.py::test_check_c_b_is_the_most_recent_blamed_commit_untagged
 tests/test_wo6_bug_select.py::test_check_c_tag_created_after_fix_rejected
+tests/test_wo6_bug_select.py::test_check_d_not_supported_moves_to_next_candidate
+tests/test_wo6_bug_select.py::test_check_d_our_gap_stops_run_not_rejected
 tests/test_wo6_bug_select.py::test_check_d_requires_both_sides_ready
+tests/test_wo6_bug_select.py::test_check_d_retries_exhausted_stops_run
+tests/test_wo6_bug_select.py::test_check_d_retryable_failure_retries_then_selects[SandboxError: measured run refused: no bridge network for the install phase-environment]
+tests/test_wo6_bug_select.py::test_check_d_retryable_failure_retries_then_selects[harness error: git fetch failed in the clone: stub-harness]
+tests/test_wo6_bug_select.py::test_check_d_unruled_class_stops_run
 tests/test_wo6_bug_select.py::test_classify_path[.github/workflows/x.yml-OTHER]
 tests/test_wo6_bug_select.py::test_classify_path[CHANGELOG-DOC]
 tests/test_wo6_bug_select.py::test_classify_path[README.md-DOC]
@@ -1018,6 +1024,15 @@ tests/test_wo6_bug_select.py::test_classify_path[src/paperless_testing/x.py-TEST
 tests/test_wo6_bug_select.py::test_classify_path[src/test_app.py-TEST]
 tests/test_wo6_bug_select.py::test_classify_path[src/tests/x.py-TEST]
 tests/test_wo6_bug_select.py::test_classify_path[src/x_test.py-TEST]
+tests/test_wo6_bug_select.py::test_classify_side[outcome0-ready]
+tests/test_wo6_bug_select.py::test_classify_side[outcome1-not_supported]
+tests/test_wo6_bug_select.py::test_classify_side[outcome2-not_supported]
+tests/test_wo6_bug_select.py::test_classify_side[outcome3-harness]
+tests/test_wo6_bug_select.py::test_classify_side[outcome4-environment]
+tests/test_wo6_bug_select.py::test_classify_side[outcome5-environment]
+tests/test_wo6_bug_select.py::test_classify_side[outcome6-our_gap]
+tests/test_wo6_bug_select.py::test_classify_side[outcome7-unruled]
+tests/test_wo6_bug_select.py::test_classify_side[outcome8-unruled]
 tests/test_wo6_bug_select.py::test_date_boundary_is_strict
 tests/test_wo6_bug_select.py::test_diff_non_ascii_path_parses
 tests/test_wo6_bug_select.py::test_diff_quoted_path_header_fails_closed
