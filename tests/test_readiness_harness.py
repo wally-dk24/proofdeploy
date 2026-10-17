@@ -111,8 +111,8 @@ def test_cutoff_sha_is_fix_for_bugs_and_c_for_cleans() -> None:
 def test_manifest_shape() -> None:
     manifest = rp.load_manifest(rp.DEFAULT_MANIFEST)
     units = manifest["units"]
-    assert len(units) == 27
-    assert sum(len(u["sides"]) for u in units) == 42
+    assert len(units) == 28
+    assert sum(len(u["sides"]) for u in units) == 43
     for unit in units:
         for side in unit["sides"]:
             assert len(side["sha"]) == 40
