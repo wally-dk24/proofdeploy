@@ -205,13 +205,13 @@ jobs:
       matrix:
         include:
           - shard: goldens
-            files: "tests/test_executor_addendum20.py tests/test_leakcheck.py tests/test_orchestrator_addendum25.py tests/test_probe.py tests/test_provisioning_sandbox.py tests/test_container_spike.py tests/test_readiness_harness.py tests/test_replay.py tests/test_runner.py tests/test_runpair_addendum21.py tests/test_runpair_addendum24.py tests/test_runpair_addendum25.py tests/test_wo7_pr2.py tests/test_lockfile_drift.py"
+            files: "tests/test_executor_addendum20.py tests/test_leakcheck.py tests/test_orchestrator_addendum25.py tests/test_probe.py tests/test_provisioning_sandbox.py tests/test_container_spike.py tests/test_readiness_harness.py tests/test_replay.py tests/test_runner.py tests/test_runpair_addendum21.py tests/test_runpair_addendum24.py tests/test_runpair_addendum25.py tests/test_wo7_pr2.py tests/test_lockfile_drift.py tests/test_golden_fixture_truth.py tests/test_kit_materialize.py"
             nodeids: "tests/test_orchestrator.py::test_check_sandbox_runtime_mismatch_fails_closed tests/test_orchestrator.py::test_clean_no_valid_probe_is_false_alarm tests/test_orchestrator.py::test_measure_bug_end_to_end tests/test_orchestrator.py::test_measure_bug_leak_check_fails_closed tests/test_orchestrator.py::test_measure_bug_model_transport_retry_succeeds tests/test_orchestrator.py::test_measure_bug_model_transport_retry_twice tests/test_orchestrator.py::test_measure_bug_refuses_fix_sha_in_snapshot tests/test_orchestrator.py::test_measure_bug_uses_fix_parent_not_b tests/test_orchestrator.py::test_measure_clean_model_transport_retry_succeeds tests/test_orchestrator.py::test_measure_clean_model_transport_retry_twice tests/test_orchestrator.py::test_sandboxed_clean_run_records_measured tests/test_orchestrator.py::test_unsandboxed_clean_run_records_not_measured tests/test_orchestrator.py::test_unsandboxed_normal_run_records_not_measured tests/test_wo81b.py::test_host_provisions_committed_lock_ready[poetry]"
           - shard: contracts
             files: "tests/test_change_model.py tests/test_examples.py tests/test_fixture.py tests/test_orchestrator_addendum23.py tests/test_orchestrator_addendum24.py tests/test_provisioning.py tests/test_runpair.py tests/test_runpair_addendum23.py tests/test_sandbox.py tests/test_setup_auth.py tests/test_submodules.py tests/test_toolstate_guard.py tests/test_wo114_contract_store.py tests/test_wo73.py tests/test_wo81.py"
             nodeids: "tests/test_orchestrator.py::test_all_blocks_invalid_records_author_output_invalid tests/test_orchestrator.py::test_check_sandbox_runtime_match tests/test_orchestrator.py::test_check_sandbox_runtime_no_declared_range tests/test_orchestrator.py::test_crash_after_authoring_records_inconclusive tests/test_orchestrator.py::test_declared_registration_provider tests/test_orchestrator.py::test_inconclusive_sandboxed_counts tests/test_orchestrator.py::test_inconclusive_unsandboxed_dev_does_not_count tests/test_orchestrator.py::test_measure_bug_provisioning_failure_is_inconclusive tests/test_orchestrator.py::test_measure_clean_end_to_end tests/test_orchestrator.py::test_measure_config_sandbox_on_by_default tests/test_orchestrator.py::test_measure_needs_revs tests/test_orchestrator.py::test_mixed_valid_invalid_blocks tests/test_orchestrator.py::test_non_json_block_records_author_output_invalid tests/test_orchestrator.py::test_provider_failure_is_inconclusive_auth tests/test_orchestrator.py::test_unsandboxed_run_is_marked_not_measured tests/test_wo81b.py::test_bootstrap_file_pins_exact_version_with_hashes[pdm] tests/test_wo81b.py::test_bootstrap_file_pins_exact_version_with_hashes[poetry] tests/test_wo81b.py::test_bootstrap_file_pins_exact_version_with_hashes[uv] tests/test_wo81b.py::test_committed_lock_plan_shape[pdm] tests/test_wo81b.py::test_committed_lock_plan_shape[poetry] tests/test_wo81b.py::test_committed_lock_plan_shape[uv] tests/test_wo81b.py::test_first_error_line_names_uv_lock_check_error tests/test_wo81b.py::test_host_provisions_committed_lock_ready[pdm] tests/test_wo81b.py::test_manager_versions_pinned_in_code tests/test_wo81b.py::test_sandbox_runs_manager_plan[pdm] tests/test_wo81b.py::test_sandbox_runs_manager_plan[poetry] tests/test_wo81b.py::test_sandbox_runs_manager_plan[uv]"
           - shard: executor
-            files: "tests/test_check_test_manifest.py tests/test_cli.py tests/test_executor.py tests/test_generate_author_skill.py tests/test_model_client.py tests/test_regb_template_selection.py tests/test_sandbox_addendum18.py tests/test_verify.py tests/test_wo74.py tests/test_wo81_addendum46.py tests/test_wo81c.py tests/test_wo83.py tests/test_yml.py"
+            files: "tests/test_check_test_manifest.py tests/test_cli.py tests/test_executor.py tests/test_generate_author_skill.py tests/test_model_client.py tests/test_regb_template_selection.py tests/test_sandbox_addendum18.py tests/test_verify.py tests/test_wo74.py tests/test_wo81_addendum46.py tests/test_wo81c.py tests/test_wo83.py tests/test_yml.py tests/test_model_workflow_serialization.py"
             nodeids: "tests/test_orchestrator.py::test_evidence_record_carries_provenance tests/test_orchestrator.py::test_inconclusive_unsandboxed_records_not_measured tests/test_orchestrator.py::test_measure_bug_model_overflow_no_retry tests/test_orchestrator.py::test_measure_bug_no_skill_arm_end_to_end tests/test_orchestrator.py::test_measure_bug_refuses_seeded_fix_diff tests/test_orchestrator.py::test_measure_clean_model_overflow_no_retry tests/test_orchestrator.py::test_no_auth_app_clean_run tests/test_orchestrator.py::test_no_auth_app_does_not_crash tests/test_orchestrator.py::test_no_auth_app_model_failure tests/test_orchestrator.py::test_no_blocks_records_author_output_invalid tests/test_orchestrator.py::test_sandboxed_crash_records_measured tests/test_orchestrator.py::test_target_process_group_killed tests/test_orchestrator.py::test_target_process_stopped_after_crash tests/test_orchestrator.py::test_target_process_stopped_after_run tests/test_orchestrator.py::test_unreachable_target_with_invalid_block_scores_inconclusive tests/test_wo81b.py::test_host_mismatch_lock_is_build_failed_with_tool_line tests/test_wo81b.py::test_host_provisions_committed_lock_ready[uv]"
 
     name: host (${{ matrix.shard }})
@@ -246,6 +246,31 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
         if: steps.gate.outputs.proceed == 'true'
+      - name: Install bun (digest-pinned, D150)
+        # D150: the goldens shard's truth tests run `bun install`
+        # for the node-bun-sqlite golden on the host, and the ubuntu
+        # runner ships no bun. Provide it through the repo's OWN
+        # digest pin — proofdeploy.provisioning's BUN_RELEASE_SHA256,
+        # the pin the sandbox bootstrap verifies (plan 1.2e) — at
+        # the version the golden declares (packageManager bun@1.4.3
+        # in conformance/golden/node-bun-sqlite). Same release URL,
+        # artifact and sha256 verification as _bun_bootstrap_step;
+        # no unpinned install, and no other shard needs bun.
+        if: steps.gate.outputs.proceed == 'true' && matrix.shard == 'goldens'
+        run: |
+          set -euo pipefail
+          pin="$(python -c 'from proofdeploy.provisioning import BUN_RELEASE_SHA256 as P; a, s = P["1.4.3"]["x86_64"]; print(a, s)')"
+          artifact="${pin% *}"
+          sha256="${pin##* }"
+          dest="$RUNNER_TEMP/pd-bun"
+          mkdir -p "$dest/bin"
+          curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/$artifact" -o "$dest/bun.zip"
+          echo "$sha256  $dest/bun.zip" | sha256sum -c -
+          unzip -o -q "$dest/bun.zip" -d "$dest/dist"
+          cp "$dest/dist/${artifact%.zip}/bun" "$dest/bin/bun"
+          chmod +x "$dest/bin/bun"
+          echo "$dest/bin" >> "$GITHUB_PATH"
+          "$dest/bin/bun" --version
       - name: tests (this shard)
         if: steps.gate.outputs.proceed == 'true'
         env:

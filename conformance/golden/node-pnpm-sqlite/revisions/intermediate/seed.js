@@ -9,4 +9,6 @@ const uid = db
   .get("seeduser").id;
 db.prepare("INSERT OR IGNORE INTO notes (id, user_id, title, done) VALUES (1, ?, ?, 0)")
   .run(uid, "seeded open note");
+db.prepare("INSERT OR IGNORE INTO notes (id, user_id, title, done) VALUES (2, ?, ?, 1)")
+  .run(uid, "seeded done note");
 console.log("seeded");
