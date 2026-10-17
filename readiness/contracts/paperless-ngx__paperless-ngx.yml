@@ -23,9 +23,19 @@
 # contract's commands address src/manage.py from there. Readiness
 # "/" is the frontend root: login_required, so an anonymous poll is
 # redirected to the Django-served allauth login page.
+# ROUND 2 (D151, ruled 2026-10-17): round 1 installed in full and
+# stopped at migrate on the app's own system checks —
+# PAPERLESS_CONSUMPTION_DIR (/checkout/consume) and
+# PAPERLESS_MEDIA_ROOT (/checkout/media) "is set but doesn't
+# exist". Those are the app's runtime data dirs, which its compose
+# deployment mounts as volumes; a bare checkout contains none of
+# them. The build step therefore creates the three runtime dirs
+# before migrate: data (the declared PAPERLESS_DATA_DIR, holding
+# db.sqlite3), media and consume (the exact paths the app's own
+# check hints named).
 app:
   path: "src"
-build: "true"
+build: "mkdir -p data media consume"
 migrate: "python src/manage.py migrate --noinput"
 start: "python src/manage.py runserver 0.0.0.0:$PORT --noreload"
 readiness: "/"
