@@ -35,6 +35,17 @@
 # comma-separated <unit>:<role> sides (the one-side rehearsal).
 # Auth-proof rows are labelled "auth-proof"; like the provision
 # rows they are evidence, never measured records.
+#
+# Pair mode (D194): the optional fix_parent_sha / fix_sha inputs
+# serve WO-6 bug selection's check (d). When BOTH are set (mode
+# provision only), the pass provisions exactly that pair for the
+# dispatched repo as one synthetic unit (roles fix^ and fix) with
+# the repo's registered contract-store entry, instead of the
+# manifest's units; when either is empty, behaviour is unchanged
+# (manifest-driven). Each value must be exactly 40 lowercase hex
+# characters — the workflow validates them before provisioning
+# and fails closed on anything else. The values travel via step
+# env only, never interpolated into run: text.
 name: readiness
 
 on:
@@ -77,6 +88,16 @@ on:
         required: false
         default: ""
         type: string
+      fix_parent_sha:
+        description: "provision only (D194): with fix_sha, provision exactly this fix^/fix pair as one synthetic unit (empty = manifest-driven)"
+        required: false
+        default: ""
+        type: string
+      fix_sha:
+        description: "provision only (D194): the pair's fix commit (see fix_parent_sha)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -104,26 +125,54 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+      - name: Validate pair SHAs (D194, fail closed)
+        if: inputs.mode == 'provision'
+        env:
+          PD_FIX_PARENT_SHA: ${{ inputs.fix_parent_sha }}
+          PD_FIX_SHA: ${{ inputs.fix_sha }}
+        run: |
+          for value in "$PD_FIX_PARENT_SHA" "$PD_FIX_SHA"; do
+            if [ -n "$value" ] && [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::pair SHAs must be exactly 40 lowercase hex characters"
+              exit 1
+            fi
+          done
       - name: Measurement gate (fail closed on an incapable host)
         run: |
           python -c "from proofdeploy.sandbox import assert_measurement_gate; assert_measurement_gate(); print('measurement gate: capable')"
       - name: Provision attempt 1 (${{ inputs.repo }})
         if: inputs.mode == 'provision'
+        env:
+          PD_FIX_PARENT_SHA: ${{ inputs.fix_parent_sha }}
+          PD_FIX_SHA: ${{ inputs.fix_sha }}
         run: |
+          args=()
+          if [ -n "$PD_FIX_PARENT_SHA" ] && [ -n "$PD_FIX_SHA" ]; then
+            args+=(--fix-parent-sha "$PD_FIX_PARENT_SHA" --fix-sha "$PD_FIX_SHA")
+          fi
           python -m readiness.provision \
             --repo "${{ inputs.repo }}" \
             --attempt 1 \
             --out "rows-attempt1.json" \
-            --workdir readiness-work
+            --workdir readiness-work \
+            "${args[@]}"
       - name: Re-provision non-READY sides (attempt 2)
         if: inputs.mode == 'provision' && inputs.attempt == '2'
+        env:
+          PD_FIX_PARENT_SHA: ${{ inputs.fix_parent_sha }}
+          PD_FIX_SHA: ${{ inputs.fix_sha }}
         run: |
+          args=()
+          if [ -n "$PD_FIX_PARENT_SHA" ] && [ -n "$PD_FIX_SHA" ]; then
+            args+=(--fix-parent-sha "$PD_FIX_PARENT_SHA" --fix-sha "$PD_FIX_SHA")
+          fi
           python -m readiness.provision \
             --repo "${{ inputs.repo }}" \
             --attempt 2 \
             --rerun-non-ready rows-attempt1.json \
             --out "rows-attempt2.json" \
-            --workdir readiness-work
+            --workdir readiness-work \
+            "${args[@]}"
       - name: Auth proof (${{ inputs.repo }})
         if: inputs.mode == 'auth-proof'
         env:
