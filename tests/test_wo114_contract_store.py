@@ -688,23 +688,47 @@ def test_readiness_rows_carry_render_fields():
 
 
 # ----------------------------------------------------------------------
-# D167: golden smoke units record measured_result False
+# D167/D171: golden smoke units record measured_result False
 #
 # A sandboxed run records measured_result True — that is what makes
 # it a registered measurement. A golden unit (contract-store owner
 # `golden`, D154) is a known-answer SMOKE unit (D152): it runs
 # sandboxed through the real measured path, but its record must
-# never be a measured result. These tests drive the real record
-# path with a stub model (the O5/O6 pattern: gates stubbed, a faked
-# READY sandbox side whose target nothing listens on — probe
-# results are errors on every side, and the record is still
-# written by the normal path). The unit's contract resolves by the
-# real slug rule from a temporary store tree; the golden run and
-# its non-golden control differ ONLY in the store owner.
+# never be a measured result. Orchestrator._measured_result is the
+# ONE helper every record site calls; D171 requires a test per
+# record SITE, each asserting measured_result False AND the record
+# kind — a test that lands in the wrong record proves nothing about
+# the site a smoke run actually reaches:
+#
+#   (a) bug run, normal completion    -> the pair record
+#   (b) clean run, normal completion  -> the clean record
+#   (c) model failure (transport)     -> the model-failure record
+#   (d) author output invalid         -> the author-invalid record
+#   (e) orchestrator crash            -> the crash record
+#
+# The runs drive the real record path with a stub model (the O5/O6
+# pattern: gates stubbed, a faked READY sandbox side whose target
+# nothing listens on — probe results are errors on every side, and
+# the normal-completion record is still written). The unit's
+# contract resolves by the real slug rule from a temporary store
+# tree; the golden runs and their non-golden control differ ONLY in
+# the store owner.
+#
+# D171 history: the first version of the fake built its
+# ProvisionResult with a `sandbox_evidence` keyword that dataclass
+# does not take, so every "normal" run died inside the fake and
+# landed in the CRASH record — the two golden tests passed for the
+# wrong reason and only the crash site was really covered. The fake
+# below builds the result the way the runner does (sandbox_evidence
+# belongs on _Side, not on ProvisionResult); the normal-completion
+# tests assert the record carries real probe results and NO crash
+# cause, and the crash case is a deliberate fake of its own.
 # ----------------------------------------------------------------------
 
 
-def _prepare_sandboxed_store_run(tmp_path, monkeypatch, owner: str):
+def _prepare_sandboxed_store_run(
+    tmp_path, monkeypatch, owner: str, *, crash: bool = False
+):
     import proofdeploy.orchestrator as orch_mod
     from proofdeploy.executor import Executor
     from proofdeploy.orchestrator import _Side
@@ -740,6 +764,10 @@ def _prepare_sandboxed_store_run(tmp_path, monkeypatch, owner: str):
         contract = orch._load_unit_contract()
 
         def fake_provision_sandbox(rev, port, unit_dir, name):
+            if crash:
+                # D171 (e): provisioning itself explodes after
+                # authoring — the run must land in the crash record.
+                raise RuntimeError("fake sandbox provisioning exploded")
             return _Side(
                 rev=rev,
                 sha=rev,
@@ -749,7 +777,6 @@ def _prepare_sandboxed_store_run(tmp_path, monkeypatch, owner: str):
                     status=ProvisionStatus.READY,
                     target_url=f"http://127.0.0.1:{port}",
                     run_id="fake",
-                    sandbox_evidence={"image": "fake"},
                 ),
                 sandbox_evidence={"image": "fake"},
             )
@@ -772,7 +799,7 @@ def _sandboxed_store_cfg(tmp_path, info, owner: str, **over) -> MeasureConfig:
         rev_bug_base=info["base"],
         rev_bug=info["bug"],
         rev_fix=info["fix"],
-        model_runner=canned_probes_store,
+        model_runner=over.pop("model_runner", canned_probes_store),
         public_contract_env_keys=["APP_ENV"],
         sandbox=True,
         allow_unsandboxed=False,
@@ -784,30 +811,69 @@ def _sandboxed_store_cfg(tmp_path, info, owner: str, **over) -> MeasureConfig:
     return cfg
 
 
-def test_golden_bug_unit_records_measured_result_false(
+def _transport_failing_runner(prompt: str) -> ModelResponse:
+    """D171 (c): the model call itself fails (transport) on every
+    attempt — the orchestrator retries exactly once, then records
+    the model-failure INCONCLUSIVE."""
+    from proofdeploy.model_client import ModelCallError
+
+    raise ModelCallError("connection reset by peer", cause="model_transport")
+
+
+def _invalid_output_runner(prompt: str) -> ModelResponse:
+    """D171 (d): the model answers, but its output holds no valid
+    probe block at all."""
+    assert "store-mini-app" in prompt
+    assert "decoy-app" not in prompt
+    return ModelResponse(
+        content="I reviewed the diff and found nothing to probe.\n"
+    )
+
+
+def _store_evidence(tmp_path, owner: str):
+    """The run's evidence record, with the D167 common ground
+    asserted: sandboxed, and labelled by the store file it ran
+    under (the flag and the label cannot disagree)."""
+    evidence = read_records(tmp_path / "records")[0]
+    assert evidence["sandboxed"] is True
+    assert evidence["contract_source"]["store_path"] == (
+        f"readiness/contracts/{owner}__mini.yml"
+    )
+    return evidence
+
+
+def test_golden_bug_unit_normal_completion_records_measured_result_false(
     tmp_path, monkeypatch
 ):
-    """D167 (a): a sandboxed golden BUG unit through the real record
-    path records measured_result False — sandboxed True, so only
-    the golden owner keeps it from counting as a measurement."""
+    """D171 (a): a sandboxed golden BUG unit that completes NORMALLY
+    — both sides READY, probes executed, the pair record written by
+    the normal path (the site the smoke runs use). measured_result
+    is False, and the record is the normal-completion record: real
+    probe results on both sides, no crash cause."""
     info, prepare = _prepare_sandboxed_store_run(
         tmp_path, monkeypatch, "golden"
     )
     orch = Orchestrator(_sandboxed_store_cfg(tmp_path, info, "golden"))
     prepare(orch)
-    orch.measure_bug()
-    evidence = read_records(tmp_path / "records")[0]
-    assert evidence["sandboxed"] is True
-    assert evidence["contract_source"]["store_path"] == (
-        "readiness/contracts/golden__mini.yml"
-    )
+    summary = orch.measure_bug()
+    # A crash or inconclusive summary names its cause; a normal
+    # completion does not have one.
+    assert "cause" not in summary
+    evidence = _store_evidence(tmp_path, "golden")
     assert evidence["measured_result"] is False
+    assert evidence["inconclusive_cause"] is None
+    assert evidence["inconclusive_error"] is None
+    assert evidence["crash_probe_results"] is None
+    assert evidence["fix_parent_results"] and evidence["fix_results"]
+    assert all("verdict" in r for r in evidence["fix_results"])
 
 
-def test_golden_clean_unit_records_measured_result_false(
+def test_golden_clean_unit_normal_completion_records_measured_result_false(
     tmp_path, monkeypatch
 ):
-    """D167 (b): the same for a sandboxed golden CLEAN unit."""
+    """D171 (b): the same for a sandboxed golden CLEAN unit that
+    completes normally — real probe results on C, no crash cause,
+    measured_result False."""
     info, prepare = _prepare_sandboxed_store_run(
         tmp_path, monkeypatch, "golden"
     )
@@ -818,29 +884,129 @@ def test_golden_clean_unit_records_measured_result_false(
     )
     orch = Orchestrator(cfg)
     prepare(orch)
-    orch.measure_clean()
-    evidence = read_records(tmp_path / "records")[0]
-    assert evidence["sandboxed"] is True
-    assert evidence["contract_source"]["store_path"] == (
-        "readiness/contracts/golden__mini.yml"
-    )
+    summary = orch.measure_clean()
+    assert "cause" not in summary
+    evidence = _store_evidence(tmp_path, "golden")
     assert evidence["measured_result"] is False
+    assert evidence["inconclusive_cause"] is None
+    assert evidence["inconclusive_error"] is None
+    assert evidence["crash_probe_results"] is None
+    assert evidence["c_results"]
+    assert all("verdict" in r for r in evidence["c_results"])
+
+
+def test_golden_bug_unit_model_failure_records_measured_result_false(
+    tmp_path, monkeypatch
+):
+    """D171 (c): the model call fails (transport) on both attempts —
+    the run lands in the model-failure INCONCLUSIVE record. A
+    non-golden measured run records measured_result True there
+    (Addendum 4: a model failure counts against the tool); a golden
+    smoke unit never counts, so it records False."""
+    info, prepare = _prepare_sandboxed_store_run(
+        tmp_path, monkeypatch, "golden"
+    )
+    cfg = _sandboxed_store_cfg(
+        tmp_path, info, "golden",
+        model_runner=_transport_failing_runner,
+    )
+    orch = Orchestrator(cfg)
+    prepare(orch)
+    summary = orch.measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "model_transport"
+    evidence = _store_evidence(tmp_path, "golden")
+    assert evidence["measured_result"] is False
+    attempts = evidence["model_call_attempts"]
+    assert attempts is not None and len(attempts) == 2
+    assert all("model_transport" in a for a in attempts)
+
+
+def test_golden_bug_unit_author_output_invalid_records_measured_result_false(
+    tmp_path, monkeypatch
+):
+    """D171 (d): the model answers with no valid probe block — the
+    run lands in the author-output-invalid record (Addendum 11
+    rule 6), and a golden unit records measured_result False."""
+    info, prepare = _prepare_sandboxed_store_run(
+        tmp_path, monkeypatch, "golden"
+    )
+    cfg = _sandboxed_store_cfg(
+        tmp_path, info, "golden",
+        model_runner=_invalid_output_runner,
+    )
+    orch = Orchestrator(cfg)
+    prepare(orch)
+    summary = orch.measure_bug()
+    assert summary["cause"] == "author_output_invalid"
+    evidence = _store_evidence(tmp_path, "golden")
+    assert evidence["measured_result"] is False
+    assert evidence["inconclusive_cause"] == "author_output_invalid"
+
+
+def test_golden_bug_unit_crash_records_measured_result_false(
+    tmp_path, monkeypatch
+):
+    """D171 (e): provisioning explodes after authoring — the run
+    lands in the orchestrator-crash record (cause tool_failure),
+    and a golden unit records measured_result False there too."""
+    info, prepare = _prepare_sandboxed_store_run(
+        tmp_path, monkeypatch, "golden", crash=True
+    )
+    orch = Orchestrator(_sandboxed_store_cfg(tmp_path, info, "golden"))
+    prepare(orch)
+    summary = orch.measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "tool_failure"
+    evidence = _store_evidence(tmp_path, "golden")
+    assert evidence["measured_result"] is False
+    assert evidence["inconclusive_cause"] == "tool_failure"
+    assert "fake sandbox provisioning exploded" in (
+        evidence["inconclusive_error"] or ""
+    )
+
+
+def test_golden_clean_unit_crash_records_measured_result_false(
+    tmp_path, monkeypatch
+):
+    """D171 (e), clean side: the same crash on a golden CLEAN unit
+    lands in the crash record with measured_result False."""
+    info, prepare = _prepare_sandboxed_store_run(
+        tmp_path, monkeypatch, "golden", crash=True
+    )
+    cfg = _sandboxed_store_cfg(
+        tmp_path, info, "golden",
+        bug_id=None, rev_bug_base=None, rev_bug=None, rev_fix=None,
+        clean_id="mini-clean", rev_clean=info["fix"],
+    )
+    orch = Orchestrator(cfg)
+    prepare(orch)
+    summary = orch.measure_clean()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "tool_failure"
+    evidence = _store_evidence(tmp_path, "golden")
+    assert evidence["measured_result"] is False
+    assert evidence["inconclusive_cause"] == "tool_failure"
+    assert "fake sandbox provisioning exploded" in (
+        evidence["inconclusive_error"] or ""
+    )
 
 
 def test_non_golden_sandboxed_unit_still_records_measured_true(
     tmp_path, monkeypatch
 ):
-    """D167 (c): the control — identical setup, non-golden store
-    owner: a sandboxed unit still records measured_result True."""
+    """D167/D171 control: identical setup, non-golden store owner,
+    NORMAL completion — a sandboxed unit still records
+    measured_result True (it IS a registered measurement)."""
     info, prepare = _prepare_sandboxed_store_run(
         tmp_path, monkeypatch, "mini"
     )
     orch = Orchestrator(_sandboxed_store_cfg(tmp_path, info, "mini"))
     prepare(orch)
-    orch.measure_bug()
-    evidence = read_records(tmp_path / "records")[0]
-    assert evidence["sandboxed"] is True
-    assert evidence["contract_source"]["store_path"] == (
-        "readiness/contracts/mini__mini.yml"
-    )
+    summary = orch.measure_bug()
+    assert "cause" not in summary
+    evidence = _store_evidence(tmp_path, "mini")
     assert evidence["measured_result"] is True
+    assert evidence["inconclusive_cause"] is None
+    assert evidence["crash_probe_results"] is None
+    assert evidence["fix_results"]
