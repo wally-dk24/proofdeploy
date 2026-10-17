@@ -1,0 +1,86 @@
+# PROVENANCE 2026-10-17 (WO-6 Phase C, D149): generic readiness
+# contract for paperless-ngx/paperless-ngx at its survivor-record
+# HEAD 0cb2cdbfdd91a2078236f8851cd310261284591c (survivor #1,
+# 46,745 stars), derived only from the app's README/config at that
+# HEAD: pyproject.toml (uv project with a committed uv.lock,
+# requires-python >=3.11, Django ~=5.2, settings module
+# paperless.settings), docker/compose/docker-compose.sqlite.yml
+# (the sqlite deployment; webserver port 8000), and
+# src/paperless/settings (sqlite is the default engine with the
+# database at DATA_DIR/db.sqlite3; PAPERLESS_SECRET_KEY is
+# mandatory — settings raise ImproperlyConfigured when it is unset
+# or left at the default). The sandbox provisions a single app
+# container, so the compose file's broker service is replaced by
+# the app's own no-service backends, taken from its own committed
+# test configuration (pyproject.toml [tool.pytest_env]):
+# PAPERLESS_CHANNELS_BACKEND and PAPERLESS_CACHE_BACKEND below.
+# PAPERLESS_SECRET_KEY's value is a throwaway for this ephemeral
+# provision only, the same practice as the app's own committed
+# test secret ("test-secret-key-do-not-use-in-production").
+# app.path "src" is the survivor record's app_path: the Django
+# project (src/manage.py) lives in src/ while the uv project is at
+# the root, so the frozen install runs at the root and the
+# contract's commands address src/manage.py from there. Readiness
+# "/" is the frontend root: login_required, so an anonymous poll is
+# redirected to the Django-served allauth login page.
+# ROUND 2 (D151, ruled 2026-10-17; string corrected under D155):
+# round 1 installed in full and stopped at migrate on the app's
+# own system checks — PAPERLESS_CONSUMPTION_DIR (/checkout/consume)
+# and PAPERLESS_MEDIA_ROOT (/checkout/media) "is set but doesn't
+# exist". Those are the app's runtime data dirs, which its compose
+# deployment mounts as volumes; a bare checkout contains none of
+# them. The build step therefore creates the runtime dirs before
+# migrate, exactly as upstream's own provisioning does: the app's
+# init-folders/run script creates base_dirs plus extra_dirs —
+# data/index, media/documents/originals and
+# media/documents/thumbnails (where the app writes its search
+# index, original documents and thumbnails) — alongside the data
+# dir itself (the declared PAPERLESS_DATA_DIR, holding
+# db.sqlite3) and consume.
+# REG-E (D158, ruled 2026-10-17): auth + fixture added for the
+# measured (blind-run) unit. The seed is the app's own
+# manage_superuser command (src/documents/management/commands/
+# manage_superuser.py), driven by the two bootstrap env NAMES
+# below — values are generated per run (D8); PAPERLESS_ADMIN_MAIL
+# is deliberately NOT declared, so the superuser's email stays
+# the app's default root@localhost. Auth is the login mode
+# against the app's DRF token endpoint (POST /api/token/ ->
+# {"token": ...}), presented as "Authorization: Token <token>".
+# PAPERLESS_TOKEN_THROTTLE_RATE raises the token endpoint's
+# login-scope throttle (default 5/min, PAPERLESS_TOKEN_THROTTLE_
+# RATE) because a measured run signs in once per probe (D137);
+# the value is identical on both sides and is disclosed in the
+# fixture's flags_note. The fixture text is the reviewer's ruled
+# D158 text, verbatim.
+app:
+  path: "src"
+build: "mkdir -p data/index media/documents/originals media/documents/thumbnails consume"
+migrate: "python src/manage.py migrate --noinput"
+seed: "python src/manage.py manage_superuser"
+start: "python src/manage.py runserver 0.0.0.0:$PORT --noreload"
+readiness: "/"
+database:
+  kind: sqlite
+  path: data/db.sqlite3
+env:
+  PAPERLESS_DBENGINE: sqlite
+  PAPERLESS_DATA_DIR: /checkout/data
+  PAPERLESS_SECRET_KEY: "wo6-phase-c-readiness-throwaway"
+  PAPERLESS_CHANNELS_BACKEND: channels.layers.InMemoryChannelLayer
+  PAPERLESS_CACHE_BACKEND: django.core.cache.backends.locmem.LocMemCache
+  PAPERLESS_TOKEN_THROTTLE_RATE: "600/min"
+auth:
+  mode: login
+  path: /api/token/
+  method: POST
+  body:
+    username: "${PAPERLESS_ADMIN_USER}"
+    password: "${PAPERLESS_ADMIN_PASSWORD}"
+  token_json_path: "token"
+  bootstrap_env: [PAPERLESS_ADMIN_USER, PAPERLESS_ADMIN_PASSWORD]
+fixture:
+  repo_name: "paperless-ngx/paperless-ngx"
+  seed_note: "The first migrate run on an empty database created one application-settings record (from the app's own first migration) whose fields are all empty, so the app's defaults apply; the permission and content-type records Django generates for every installed model; and one user named AnonymousUser with an unusable password (created by the django-guardian library). ProofDeploy's setup then ran the app's own manage_superuser command, which created one superuser whose username and password are generated fresh for each run and whose email is root@localhost. No groups and no content were created."
+  auth_mechanism: "the token is presented in the Authorization header in the form 'Token <token>'"
+  auth_scope: "the API token belonging to the generated superuser; ProofDeploy obtains it by signing in as that user, the first sign-in creates it, and later sign-ins return the same token"
+  flags_note: "application settings are at this version's defaults except the run's deployment choices (SQLite database, in-memory cache and channel layer) and the token sign-in rate limit, raised to 600 per minute (PAPERLESS_TOKEN_THROTTLE_RATE); no feature flags were changed"

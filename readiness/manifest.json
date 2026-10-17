@@ -8,15 +8,16 @@
   "checkpoint bug SHAs supplied by Addendum 65 (orchestrator record); fix^ re-derived from the commit graph and matched, per unit note"
  ],
  "counts": {
-  "units": 27,
-  "sides": 42,
+  "units": 28,
+  "sides": 43,
   "by_class": {
    "checkpoint-bug": 4,
    "checkpoint-control": 5,
    "heldout-bug": 4,
    "heldout-clean": 4,
    "train-bug": 7,
-   "train-clean": 3
+   "train-clean": 3,
+   "wo6-phase-c": 1
   }
  },
  "units": [
@@ -455,6 +456,20 @@
      "role": "C",
      "sha": "f376f6082b5ddfe5ea96fdd3d98a66377b6bb4c2",
      "source": "registered"
+    }
+   ]
+  },
+  {
+   "unit_id": "WO6-C1",
+   "repo": "paperless-ngx/paperless-ngx",
+   "class": "wo6-phase-c",
+   "status": "resolved",
+   "note": "WO-6 Phase C candidate (D149): provisioning-readiness walk, survivor order 1; the single side is the survivor record's HEAD SHA from the D149 close-out (regc-add2-survivors.json).",
+   "sides": [
+    {
+     "role": "C",
+     "sha": "0cb2cdbfdd91a2078236f8851cd310261284591c",
+     "source": "wo6-survivor-record"
     }
    ]
   }
