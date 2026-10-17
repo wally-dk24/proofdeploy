@@ -657,3 +657,211 @@ def test_allowlist_refuses_manifest_missing_omitted_link(tmp_path):
         check_bundle_answer_key(
             ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
         )
+
+
+# ---------------------------------------------------------------------------
+# D143: gitlink handling — a submodule entry is not a file of B.
+# ---------------------------------------------------------------------------
+
+_GITLINK_PATHS = ("content/themes/casper", "content/themes/source")
+
+
+def _eq_repo_with_gitlinks(root: Path) -> dict[str, str]:
+    """base (B^) -> bug (B) -> fix, where B's tree carries two gitlinks.
+
+    The gitlinks (mode 160000, staged via update-index --cacheinfo)
+    pin the base commit — a real commit object in this repo. That is
+    all the tree/archive mechanics need to be identical to Ghost's
+    submodule themes: `git archive B` emits each gitlink as an empty
+    directory and never carries submodule contents. Before D143 the
+    answer-key check counted both gitlinks as expected FILES, so a
+    bundle for any submodule-carrying tree could never pass it.
+    """
+    repo = root / "eq-gl-repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@test")
+    (repo / "app.py").write_text("VALUE = 1\n")
+    (repo / "proofdeploy.yml").write_text(_YML)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "app.py").write_text("VALUE = 2\n")
+    _git(repo, "add", "-A")
+    for path in _GITLINK_PATHS:
+        _git(
+            repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{base},{path}",
+        )
+    _git(repo, "commit", "-q", "-m", "bug")
+    bug = _git(repo, "rev-parse", "HEAD")
+    (repo / "app.py").write_text("VALUE = 1\n")
+    (repo / "test_fix.py").write_text("def test_fix():\n    assert True\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "Fix app value handling")
+    fix = _git(repo, "rev-parse", "HEAD")
+    return {"repo": str(repo), "base": base, "bug": bug, "fix": fix, "pinned": base}
+
+
+def _eq_bundle_with_gitlinks(root: Path, info: dict[str, str]) -> dict:
+    """Assemble B's bundle through the real path: create_snapshot
+    (gitlinks arrive as empty directories), then assemble_author_bundle
+    with B's gitlinks passed in (as the orchestrator passes them), the
+    prompt built from the BUNDLE snapshot."""
+    import hashlib
+    import json
+
+    from proofdeploy.fixture import (
+        assemble_author_bundle,
+        create_snapshot,
+        template_filename,
+        template_hash,
+        template_path,
+        tree_gitlinks,
+    )
+    from proofdeploy.model_client import build_author_prompt
+
+    repo = Path(info["repo"])
+    work = root / "eq-gl-work"
+    work.mkdir()
+    diff_text = _git(repo, "diff", f"{info['base']}..{info['bug']}", "--")
+    diff_path = work / "diff.patch"
+    diff_path.write_text(diff_text)
+    snap = create_snapshot(
+        repo_dir=repo, commit_rev=info["bug"], output_dir=work / "snap-src"
+    )
+    # git archive delivers each gitlink as an empty directory.
+    for path in _GITLINK_PATHS:
+        gitlink_dir = snap.dir / path
+        assert gitlink_dir.is_dir()
+        assert not any(gitlink_dir.iterdir())
+    skill_path = work / "skill.md"
+    skill_path.write_text("# test skill\n")
+    skill_hash = hashlib.sha256(skill_path.read_bytes()).hexdigest()
+    bundle_dir = work / "bundle"
+    selected_template = template_path(template_filename(False))
+    bundle = assemble_author_bundle(
+        diff_path=diff_path,
+        snapshot_dir=snap.dir,
+        yml_fixture={
+            "repo_name": "ak",
+            "seed_note": "seed",
+            "auth_mechanism": "none",
+            "auth_scope": "none",
+            "flags_note": "none",
+        },
+        output_dir=bundle_dir,
+        expected_template_hash=template_hash(selected_template),
+        template_file=selected_template,
+        source_sha=info["bug"],
+        diff_range=f"{info['base']}..{info['bug']}",
+        skill_path=skill_path,
+        no_skill=True,
+        gitlinks=tree_gitlinks(repo, info["bug"]),
+    )
+    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+    prompt, _ = build_author_prompt(
+        skill_text="",
+        fixture_description=(bundle_dir / "fixture-description.txt").read_text(),
+        diff_text=diff_text,
+        snapshot_dir=bundle_dir / "snapshot",
+    )
+    return {
+        "bundle": bundle_dir,
+        "manifest": bundle.manifest,
+        "manifest_data": manifest,
+        "prompt": prompt,
+        "skill_hash": skill_hash,
+        "info": info,
+        "no_skill": True,
+    }
+
+
+def test_allowlist_bundle_with_gitlinks_passes(tmp_path):
+    """D143: equality holds for a submodule-carrying tree — B's
+    gitlinks are excluded from the expected file list (they are not
+    files of B) and matched against the manifest's omitted_gitlinks
+    record, path and pinned commit."""
+    info = _eq_repo_with_gitlinks(tmp_path)
+    ctx = _eq_bundle_with_gitlinks(tmp_path, info)
+    snap = ctx["bundle"] / "snapshot"
+    # In the bundle each gitlink is an empty directory holding no
+    # files, so neither path can appear in the author's file list
+    # (the prompt's list is built from files only — the checker's
+    # byte-equality re-derivation of the prompt covers it).
+    for path in _GITLINK_PATHS:
+        gitlink_dir = snap / path
+        assert gitlink_dir.is_dir()
+        assert not any(p.is_file() for p in gitlink_dir.rglob("*"))
+    # The gitlinks appear only in the manifest, as path + pinned commit.
+    assert ctx["manifest_data"]["omitted_gitlinks"] == [
+        {"path": path, "commit": info["pinned"]} for path in sorted(_GITLINK_PATHS)
+    ]
+    sha = check_bundle_answer_key(
+        ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+    )
+    assert sha == bundle_manifest_hash(ctx["manifest"])
+
+
+def test_allowlist_refuses_gitlink_counted_as_file(tmp_path):
+    """D143 plant (the pre-fix failure): the gitlink path itself
+    materialised as a FILE in the bundle snapshot — the shape the old
+    step 3 demanded — is refused: the path is not a file of B."""
+    info = _eq_repo_with_gitlinks(tmp_path)
+    ctx = _eq_bundle_with_gitlinks(tmp_path, info)
+    gitlink_path = ctx["bundle"] / "snapshot" / _GITLINK_PATHS[0]
+    gitlink_path.rmdir()
+    gitlink_path.write_text("submodule contents, materialised\n")
+    with pytest.raises(AnswerKeyLeakError, match="file list"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
+
+
+def test_allowlist_refuses_file_under_gitlink_path(tmp_path):
+    """D143: a file materialised UNDER a gitlink path (submodule
+    contents reaching the author) is extra and refused."""
+    info = _eq_repo_with_gitlinks(tmp_path)
+    ctx = _eq_bundle_with_gitlinks(tmp_path, info)
+    smuggled = ctx["bundle"] / "snapshot" / _GITLINK_PATHS[0] / "index.hbs"
+    smuggled.write_text("submodule contents\n")
+    with pytest.raises(AnswerKeyLeakError, match="file list"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
+
+
+def test_allowlist_refuses_wrong_gitlink_commit_recorded(tmp_path):
+    """D143: a manifest recording the wrong pinned commit for a
+    gitlink is refused — the record is recomputed from B."""
+    import json
+
+    info = _eq_repo_with_gitlinks(tmp_path)
+    ctx = _eq_bundle_with_gitlinks(tmp_path, info)
+    manifest = json.loads(ctx["manifest"].read_text(encoding="utf-8"))
+    manifest["omitted_gitlinks"][0]["commit"] = info["fix"]
+    ctx["manifest"].write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(AnswerKeyLeakError, match="omitted_gitlinks"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )
+
+
+def test_allowlist_refuses_manifest_missing_omitted_gitlinks(tmp_path):
+    """D143: a manifest that drops the omitted_gitlinks record for
+    B's gitlinks is refused — the record is recomputed from B."""
+    import json
+
+    info = _eq_repo_with_gitlinks(tmp_path)
+    ctx = _eq_bundle_with_gitlinks(tmp_path, info)
+    manifest = json.loads(ctx["manifest"].read_text(encoding="utf-8"))
+    manifest["omitted_gitlinks"] = []
+    ctx["manifest"].write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(AnswerKeyLeakError, match="omitted_gitlinks"):
+        check_bundle_answer_key(
+            ctx["bundle"], ctx["manifest"], ctx["prompt"], **_eq_check_kwargs(ctx)
+        )

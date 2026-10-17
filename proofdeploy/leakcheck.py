@@ -105,7 +105,11 @@ def check_bundle_answer_key(
       ``git ls-tree``, bytes from ``git show``; ``.git`` refused, and
       symlinks handled by the WO-8.4b rule: none in the bundle, B's
       symlink entries excluded from the expected file list and matched
-      against the manifest's ``omitted_links`` record);
+      against the manifest's ``omitted_links`` record; gitlinks
+      handled by the D143 rule: B's gitlink entries (mode 160000) are
+      likewise excluded — ``git archive`` carries no submodule
+      contents — and matched against the manifest's
+      ``omitted_gitlinks`` record, path and pinned commit);
     - the skill hash equals ``expected_skill_hash``, or the skill is
       absent in the no-skill arm;
     - the fixture description is byte-equal to the approved template
@@ -173,11 +177,20 @@ def check_bundle_answer_key(
     #    (mode 120000) are NOT expected in the bundle snapshot; they are
     #    expected in the manifest's omitted_links record instead, which
     #    step 5 cross-verifies against the set derived here from B.
+    #    D143: gitlink entries (mode 160000, submodule pins) get the
+    #    same treatment — `git archive B` writes a gitlink as an empty
+    #    directory and never carries submodule contents, so a gitlink
+    #    is NOT an expected file; it is expected in the manifest's
+    #    omitted_gitlinks record (path -> pinned commit), which step 5
+    #    cross-verifies. Anything the bundle holds AT or UNDER a
+    #    gitlink path is a file outside the expected set: extra, and
+    #    refused by the equality below.
     tree_hash = _git_text(repo_dir, "rev-parse", f"{bug_sha}^{{tree}}").strip()
     if not tree_hash:
         raise AnswerKeyLeakError("answer-key check: could not resolve B^{tree}")
     expected_files: set[str] = set()
     expected_links: dict[str, str] = {}
+    expected_gitlinks: dict[str, str] = {}
     for entry in (
         _git_bytes(repo_dir, "ls-tree", "-r", "-z", bug_sha)
         .decode("utf-8", "surrogateescape")
@@ -186,11 +199,14 @@ def check_bundle_answer_key(
         if not entry:
             continue
         meta, _, path = entry.partition("\t")
-        mode = meta.split(" ", 1)[0]
+        meta_parts = meta.split(" ")
+        mode = meta_parts[0]
         if mode == "120000":  # symlink: the blob's bytes are the target
             expected_links[path] = _git_bytes(
                 repo_dir, "show", f"{bug_sha}:{path}"
             ).decode("utf-8", "surrogateescape")
+        elif mode == "160000":  # gitlink: the object is the pinned commit
+            expected_gitlinks[path] = meta_parts[2]
         else:
             expected_files.add(path)
     actual_files = {
@@ -302,6 +318,29 @@ def check_bundle_answer_key(
             "B's symlinks: "
             f"extra={sorted(set(recorded_links) - set(expected_links))[:5]} "
             f"missing={sorted(set(expected_links) - set(recorded_links))[:5]}"
+        )
+    # D143: the manifest's omitted_gitlinks record must equal B's
+    # gitlink set, recomputed in step 3 — path and pinned commit for
+    # every gitlink the archive (and so the bundle) omits, nothing
+    # more, nothing less.
+    recorded_gitlinks: dict[str, str] = {}
+    raw_gitlinks = manifest.get("omitted_gitlinks", [])
+    if isinstance(raw_gitlinks, list):
+        for item in raw_gitlinks:
+            if isinstance(item, dict) and "path" in item and "commit" in item:
+                recorded_gitlinks[str(item["path"])] = str(item["commit"])
+    if recorded_gitlinks != expected_gitlinks:
+        wrong_commit = sorted(
+            p
+            for p in recorded_gitlinks.keys() & expected_gitlinks.keys()
+            if recorded_gitlinks[p] != expected_gitlinks[p]
+        )
+        raise AnswerKeyLeakError(
+            "answer-key check: manifest omitted_gitlinks does not match "
+            "B's gitlinks: "
+            f"extra={sorted(set(recorded_gitlinks) - set(expected_gitlinks))[:5]} "
+            f"missing={sorted(set(expected_gitlinks) - set(recorded_gitlinks))[:5]} "
+            f"wrong_commit={wrong_commit[:5]}"
         )
     template_text = selected_path.read_text(encoding="utf-8")
     try:
