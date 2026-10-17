@@ -1,0 +1,22 @@
+build: "node --check server.js"
+migrate: "node migrate.js"
+seed: "node seed.js"
+start: "node server.js"
+readiness: "/health"
+env:
+  CANARY_SECRET: "pdcanary-env-e90c41bd77"
+database:
+  kind: sqlite
+  path: ./app.db
+auth:
+  mode: login
+  path: /login
+  method: POST
+  body: {username: seeduser, password: seedpass}
+  token_json_path: token
+fixture:
+  repo_name: "node-bun-sqlite"
+  seed_note: "seed user seeduser/seedpass owns two notes after seed: id 1 (done=false) and id 2 (done=true)"
+  auth_mechanism: "Bearer token from POST /register or /login in the Authorization header"
+  auth_scope: "a regular user token belonging to seeduser, obtained by signing in as seeduser"
+  flags_note: "no feature flags"

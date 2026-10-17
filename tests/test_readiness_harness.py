@@ -548,11 +548,33 @@ def test_commit_contract_delta_is_only_the_contract(tmp_path: Path) -> None:
 # --- committed contracts ------------------------------------------------
 
 
+# D154: the contract store also carries the five golden apps'
+# contracts under the reserved slug owner `golden`, which is not a
+# GitHub owner and never resolves to a real repo — a golden app has
+# no upstream repo to register in the readiness manifest, so its
+# store file cannot honestly satisfy the manifest<->store coverage
+# equality below. GOLDEN_STORE_STEMS is the named exception set:
+# each golden store stem mapped to its golden app directory under
+# conformance/golden/. Any OTHER unmanifested store file (including
+# an unlisted golden__* file) still fails the coverage guard.
+GOLDEN_STORE_STEMS: dict[str, str] = {
+    "golden__node-express-sqlite": "node-express-sqlite",
+    "golden__python-flask-sqlite": "python-flask-sqlite",
+    "golden__node-pnpm-sqlite": "node-pnpm-sqlite",
+    "golden__node-pnpm-monorepo": "node-pnpm-monorepo",
+    "golden__node-bun-sqlite": "node-bun-sqlite",
+}
+
+GOLDEN_DIR = Path(__file__).resolve().parents[1] / "conformance" / "golden"
+
+
 def test_manifest_and_contracts_cover_the_same_repos() -> None:
     manifest = rp.load_manifest(rp.DEFAULT_MANIFEST)
     repos = {u["repo"] for u in manifest["units"]}
     files = {p.stem for p in rp.CONTRACTS_DIR.glob("*.yml")}
-    assert {rp.repo_slug(r) for r in repos} == files
+    golden_files = {s for s in files if s.startswith("golden__")}
+    assert golden_files == set(GOLDEN_STORE_STEMS)
+    assert {rp.repo_slug(r) for r in repos} == files - golden_files
 
 
 def test_every_contract_validates() -> None:
@@ -571,6 +593,12 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
     # (login with the D120 token_header, approved D120/D131): its
     # login body names upstream's published core-default superadmin
     # credentials — the same on every instance, not per-run secrets.
+    # The five golden store entries (D154) are the fourth approved
+    # group: each is a byte-identical copy of its golden app's
+    # committed contract, whose login body names the app's own seed
+    # user (D146 uniform seeds, D147) — fixture credentials created
+    # by the app's own seed on every run, not per-run secrets.
+    golden_names = {f"{stem}.yml" for stem in GOLDEN_STORE_STEMS}
     for path in sorted(rp.CONTRACTS_DIR.glob("*.yml")):
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         if path.name == "directus__directus.yml":
@@ -579,8 +607,25 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
             assert data.get("auth", {}).get("mode") == "ghost_jwt"
         elif path.name == "vendure-ecommerce__vendure.yml":
             assert data.get("auth", {}).get("mode") == "login"
+        elif path.name in golden_names:
+            assert data.get("auth", {}).get("mode") == "login"
         else:
             assert "auth" not in data, path.name
+
+
+def test_golden_store_entries_are_byte_identical_to_every_revision() -> None:
+    # D154 identity guard: one store file per golden app is honest
+    # only because the app's committed contract is byte-identical
+    # across all seven revisions (verified when the entries were
+    # created). The store copy must stay byte-identical to EVERY
+    # revision's proofdeploy.yml — any drift on either side fails.
+    for stem, app in sorted(GOLDEN_STORE_STEMS.items()):
+        store_bytes = (rp.CONTRACTS_DIR / f"{stem}.yml").read_bytes()
+        revisions = sorted((GOLDEN_DIR / app / "revisions").iterdir())
+        assert len(revisions) == 7, (app, [r.name for r in revisions])
+        for revision in revisions:
+            committed = (revision / "proofdeploy.yml").read_bytes()
+            assert store_bytes == committed, (stem, app, revision.name)
 
 
 def test_vendure_login_query_loads_with_plain_quotes() -> None:
