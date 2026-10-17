@@ -846,6 +846,22 @@ class Orchestrator:
             return dict(self._unit_contract_source)
         return None
 
+    def _measured_result(self, use_sandbox: bool) -> bool:
+        """Whether this run's record counts as a measured result
+        (D167). A sandboxed run counts — except a smoke run: a unit
+        whose contract comes from the contract store's reserved
+        ``golden`` owner (D154) is a known-answer smoke unit (D152),
+        never a registered measurement, so it records
+        measured_result False even though it runs sandboxed. The
+        owner is read from the same contract_source the record
+        carries, so the flag and the label cannot disagree."""
+        if self._unit_contract_source is not None:
+            store_path = str(self._unit_contract_source.get("store_path") or "")
+            owner, sep, _ = Path(store_path).name.partition("__")
+            if sep and owner == "golden":
+                return False
+        return use_sandbox
+
     def _record_contract_refusal(
         self,
         cfg: MeasureConfig,
@@ -1131,7 +1147,9 @@ class Orchestrator:
         # Minimal evidence: no probes were produced, but both model call
         # attempts are recorded. Per Master's rule, a model failure in a
         # sandboxed measured run IS a measured result (measured_result =
-        # use_sandbox, matching the normal path). A dev run never counts.
+        # self._measured_result(use_sandbox), matching the normal path;
+        # a golden smoke unit never counts, D167). A dev run never
+        # counts.
         record = build_evidence_record(
             run_kind=run_kind,
             bug_id=cfg.bug_id if run_kind == "bug" else None,
@@ -1143,7 +1161,7 @@ class Orchestrator:
             author_prompt_builder_sha256=author_prompt_builder_sha256(),
             skill_sha256=manifest.get("skill_sha256"),
             sandboxed=use_sandbox,
-            measured_result=use_sandbox,
+            measured_result=self._measured_result(use_sandbox),
             provenance=self._provenance(capability_probe),
             model_call_attempts=attempts,
             contract_source=self._contract_source_record(),
@@ -1256,7 +1274,7 @@ class Orchestrator:
             author_prompt_builder_sha256=author_prompt_builder_sha256(),
             skill_sha256=manifest.get("skill_sha256"),
             sandboxed=use_sandbox,
-            measured_result=use_sandbox,
+            measured_result=self._measured_result(use_sandbox),
             provenance=self._provenance(capability_probe),
             model_request=raw.request_record,
             contract_source=self._contract_source_record(),
@@ -1408,7 +1426,7 @@ class Orchestrator:
             skill_sha256=manifest.get("skill_sha256"),
             truncation_flags=truncation_flags,
             sandboxed=use_sandbox,
-            measured_result=use_sandbox,
+            measured_result=self._measured_result(use_sandbox),
             provenance=self._provenance(capability_probe),
             runner_log=list(self.log),
             contract_source=self._contract_source_record(),
@@ -2637,7 +2655,7 @@ class Orchestrator:
                     "fix": self._auth_bootstrap(fix),
                 },
                 sandboxed=use_sandbox,
-                measured_result=use_sandbox,
+                measured_result=self._measured_result(use_sandbox),
                 provenance=self._provenance(capability_probe),
                 contract_source=self._contract_source_record(),
                 fix_parent_provision=parent.provision.to_dict(),
@@ -2930,7 +2948,7 @@ class Orchestrator:
                 write_grants={"c": self._write_grant(side)},
                 auth_bootstrap={"c": self._auth_bootstrap(side)},
                 sandboxed=use_sandbox,
-                measured_result=use_sandbox,
+                measured_result=self._measured_result(use_sandbox),
                 provenance=self._provenance(capability_probe),
                 contract_source=self._contract_source_record(),
                 runner_log=list(self.log),
