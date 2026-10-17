@@ -365,3 +365,119 @@ Integrity rerun after the lock transition (2026-10-16 ~21:19Z):
   `b80013adf2056165733d8a90fbc4c0f73fd4608737f5b2ebce3c998ecfeee636`,
   main SHA `29045fbee500ab4700c97fe661a5717bdc6b138e`, snapshot
   date `2026-10-16`.
+
+
+---
+
+## D148 stop and D149 close-out (appended 2026-10-17)
+
+Master stopped the run on his word (D148) at 2026-10-17T11:43:32Z,
+at 2,936 of 3,000 pool repos screened. The reviewer ruled the
+close-out (D149): the journal stays byte-untouched (no resume, no
+"completed" exit event), and the outputs are derived from the
+journal as-is with the script's own code. This section is that
+record.
+
+### Per-instance ledger — all 23 starts
+
+Start times are the journal's own `events.jsonl` start events (23
+starts, no exit events — no session ever recorded an exit). "Entries
+appended" is stated only where the recorded checkpoints force it;
+otherwise it is marked not separately recorded rather than guessed.
+Cumulative checkpoints observed during the run: 406 entries at
+13:22Z (during #2); 622 when #3 froze; 1,822 at #5's last write
+(19:04:00Z); 2,094 at #6's last write (20:11:01Z); 2,127 at #9's
+last write (21:18:34Z); 2,936 reached during #10 (last append
+2026-10-17T03:00:07Z); 2,936 unchanged from then on.
+
+| # | Start (UTC) | Under D140 lock | End (UTC) | Entries appended | Cause / evidence |
+|---|---|---|---|---|---|
+| 1 | 2026-10-16T12:02:26Z | n | ~12:18:34Z | not separately recorded | VM restart ~12:18:34Z (podman wiped; established at the time) |
+| 2 | 2026-10-16T12:19:00Z | n | ~13:43–13:46Z | not separately recorded (406 cumulative observed 13:22Z during this instance) | runtime-layer interruption, NOT a VM reset (established at the time) |
+| 3 | 2026-10-16T15:00:59Z | n | not established | not separately recorded (entries froze at 622 cumulative) | cause unknown — accepted as the honest record; entries froze at 622 with no exit record |
+| 4 | 2026-10-16T15:57:29Z | n | 17:33:54Z | not separately recorded | VM reset 17:33:54Z (established at the time) |
+| 5 | 2026-10-16T17:37:09Z | n | ~19:04Z (last write 19:04:00Z) | not separately recorded (1,822 cumulative at its last write) | ended ~19:04Z; established at the time |
+| 6 | 2026-10-16T19:20:13Z | n | ~20:10Z (last write 20:11:01Z) | 272 (2,094 cumulative at its last write, from 1,822 at #5's end) | VM restart ~20:10Z (established at the time) |
+| 7 | 2026-10-16T20:39:48Z | n | ~20:42:17Z | not separately recorded | killed by the coordinator ~20:42:17Z while applying the D140 lock (start 7 predated the lock) |
+| 8 | 2026-10-16T20:41:43Z | y | by 20:43:15Z | not separately recorded | manner not established; brief two-writer overlap with #7 until ~20:42:17Z, no appends during the overlap and no journal damage (integrity rerun, previous section) |
+| 9 | 2026-10-16T20:43:18Z | y | ~21:18Z (last write 21:18:34Z) | not separately recorded (2,127 cumulative at its last write) | runtime restart ~21:18Z (established at the time) |
+| 10 | 2026-10-16T21:21:27Z | y | ~03:00Z (last append 2026-10-17T03:00:07Z) | 809 (2,936 cumulative reached, from 2,127 at #9's end) | mechanism not established — no exit record; the journal simply stops at 2,936 |
+| 11 | 2026-10-17T03:32:15Z | y | ~03:56Z | 0 | VM/runtime restart ~03:56Z; wrote nothing |
+| 12 | 2026-10-17T04:03:24Z | y | by 04:19:47Z | 0 | manner not established (gone when #13 started) |
+| 13 | 2026-10-17T04:19:47Z | y | ~04:52Z | 0 | daemon restart ~04:52Z |
+| 14 | 2026-10-17T04:52:32Z | y | ~04:59Z | 0 | VM restart ~04:59Z |
+| 15 | 2026-10-17T05:00:33Z | y | ~06:44Z | 0 | daemon restart ~06:44Z; this instance ran 1h44m inside one boot without appending |
+| 16 | 2026-10-17T06:44:55Z | y | by 07:23:46Z | 0 | manner not established |
+| 17 | 2026-10-17T07:23:46Z | y | by 07:54:53Z | 0 | manner not established |
+| 18 | 2026-10-17T07:54:53Z | y | 08:30:30Z | 0 | death observed by the monitor's watcher at 08:30:30Z with entries=2936; mechanism not established |
+| 19 | 2026-10-17T08:30:48Z | y | by 09:27Z | 0 | manner not established (alive at 09:01Z, gone by 09:27Z) |
+| 20 | 2026-10-17T09:27:06Z | y | by 10:16:02Z | 0 | manner not established (gone when #21 started) |
+| 21 | 2026-10-17T10:16:02Z | y | by 10:55:24Z | 0 | manner not established (gone when #22 started) |
+| 22 | 2026-10-17T10:55:24Z | y | by 11:32:04Z | 0 | manner not established (gone when #23 started) |
+| 23 | 2026-10-17T11:32:04Z | y | 2026-10-17T11:43:32Z | 0 | STOPPED on Master's word (D148) — process terminated by Wally at 11:43:32Z; the monitor was stood down and nothing resumes the run |
+
+### The stall
+
+No entry was appended after 2026-10-17T03:00:07Z (during #10),
+across starts #11–#23. Root cause is **not established** and this
+record does not claim one. What was checked: a journaled resume
+does not re-collect the pool (the script reads `pool.json` from the
+journal; its mtime is still the original 2026-10-16 write), and
+GitHub's rate-limit quota was full when checked (core 5,000/5,000).
+The single direct observation of the stalled state, captured
+2026-10-17T11:32Z on #23: the process was asleep in a network poll
+(`poll_schedule_timeout`), holding one open connection to the
+egress proxy (port 3128), waiting on a response. That is an
+observation, not a cause: it is consistent with a proxied request
+never completing, and a single snapshot does not prove it.
+
+### The stop (D148) and the close-out (D149)
+
+- D148: Master asked whether the searched work would be lost if
+  the run stopped (it would not — the journal is append-only on
+  disk), then directed the stop. The process was terminated at
+  11:43:32Z; the journal's final state: 2,936 entries, all valid
+  JSON, 2,936 distinct repos, no duplicates, no torn line.
+- The script's own end-of-run sequence (`_retry_errored` →
+  `_winners_and_error_history` → `_finalize` →
+  `record_exit("completed")`) never ran: no exit event exists and
+  the run did not earn one.
+- D149 close-out (Option 2): the outputs were derived with the
+  script's own `_winners_and_error_history` and `_finalize` by the
+  new driver `scripts/wo6/regc_add2_closeout.py`, reading the
+  journal as-is. The journal is byte-untouched — sha256 before and
+  after the close-out: header.json
+  `b8a1541e5bf0e1d6693f66d3677920957cad7617b2ee41ee4e5750059b8b88c5`,
+  pool.json
+  `a8c31371e56a59ecb5e7a94a0f89c91dda7a05fc01da21f0607aac28bf1054fd`,
+  entries.jsonl
+  `dce465227607d535230ff2f357f46fede9906ad095d067340a04ddf7fdc4894f`,
+  events.jsonl
+  `6a3e674a69b5bd1b4f7a7c6161e72f0df72c6fb6532aacb38a2cda072f851df0`.
+  The run script is unchanged (sha256
+  `b80013adf2056165733d8a90fbc4c0f73fd4608737f5b2ebce3c998ecfeee636`).
+- Close-out outputs, in
+  `docs/registration/wo6-regc-add2-closeout-2026-10-17/`:
+  `regc-add2-raw.json` and `regc-add2-survivors.json` exactly as
+  `_finalize` writes them; `closeout-header.json` (pool 3,000 /
+  screened 2,936 / unscreened 64 / SURVIVORS 14 / ERRORED 0 /
+  stopped 2026-10-17T11:43:32Z on Master's word (D148) / close-out
+  per D149 / last append 2026-10-17T03:00:07Z / script and journal
+  hashes / max unscreened stars); `UNSCREENED.json` (the 64
+  unscreened in pool order, each with stars and its language
+  query). `_retry_errored` is stated in the header as a verified
+  no-op: no repo's latest attempt carries an error (ERRORED = 0),
+  so the pass would re-screen nothing; the driver refuses any
+  journal for which that does not hold.
+- **max_unscreened_stars: 7,409** (Abdess/retrobios, Python query,
+  first of the 64 in pool order). Per the D149 bound (from D148),
+  applied at Phase C selection time: a survivor counts as the
+  candidate only if its stars exceed 7,409; otherwise the walk
+  stops and the unscreened repos at or above its stars are screened
+  (same script, same journal, under the lock) before any sign-off.
+- Raw journal evidence is committed beside this record at
+  `docs/registration/wo6-regc-add2-journal-2026-10-16/` (header,
+  pool and events byte-exact; entries gzipped) with
+  `SHA256SUMS.txt` recording the raw and committed hashes.
+- Phase C waits for the reviewer's verification of the close-out
+  and the raw evidence (D149 item 5).
