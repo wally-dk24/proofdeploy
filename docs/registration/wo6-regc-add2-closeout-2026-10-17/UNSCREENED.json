@@ -1,0 +1,450 @@
+[
+ {
+  "full_name": "Abdess/retrobios",
+  "stars": 7409,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "arcee-ai/mergekit",
+  "stars": 7403,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "hellerve/programming-talks",
+  "stars": 7373,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "bup/bup",
+  "stars": 7364,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "vladmandic/sdnext",
+  "stars": 7355,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "ml-explore/mlx-lm",
+  "stars": 7350,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "python-trio/trio",
+  "stars": 7346,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "leminlimez/Nugget",
+  "stars": 7342,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "jrnl-org/jrnl",
+  "stars": 7342,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "z1069614715/objectdetection_script",
+  "stars": 7335,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "feast-dev/feast",
+  "stars": 7334,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "princeton-vl/infinigen",
+  "stars": 7333,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "bee-san/pyWhat",
+  "stars": 7331,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "NVIDIA-NeMo/Guardrails",
+  "stars": 7312,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "tw93/Waza",
+  "stars": 7310,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "Yelp/dumb-init",
+  "stars": 7310,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "interviewstreet/hiring-agent",
+  "stars": 7308,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "XBuilderLAB/cheat-on-content",
+  "stars": 7295,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "netalertx/NetAlertX",
+  "stars": 7292,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "Zipstack/unstract",
+  "stars": 7284,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "OneDragon-Anything/ZenlessZoneZero-OneDragon",
+  "stars": 7276,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "jupytext/jupytext",
+  "stars": 7267,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "kyegomez/swarms",
+  "stars": 7266,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "wbh604/UZI-Skill",
+  "stars": 7250,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "marshmallow-code/marshmallow",
+  "stars": 7249,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "TagStudioDev/TagStudio",
+  "stars": 7247,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "amoffat/sh",
+  "stars": 7247,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "pypa/hatch",
+  "stars": 7244,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "kohya-ss/sd-scripts",
+  "stars": 7244,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "mher/flower",
+  "stars": 7240,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "jarun/buku",
+  "stars": 7225,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "docker/docker-py",
+  "stars": 7220,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "XuehaiPan/nvitop",
+  "stars": 7210,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "NVIDIA/warp",
+  "stars": 7205,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "vllm-project/vllm-omni",
+  "stars": 7205,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "RsaCtfTool/RsaCtfTool",
+  "stars": 7185,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "lintsinghua/DeepAudit",
+  "stars": 7169,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "flwrlabs/flower",
+  "stars": 7165,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "dwzhu-pku/PaperBanana",
+  "stars": 7165,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "happycola233/tchMaterial-parser",
+  "stars": 7160,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "onionshare/onionshare",
+  "stars": 7160,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "datajuicer/data-juicer",
+  "stars": 7150,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "htdt/godogen",
+  "stars": 7141,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "qbittorrent/search-plugins",
+  "stars": 7140,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "wger-project/wger",
+  "stars": 7133,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "bleachbit/bleachbit",
+  "stars": 7127,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "TokenRhythm/opensquilla",
+  "stars": 7102,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "yeasy/blockchain_guide",
+  "stars": 7074,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "zai-org/GLM-4",
+  "stars": 7067,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "hhyo/Archery",
+  "stars": 7065,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "simple-login/app",
+  "stars": 7059,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "deepchem/deepchem",
+  "stars": 7059,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "Ultimaker/Cura",
+  "stars": 7049,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "TheTom/turboquant_plus",
+  "stars": 7021,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "adbar/trafilatura",
+  "stars": 6974,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "subzeroid/instagrapi",
+  "stars": 6964,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "PyCQA/isort",
+  "stars": 6963,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "HaujetZhao/CapsWriter-Offline",
+  "stars": 6959,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "mizorewww/laya-mlx",
+  "stars": 6948,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "ningzimu/codex-ppt-skill",
+  "stars": 6948,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "yihong0618/xiaogpt",
+  "stars": 6942,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "mahmoud/boltons",
+  "stars": 6939,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "openJiuwen-ai/jiuwenswarm",
+  "stars": 6925,
+  "queries": [
+   "Python"
+  ]
+ },
+ {
+  "full_name": "clearml/clearml",
+  "stars": 6908,
+  "queries": [
+   "Python"
+  ]
+ }
+]

@@ -1,0 +1,14 @@
+# WO-6 REG-C Addendum 2 run journal (D149 item 2): byte-exact copies of
+# ~/workspace/wo6-scratch/regc-add2-journal-2026-10-16 as it lay after the
+# D148 stop. entries.jsonl (1,446,427 bytes raw) is committed gzipped.
+#
+# Raw files, sha256 as on disk in the live journal:
+b8a1541e5bf0e1d6693f66d3677920957cad7617b2ee41ee4e5750059b8b88c5  header.json
+a8c31371e56a59ecb5e7a94a0f89c91dda7a05fc01da21f0607aac28bf1054fd  pool.json
+dce465227607d535230ff2f357f46fede9906ad095d067340a04ddf7fdc4894f  entries.jsonl
+6a3e674a69b5bd1b4f7a7c6161e72f0df72c6fb6532aacb38a2cda072f851df0  events.jsonl
+#
+# Committed entries.jsonl.gz, sha256 as committed:
+0297fb67a63e58c946aa096316ca6184293bf1b761944ded56f6f6dea7dd7cfb  entries.jsonl.gz
+# gunzip -c entries.jsonl.gz | sha256sum reproduces the raw
+# entries.jsonl hash dce465227607d535230ff2f357f46fede9906ad095d067340a04ddf7fdc4894f.

@@ -111,8 +111,8 @@ def test_cutoff_sha_is_fix_for_bugs_and_c_for_cleans() -> None:
 def test_manifest_shape() -> None:
     manifest = rp.load_manifest(rp.DEFAULT_MANIFEST)
     units = manifest["units"]
-    assert len(units) == 27
-    assert sum(len(u["sides"]) for u in units) == 42
+    assert len(units) == 28
+    assert sum(len(u["sides"]) for u in units) == 43
     for unit in units:
         for side in unit["sides"]:
             assert len(side["sha"]) == 40
@@ -593,7 +593,11 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
     # (login with the D120 token_header, approved D120/D131): its
     # login body names upstream's published core-default superadmin
     # credentials — the same on every instance, not per-run secrets.
-    # The five golden store entries (D154) are the fourth approved
+    # Paperless-ngx's is the fourth (login, approved D158): its login
+    # body names only the per-run generated bootstrap env NAMES
+    # (PAPERLESS_ADMIN_USER / PAPERLESS_ADMIN_PASSWORD) — values are
+    # generated per run, never committed.
+    # The five golden store entries (D154) are the fifth approved
     # group: each is a byte-identical copy of its golden app's
     # committed contract, whose login body names the app's own seed
     # user (D146 uniform seeds, D147) — fixture credentials created
@@ -606,6 +610,8 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
         elif path.name == "TryGhost__Ghost.yml":
             assert data.get("auth", {}).get("mode") == "ghost_jwt"
         elif path.name == "vendure-ecommerce__vendure.yml":
+            assert data.get("auth", {}).get("mode") == "login"
+        elif path.name == "paperless-ngx__paperless-ngx.yml":
             assert data.get("auth", {}).get("mode") == "login"
         elif path.name in golden_names:
             assert data.get("auth", {}).get("mode") == "login"

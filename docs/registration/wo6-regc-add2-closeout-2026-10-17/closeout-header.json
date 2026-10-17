@@ -1,0 +1,23 @@
+{
+ "label": "stopped-run close-out (D148/D149)",
+ "rule": "Outputs derived with the run script's own _winners_and_error_history and _finalize from the journal as-is; the journal was not resumed, edited, or given an exit record.",
+ "stopped_at": "2026-10-17T11:43:32Z",
+ "stopped_by": "Master's word (D148)",
+ "last_append_at": "2026-10-17T03:00:07Z",
+ "pool_size": 3000,
+ "screened": 2936,
+ "unscreened": 64,
+ "survivors": 14,
+ "errored": 0,
+ "retry_errored": "_retry_errored not run: verified no-op for this journal \u2014 no repo's latest attempt carries an 'error' (ERRORED = 0), so the pass would re-screen nothing.",
+ "authenticated": true,
+ "authenticated_basis": "A _finalize input the journal header does not carry; the run's sessions executed with a GitHub token (GH_TOKEN), as recorded in the run record.",
+ "script_sha256": "b80013adf2056165733d8a90fbc4c0f73fd4608737f5b2ebce3c998ecfeee636",
+ "journal_sha256": {
+  "header.json": "b8a1541e5bf0e1d6693f66d3677920957cad7617b2ee41ee4e5750059b8b88c5",
+  "pool.json": "a8c31371e56a59ecb5e7a94a0f89c91dda7a05fc01da21f0607aac28bf1054fd",
+  "entries.jsonl": "dce465227607d535230ff2f357f46fede9906ad095d067340a04ddf7fdc4894f",
+  "events.jsonl": "6a3e674a69b5bd1b4f7a7c6161e72f0df72c6fb6532aacb38a2cda072f851df0"
+ },
+ "max_unscreened_stars": 7409
+}

@@ -1,0 +1,296 @@
+[
+ {
+  "full_name": "paperless-ngx/paperless-ngx",
+  "stars": 46745,
+  "default_branch": "dev",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "0cb2cdbfdd91a2078236f8851cd310261284591c",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": "src",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 1
+ },
+ {
+  "full_name": "PostHog/posthog",
+  "stars": 40305,
+  "default_branch": "master",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "798ec5bed8a1a7912e9441c101ff0b2573540446",
+  "tree_truncated": true,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": ".",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 4
+   }
+  },
+  "survivor": true,
+  "order": 2
+ },
+ {
+  "full_name": "jumpserver/jumpserver",
+  "stars": 31781,
+  "default_branch": "dev",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "7512f08fec27aa82f638c3d9a1cfbfa9537e23f6",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": "apps",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 3
+ },
+ {
+  "full_name": "ArchiveBox/ArchiveBox",
+  "stars": 28791,
+  "default_branch": "dev",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "eec1d7db5fc02e99633c4f2b0bfb76070851853e",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": "archivebox",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 4
+ },
+ {
+  "full_name": "cvat-ai/cvat",
+  "stars": 16938,
+  "default_branch": "develop",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "d6d718f1168664617b30b8c74c721efbbf903473",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": ".",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 2
+   }
+  },
+  "survivor": true,
+  "order": 5
+ },
+ {
+  "full_name": "ansible/awx",
+  "stars": 15595,
+  "default_branch": "devel",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "6fc51b6d25b5bf3ad7efa66cc4e62bdb27177027",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": ".",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 6
+ },
+ {
+  "full_name": "sissbruecker/linkding",
+  "stars": 11304,
+  "default_branch": "master",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "27b7303baf41bb28babc610ac8eaa486e1ddfab5",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": ".",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 7
+ },
+ {
+  "full_name": "django-cms/django-cms",
+  "stars": 10675,
+  "default_branch": "main",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "ea2344ee399cb27f60a07ce1a2fe73dd7d77eddc",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": ".",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 8
+ },
+ {
+  "full_name": "healthchecks/healthchecks",
+  "stars": 10424,
+  "default_branch": "master",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "b932fc404aa2868c6be46e90e803d9b35f460cc0",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": ".",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 9
+ },
+ {
+  "full_name": "pennersr/django-allauth",
+  "stars": 10379,
+  "default_branch": "main",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "5ea117e72397adbd8ca6bc61c692d64ecca4d31b",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": ".",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 10
+ },
+ {
+  "full_name": "tubearchivist/tubearchivist",
+  "stars": 8515,
+  "default_branch": "develop",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "ba0ccc932678ec398fae904cc0aced67ad13aede",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": "backend",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 11
+ },
+ {
+  "full_name": "readthedocs/readthedocs.org",
+  "stars": 8392,
+  "default_branch": "main",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "2b993d6543e72984bd092b10f00cbfb68b9c3c53",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": ".",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 12
+ },
+ {
+  "full_name": "django-commons/django-debug-toolbar",
+  "stars": 8379,
+  "default_branch": "main",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "0d0adc5f220592a9e58f0183b9df6c8fcdd543e7",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": "example",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 13
+ },
+ {
+  "full_name": "openedx/openedx-platform",
+  "stars": 8203,
+  "default_branch": "master",
+  "queries": [
+   "Python"
+  ],
+  "excluded": null,
+  "head_sha": "d7859be168dfe80f1baa9b3cea41e7447703d56e",
+  "tree_truncated": false,
+  "stacks": {
+   "python": {
+    "passed": true,
+    "app_path": ".",
+    "drop_reasons": [],
+    "sqlite_scan_skipped_members": 0
+   }
+  },
+  "survivor": true,
+  "order": 14
+ }
+]
