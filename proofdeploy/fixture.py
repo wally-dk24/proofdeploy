@@ -32,7 +32,7 @@ from typing import Any
 TEMPLATE_FIELDS = ("repo_name", "seed_note", "auth_mechanism", "auth_scope", "flags_note")
 
 # The author's input bundle contains exactly these items, nothing else.
-# skill-author.md is the generated author copy (hash e42f12d7...); the audited
+# skill-author.md is the generated author copy (hash e04cb811...); the audited
 # source skill.md never enters the bundle. In no-skill mode the bundle omits
 # skill-author.md and the allowlist shrinks accordingly.
 BUNDLE_ALLOWLIST = ("diff.patch", "snapshot", "fixture-description.txt", "skill-author.md")
@@ -41,7 +41,7 @@ BUNDLE_ALLOWLIST_NO_SKILL = ("diff.patch", "snapshot", "fixture-description.txt"
 # Expected sha256 of the generated author copy. Fixed in code, not a
 # parameter: the assembler verifies this fail-closed, and a different skill
 # means a different measurement. Override only in tests via monkeypatch.
-EXPECTED_SKILL_HASH = "e42f12d71ea9f5ceee0f6d13b553f7cb13426954053db684ae4e2a6a8d73f5f9"
+EXPECTED_SKILL_HASH = "e04cb8111c9767149abc371d0ee1b0781d01db9e2baab96f767224ee846f2099"
 
 TEMPLATE_FILENAME = "fixture_template.txt"
 NO_CREDENTIAL_TEMPLATE_FILENAME = "fixture_template_nocredential.txt"
