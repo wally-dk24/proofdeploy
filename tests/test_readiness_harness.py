@@ -19,6 +19,7 @@ The drift guarantee (Addendum 65 item 3) has two halves:
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -2290,3 +2291,254 @@ def test_auth_proof_side_proves_directus_with_login_acquisitions(
     # The acquired token's value never reaches the row.
     assert _FAKE_DIRECTUS_TOKEN not in json.dumps(row)
     assert side.provision.proc.stopped is True
+
+
+# --- Pair mode (D194/D195/D196): the provision CLI's pair path -------
+#
+# readiness.yml's pair inputs land here as --fix-parent-sha/--fix-sha.
+# The pair is validated against a REAL tiny git repo (the established
+# real-git pattern above): a merge fixture whose second parent is
+# the plant target — a checker that accepts any parent, not just the
+# first, must fail test_validate_pair_refuses_a_second_parent.
+
+
+def _commit_file(repo: Path, name: str, text: str) -> str:
+    (repo / name).write_text(text, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", text)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _pair_fixture(tmp_path: Path) -> dict[str, Any]:
+    """A source repo shaped for first-parent questions:
+
+        base ──► main1 ──► merge ──► after
+          └────► side ────┘
+
+    merge's FIRST parent is main1; side is its second parent; base
+    is an ancestor but not a parent at all. Plus a clone of it,
+    pre-created exactly as ensure_clone leaves it (empty, origin
+    the local source) under the workdir the CLI will use."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _git(src, "init", "-q")
+    _git(src, "config", "user.name", "readiness-test")
+    _git(src, "config", "user.email", "test@proofdeploy.invalid")
+    _git(src, "config", "uploadpack.allowAnySHA1InWant", "true")
+    trunk = _git(src, "branch", "--show-current")
+    base = _commit_file(src, "app.py", "base\n")
+    _git(src, "checkout", "-q", "-b", "side")
+    side = _commit_file(src, "side.py", "side\n")
+    _git(src, "checkout", "-q", trunk)
+    main1 = _commit_file(src, "main.py", "main\n")
+    _git(src, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    merge = _git(src, "rev-parse", "HEAD")
+    after = _commit_file(src, "after.py", "after\n")
+    # Fixture sanity: the parent order every case below relies on.
+    assert _git(src, "show", "-s", "--format=%P", merge).split() == [
+        main1,
+        side,
+    ]
+    assert _git(src, "show", "-s", "--format=%P", after).split() == [merge]
+
+    repo = "example/widgets"
+    workdir = tmp_path / "work"
+    clone = workdir / "repos" / rp.repo_slug(repo)
+    clone.mkdir(parents=True)
+    _git(clone, "init", "-q")
+    _git(clone, "remote", "add", "origin", src.as_uri())
+    return {
+        "src": src,
+        "repo": repo,
+        "workdir": workdir,
+        "clone": clone,
+        "base": base,
+        "side": side,
+        "main1": main1,
+        "merge": merge,
+        "after": after,
+    }
+
+
+def test_pair_unit_is_one_synthetic_fix_pair() -> None:
+    unit = rp.pair_unit("example/widgets", "a" * 40, "b" * 40)
+    assert unit["unit_id"] == "WO6-BUGSEL-" + "b" * 8
+    assert unit["repo"] == "example/widgets"
+    assert [(s["role"], s["sha"]) for s in unit["sides"]] == [
+        ("fix^", "a" * 40),
+        ("fix", "b" * 40),
+    ]
+    # The pair unit's REG-A cutoff is its fix commit, like a bug
+    # unit's (provision_repo resolves it through cutoff_sha).
+    assert rp.cutoff_sha(unit) == "b" * 40
+
+
+def test_validate_pair_accepts_the_first_parent(tmp_path: Path) -> None:
+    fx = _pair_fixture(tmp_path)
+    rp.validate_pair(fx["clone"], fx["main1"], fx["merge"])
+    rp.validate_pair(fx["clone"], fx["merge"], fx["after"])
+
+
+def test_validate_pair_refuses_a_second_parent(tmp_path: Path) -> None:
+    fx = _pair_fixture(tmp_path)
+    with pytest.raises(ValueError, match="not the first parent"):
+        rp.validate_pair(fx["clone"], fx["side"], fx["merge"])
+
+
+def test_validate_pair_refuses_a_grandparent(tmp_path: Path) -> None:
+    fx = _pair_fixture(tmp_path)
+    with pytest.raises(ValueError, match="not the first parent"):
+        rp.validate_pair(fx["clone"], fx["base"], fx["merge"])
+
+
+def test_validate_pair_refuses_a_non_commit_object(
+    tmp_path: Path,
+) -> None:
+    fx = _pair_fixture(tmp_path)
+    tree = _git(fx["src"], "rev-parse", f"{fx['merge']}^{{tree}}")
+    # A tree is fetchable but is not a commit: refused either at
+    # the fetch (RuntimeError) or at the object-type check.
+    with pytest.raises((ValueError, RuntimeError)):
+        rp.validate_pair(fx["clone"], fx["main1"], tree)
+
+
+def test_validate_pair_refuses_a_foreign_commit(tmp_path: Path) -> None:
+    fx = _pair_fixture(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    _git(other, "init", "-q")
+    _git(other, "config", "user.name", "readiness-test")
+    _git(other, "config", "user.email", "test@proofdeploy.invalid")
+    foreign = _commit_file(other, "x.py", "foreign\n")
+    # A real commit — of another repo. Its own origin cannot serve
+    # it, so the fetch refuses before any parent arithmetic.
+    with pytest.raises(RuntimeError):
+        rp.validate_pair(fx["clone"], foreign, fx["merge"])
+
+
+def test_pair_manifest_refuses_a_malformed_sha(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="40 lowercase hex"):
+        rp.pair_manifest(
+            "example/widgets", tmp_path, "A" * 40, "b" * 40
+        )
+    with pytest.raises(ValueError, match="40 lowercase hex"):
+        rp.pair_manifest(
+            "example/widgets", tmp_path, "a" * 40, "b" * 39
+        )
+
+
+def test_pair_manifest_refuses_a_repo_without_a_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(rp, "contract_path", lambda r: tmp_path / "none.yml")
+    with pytest.raises(ValueError, match="no contract-store entry"):
+        rp.pair_manifest(
+            "example/widgets", tmp_path, "a" * 40, "b" * 40
+        )
+
+
+def test_main_pair_refuses_exactly_one_sha(tmp_path: Path) -> None:
+    out = str(tmp_path / "rows.json")
+    with pytest.raises(SystemExit):
+        rp.main(
+            [
+                "--repo", "example/widgets", "--out", out,
+                "--fix-sha", "a" * 40,
+            ]
+        )
+    with pytest.raises(SystemExit):
+        rp.main(
+            [
+                "--repo", "example/widgets", "--out", out,
+                "--fix-parent-sha", "a" * 40,
+            ]
+        )
+
+
+def _pair_main_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[dict[str, Any], Path, list[str]]:
+    """The merge fixture wired for a CLI run: the pre-created
+    clone (local origin), a real tiny contract behind the patched
+    contract_path, the measurement gate stubbed, and the sandbox
+    call stubbed with a recorder. Returns (fixture, contract,
+    sandbox tags seen)."""
+    fx = _pair_fixture(tmp_path)
+    contract = tmp_path / "widgets.yml"
+    contract.write_text(
+        'build: "true"\nstart: "python app.py"\nreadiness: "/"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rp, "contract_path", lambda r: contract)
+    monkeypatch.setattr(rp, "assert_measurement_gate", lambda: None)
+    tags: list[str] = []
+
+    def fake_method(
+        self: Orchestrator, rev: str, port: int, unit_dir: Path, tag: str
+    ) -> SimpleNamespace:
+        tags.append(tag)
+        return _fake_side()
+
+    monkeypatch.setattr(Orchestrator, "_provision_side_sandbox", fake_method)
+    monkeypatch.chdir(tmp_path)  # pd-logs/ land in tmp
+    return fx, contract, tags
+
+
+def test_main_pair_provisions_exactly_the_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fx, contract, tags = _pair_main_setup(tmp_path, monkeypatch)
+    out = tmp_path / "rows.json"
+    rc = rp.main(
+        [
+            "--repo", fx["repo"],
+            "--attempt", "1",
+            "--out", str(out),
+            "--workdir", str(fx["workdir"]),
+            "--fix-parent-sha", fx["main1"],
+            "--fix-sha", fx["merge"],
+        ]
+    )
+    assert rc == 0
+    result = json.loads(out.read_text(encoding="utf-8"))
+    rows = result["rows"]
+    # Exactly the pair: two rows, the synthetic unit, roles and
+    # registered SHAs as dispatched — no manifest unit anywhere.
+    assert [r["role"] for r in rows] == ["fix^", "fix"]
+    assert [r["registered_sha"] for r in rows] == [
+        fx["main1"],
+        fx["merge"],
+    ]
+    assert {r["unit"] for r in rows} == {
+        "WO6-BUGSEL-" + fx["merge"][:8]
+    }
+    assert tags == ["fix-parent", "fix"]
+    digest = hashlib.sha256(contract.read_bytes()).hexdigest()
+    for row in rows:
+        assert row["status"] == "READY"
+        assert row["contract_store_sha256"] == digest
+        assert row["engine"]
+        assert row["isolation_mode"] in (
+            "userns-remap",
+            "no-userns-remap",
+        )
+
+
+def test_main_pair_refuses_a_non_first_parent_without_provisioning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fx, _contract, tags = _pair_main_setup(tmp_path, monkeypatch)
+    out = tmp_path / "rows.json"
+    rc = rp.main(
+        [
+            "--repo", fx["repo"],
+            "--attempt", "1",
+            "--out", str(out),
+            "--workdir", str(fx["workdir"]),
+            "--fix-parent-sha", fx["side"],
+            "--fix-sha", fx["merge"],
+        ]
+    )
+    assert rc == 2
+    assert tags == []
+    assert not out.exists()

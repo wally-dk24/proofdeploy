@@ -36,6 +36,14 @@ Guarantees (Addendum 65):
   and the entries added/removed between differing trees.
 * A READY side is a live container: it is stopped in a ``finally``
   so no outcome — row written, row failed, exception — can leak it.
+* Pair mode (D194/D196): ``--fix-parent-sha``/``--fix-sha`` (both
+  or neither) replace the manifest's units with one synthetic
+  fix^/fix unit for WO-6 bug selection's check (d). The pair is
+  refused before anything is provisioned unless both values are
+  exactly 40 lowercase hex, the repo has a contract-store entry,
+  both SHAs are commits of the repo, and the first is the fix
+  commit's FIRST parent. Pair rows additionally record the
+  contract-store sha256 and the sandbox engine/isolation mode.
 
 Exit status: 0 when the harness ran and wrote its rows (a
 non-READY side is data, not a harness failure); 2 when the harness
@@ -48,6 +56,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -62,7 +71,7 @@ from proofdeploy.fixture import (
     template_path,
 )
 from proofdeploy.orchestrator import MeasureConfig, Orchestrator, _free_port
-from proofdeploy.sandbox import assert_measurement_gate
+from proofdeploy.sandbox import assert_measurement_gate, check_sandbox_capabilities
 from proofdeploy.yml import load_contract
 
 ROOT = Path(__file__).resolve().parent
@@ -718,6 +727,118 @@ def provision_side(
     return row
 
 
+# ------------------------------------------------------------------
+# Pair mode (D194/D195/D196): --fix-parent-sha / --fix-sha provision
+# ONE synthetic unit — the fix^ / fix pair WO-6 bug selection's
+# check (d) names — instead of the manifest's registered units.
+# This is the CLI half of readiness.yml's pair inputs; the local
+# bug-selection checker (scripts/wo6/regc_bug_select.py) builds
+# the same unit shape in-process for its own check (d).
+# ------------------------------------------------------------------
+
+_PAIR_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def pair_unit(repo: str, fix_parent_sha: str, fix_sha: str) -> dict[str, Any]:
+    """The synthetic pair unit: exactly one unit for the repo,
+    sides ``fix^`` and ``fix`` — the shape the bug-selection
+    checker's synthetic unit carries, so pair rows are read the
+    same way from either path."""
+    return {
+        "unit_id": f"WO6-BUGSEL-{fix_sha[:8]}",
+        "repo": repo,
+        "class": "wo6-bug-select",
+        "sides": [
+            {"role": "fix^", "sha": fix_parent_sha, "source": "readiness-pair"},
+            {"role": "fix", "sha": fix_sha, "source": "readiness-pair"},
+        ],
+    }
+
+
+def validate_pair(clone: Path, fix_parent_sha: str, fix_sha: str) -> None:
+    """Refuse a pair that is not what it claims (D196). Both SHAs
+    must be commits of the repo (fetched from its own origin), and
+    fix_parent_sha must be the FIRST parent of fix_sha — a second
+    parent, a grandparent, or an unrelated commit is not the
+    fix's parent side. Raises ValueError (a typed refusal) or the
+    fetch layer's RuntimeError; main() maps both to exit 2."""
+    for sha in (fix_parent_sha, fix_sha):
+        fetch_sha(clone, sha)
+        obj_type = _git(clone, "cat-file", "-t", sha)
+        if obj_type != "commit":
+            raise ValueError(
+                f"pair SHA {sha} is a {obj_type} object in the "
+                "repo, not a commit: pair refused"
+            )
+    # The parents are read from the raw commit object, not from
+    # `git show --format=%P`: the fetches above are depth-1, and a
+    # shallow commit's parent list is grafted away for traversal
+    # commands (show reports NO parents) while the object itself
+    # always carries its true parent lines.
+    raw = _git(clone, "cat-file", "commit", fix_sha)
+    parents = [
+        line.split(" ", 1)[1]
+        for line in raw.splitlines()
+        if line.startswith("parent ")
+    ]
+    if not parents or parents[0] != fix_parent_sha:
+        raise ValueError(
+            f"fix_parent_sha {fix_parent_sha} is not the first "
+            f"parent of fix_sha {fix_sha} (first parent: "
+            f"{parents[0] if parents else 'none'}): pair refused"
+        )
+
+
+def pair_manifest(
+    repo: str, workdir: Path, fix_parent_sha: str, fix_sha: str
+) -> dict[str, Any]:
+    """Validate a --fix-parent-sha/--fix-sha pair and return the
+    one-unit manifest it provisions. Every refusal is raised
+    before anything is provisioned: the values must be exactly
+    40 lowercase hex characters; the repo must have a registered
+    contract-store entry (pair provisioning adds that entry to
+    both sides' trees, so there is nothing to provision without
+    one); and the pair itself must pass validate_pair against the
+    repo's own clone."""
+    for label, value in (
+        ("--fix-parent-sha", fix_parent_sha),
+        ("--fix-sha", fix_sha),
+    ):
+        if _PAIR_SHA_RE.fullmatch(value) is None:
+            raise ValueError(
+                f"{label} must be exactly 40 lowercase hex "
+                f"characters, got {value!r}: pair refused"
+            )
+    store = contract_path(repo)
+    if not store.exists():
+        raise ValueError(
+            f"no contract-store entry for repo {repo!r} ({store}): "
+            "pair refused"
+        )
+    clone = ensure_clone(workdir.resolve(), repo)
+    validate_pair(clone, fix_parent_sha, fix_sha)
+    return {"units": [pair_unit(repo, fix_parent_sha, fix_sha)]}
+
+
+def stamp_pair_rows(result: dict[str, Any], repo: str) -> None:
+    """Pair-mode rows carry the run's evidence on the row itself
+    (D196), in the vocabulary the bug-selection record uses: the
+    contract-store sha256 and the sandbox engine / isolation
+    mode, next to the network_mode every readiness row already
+    records. Manifest-driven rows are unchanged — their evidence
+    has always been read from the run, not the row."""
+    digest = hashlib.sha256(contract_path(repo).read_bytes()).hexdigest()
+    caps = check_sandbox_capabilities()
+    engine = (
+        f"podman {caps.podman_version}" if caps.podman_version else "podman"
+    )
+    isolation_mode = "userns-remap" if caps.userns_remap else "no-userns-remap"
+    for row in result["rows"]:
+        row["contract_store_sha256"] = digest
+        row["engine"] = engine
+        row["isolation_mode"] = isolation_mode
+
+
 def provision_repo(
     manifest: dict[str, Any],
     repo: str,
@@ -853,17 +974,42 @@ def main(argv: list[str] | None = None) -> int:
         "--rerun-non-ready", type=Path, default=None,
         help="prior rows JSON; re-provision only its non-READY sides",
     )
+    ap.add_argument(
+        "--fix-parent-sha", default=None,
+        help="pair mode (D194): with --fix-sha, provision exactly "
+        "this fix^/fix pair as one synthetic unit instead of the "
+        "manifest's units (both flags or neither)",
+    )
+    ap.add_argument(
+        "--fix-sha", default=None,
+        help="pair mode (D194): the pair's fix commit (see "
+        "--fix-parent-sha)",
+    )
     args = ap.parse_args(argv)
-    manifest = load_manifest(args.manifest)
+    if (args.fix_parent_sha is None) != (args.fix_sha is None):
+        ap.error(
+            "--fix-parent-sha and --fix-sha must be given together "
+            "(D196): exactly one was given"
+        )
+    pair = args.fix_parent_sha is not None
     only = (
         _rerun_targets(args.rerun_non_ready)
         if args.rerun_non_ready is not None
         else None
     )
     try:
+        if pair:
+            manifest = pair_manifest(
+                args.repo, args.workdir,
+                str(args.fix_parent_sha), str(args.fix_sha),
+            )
+        else:
+            manifest = load_manifest(args.manifest)
         result = provision_repo(
             manifest, args.repo, args.workdir, args.attempt, only=only
         )
+        if pair:
+            stamp_pair_rows(result, args.repo)
     except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"readiness harness failed: {exc}", file=sys.stderr)
         return 2
