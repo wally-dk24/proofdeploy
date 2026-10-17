@@ -30,3 +30,9 @@ v1 was voided (drafted from a fabricated dev list). v1→v2 T-number mapping: v1
 - **Item 10:** the "performed twice" sentences deleted, same reason. The batch/hostile-record sentence stays `[DEV: T1]`.
 - **Item 13:** retagged `[DEV: Bottle]` → `[DEV: T6]` to match dev-set numbering. The v2 entry above still says `[DEV: Bottle]`.
 - **Item 15:** retagged `[DEV: T4]` → `[DEV: T3]`. The "different route or handler" shape is T3 (Fastify), not T4 (Django GIS); the v2 entry above still says `[DEV: T4]` due to v1→v2 renumbering confusion.
+
+### v3 (skill registration v3, 2026-10-17; signed D181, re-signed D185)
+
+- **New section 1a ("The change can be the bug"), items A1–A5**, inserted after section 1: the change under test can itself be the defect; correct behaviour is established from sources outside the changed lines (fixture, field/route names, untouched neighbouring code, docs/comments/tests) before probing, and asserted over the diff's behaviour when the two contradict. Motivated by smoke runs V3 and M1 (D175, D178).
+- **New section 1b ("Check the format before you answer"), items B1–B2**: assertions use only the schema types (status, header, body, db; a JSON body field is type `body` with a `json_path` object — there is no `json_path` assertion type), and every probe is re-read against the schema before answering. Motivated by smoke run M4 (D183), where a non-existent assertion type turned a correct clean run into a false alarm.
+- Nothing else in the skill changes: items 1–23, their numbering and cross-references are unchanged (the new items are lettered). The author copy (`skill-author.md`) is regenerated with `scripts/generate_author_skill.py`; new hashes are recorded in `docs/evaluation/skill-registration-v3.md`. The author prompt (`fa72a0e6`), model, temperature and attempts are unchanged.
