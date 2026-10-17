@@ -99,6 +99,20 @@ checkout of this repo whose HEAD contains current main; check
 sandboxed runner. The record carries the launch HEAD (main_sha)
 and its merge-base with main (merge_base_with_main).
 
+Check (d) has a second venue (D194, ruled after the first live
+run stopped fail-closed on this host: the VM cannot create the
+user-namespace-remapped, isolated-network sandbox the measured
+path requires, so no local READY evidence can ever be produced
+here). With `--check-d github`, each check-(d) attempt instead
+dispatches readiness.yml — the pair inputs of D195 — from main
+to the GitHub runners, where the sandboxed runner can honour
+the isolation; the workflow's rows artifact is read back as the
+sides' outcomes, the run ID is journaled per attempt, and the
+D48 classification, retries (each retry is a NEW dispatch) and
+stop rules apply unchanged. The walk, the journal and the lock
+stay on this host either way; the local sandboxed checker
+remains the default.
+
 CONTAMINATION GUARD: this script records commit metadata and check
 outcomes only. It never prints or writes the fix's diff, any file
 content, test content, or any commit message body — to stdout, to
@@ -150,9 +164,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -582,6 +598,13 @@ ENVIRONMENT_MARKERS = (
     "Connection refused",
     "Connection reset",
     "timed out",
+    # D194: the GitHub check-(d) checker's own failure prefix. A
+    # readiness workflow run that fails, or a rows artifact that
+    # never arrives, is a fact about the environment the check
+    # executes in — never about the candidate — so the checker's
+    # dispatch-side failures carry this prefix and classify as
+    # environment (the ruled retry path).
+    "github readiness:",
 )
 
 
@@ -709,6 +732,14 @@ def _run_check_d(
                 "reason": outcome.get("typed_reason")
                 or outcome.get("last_error"),
             }
+            if outcome.get("workflow_run_id") is not None:
+                # The GitHub checker (D194): the readiness
+                # workflow run this attempt dispatched, journaled
+                # per attempt alongside the attempt record itself
+                # (the journal payload below spreads attempt_rec).
+                attempt_rec["workflow_run_id"] = outcome[
+                    "workflow_run_id"
+                ]
             attempts[role].append(attempt_rec)
             if journal is not None:
                 journal.append_attempt({
@@ -1331,6 +1362,330 @@ def make_provision_pair_checker(
     return check
 
 
+# ---------------------------------------------------------------------
+# The GitHub readiness pair check (D194): check (d) dispatched to
+# the GitHub runners. Same ReadyPairCheck protocol as the local
+# checker; every attempt is one readiness.yml dispatch from main.
+# ---------------------------------------------------------------------
+
+# The workflow that provisions a pair on the runners, and the
+# only ref check (d) may dispatch it from: the pair inputs and
+# the synthetic-unit provisioning live on main (D195), and a
+# dispatch from any other ref would provision with a different
+# harness than the one the reviewer accepted.
+READINESS_WORKFLOW = "readiness.yml"
+GITHUB_CHECK_D_REF = "main"
+
+# A dispatched SHA is exactly 40 lowercase hex characters (the
+# workflow validates the same shape and fails closed, D195/D196).
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# The failure prefix on this checker's dispatch-side outcomes
+# (see ENVIRONMENT_MARKERS): environment class, never a guess.
+GITHUB_CHECK_D_PREFIX = "github readiness:"
+
+
+def _validate_sha40(value: str, *, what: str) -> str:
+    """Fail closed on a SHA that is not exactly 40 lowercase hex
+    characters, before anything is dispatched (D194)."""
+    if not SHA40_RE.match(value):
+        raise HarnessError(
+            f"check (d) refused: {what} {value!r} is not exactly "
+            "40 lowercase hex characters"
+        )
+    return value
+
+
+def _contract_store_sha256(repo_name: str) -> str | None:
+    """The sha256 of the repo's contract-store entry in THIS
+    checkout, or None when there is no readable entry. The GitHub
+    checker dispatches from main out of a main checkout, so this
+    is the entry the dispatched workflow provisions under (it
+    checks out the same ref)."""
+    try:
+        from readiness.provision import contract_path
+
+        store = contract_path(repo_name)
+        if store.exists():
+            return hashlib.sha256(store.read_bytes()).hexdigest()
+    except Exception:
+        return None
+    return None
+
+
+def _gh(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["gh", *args], capture_output=True, text=True
+    )
+
+
+class GhReadinessDispatcher:
+    """The real check-(d) dispatcher: `gh` against this
+    repository (the live run executes from a checkout of it, so
+    gh resolves the repo from the checkout's remote).
+
+    dispatch_pair runs readiness.yml by workflow dispatch and
+    resolves the created run's ID; wait polls the run to
+    completion and reports whether it succeeded; fetch_rows
+    downloads the run's rows artifact and parses
+    rows-attempt1.json. Failure is reported, never papered over:
+    dispatch raises HarnessError, wait returns False, fetch_rows
+    returns None — and the checker maps each to an
+    environment-class outcome."""
+
+    def __init__(
+        self,
+        *,
+        poll_seconds: float = 20.0,
+        timeout_seconds: float = 7800.0,
+    ) -> None:
+        self._poll = poll_seconds
+        self._timeout = timeout_seconds
+
+    def dispatch_pair(
+        self,
+        *,
+        repo: str,
+        fix_parent_sha: str,
+        fix_sha: str,
+        ref: str,
+    ) -> str:
+        if ref != GITHUB_CHECK_D_REF:
+            raise HarnessError(
+                f"check (d) refused: readiness dispatches only "
+                f"from {GITHUB_CHECK_D_REF!r}, not {ref!r} (D194)"
+            )
+        _validate_sha40(fix_parent_sha, what="fix_parent_sha")
+        _validate_sha40(fix_sha, what="fix_sha")
+        before = datetime.now(timezone.utc)
+        proc = _gh(
+            "workflow", "run", READINESS_WORKFLOW,
+            "--ref", ref,
+            "-f", f"repo={repo}",
+            "-f", "attempt=1",
+            "-f", "mode=provision",
+            "-f", f"fix_parent_sha={fix_parent_sha}",
+            "-f", f"fix_sha={fix_sha}",
+        )
+        if proc.returncode != 0:
+            raise HarnessError(
+                "gh workflow run failed: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        match = re.search(r"actions/runs/(\d+)", proc.stdout)
+        if match:
+            return match.group(1)
+        # Older gh prints no run URL: resolve the run as the
+        # newest workflow_dispatch run of the workflow on the ref
+        # created at/after the dispatch (dispatches from this
+        # checker are sequential and rare).
+        for _ in range(12):
+            proc = _gh(
+                "run", "list",
+                "--workflow", READINESS_WORKFLOW,
+                "--branch", ref,
+                "--event", "workflow_dispatch",
+                "--limit", "10",
+                "--json", "databaseId,createdAt",
+            )
+            if proc.returncode == 0:
+                try:
+                    runs = json.loads(proc.stdout or "[]")
+                except json.JSONDecodeError:
+                    runs = []
+                for run in runs:
+                    try:
+                        created = datetime.fromisoformat(
+                            str(run["createdAt"]).replace(
+                                "Z", "+00:00"
+                            )
+                        )
+                    except (KeyError, ValueError):
+                        continue
+                    if created >= before - timedelta(seconds=5):
+                        return str(run["databaseId"])
+            time.sleep(5)
+        raise HarnessError(
+            "gh workflow run created no resolvable run"
+        )
+
+    def wait(self, run_id: str) -> bool:
+        deadline = time.monotonic() + self._timeout
+        while True:
+            proc = _gh(
+                "run", "view", run_id,
+                "--json", "status,conclusion",
+            )
+            if proc.returncode == 0:
+                try:
+                    data = json.loads(proc.stdout or "{}")
+                except json.JSONDecodeError:
+                    data = {}
+                if isinstance(data, dict) and (
+                    data.get("status") == "completed"
+                ):
+                    conclusion: Any = data.get("conclusion")
+                    return bool(conclusion == "success")
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self._poll)
+
+    def fetch_rows(
+        self, run_id: str, *, repo: str
+    ) -> list[dict[str, Any]] | None:
+        # The artifact name is readiness-<repo slug>-<attempt>,
+        # the slug being the repo with "/" folded to "-" (the
+        # workflow's own computation); check (d) always dispatches
+        # attempt 1.
+        name = f"readiness-{repo.replace('/', '-')}-1"
+        with tempfile.TemporaryDirectory() as td:
+            proc = _gh(
+                "run", "download", run_id,
+                "--name", name, "--dir", td,
+            )
+            if proc.returncode != 0:
+                return None
+            path = Path(td) / "rows-attempt1.json"
+            if not path.exists():
+                return None
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                return None
+        return data if isinstance(data, list) else None
+
+
+def make_github_pair_checker(
+    *, repo_name: str, dispatcher: Any = None
+) -> ReadyPairCheck:
+    """Check (d) through readiness.yml on the GitHub runners
+    (D194): the venue ruled after this host proved unable to
+    create the user-namespace-remapped, isolated-network sandbox
+    the measured path requires.
+
+    Each call dispatches ONE workflow run (repo, attempt 1, mode
+    provision, the pair SHAs) from main, waits for it to
+    complete, and reads the rows artifact back as the sides'
+    outcomes — the readiness row's own fields (status, typed
+    reason, last error) plus the row's evidence (engine,
+    isolation mode, network mode and evidence, contract sha),
+    in exactly the local checker's shape, so the D48
+    classification, retries (each retry is a NEW dispatch) and
+    stop rules apply unchanged. The dispatching run's ID rides
+    on every outcome as workflow_run_id and is journaled per
+    attempt by _run_check_d.
+
+    A failed workflow run, or a missing/unreadable rows
+    artifact, yields environment-class outcomes for every
+    requested side (GITHUB_CHECK_D_PREFIX) — never a guessed
+    READY. A side with no row in the artifact is our gap, as in
+    the local checker. The contract-store sha256 falls back to
+    this checkout's store entry when a row does not carry one:
+    the dispatch is from main and this checkout is main, so it
+    is the same entry the workflow provisioned under."""
+    if dispatcher is None:
+        dispatcher = GhReadinessDispatcher()
+    contract_store_sha256 = _contract_store_sha256(repo_name)
+
+    def env_outcome(
+        reason: str, run_id: str | None
+    ) -> dict[str, Any]:
+        return {
+            "ready": False,
+            "status": None,
+            "typed_reason": f"{GITHUB_CHECK_D_PREFIX} {reason}",
+            "last_error": reason,
+            "engine": None,
+            "isolation_mode": None,
+            "network_mode": None,
+            "network_none_evidence": _network_none_evidence(None),
+            "contract_store_sha256": contract_store_sha256,
+            "workflow_run_id": run_id,
+        }
+
+    def check(
+        parent_sha: str, fix_sha: str, roles: tuple[str, ...]
+    ) -> dict[str, dict[str, Any]]:
+        _validate_sha40(parent_sha, what="fix^ sha")
+        _validate_sha40(fix_sha, what="fix sha")
+        try:
+            run_id = dispatcher.dispatch_pair(
+                repo=repo_name,
+                fix_parent_sha=parent_sha,
+                fix_sha=fix_sha,
+                ref=GITHUB_CHECK_D_REF,
+            )
+        except Exception as exc:
+            reason = (
+                f"dispatch of {READINESS_WORKFLOW} from "
+                f"{GITHUB_CHECK_D_REF} failed: {exc}"
+            )
+            return {role: env_outcome(reason, None) for role in roles}
+        if not dispatcher.wait(run_id):
+            reason = (
+                f"readiness workflow run {run_id} did not "
+                "complete successfully"
+            )
+            return {role: env_outcome(reason, run_id) for role in roles}
+        rows = dispatcher.fetch_rows(run_id, repo=repo_name)
+        if rows is None:
+            reason = (
+                f"readiness workflow run {run_id} produced no "
+                "readable rows artifact"
+            )
+            return {role: env_outcome(reason, run_id) for role in roles}
+        by_role = {
+            row.get("role"): row
+            for row in rows
+            if isinstance(row, dict)
+        }
+        outcomes: dict[str, dict[str, Any]] = {}
+        for role in roles:
+            row = by_role.get(role)
+            if row is None:
+                outcomes[role] = {
+                    "ready": False,
+                    "status": None,
+                    "typed_reason": (
+                        "the readiness workflow wrote no row for "
+                        "this side (our gap)"
+                    ),
+                    "last_error": None,
+                    "engine": None,
+                    "isolation_mode": None,
+                    "network_mode": None,
+                    "network_none_evidence": _network_none_evidence(
+                        None
+                    ),
+                    "contract_store_sha256": contract_store_sha256,
+                    "workflow_run_id": run_id,
+                }
+                continue
+            network_mode = row.get("network_mode")
+            outcomes[role] = {
+                "ready": row.get("status") == "READY",
+                "status": row.get("status"),
+                "typed_reason": row.get("typed_reason"),
+                "last_error": row.get("last_error"),
+                "engine": row.get("engine"),
+                "isolation_mode": row.get("isolation_mode"),
+                "network_mode": network_mode,
+                "network_none_evidence": row.get(
+                    "network_none_evidence"
+                )
+                or _network_none_evidence(network_mode),
+                "contract_store_sha256": row.get(
+                    "contract_store_sha256"
+                )
+                or row.get("contract_sha256")
+                or contract_store_sha256,
+                "workflow_run_id": run_id,
+            }
+        return outcomes
+
+    return check
+
+
 def _clone_app(clone_dir: Path, repo_name: str, head_sha: str) -> AppRepo:
     """A full clone of the app (the walk needs history, blame and
     tags), pinned to the list's HEAD SHA: the recorded commit must
@@ -1405,6 +1760,14 @@ def main(argv: list[str] | None = None) -> int:
         "journal header and the record); defaults to the HEAD of "
         "the checkout containing this script",
     )
+    ap.add_argument(
+        "--check-d",
+        choices=("local", "github"),
+        default="local",
+        help="check (d) venue: local = the sandboxed runner on "
+        "this host (default); github = readiness.yml dispatched "
+        "from main to the GitHub runners (D194)",
+    )
     args = ap.parse_args(argv)
 
     journal_dir = args.journal or args.out.with_suffix("").with_name(
@@ -1431,9 +1794,14 @@ def main(argv: list[str] | None = None) -> int:
                 resumed=resumed, previous_exit_cause=previous_cause
             )
             repo = _clone_app(clone_dir, app["repo"], str(app["head_sha"]))
-            ready_pair = make_provision_pair_checker(
-                repo_name=app["repo"], workdir=workdir
-            )
+            if args.check_d == "github":
+                ready_pair = make_github_pair_checker(
+                    repo_name=app["repo"]
+                )
+            else:
+                ready_pair = make_provision_pair_checker(
+                    repo_name=app["repo"], workdir=workdir
+                )
             record = select_fix(
                 repo=repo,
                 app=app,
