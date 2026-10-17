@@ -1,0 +1,40 @@
+# PROVENANCE 2026-10-17 (WO-6 Phase C, D149): generic readiness
+# contract for paperless-ngx/paperless-ngx at its survivor-record
+# HEAD 0cb2cdbfdd91a2078236f8851cd310261284591c (survivor #1,
+# 46,745 stars), derived only from the app's README/config at that
+# HEAD: pyproject.toml (uv project with a committed uv.lock,
+# requires-python >=3.11, Django ~=5.2, settings module
+# paperless.settings), docker/compose/docker-compose.sqlite.yml
+# (the sqlite deployment; webserver port 8000), and
+# src/paperless/settings (sqlite is the default engine with the
+# database at DATA_DIR/db.sqlite3; PAPERLESS_SECRET_KEY is
+# mandatory — settings raise ImproperlyConfigured when it is unset
+# or left at the default). The sandbox provisions a single app
+# container, so the compose file's broker service is replaced by
+# the app's own no-service backends, taken from its own committed
+# test configuration (pyproject.toml [tool.pytest_env]):
+# PAPERLESS_CHANNELS_BACKEND and PAPERLESS_CACHE_BACKEND below.
+# PAPERLESS_SECRET_KEY's value is a throwaway for this ephemeral
+# provision only, the same practice as the app's own committed
+# test secret ("test-secret-key-do-not-use-in-production").
+# app.path "src" is the survivor record's app_path: the Django
+# project (src/manage.py) lives in src/ while the uv project is at
+# the root, so the frozen install runs at the root and the
+# contract's commands address src/manage.py from there. Readiness
+# "/" is the frontend root: login_required, so an anonymous poll is
+# redirected to the Django-served allauth login page.
+app:
+  path: "src"
+build: "true"
+migrate: "python src/manage.py migrate --noinput"
+start: "python src/manage.py runserver 0.0.0.0:$PORT --noreload"
+readiness: "/"
+database:
+  kind: sqlite
+  path: data/db.sqlite3
+env:
+  PAPERLESS_DBENGINE: sqlite
+  PAPERLESS_DATA_DIR: /checkout/data
+  PAPERLESS_SECRET_KEY: "wo6-phase-c-readiness-throwaway"
+  PAPERLESS_CHANNELS_BACKEND: channels.layers.InMemoryChannelLayer
+  PAPERLESS_CACHE_BACKEND: django.core.cache.backends.locmem.LocMemCache
