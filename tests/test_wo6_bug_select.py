@@ -276,6 +276,71 @@ def test_check_c_tag_created_after_fix_rejected(tmp_path: Path) -> None:
     assert "at or after the fix" in entry["reason"]
 
 
+def two_blamed_commits_history(
+    tmp_path: Path, *, tag_target: str
+) -> tuple[Path, str, str, str]:
+    """base (Jan) -> older changes line 2 (Feb) -> newer changes
+    line 3 (Mar) -> fix changes BOTH lines (Aug 15). Blame at fix^
+    attributes the fix's removed lines to TWO commits: line 2 to
+    `older`, line 3 to `newer`. B is the MOST RECENT blamed commit
+    (REG-C item 7): `newer`. The single tag v1.0 is placed on
+    `tag_target` ("older" or "newer"), created the day after it —
+    always before the fix."""
+    repo = init_repo(tmp_path)
+    commit(repo, "Initial commit", ts(2026, 1, 10),
+           {"src/app.py": "l1\nl2\nl3\nl4\n"})
+    older = commit(repo, "Introduce the counter", ts(2026, 2, 1),
+                   {"src/app.py": "l1\nl2-old\nl3\nl4\n"})
+    newer = commit(repo, "Introduce the meter", ts(2026, 3, 1),
+                   {"src/app.py": "l1\nl2-old\nl3-new\nl4\n"})
+    if tag_target == "older":
+        add_tag(repo, "v1.0", ts(2026, 2, 2), target=older)
+    else:
+        add_tag(repo, "v1.0", ts(2026, 3, 2), target=newer)
+    fix = commit(repo, "Fix the counter and the meter", ts(2026, 8, 15),
+                 {"src/app.py": "l1\nl2-fixed\nl3-fixed\nl4\n"})
+    return repo, older, newer, fix
+
+
+def test_check_c_b_is_the_most_recent_blamed_commit_untagged(
+    tmp_path: Path,
+) -> None:
+    """D177 (1), case (i): the fix's removed lines blame to two
+    commits; only the OLDER is contained in a tag created before
+    the fix. B is the NEWER blamed commit, which is untagged, so
+    the candidate is rejected at (c) — selecting the older commit
+    as B (e.g. min instead of max) would wrongly pass it."""
+    repo, older, newer, fix = two_blamed_commits_history(
+        tmp_path, tag_target="older"
+    )
+    record = select(repo, fix, FakeReady({newer, fix}))
+    entry = record["walked"][-1]
+    assert entry["b_sha"] == newer  # the most recent blamed commit
+    assert entry["b_sha"] != older
+    assert entry["failed_check"] == "c"
+    assert "contained in no tag" in entry["reason"]
+    assert record["outcome"] == "exhausted"
+
+
+def test_check_c_b_is_the_most_recent_blamed_commit_tagged(
+    tmp_path: Path,
+) -> None:
+    """D177 (1), case (ii): only the NEWER blamed commit is tagged
+    before the fix. B (the newer) is shipped, check (c) passes, and
+    the selected record names the newer commit as B."""
+    repo, older, newer, fix = two_blamed_commits_history(
+        tmp_path, tag_target="newer"
+    )
+    record = select(repo, fix, FakeReady({newer, fix}))
+    entry = record["walked"][-1]
+    assert entry["outcome"] == "selected"
+    assert entry["b_sha"] == newer
+    assert entry["b_sha"] != older
+    assert entry["tag"] == "v1.0"
+    assert record["selected"]["b"] == newer
+    assert record["selected"]["tag"] == "v1.0"
+
+
 def test_check_d_requires_both_sides_ready(tmp_path: Path) -> None:
     repo, _base, _b, mid, fix = standard_history(tmp_path)
 

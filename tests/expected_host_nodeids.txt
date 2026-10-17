@@ -994,6 +994,8 @@ tests/test_wo6_bug_select.py::test_check_a_failure_is_recorded_first
 tests/test_wo6_bug_select.py::test_check_b_docs_and_tests_only_fix_rejected
 tests/test_wo6_bug_select.py::test_check_c_add_only_fix_has_no_b
 tests/test_wo6_bug_select.py::test_check_c_b_in_no_tag_rejected
+tests/test_wo6_bug_select.py::test_check_c_b_is_the_most_recent_blamed_commit_tagged
+tests/test_wo6_bug_select.py::test_check_c_b_is_the_most_recent_blamed_commit_untagged
 tests/test_wo6_bug_select.py::test_check_c_tag_created_after_fix_rejected
 tests/test_wo6_bug_select.py::test_check_d_requires_both_sides_ready
 tests/test_wo6_bug_select.py::test_classify_path[.github/workflows/x.yml-OTHER]
