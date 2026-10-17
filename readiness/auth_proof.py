@@ -162,6 +162,12 @@ PROOF_SPECS: dict[str, ProofSpec] = {
         unauthenticated_body_path="errors[0].extensions.code",
         unauthenticated_body_value="FORBIDDEN",
     ),
+    # D158: paperless-ngx's user-self endpoint (ProfileView,
+    # IsAuthenticated); a request with no Authorization header is
+    # refused with a real HTTP 401, so no body checks.
+    "paperless-ngx/paperless-ngx": ProofSpec(
+        "GET", "/api/profile/", 401, acquisition_kind="login"
+    ),
 }
 
 

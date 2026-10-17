@@ -571,6 +571,10 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
     # (login with the D120 token_header, approved D120/D131): its
     # login body names upstream's published core-default superadmin
     # credentials — the same on every instance, not per-run secrets.
+    # Paperless-ngx's is the fourth (login, approved D158): its login
+    # body names only the per-run generated bootstrap env NAMES
+    # (PAPERLESS_ADMIN_USER / PAPERLESS_ADMIN_PASSWORD) — values are
+    # generated per run, never committed.
     for path in sorted(rp.CONTRACTS_DIR.glob("*.yml")):
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         if path.name == "directus__directus.yml":
@@ -578,6 +582,8 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
         elif path.name == "TryGhost__Ghost.yml":
             assert data.get("auth", {}).get("mode") == "ghost_jwt"
         elif path.name == "vendure-ecommerce__vendure.yml":
+            assert data.get("auth", {}).get("mode") == "login"
+        elif path.name == "paperless-ngx__paperless-ngx.yml":
             assert data.get("auth", {}).get("mode") == "login"
         else:
             assert "auth" not in data, path.name
