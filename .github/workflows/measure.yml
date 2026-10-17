@@ -36,6 +36,15 @@ on:
         description: "Target app repo URL (e.g. https://github.com/org/app.git)"
         required: true
         type: string
+      unit_repo:
+        description: "Unit repo slug for the contract-store lookup; golden/<app> materializes a golden unit instead of cloning target_repo"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - golden/node-express-sqlite
+          - golden/python-flask-sqlite
       bug_id:
         description: "Bug ID (for bug runs; leave empty for clean runs)"
         required: false
@@ -104,11 +113,37 @@ jobs:
           pip install -e .
 
       - name: Check out target repo
+        # D154: golden units are materialized, not cloned.
+        if: ${{ !startsWith(inputs.unit_repo, 'golden/') }}
         env:
           TARGET_REPO: ${{ inputs.target_repo }}
         run: |
           # Quote the input via env to avoid shell injection.
           git clone "$TARGET_REPO" /tmp/target-repo
+
+      - name: Materialize golden unit
+        # D154: a golden unit exists only as committed revision trees
+        # under conformance/golden/ in THIS repo. Materialize it with
+        # the conformance kit at the ProofDeploy commit being run;
+        # the kit's revision SHAs become the measure inputs (its
+        # linear history carries fix-parent as an ancestor of fix).
+        if: ${{ startsWith(inputs.unit_repo, 'golden/') }}
+        id: golden
+        env:
+          UNIT_REPO: ${{ inputs.unit_repo }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from conformance.kit import materialize_golden
+
+          app = os.environ["UNIT_REPO"].removeprefix("golden/")
+          shas = materialize_golden(app, Path("/tmp/target-repo"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              for name in ("base", "bug", "fix", "clean"):
+                  print(f"{name}={shas[name]}", file=fh)
+          PY
 
       - name: Capability probe (fail-closed gate)
         id: probe
@@ -129,12 +164,13 @@ jobs:
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           ARM: ${{ inputs.arm }}
+          UNIT_REPO: ${{ inputs.unit_repo }}
           BUG_ID: ${{ inputs.bug_id }}
-          BASE: ${{ inputs.base }}
-          BUG: ${{ inputs.bug }}
-          FIX: ${{ inputs.fix }}
+          BASE: ${{ steps.golden.outputs.base || inputs.base }}
+          BUG: ${{ steps.golden.outputs.bug || inputs.bug }}
+          FIX: ${{ steps.golden.outputs.fix || inputs.fix }}
           CLEAN_ID: ${{ inputs.clean_id }}
-          CLEAN: ${{ inputs.clean }}
+          CLEAN: ${{ steps.golden.outputs.clean || inputs.clean }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_ID: ${{ github.run_id }}
           # Note: $ImageOS/$ImageVersion are available in the runner env;
@@ -156,12 +192,20 @@ jobs:
           else
             SKILL_ARGS="--no-skill"
           fi
+          # D154: --unit-repo names the contract-store slug. Empty for
+          # real-repo runs, which leaves their command line unchanged.
+          if [ -n "$UNIT_REPO" ]; then
+            UNIT_ARGS="--unit-repo $UNIT_REPO"
+          else
+            UNIT_ARGS=""
+          fi
           if [ -n "$BUG_ID" ]; then
             OUTPUT=$(python -m proofdeploy.cli measure \
               --repo /tmp/target-repo \
               --workdir /tmp/workdir \
               --output-dir /tmp/output \
               $SKILL_ARGS \
+              $UNIT_ARGS \
               --bug-id "$BUG_ID" \
               --base "$BASE" \
               --bug "$BUG" \
@@ -173,6 +217,7 @@ jobs:
               --workdir /tmp/workdir \
               --output-dir /tmp/output \
               $SKILL_ARGS \
+              $UNIT_ARGS \
               --clean-id "$CLEAN_ID" \
               --clean "$CLEAN" \
               $PROV_ARGS 2>&1)

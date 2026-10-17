@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -162,3 +163,123 @@ def test_guard_ignores_a_non_model_workflow_without_the_group(tmp_path):
         "    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
     )
     assert _violations(tmp_path) == []
+
+
+# ----------------------------------------------------------------------
+# D154: measure.yml's golden branch — workflow shape
+#
+# Golden units were refused on the measured path (contract_missing:
+# the path loads only contract-store entries, and the golden apps
+# had none). D154 adds the store entries (guarded in
+# test_readiness_harness.py) and a golden branch in measure.yml:
+# with unit_repo = golden/<app> the clone is skipped, the kit
+# materializes the app at the commit being run, and the measure
+# step receives the kit's revision SHAs plus --unit-repo. These
+# tests pin the workflow's shape only; nothing here dispatches.
+# ----------------------------------------------------------------------
+
+MEASURE_YML = WORKFLOWS / "measure.yml"
+
+GOLDEN_CHOICES = ["", "golden/node-express-sqlite", "golden/python-flask-sqlite"]
+
+
+def _measure_workflow() -> dict[str, Any]:
+    return yaml.safe_load(MEASURE_YML.read_text(encoding="utf-8"))
+
+
+def _measure_steps() -> list[dict[str, Any]]:
+    return _measure_workflow()["jobs"]["measure"]["steps"]
+
+
+def _measure_step(name: str) -> dict[str, Any]:
+    for step in _measure_steps():
+        if step.get("name") == name:
+            return step
+    raise AssertionError(f"no step named {name!r}")
+
+
+def test_unit_repo_input_is_a_choice_with_exactly_the_ruled_values():
+    data = _measure_workflow()
+    on = data.get("on", data.get(True))
+    unit_repo = on["workflow_dispatch"]["inputs"]["unit_repo"]
+    assert unit_repo["type"] == "choice"
+    assert unit_repo["options"] == GOLDEN_CHOICES
+    assert unit_repo["required"] is False
+    assert unit_repo["default"] == ""
+
+
+def test_inputs_reach_the_shell_only_via_env():
+    # No ${{ inputs.* }} may be interpolated into a run script;
+    # inputs reach the shell through step env only.
+    for step in _measure_steps():
+        run = step.get("run", "")
+        assert "${{ inputs." not in run, step.get("name")
+        assert "${{inputs." not in run, step.get("name")
+
+
+def test_measure_environment_and_concurrency_are_unchanged():
+    data = _measure_workflow()
+    assert data["jobs"]["measure"]["environment"] == "measurement"
+    concurrency = data["concurrency"]
+    assert concurrency["group"] == MODEL_CONCURRENCY_GROUP
+    assert concurrency["cancel-in-progress"] is False
+    assert concurrency["queue"] == "max"
+
+
+def test_measure_no_new_secret_and_every_action_is_sha_pinned():
+    text = MEASURE_YML.read_text(encoding="utf-8")
+    assert set(re.findall(r"secrets\.(\w+)", text)) == {"GROQ_API_KEY"}
+    for uses in re.findall(r"uses:\s*(\S+)", text):
+        assert re.fullmatch(r"[\w./-]+@[0-9a-f]{40}", uses), uses
+
+
+def test_golden_branch_skips_the_clone_and_materializes():
+    clone = _measure_step("Check out target repo")
+    assert clone["if"] == "${{ !startsWith(inputs.unit_repo, 'golden/') }}"
+    golden = _measure_step("Materialize golden unit")
+    assert golden["if"] == "${{ startsWith(inputs.unit_repo, 'golden/') }}"
+    assert golden["id"] == "golden"
+    assert golden["env"]["UNIT_REPO"] == "${{ inputs.unit_repo }}"
+    run = golden["run"]
+    assert "from conformance.kit import materialize_golden" in run
+    assert 'materialize_golden(app, Path("/tmp/target-repo"))' in run
+    for name in ("base", "bug", "fix", "clean"):
+        assert f'"{name}"' in run
+
+
+def test_measure_step_passes_unit_repo_and_golden_shas_via_env():
+    measure = _measure_step("Run measured unit")
+    env = measure["env"]
+    assert env["UNIT_REPO"] == "${{ inputs.unit_repo }}"
+    for env_name, sha_name in (
+        ("BASE", "base"),
+        ("BUG", "bug"),
+        ("FIX", "fix"),
+        ("CLEAN", "clean"),
+    ):
+        assert env[env_name] == (f"${{{{ steps.golden.outputs.{sha_name} || inputs.{sha_name} }}}}")
+    run = measure["run"]
+    assert 'if [ -n "$UNIT_REPO" ]; then' in run
+    assert 'UNIT_ARGS="--unit-repo $UNIT_REPO"' in run
+    assert 'UNIT_ARGS=""' in run
+    assert run.count("$UNIT_ARGS") == 2  # expanded in both invocations
+
+
+def test_real_repo_path_commands_are_unchanged():
+    # With unit_repo empty the golden branch is not taken: the clone
+    # step's command and the measure invocations' argument lines are
+    # exactly the pre-D154 ones (UNIT_ARGS expands to nothing).
+    clone = _measure_step("Check out target repo")
+    assert clone["env"]["TARGET_REPO"] == "${{ inputs.target_repo }}"
+    assert 'git clone "$TARGET_REPO" /tmp/target-repo' in clone["run"]
+    run = _measure_step("Run measured unit")["run"]
+    for line in (
+        "--repo /tmp/target-repo",
+        '--bug-id "$BUG_ID"',
+        '--base "$BASE"',
+        '--bug "$BUG"',
+        '--fix "$FIX"',
+        '--clean-id "$CLEAN_ID"',
+        '--clean "$CLEAN"',
+    ):
+        assert line in run, line
