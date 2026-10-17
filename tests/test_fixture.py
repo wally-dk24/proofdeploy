@@ -356,6 +356,47 @@ def test_assemble_omits_in_tree_links_and_records_them(tmp_path):
     ]
 
 
+_FAKE_PIN = "a" * 40
+
+
+def test_assemble_records_omitted_gitlinks(tmp_path):
+    """D143: a gitlink of the source tree arrives in the snapshot as
+    an empty directory (what `git archive` delivers); the bundle
+    holds the empty directory and no contents, and the manifest
+    records the omission as path + pinned commit."""
+    snap = _snapshot(tmp_path)
+    (snap / "themes" / "casper").mkdir(parents=True)
+    bundle = _assemble(
+        tmp_path, snap=snap, gitlinks={"themes/casper": _FAKE_PIN}
+    )
+    gitlink_dir = bundle.snapshot / "themes" / "casper"
+    assert gitlink_dir.is_dir()
+    assert not any(p.is_file() for p in gitlink_dir.rglob("*"))
+    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+    assert manifest["omitted_gitlinks"] == [
+        {"path": "themes/casper", "commit": _FAKE_PIN}
+    ]
+
+
+def test_assemble_refuses_file_under_gitlink_path(tmp_path):
+    """D143: submodule contents materialised under a gitlink path
+    refuse assembly — contents never enter the bundle."""
+    snap = _snapshot(tmp_path)
+    gitlink_dir = snap / "themes" / "casper"
+    gitlink_dir.mkdir(parents=True)
+    (gitlink_dir / "index.hbs").write_text("submodule contents\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="under gitlink path"):
+        _assemble(tmp_path, snap=snap, gitlinks={"themes/casper": _FAKE_PIN})
+
+
+def test_assemble_refuses_gitlink_path_missing_from_snapshot(tmp_path):
+    """D143: a declared gitlink with no directory in the snapshot
+    means the snapshot is not the archive of that tree: refuse."""
+    snap = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="not a directory in the snapshot"):
+        _assemble(tmp_path, snap=snap, gitlinks={"themes/casper": _FAKE_PIN})
+
+
 def test_assemble_refuses_escaping_symlink_in_snapshot(tmp_path):
     """WO-8.4b rule 2: a `../` escape is refused with the path named."""
     snap = _snapshot(tmp_path)

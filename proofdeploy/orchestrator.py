@@ -61,6 +61,7 @@ from proofdeploy.fixture import (
     render_description,
     template_filename,
     template_path,
+    tree_gitlinks,
 )
 from proofdeploy.leakcheck import (
     assert_no_secrets,
@@ -1012,6 +1013,12 @@ class Orchestrator:
             diff_range=f"{base_sha}..{tip_sha}",
             skill_path=cfg.skill_path,
             no_skill=cfg.no_skill,
+            # D143: B's gitlinks (submodule entries), derived from
+            # the tip tree — the assembler records them in the
+            # manifest as omitted_gitlinks, and the answer-key check
+            # re-derives them from B and cross-verifies path and
+            # pinned commit.
+            gitlinks=tree_gitlinks(repo, tip_sha),
         )
         manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
         # Pass None for no-skill; the builder renders "(none)" itself.

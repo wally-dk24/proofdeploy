@@ -294,6 +294,32 @@ def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
     )
 
 
+def tree_gitlinks(repo_dir: str | Path, rev: str) -> dict[str, str]:
+    """{path: pinned commit} for every gitlink (mode 160000) in rev's tree.
+
+    Derived from ``git ls-tree -r`` on the commit itself. The measured
+    path passes this to `assemble_author_bundle` for the manifest's
+    ``omitted_gitlinks`` record (D143); the answer-key check recomputes
+    the same set from B independently and cross-verifies the record —
+    it is never trusted from the manifest.
+    """
+    proc = _git(Path(repo_dir), "ls-tree", "-r", "-z", rev)
+    if proc.returncode != 0:
+        raise ValueError(
+            f"git ls-tree {rev} failed in {repo_dir}: "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    gitlinks: dict[str, str] = {}
+    for entry in proc.stdout.decode("utf-8", "surrogateescape").split("\x00"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        parts = meta.split(" ")
+        if len(parts) == 3 and parts[0] == "160000":
+            gitlinks[path] = parts[2]
+    return gitlinks
+
+
 def create_snapshot(
     *,
     repo_dir: str | Path,
@@ -413,6 +439,7 @@ def assemble_author_bundle(
     diff_range: str | None = None,
     skill_path: str | Path | None = None,
     no_skill: bool = False,
+    gitlinks: dict[str, str] | None = None,
 ) -> AuthorBundle:
     """Assemble the blind author's input bundle from the allowlist.
 
@@ -441,6 +468,18 @@ def assemble_author_bundle(
     escaping, or looping target) refuses assembly outright
     (SnapshotLinkError naming the path).
 
+    D143: the source tree's gitlinks (submodule entries, mode 160000)
+    are passed in as `gitlinks` ({path: pinned commit}, derived from
+    the tree by the caller — see `tree_gitlinks`) and recorded in the
+    manifest as `omitted_gitlinks`. `git archive` carries no submodule
+    contents — a gitlink arrives in the snapshot as an empty directory
+    and holds no files — so, like an omitted link, the omission is
+    what the record attests; the answer-key check re-derives the set
+    from B and cross-verifies path and commit. Assembly refuses if a
+    declared gitlink path is not a directory in the snapshot or if any
+    file sits at or under it (submodule contents never enter the
+    bundle; D46 materialisation stays on the provisioning path).
+
     Fail-closed throughout: template hash mismatch, skill hash mismatch,
     non-empty output dir, `.git` at any depth in the snapshot, a symlink
     failing the WO-8.4b rule, or a final bundle whose contents differ
@@ -461,6 +500,27 @@ def assemble_author_bundle(
     if not snap_p.is_dir():
         raise ValueError(f"snapshot dir not found: {snap_p}")
     snap_dirs, snap_files, snap_links = _scan_snapshot_tree(snap_p)
+    gitlink_map: dict[str, str] = dict(gitlinks) if gitlinks else {}
+    if gitlink_map:
+        # D143: a declared gitlink must be exactly what `git archive`
+        # delivers — an empty directory. A missing path, or any file
+        # at or under the path, means the snapshot is not the archive
+        # of the tree the gitlinks were derived from: refuse.
+        snap_dir_set = {d.relative_to(snap_p).as_posix() for d in snap_dirs}
+        snap_file_set = {f.relative_to(snap_p).as_posix() for f in snap_files}
+        for rel in sorted(gitlink_map):
+            if rel not in snap_dir_set:
+                raise ValueError(
+                    f"gitlink path is not a directory in the snapshot: {rel}"
+                )
+            under = sorted(
+                f for f in snap_file_set if f == rel or f.startswith(rel + "/")
+            )
+            if under:
+                raise ValueError(
+                    f"snapshot holds files under gitlink path {rel}: "
+                    f"{under[:5]}; submodule contents never enter the bundle"
+                )
     _check_output_dir(out)
 
     description = render_description(tpath.read_text(encoding="utf-8"), yml_fixture)
@@ -525,6 +585,15 @@ def assemble_author_bundle(
         # the bundle, never inside it, so this reaches no author.
         "omitted_links": [
             {"path": rel, "target": snap_links[rel]} for rel in sorted(snap_links)
+        ],
+        # D143: every gitlink of the source tree, recorded as its path
+        # and pinned commit. `git archive` delivers the path as an
+        # empty directory with no contents, so the bundle omits the
+        # submodule by construction; the record lets the answer-key
+        # check verify the omission against B. The manifest sits next
+        # to the bundle, never inside it, so this reaches no author.
+        "omitted_gitlinks": [
+            {"path": rel, "commit": gitlink_map[rel]} for rel in sorted(gitlink_map)
         ],
         "files": {
             "diff.patch": _sha256_file(out_diff),
