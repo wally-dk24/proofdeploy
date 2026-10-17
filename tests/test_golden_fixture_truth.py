@@ -41,10 +41,24 @@ owns those notes — the seed user. The seed-truth tests run a
 real migrate+seed and compare the rows in the database with
 the rows parsed out of the fixture text itself, so the text
 and the data can never drift apart silently again.
+
+Third (D153): the python golden's steps ran under whatever
+`python` the host provided — this VM's interpreter has flask
+installed, CI's does not — so the app server started here and
+timed out there. The fixture now builds an isolated venv per
+distinct committed `requirements.txt` (no system site
+packages, `pip install --require-hashes` from the revision's
+own file) and points the python golden's `python` at that
+venv's interpreter, so the app runs on its own declared
+dependencies in every environment. The one exception is
+lockmismatch, whose requirements file is uninstallable by
+design (see _python_golden_venvs); it shares the base venv,
+exactly as every Node revision links the base install.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -173,6 +187,94 @@ def _python_shim(tmp_path_factory) -> Path:
     return shim
 
 
+# Revisions whose requirements.txt is uninstallable BY DESIGN —
+# they share the base file's venv (see _python_golden_venvs).
+_PYTHON_SHARED_VENV_REVISIONS = {"lockmismatch"}
+
+
+@pytest.fixture(scope="session")
+def _python_golden_venvs(tmp_path_factory) -> dict[str, Path]:
+    """{revision: venv dir} for the python golden (D153).
+
+    One isolated venv per DISTINCT committed requirements.txt:
+    the file is byte-identical (sha256 c39c56e9…) on base, bug,
+    clean, fix, fix-parent and intermediate — flask==3.1.0 — so
+    those six share one venv. Each venv is created without
+    system site packages and populated solely by
+    `pip install --require-hashes` from that committed file.
+    --copies makes the venv's python a real file inside the venv,
+    so a running server's /proc/<pid>/exe names the venv itself
+    rather than resolving through a symlink to the host binary.
+
+    lockmismatch's file is distinct (b8a9272f…) but cannot be
+    installed at all: it pins flask==3.0.3 while carrying flask
+    3.1.0's hashes, so --require-hashes refuses its wheel in
+    every environment — the same by-design mismatch as the Node
+    goldens' lockmismatch lockfiles. Like those revisions, which
+    all link the base install (see _golden_installs), it shares
+    the base file's venv.
+    """
+    app_revisions = GOLDEN / "python-flask-sqlite" / "revisions"
+    base_digest = hashlib.sha256(
+        (app_revisions / "base" / "requirements.txt").read_bytes()
+    ).hexdigest()
+    by_hash: dict[str, Path] = {}
+    venvs: dict[str, Path] = {}
+    for revision in REVISIONS:
+        req = app_revisions / revision / "requirements.txt"
+        digest = hashlib.sha256(req.read_bytes()).hexdigest()
+        if revision in _PYTHON_SHARED_VENV_REVISIONS:
+            digest = base_digest
+        if digest not in by_hash:
+            # The shared venv is always installed from the base
+            # file, never from a sharing revision's own file.
+            src_req = (
+                app_revisions / "base" / "requirements.txt"
+                if digest == base_digest
+                else req
+            )
+            venv = tmp_path_factory.mktemp(f"pyvenv-{digest[:8]}")
+            subprocess.run(
+                [sys.executable, "-m", "venv", "--copies", str(venv)],
+                check=True, capture_output=True, text=True, timeout=300,
+            )
+            subprocess.run(
+                [
+                    str(venv / "bin" / "python"), "-m", "pip", "install",
+                    "--require-hashes", "-r", str(src_req),
+                ],
+                check=True, capture_output=True, text=True, timeout=900,
+            )
+            by_hash[digest] = venv
+        venvs[revision] = by_hash[digest]
+    return venvs
+
+
+@pytest.fixture(scope="session")
+def _golden_shims(
+    _python_shim, _python_golden_venvs
+) -> dict[tuple[str, str], Path]:
+    """{(app, revision): PATH dir} that resolves the contract's `python`.
+
+    Every app gets the host-interpreter shim except the python
+    golden, which gets its fixture venv's own bin directory
+    (D153). It must be the bin directory itself, NOT a shim
+    symlink to the venv python: an interpreter invoked through a
+    symlink in another directory does not find pyvenv.cfg, so it
+    silently runs with the BASE prefix (and this host's user
+    site-packages) and the venv never applies — proven by the
+    D153 plant in this VM, whose host python has flask.
+    """
+    shims: dict[tuple[str, str], Path] = {}
+    for app in APPS:
+        for revision in REVISIONS:
+            if app != "python-flask-sqlite":
+                shims[(app, revision)] = _python_shim
+            else:
+                shims[(app, revision)] = _python_golden_venvs[revision] / "bin"
+    return shims
+
+
 # One dependency install per Node app, from its base revision, with
 # the app's own pinned toolchain; every revision then symlinks the
 # installed node_modules (all revisions of an app share one lock).
@@ -210,7 +312,8 @@ def _golden_installs(tmp_path_factory) -> dict[str, list[tuple[str, Path]]]:
 
 
 @contextmanager
-def _provisioned_golden(app: str, revision: str, tmp_path: Path, shim: Path,
+def _provisioned_golden(app: str, revision: str, tmp_path: Path,
+                        shims: dict[tuple[str, str], Path],
                         installs: dict[str, list[tuple[str, Path]]]):
     """Copy one revision, link its deps, run the contract's migrate+seed.
 
@@ -233,7 +336,7 @@ def _provisioned_golden(app: str, revision: str, tmp_path: Path, shim: Path,
     env = dict(
         os.environ,
         APP_DB=str(dst / contract.database["path"]),
-        PATH=f"{shim}{os.pathsep}{os.environ['PATH']}",
+        PATH=f"{shims[(app, revision)]}{os.pathsep}{os.environ['PATH']}",
     )
     for cmd in (contract.migrate, contract.seed):
         assert cmd
@@ -246,14 +349,15 @@ def _provisioned_golden(app: str, revision: str, tmp_path: Path, shim: Path,
 
 
 @contextmanager
-def _running_golden(app: str, revision: str, tmp_path: Path, shim: Path,
+def _running_golden(app: str, revision: str, tmp_path: Path,
+                    shims: dict[tuple[str, str], Path],
                     installs: dict[str, list[tuple[str, Path]]]):
-    with _provisioned_golden(app, revision, tmp_path, shim, installs) as (dst, contract):
+    with _provisioned_golden(app, revision, tmp_path, shims, installs) as (dst, contract):
         workdir = dst / contract.app_path if contract.app_path else dst
         env = dict(
             os.environ,
             APP_DB=str(dst / contract.database["path"]),
-            PATH=f"{shim}{os.pathsep}{os.environ['PATH']}",
+            PATH=f"{shims[(app, revision)]}{os.pathsep}{os.environ['PATH']}",
         )
         port = _free_port()
         env["PORT"] = str(port)
@@ -270,17 +374,44 @@ def _running_golden(app: str, revision: str, tmp_path: Path, shim: Path,
         base = f"http://127.0.0.1:{port}"
         try:
             deadline = time.time() + 60
-            while True:
+            ready = False
+            while time.time() <= deadline:
+                if proc.poll() is not None:
+                    break  # server exited; its output names the cause
                 try:
                     with urllib.request.urlopen(base + contract.readiness, timeout=2) as resp:
                         if resp.status == 200:
+                            ready = True
                             break
                 except Exception:
-                    if time.time() > deadline:
-                        raise RuntimeError(
-                            f"{app}/{revision} never became ready"
-                        ) from None
                     time.sleep(0.25)
+            if not ready:
+                # D153 diagnosability: a "never became ready" error
+                # must name the concrete cause — the server's exit
+                # status (if it exited) and the tail of its output,
+                # so a missing module names itself.
+                exit_status = proc.poll()
+                # Stop the server before draining its pipe (a no-op
+                # if it already exited) so communicate() can return.
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    out, _ = proc.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    out, _ = proc.communicate(timeout=30)
+                status = (
+                    f"exit status {exit_status}"
+                    if exit_status is not None
+                    else "still running at the deadline"
+                )
+                tail = "\n".join((out or "").splitlines()[-20:])
+                raise RuntimeError(
+                    f"{app}/{revision} never became ready ({status}); "
+                    f"last server output:\n{tail}"
+                )
             yield base, contract
         finally:
             # Kill the whole process group: the shell's child IS the
@@ -305,11 +436,11 @@ def _running_golden(app: str, revision: str, tmp_path: Path, shim: Path,
 @pytest.mark.parametrize("app", APPS)
 @pytest.mark.parametrize("revision", REVISIONS)
 def test_seeded_rows_equal_what_seed_note_states(
-    app, revision, tmp_path, _python_shim, _golden_installs
+    app, revision, tmp_path, _golden_shims, _golden_installs
 ):
     username, password, expected_notes = _described_seed(app, revision)
     with _provisioned_golden(
-        app, revision, tmp_path, _python_shim, _golden_installs
+        app, revision, tmp_path, _golden_shims, _golden_installs
     ) as (dst, contract):
         db_path = dst / contract.database["path"]
         conn = sqlite3.connect(db_path)
@@ -353,10 +484,10 @@ def _note_probe(note_id: int):
 @pytest.mark.parametrize("app", APPS)
 @pytest.mark.parametrize("revision", REVISIONS)
 def test_presented_token_belongs_to_the_described_seed_user(
-    app, revision, tmp_path, _python_shim, _golden_installs
+    app, revision, tmp_path, _golden_shims, _golden_installs
 ):
     with _running_golden(
-        app, revision, tmp_path, _python_shim, _golden_installs
+        app, revision, tmp_path, _golden_shims, _golden_installs
     ) as (base, contract):
         # The executor's config is the contract's auth mapping — the
         # same content Orchestrator._credential_config passes (these
@@ -376,12 +507,12 @@ def test_presented_token_belongs_to_the_described_seed_user(
 
 @pytest.mark.parametrize("app", APPS)
 def test_plant_register_mode_token_is_not_the_seed_users(
-    app, tmp_path, _python_shim, _golden_installs
+    app, tmp_path, _golden_shims, _golden_installs
 ):
     """Plant: the pre-fix register provider presents a disposable
     user's token; that token must NOT be able to read note id 1."""
     with _running_golden(
-        app, "fix", tmp_path, _python_shim, _golden_installs
+        app, "fix", tmp_path, _golden_shims, _golden_installs
     ) as (base, contract):
         register_cfg = {
             "mode": "register",
@@ -394,3 +525,48 @@ def test_plant_register_mode_token_is_not_the_seed_users(
         ex = Executor(target_url=base, provisioned=True, credential_config=register_cfg)
         r = ex.run_probe(_note_probe(1))
         assert r.verdict == Verdict.FAIL, r.details
+
+
+# ------------------------------------------------------------------
+# D153: the python golden's server runs on the fixture venv
+# ------------------------------------------------------------------
+
+
+def test_python_golden_server_runs_under_the_fixture_venv(
+    tmp_path, _golden_shims, _golden_installs, _python_golden_venvs
+):
+    """The running server's executable is the fixture venv's python.
+
+    The server process is found by its argv (`python app.py`) and
+    its working directory (this test's unique checkout copy); its
+    /proc/<pid>/exe must lie inside the venv the fixture built for
+    the revision — never the host interpreter, whose site-packages
+    silently supplied flask in some environments (D153). The venv
+    is created --copies precisely so this path is the venv's own
+    binary, not a symlink chain resolving out to the host's.
+    """
+    app, revision = "python-flask-sqlite", "fix"
+    with _running_golden(
+        app, revision, tmp_path, _golden_shims, _golden_installs
+    ) as (base, contract):
+        dst = tmp_path / f"{app}-{revision}"
+        workdir = dst / contract.app_path if contract.app_path else dst
+        server_pid = None
+        for pid_dir in Path("/proc").glob("[0-9]*"):
+            try:
+                argv = (pid_dir / "cmdline").read_bytes().split(b"\0")
+                cwd = os.readlink(pid_dir / "cwd")
+            except OSError:
+                continue
+            if (
+                len(argv) >= 2
+                and argv[0].endswith(b"python")
+                and argv[1] == b"app.py"
+                and cwd == str(workdir)
+            ):
+                server_pid = int(pid_dir.name)
+                break
+        assert server_pid is not None, "golden server process not found in /proc"
+        exe = os.readlink(f"/proc/{server_pid}/exe")
+        venv = _python_golden_venvs[revision]
+        assert exe.startswith(str(venv) + os.sep), (exe, venv)
