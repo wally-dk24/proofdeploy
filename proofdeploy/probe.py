@@ -59,7 +59,12 @@ HARNESS_VERSION = "1.0.0"
 # never covers two sets again. The full set 1.5.0 names: WO-8.1's
 # lock facts, WO-8.1c's build-backend facts, and WO-8.3's
 # auth_bootstrap. Records at 1.0.0–1.4.0 still load.
-SCHEMA_VERSION = "1.5.0"
+# 1.6.0 (WO-1.14 / REG-E): evidence records carry contract_source —
+# the committed contract store path the measured unit's contract was
+# loaded from and that file's sha256 (null on paths that do not load
+# a contract from the store). Non-scoring provenance; records at
+# 1.0.0–1.5.0 still load (readers default the new key).
+SCHEMA_VERSION = "1.6.0"
 
 # HTTP methods the schema allows. No CONNECT, TRACE, or custom verbs.
 ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})

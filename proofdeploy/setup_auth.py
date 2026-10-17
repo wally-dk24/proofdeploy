@@ -394,16 +394,23 @@ class CredentialProvider:
     - `login` (WO-8.3): POST the declared login path with the declared
       body template — its `${NAME}` placeholders resolve from the
       run's bindings, which is how the per-run bootstrap values feed
-      it — and extract the token at `token_json_path`. Config:
-      {"mode": "login", "path": "/auth/login", "method": "POST",
+      it — and extract the token from exactly one declared place
+      (D120): the JSON body at `token_json_path`, or the response
+      header named by `token_header` (case-insensitive) for APIs that
+      deliver the session token in a header instead of the body.
+      Config: {"mode": "login", "path": "/auth/login", "method": "POST",
       "body": {"email": "${ADMIN_EMAIL}", "password": "${ADMIN_PASSWORD}"},
       "token_json_path": "data.access_token",
-      "expires_in_json_path": "data.expires"}.
+      "expires_in_json_path": "data.expires",
+      "expires_in_unit": "milliseconds"}. The lifetime at
+      `expires_in_json_path` is seconds unless `expires_in_unit`
+      declares "milliseconds" (D137); both modes above honor it.
     - `refresh` (default): call a refresh endpoint, but only when there is
       no token or a provider-issued token nears expiry. Config:
       {"mode": "refresh", "path": "/auth/refresh", "method": "POST",
       "headers": {...}, "body": {...}, "token_json_path": "access_token",
-      "expires_in_json_path": "expires_in"}. With `login_path`/
+      "expires_in_json_path": "expires_in",
+      "expires_in_unit": "seconds"}. With `login_path`/
       `login_body` declared (WO-8.3), the first acquisition is a login
       (as `login` mode, at the login path); the response's refresh
       token is read at `refresh_token_json_path` and bound as

@@ -6,7 +6,7 @@ requirements.txt (a complete committed lock). This variant swaps
 in the same dependency set as ``==`` pins with NO hashes — not a
 complete lock under REG-A — so provisioning must generate the
 lock inside the sandbox install container: the pinned uv 0.13.0
-(bootstrapped into /checkout/.pd-tools) resolves the pins with
+(bootstrapped into /pd-home/.pd-tools) resolves the pins with
 ``--generate-hashes`` at the unit's cutoff (this single commit's
 committer time) against https://pypi.org/simple, and the
 generated lock installs ``--require-hashes --no-deps``. The
@@ -128,7 +128,7 @@ def test_unhashed_golden_ready_via_generated_lock(tmp_path):
         argvs = [s.get("argv_rendered") or [] for s in installs]
         # Addendum 46: the resolver was installed BY HASH from the
         # committed bootstrap requirements file (materialized into
-        # .pd-tools by the writer step), and the plan records that
+        # {pd_tools} by the writer step), and the plan records that
         # file's sha256.
         assert any(
             any("uv==0.13.0" in el and "--hash=sha256:" in el for el in a)

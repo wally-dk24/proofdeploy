@@ -92,6 +92,17 @@ from typing import Any
 
 from proofdeploy.executor import InconclusiveReason, ProbeResult, Verdict
 from proofdeploy.probe import HARNESS_VERSION, SCHEMA_VERSION
+from proofdeploy.versions import (
+    SUPPORTED_SCHEMA_MAJORS,
+    UnknownSchemaVersionError,
+    check_schema_version,
+)
+
+__all__ = [
+    "SUPPORTED_SCHEMA_MAJORS",
+    "UnknownSchemaVersionError",
+    "check_schema_version",
+]
 
 # The only scoring version: the registered per-probe rule (2026-10-09,
 # PR #38). There is no legacy version; unregistered rules must not be
@@ -101,6 +112,11 @@ DEFAULT_SCORING_VERSION = SCORING_VERSION
 
 # Name of the append-only JSONL log inside the output directory.
 RUNS_LOG_NAME = "runs.jsonl"
+
+# The reader-side version check (plan 1.10 / WO-1.10, closing the
+# result contract's ambiguity 1) is defined once in
+# proofdeploy.versions — the gate every reader shares — and
+# re-exported here, the records home its callers already import.
 
 
 class RunPairVerdict(Enum):
@@ -665,6 +681,13 @@ def build_evidence_record(
     inconclusive_error: str | None = None,
     crash_provisioning: dict[str, Any] | None = None,
     crash_probe_results: Any | None = None,
+    # WO-1.14 (REG-E, schema 1.6.0): where the measured unit's
+    # contract came from — {"store_path": the committed contract
+    # store path relative to the ProofDeploy tree, "sha256": the
+    # contract file's sha256}. sha256 is None when the store file
+    # could not be read (a contract refusal record). None on paths
+    # that do not load a contract from the store.
+    contract_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the evidence record for a run pair (before scoring).
 
@@ -790,6 +813,8 @@ def build_evidence_record(
         "inconclusive_error": inconclusive_error,
         "crash_provisioning": crash_provisioning or {},
         "crash_probe_results": crash_probe_results,
+        # WO-1.14 (REG-E): the contract store source, as above.
+        "contract_source": contract_source,
         "verdict": None,
     }
     return record
@@ -914,6 +939,7 @@ def _read_record_at_commit(
         except json.JSONDecodeError:
             continue
         if isinstance(rec, dict) and rec.get("record_id") == record_id:
+            check_schema_version(rec.get("schema_version"))
             return rec
     return None
 
@@ -1203,7 +1229,11 @@ def write_judgment_record(
 
 
 def read_records(output_dir: str | Path) -> list[dict[str, Any]]:
-    """Read all records from the JSONL log, in append order."""
+    """Read all records from the JSONL log, in append order.
+
+    Every record passes the shared reader-side version check
+    (``check_schema_version``): an unknown schema major is refused,
+    never defaulted into a load."""
     path = Path(output_dir) / RUNS_LOG_NAME
     if not path.is_file():
         return []
@@ -1212,5 +1242,8 @@ def read_records(output_dir: str | Path) -> list[dict[str, Any]]:
         for line in f:
             line = line.strip()
             if line:
-                records.append(json.loads(line))
+                record = json.loads(line)
+                if isinstance(record, dict):
+                    check_schema_version(record.get("schema_version"))
+                records.append(record)
     return records

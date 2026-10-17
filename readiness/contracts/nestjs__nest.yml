@@ -1,7 +1,9 @@
 # PROVENANCE 2026-10-15: app.path declared "." under the reviewer's app-identification ruling (plan 1.2b follow-up) — the app is named in the contract; the tool never guesses. This contract's commands already run from the repo root, so "." preserves them exactly.
 # PROVENANCE 2026-10-15 (plans 1.2h + 1.2i, combined): install.npm_flags declares --legacy-peer-deps, the mode nest's own CI installs with; the adapter's frozen npm ci renders it, so the redundant leading "npm ci &&" is dropped from build (the adapter's install IS the npm ci). The sample install is REG-D dated resolution: --before={regd_cutoff} renders the unit's REG-A lock cutoff at plan time — never a hard-coded date in this file.
+# PROVENANCE 2026-10-16 (plan 1.2(o), D98): app.port declares 3000, the sample app's own fixed listen port — sample/01-cats-app/src/main.ts (blob 261ee54a, identical at all 6 held-out H2–H4 SHAs) calls app.listen(3000) and never reads $PORT, so the bridge forwards to the declared port; PORT is still exported as assigned. The port is declared here, never inferred by the tool.
 app:
   path: "."
+  port: 3000
 install:
   npm_flags: ["--legacy-peer-deps"]
 build: "npm run build && npm --prefix sample/01-cats-app install --legacy-peer-deps --before={regd_cutoff} && npm --prefix sample/01-cats-app run build"

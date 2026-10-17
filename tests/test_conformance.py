@@ -77,16 +77,16 @@ APPS = list(kit.APPS)
 # tokens that must appear in the recorded install argv.
 FROZEN_INSTALL = {
     "node-express-sqlite": ["npm", "ci"],
-    "node-pnpm-sqlite": ["/checkout/.pd-tools/node_modules/.bin/corepack",
+    "node-pnpm-sqlite": ["/pd-home/.pd-tools/node_modules/.bin/corepack",
                          "pnpm@9.15.0", "install", "--frozen-lockfile"],
     "python-flask-sqlite": ["install", "--require-hashes", "--no-deps"],
     # The workspace golden installs frozen from the root with the
     # same corepack-pinned pnpm as node-pnpm-sqlite.
-    "node-pnpm-monorepo": ["/checkout/.pd-tools/node_modules/.bin/corepack",
+    "node-pnpm-monorepo": ["/pd-home/.pd-tools/node_modules/.bin/corepack",
                            "pnpm@9.15.0", "install", "--frozen-lockfile"],
     # Plan 1.2e: bun runs from the plan's digest-pinned bootstrap
-    # in the persisted .pd-tools, never a floating system bun.
-    "node-bun-sqlite": ["/checkout/.pd-tools/bin/bun",
+    # in the persisted home .pd-tools, never a floating system bun.
+    "node-bun-sqlite": ["/pd-home/.pd-tools/bin/bun",
                         "install", "--frozen-lockfile"],
 }
 

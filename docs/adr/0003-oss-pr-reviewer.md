@@ -1,7 +1,11 @@
 # ADR 0003: OSS agent reviewer for every PR
 
 Date: 2026-10-08
-Status: Accepted
+Status: Superseded by Master decision D116 (2026-10-16): the pr-agent
+workflow is removed. It ran the pinned model on every push against a
+repo-level GROQ_API_KEY secret, competing with measurement runs for the
+same provider rate limit. The decision below stands as the historical
+record of why the reviewer was adopted.
 
 ## Context
 

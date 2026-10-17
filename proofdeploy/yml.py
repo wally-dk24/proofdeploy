@@ -18,12 +18,22 @@ declares only the names.
 
 `app` (optional, added 2026-10-14 for monorepo/workspace support,
 plan 1.2b) names the workspace member to build and start: a mapping
-with the single key `path` — the package directory inside the
-checkout ("." for the workspace root itself). The provisioning
-adapter installs frozen from the workspace root and runs the
-contract's build/migrate/seed/start scoped to that directory. A
-workspace with several candidate apps and no `app.path` is a typed
-refusal ("ambiguous app: <n> candidates"), never a guess.
+with the key `path` — the package directory inside the checkout
+("." for the workspace root itself) — and, since plan 1.2(o), the
+optional key `port`. The provisioning adapter installs frozen from
+the workspace root and runs the contract's build/migrate/seed/start
+scoped to that directory. A workspace with several candidate apps
+and no `app.path` is a typed refusal ("ambiguous app: <n>
+candidates"), never a guess.
+
+`app.port` (optional, plan 1.2(o)) is the app's own fixed listen
+port: an integer in 1–65535, DECLARED by the contract and never
+inferred from the app's code or config. Some apps bind a hardcoded
+port and ignore the runner-assigned `$PORT` (nestjs/nest's sample
+app calls `app.listen(3000)`); for those, the readiness bridge
+forwards to the declared port instead of the assigned one. `PORT`
+is still exported to the app environment exactly as before, and
+when `app.port` is absent the bridge behaviour is unchanged.
 
 `install` (optional, added 2026-10-15, plan 1.2h) declares how the
 adapter's own frozen install is invoked: a mapping with the single
@@ -67,12 +77,12 @@ _AUTH_MODE_KEYS: dict[str, set[str]] = {
         "token_json_path",
     },
     "login": {
-        "mode", "path", "method", "body", "token_json_path",
-        "expires_in_json_path",
+        "mode", "path", "method", "body", "token_json_path", "token_header",
+        "expires_in_json_path", "expires_in_unit",
     },
     "refresh": {
         "mode", "path", "method", "body", "headers", "token_json_path",
-        "refresh_token_json_path", "expires_in_json_path",
+        "refresh_token_json_path", "expires_in_json_path", "expires_in_unit",
         "login_path", "login_method", "login_body",
     },
     "ghost_jwt": {"mode", "key", "key_file", "ttl_seconds"},
@@ -106,6 +116,13 @@ class RepoContract:
     # from the workspace layout itself (single member, or the root)
     # or refuses an ambiguous workspace with a typed refusal.
     app_path: str | None = None
+    # The app's own fixed listen port (optional, plan 1.2(o)): the
+    # contract's `app.port`, validated at load (an int in 1–65535,
+    # declared, never inferred). When set, the sandbox bridge
+    # targets this port; the assigned `PORT` is still exported to
+    # the app environment. Absent means the bridge targets the
+    # assigned port, exactly as before.
+    app_port: int | None = None
     # Extra flags for the adapter's frozen `npm ci` (optional, plan
     # 1.2h): the contract's `install.npm_flags`, validated against
     # the allowlist at load (see _validate_install). Empty when the
@@ -162,7 +179,7 @@ class RepoContract:
         auth = data.get("auth")
         if auth is not None:
             auth = _validate_auth(auth)
-        app_path = _validate_app(data.get("app"))
+        app_path, app_port = _validate_app(data.get("app"))
         npm_flags = _validate_install(data.get("install"))
         return cls(
             build=data["build"],
@@ -175,27 +192,34 @@ class RepoContract:
             database=database,
             auth=auth,
             app_path=app_path,
+            app_port=app_port,
             npm_flags=npm_flags,
         )
 
 
-def _validate_app(app: Any) -> str | None:
-    """Validate the contract's `app:` mapping (plan 1.2b).
+def _validate_app(app: Any) -> tuple[str | None, int | None]:
+    """Validate the contract's `app:` mapping (plans 1.2b + 1.2(o)).
 
-    The one key is `path`: the workspace member directory to build
-    and start, declared so a multi-app workspace names its app
-    instead of the adapter guessing. Unknown keys are refused (the
-    same rule as the `database` and `auth` mappings: typos must
-    fail, not silently pass). The path must stay inside the
-    checkout (same rule as `database.path` — the contract comes
-    from untrusted repos). Returns the normalized path ("." for
-    the workspace root itself), or None when `app` is absent.
+    `path` is the workspace member directory to build and start,
+    declared so a multi-app workspace names its app instead of the
+    adapter guessing. `port` (plan 1.2(o)) is the app's own fixed
+    listen port, declared for apps that bind a hardcoded port and
+    ignore the assigned `$PORT` — it is never inferred. Unknown
+    keys are refused (the same rule as the `database` and `auth`
+    mappings: typos must fail, not silently pass). The path must
+    stay inside the checkout (same rule as `database.path` — the
+    contract comes from untrusted repos). The port must be an
+    integer in 1–65535: a string, a float, a bool, or an
+    out-of-range value is refused here, at load, before anything
+    runs. Returns (normalized path, port): the path is "." for the
+    workspace root itself; both are None when `app` is absent, and
+    the port alone is None when undeclared.
     """
     if app is None:
-        return None
+        return None, None
     if not isinstance(app, dict):
         raise ValueError("proofdeploy.yml 'app' must be a mapping")
-    unknown = set(app) - {"path"}
+    unknown = set(app) - {"path", "port"}
     if unknown:
         raise ValueError(
             f"proofdeploy.yml 'app' has unknown keys: {sorted(unknown)}"
@@ -208,7 +232,18 @@ def _validate_app(app: Any) -> str | None:
             "proofdeploy.yml 'app.path' must resolve inside the "
             f"checkout, got: {path!r}"
         )
-    return str(Path(path))
+    port = app.get("port")
+    if port is not None:
+        if (
+            not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError(
+                "proofdeploy.yml 'app.port' must be an integer "
+                f"between 1 and 65535, got: {port!r}"
+            )
+    return str(Path(path)), port
 
 
 def _validate_install(install: Any) -> list[str]:
@@ -362,6 +397,37 @@ def _validate_bootstrap_env(auth: dict) -> list[str] | None:
     return names
 
 
+# The units `auth.expires_in_unit` may declare (D137): the value at
+# `expires_in_json_path` is a lifetime in seconds unless the contract
+# says milliseconds (Directus's `data.expires` is 900000 ms for a
+# 15-minute token). Undeclared means seconds.
+_EXPIRES_IN_UNITS = ("milliseconds", "seconds")
+
+
+def _validate_expires_unit(auth: dict[str, Any], out: dict[str, Any]) -> None:
+    """Validate + copy `expires_in_unit` (login/refresh modes).
+
+    A unit with no `expires_in_json_path` to apply to is a
+    contract error, refused at load: the declaration would
+    otherwise sit inert while the reader believes expiry is
+    unit-aware."""
+    unit = _auth_str(auth, "expires_in_unit", required=False)
+    if unit is None:
+        return
+    if unit not in _EXPIRES_IN_UNITS:
+        raise ValueError(
+            "proofdeploy.yml 'auth.expires_in_unit' must be one of "
+            f"{sorted(_EXPIRES_IN_UNITS)}, got: {unit!r}"
+        )
+    if not _auth_str(auth, "expires_in_json_path", required=False):
+        raise ValueError(
+            "proofdeploy.yml 'auth.expires_in_unit' requires "
+            "'auth.expires_in_json_path' (a unit with nothing to "
+            "apply to is a contract error)"
+        )
+    out["expires_in_unit"] = unit
+
+
 def _validate_auth(auth: Any) -> dict[str, Any]:
     """Validate the contract's `auth:` mapping (ADR-0010, WO-8.3).
 
@@ -396,7 +462,20 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
             out[key] = _auth_str(auth, key)
     elif mode == "login":
         out["path"] = _auth_path(auth, "path")
-        out["token_json_path"] = _auth_str(auth, "token_json_path")
+        # D120: the login response carries the token in exactly one
+        # place — the JSON body at `token_json_path`, or a response
+        # header named by `token_header`. Both or neither is refused.
+        token_json_path = _auth_str(auth, "token_json_path", required=False)
+        token_header = _auth_str(auth, "token_header", required=False)
+        if (token_json_path is None) == (token_header is None):
+            raise ValueError(
+                "proofdeploy.yml 'auth' login mode needs exactly one of "
+                "'token_json_path' or 'token_header'"
+            )
+        if token_json_path is not None:
+            out["token_json_path"] = token_json_path
+        if token_header is not None:
+            out["token_header"] = token_header
         method = _auth_str(auth, "method", required=False)
         if method is not None:
             out["method"] = method
@@ -406,6 +485,7 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
         expires = _auth_str(auth, "expires_in_json_path", required=False)
         if expires is not None:
             out["expires_in_json_path"] = expires
+        _validate_expires_unit(auth, out)
     elif mode == "refresh":
         out["path"] = _auth_path(auth, "path")
         out["token_json_path"] = _auth_str(auth, "token_json_path")
@@ -420,6 +500,7 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
             val = _auth_str(auth, key, required=False)
             if val is not None:
                 out[key] = val
+        _validate_expires_unit(auth, out)
         login_path = _auth_path(auth, "login_path", required=False)
         if login_path is not None:
             out["login_path"] = login_path
@@ -462,6 +543,46 @@ def load_contract(path: str | Path) -> RepoContract:
     except yaml.YAMLError as exc:
         raise ValueError(f"proofdeploy.yml is not valid YAML: {exc}") from exc
     return RepoContract.from_dict(data)
+
+
+def proofdeploy_tree_root() -> Path:
+    """The root of the ProofDeploy tree this code executes from.
+
+    Measured runs execute from a checkout of the ProofDeploy repo
+    (CI checks it out and installs it editable), so the package's
+    parent directory is that tree's root — the tree of the main SHA
+    the run was dispatched from (REG-E item 1).
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+def contract_store_path(
+    repo_slug: str, *, tree_root: Path | None = None
+) -> Path:
+    """The committed contract-store file for a measured unit's repo.
+
+    REG-E item 1 (WO-1.14): a measured unit's contract is its repo's
+    file in the committed contract store, ``readiness/contracts/
+    <owner>__<repo>.yml``, resolved against the ProofDeploy tree the
+    run executes from — never a file inside the measured repo's own
+    tree. ``repo_slug`` is ``owner/repo``; anything else is refused
+    here, before a path is built from it (the slug becomes a file
+    name, so it must carry no separators or traversal).
+    """
+    owner, sep, name = repo_slug.partition("/")
+    if (
+        not sep
+        or not owner
+        or not name
+        or "/" in name
+        or owner in (".", "..")
+        or name in (".", "..")
+    ):
+        raise ValueError(
+            f"repo slug must be 'owner/repo', got: {repo_slug!r}"
+        )
+    root = tree_root if tree_root is not None else proofdeploy_tree_root()
+    return root / "readiness" / "contracts" / f"{owner}__{name}.yml"
 
 
 def find_contract(repo_root: str | Path) -> Path | None:

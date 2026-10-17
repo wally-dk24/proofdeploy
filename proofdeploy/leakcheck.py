@@ -92,6 +92,7 @@ def check_bundle_answer_key(
     fix_subject: str | None,
     expected_skill_hash: str,
     no_skill: bool = False,
+    contract: Any = None,
 ) -> str:
     """Fail-closed allowlist-by-equality check on the author bundle.
 
@@ -104,7 +105,11 @@ def check_bundle_answer_key(
       ``git ls-tree``, bytes from ``git show``; ``.git`` refused, and
       symlinks handled by the WO-8.4b rule: none in the bundle, B's
       symlink entries excluded from the expected file list and matched
-      against the manifest's ``omitted_links`` record);
+      against the manifest's ``omitted_links`` record; gitlinks
+      handled by the D143 rule: B's gitlink entries (mode 160000) are
+      likewise excluded — ``git archive`` carries no submodule
+      contents — and matched against the manifest's
+      ``omitted_gitlinks`` record, path and pinned commit);
     - the skill hash equals ``expected_skill_hash``, or the skill is
       absent in the no-skill arm;
     - the fixture description is byte-equal to the approved template
@@ -172,11 +177,20 @@ def check_bundle_answer_key(
     #    (mode 120000) are NOT expected in the bundle snapshot; they are
     #    expected in the manifest's omitted_links record instead, which
     #    step 5 cross-verifies against the set derived here from B.
+    #    D143: gitlink entries (mode 160000, submodule pins) get the
+    #    same treatment — `git archive B` writes a gitlink as an empty
+    #    directory and never carries submodule contents, so a gitlink
+    #    is NOT an expected file; it is expected in the manifest's
+    #    omitted_gitlinks record (path -> pinned commit), which step 5
+    #    cross-verifies. Anything the bundle holds AT or UNDER a
+    #    gitlink path is a file outside the expected set: extra, and
+    #    refused by the equality below.
     tree_hash = _git_text(repo_dir, "rev-parse", f"{bug_sha}^{{tree}}").strip()
     if not tree_hash:
         raise AnswerKeyLeakError("answer-key check: could not resolve B^{tree}")
     expected_files: set[str] = set()
     expected_links: dict[str, str] = {}
+    expected_gitlinks: dict[str, str] = {}
     for entry in (
         _git_bytes(repo_dir, "ls-tree", "-r", "-z", bug_sha)
         .decode("utf-8", "surrogateescape")
@@ -185,11 +199,14 @@ def check_bundle_answer_key(
         if not entry:
             continue
         meta, _, path = entry.partition("\t")
-        mode = meta.split(" ", 1)[0]
+        meta_parts = meta.split(" ")
+        mode = meta_parts[0]
         if mode == "120000":  # symlink: the blob's bytes are the target
             expected_links[path] = _git_bytes(
                 repo_dir, "show", f"{bug_sha}:{path}"
             ).decode("utf-8", "surrogateescape")
+        elif mode == "160000":  # gitlink: the object is the pinned commit
+            expected_gitlinks[path] = meta_parts[2]
         else:
             expected_files.add(path)
     actual_files = {
@@ -231,14 +248,22 @@ def check_bundle_answer_key(
             )
         skill_text = skill_path.read_text(encoding="utf-8")
 
-    # 5. The fixture description matches the approved template for B's
-    #    contract (REG-B). The template choice is mechanical: a top-level
-    #    auth: mapping in B's proofdeploy.yml selects the credential
+    # 5. The fixture description matches the approved template for the
+    #    unit's contract (REG-B). The template choice is mechanical: a
+    #    top-level auth: mapping in the contract selects the credential
     #    template, anything else the no-credential template. Re-derive
-    #    the selection from B's contract (never from the manifest),
+    #    the selection from the contract (never from the manifest),
     #    verify the selected template against its registered sha256,
     #    verify the manifest's fixture_template record against the
     #    recomputation, re-render, and byte-compare.
+    #
+    #    WO-1.14 (REG-E): the caller passes the ONE contract the run
+    #    loaded — under the contract store, that is the committed
+    #    store file, and B's tree is never consulted for a contract
+    #    (its proofdeploy.yml, if any, is snapshot content, not the
+    #    unit's contract). Without a passed contract (direct callers,
+    #    legacy in-tree path), the contract is read from B's tree as
+    #    before.
     from proofdeploy.fixture import (
         REGISTERED_TEMPLATE_SHA256,
         render_description,
@@ -247,13 +272,14 @@ def check_bundle_answer_key(
     )
     from proofdeploy.yml import RepoContract
 
-    try:
-        yml_text = _git_text(repo_dir, "show", f"{bug_sha}:proofdeploy.yml")
-        contract = RepoContract.from_dict(yaml.safe_load(yml_text))
-    except Exception as e:
-        raise AnswerKeyLeakError(
-            f"answer-key check: cannot load B's contract: {e}"
-        ) from e
+    if contract is None:
+        try:
+            yml_text = _git_text(repo_dir, "show", f"{bug_sha}:proofdeploy.yml")
+            contract = RepoContract.from_dict(yaml.safe_load(yml_text))
+        except Exception as e:
+            raise AnswerKeyLeakError(
+                f"answer-key check: cannot load B's contract: {e}"
+            ) from e
     selected_name = template_filename(contract.auth is not None)
     selected_path = template_path(selected_name)
     selected_hash = hashlib.sha256(selected_path.read_bytes()).hexdigest()
@@ -292,6 +318,29 @@ def check_bundle_answer_key(
             "B's symlinks: "
             f"extra={sorted(set(recorded_links) - set(expected_links))[:5]} "
             f"missing={sorted(set(expected_links) - set(recorded_links))[:5]}"
+        )
+    # D143: the manifest's omitted_gitlinks record must equal B's
+    # gitlink set, recomputed in step 3 — path and pinned commit for
+    # every gitlink the archive (and so the bundle) omits, nothing
+    # more, nothing less.
+    recorded_gitlinks: dict[str, str] = {}
+    raw_gitlinks = manifest.get("omitted_gitlinks", [])
+    if isinstance(raw_gitlinks, list):
+        for item in raw_gitlinks:
+            if isinstance(item, dict) and "path" in item and "commit" in item:
+                recorded_gitlinks[str(item["path"])] = str(item["commit"])
+    if recorded_gitlinks != expected_gitlinks:
+        wrong_commit = sorted(
+            p
+            for p in recorded_gitlinks.keys() & expected_gitlinks.keys()
+            if recorded_gitlinks[p] != expected_gitlinks[p]
+        )
+        raise AnswerKeyLeakError(
+            "answer-key check: manifest omitted_gitlinks does not match "
+            "B's gitlinks: "
+            f"extra={sorted(set(recorded_gitlinks) - set(expected_gitlinks))[:5]} "
+            f"missing={sorted(set(expected_gitlinks) - set(recorded_gitlinks))[:5]} "
+            f"wrong_commit={wrong_commit[:5]}"
         )
     template_text = selected_path.read_text(encoding="utf-8")
     try:

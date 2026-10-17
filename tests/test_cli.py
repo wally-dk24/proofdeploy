@@ -8,18 +8,21 @@ def test_verify_flags_match_prd():
         [
             "verify",
             "--repo",
-            "https://example.com/r.git",
+            "/tmp/some-repo",
             "--from",
             "main",
             "--to",
             "abc123",
             "--target-url",
             "http://localhost:5000",
-            "--allow-remote-target",
             "--format",
             "json",
             "--output",
             "out.json",
+            "--output-dir",
+            "records",
+            "--workdir",
+            "work",
             "--model",
             "some-model",
         ]
@@ -27,13 +30,34 @@ def test_verify_flags_match_prd():
     assert args.command == "verify"
     assert args.from_ref == "main"
     assert args.to_ref == "abc123"
-    assert args.allow_remote_target is True
+    assert args.target_url == "http://localhost:5000"
+    # The stub's remote-target escape hatch is gone (plan 1.10):
+    # Stage 1 verify provisions its own sandboxed instance only.
+    assert not hasattr(args, "allow_remote_target")
     assert args.format == "json"
+    assert args.output_dir == "records"
+    assert args.workdir == "work"
 
 
-def test_verify_not_implemented_returns_tool_error():
-    # cmd_verify is a stub until ticket #55 and on: exit 2 = tool error.
-    assert main(["verify"]) == 2
+def test_verify_without_contract_is_not_supported(tmp_path, monkeypatch):
+    # Plan 1.10: a repo with no proofdeploy.yml is a typed
+    # not-supported (exit 3), never a crash. Full CLI behavior is
+    # covered in tests/test_verify.py.
+    import subprocess
+
+    repo = tmp_path / "app"
+    repo.mkdir()
+    for git_args in (
+        ["init", "-q"],
+        ["config", "user.name", "t"],
+        ["config", "user.email", "t@t.invalid"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *git_args], check=True)
+    (repo / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "one"], check=True)
+    monkeypatch.chdir(repo)
+    assert main(["verify"]) == 3
 
 
 def _measure_args(*extra):

@@ -55,6 +55,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from proofdeploy.fixture import (
+    REGISTERED_TEMPLATE_SHA256,
+    render_description,
+    template_filename,
+    template_path,
+)
 from proofdeploy.orchestrator import MeasureConfig, Orchestrator, _free_port
 from proofdeploy.sandbox import assert_measurement_gate
 from proofdeploy.yml import load_contract
@@ -220,12 +226,77 @@ def contract_env_keys(repo: str) -> list[str]:
         return []
 
 
+def contract_app_port(repo: str) -> int | None:
+    """The repo contract's declared ``app.port`` (plan 1.2(o)), or
+    None when it declares none (or cannot be loaded — provisioning
+    then surfaces the loader's own error per side). Rows for sides
+    that never reached a provision result (exception / harness
+    error rows) carry this value: the declaration is a property of
+    the repo's one contract, identical on every side."""
+    try:
+        return load_contract(contract_path(repo)).app_port
+    except (FileNotFoundError, ValueError):
+        return None
+
+
 def _last_log_line(logs: list[str]) -> str | None:
     for entry in reversed(logs):
         text = str(entry).strip()
         if text:
             return text
     return None
+
+
+def fixture_render_fields(repo: str) -> dict[str, Any]:
+    """REG-E item 6 (WO-1.14): render the repo's author text from
+    its committed store contract, with the engine's own renderer
+    and the REG-B template choice, and report the outcome for the
+    row: the template name, the rendered text's sha256, and — on
+    failure — the typed error.
+
+    The render is per repo (one contract serves every side), but it
+    is RECORDED per side, on every row. A render failure is our
+    gap — the store and its texts are ProofDeploy's own authoring —
+    and it is data on the row, never a harness crash: provisioning
+    proceeds and reports exactly as before. The frozen template is
+    hash-verified before rendering, exactly as bundle assembly
+    verifies it."""
+    fields: dict[str, Any] = {
+        "fixture_template": None,
+        "fixture_render_sha256": None,
+        "fixture_render_error": None,
+    }
+    try:
+        contract = load_contract(contract_path(repo))
+    except (FileNotFoundError, ValueError) as exc:
+        fields["fixture_render_error"] = (
+            f"contract cannot be loaded for the fixture render: "
+            f"{exc} (our gap)"
+        )
+        return fields
+    selected = template_filename(contract.auth is not None)
+    fields["fixture_template"] = selected
+    tpath = template_path(selected)
+    digest = hashlib.sha256(tpath.read_bytes()).hexdigest()
+    if digest != REGISTERED_TEMPLATE_SHA256[selected]:
+        fields["fixture_render_error"] = (
+            f"fixture template {selected} hash mismatch: the "
+            f"frozen template changed (our gap)"
+        )
+        return fields
+    try:
+        rendered = render_description(
+            tpath.read_text(encoding="utf-8"), contract.fixture
+        )
+    except ValueError as exc:
+        fields["fixture_render_error"] = (
+            f"fixture render failed: {exc} (our gap)"
+        )
+        return fields
+    fields["fixture_render_sha256"] = hashlib.sha256(
+        rendered.encode("utf-8")
+    ).hexdigest()
+    return fields
 
 
 def _regd_row(plan_regd: Any) -> dict[str, Any]:
@@ -284,6 +355,16 @@ def row_from_provision(
     typed = prov.reason or plan.get("refusal")
     evidence = side.sandbox_evidence or {}
     network_mode = evidence.get("app_network_mode") or fallback_network_mode
+    # Plan 1.2(o): the contract's declared app.port rides on the row,
+    # read from the side's own loaded contract (the snapshot's
+    # proofdeploy.yml — the contract actually provisioned). None
+    # when the contract declares none.
+    side_contract = getattr(side, "contract", None)
+    app_port = (
+        getattr(side_contract, "app_port", None)
+        if side_contract is not None
+        else None
+    )
     return {
         "kind": "readiness",
         "unit": unit["unit_id"],
@@ -302,6 +383,7 @@ def row_from_provision(
         # whose plan resolves app_path "." (provisioning.py's
         # plan_workspace) and scopes its steps by it.
         "app_path": plan.get("app_path"),
+        "app_port": app_port,
         "workspace_root": plan.get("workspace_root"),
         "npm_flags": plan.get("npm_flags") or [],
         "regd": _regd_row(plan.get("regd")),
@@ -314,6 +396,9 @@ def row_from_provision(
         # Plan 1.2(l): the submodules materialized into this side's
         # snapshot at their recorded commits ([] when none).
         "submodules": list(prov.submodules),
+        # REG-E item 6 (WO-1.14): the author-text render for this
+        # side's repo contract, recorded per side.
+        **fixture_render_fields(str(unit["repo"])),
     }
 
 
@@ -324,6 +409,7 @@ def row_from_exception(
     attempt: int,
     network_mode: str | None,
     exc: Exception,
+    app_port: int | None = None,
 ) -> dict[str, Any]:
     """Type a raising provision path into a row (design obstacle
     O3): an undetected runtime is the typed ``runtime not
@@ -346,6 +432,7 @@ def row_from_exception(
         "runtime_version": None,
         "package_manager": None,
         "app_path": None,
+        "app_port": app_port,
         "workspace_root": None,
         "npm_flags": [],
         "regd": _regd_row(None),
@@ -356,6 +443,9 @@ def row_from_exception(
         "network_mode": network_mode,
         "attempt": attempt,
         "submodules": [],
+        # REG-E item 6 (WO-1.14): the author-text render outcome,
+        # recorded per side on every row shape.
+        **fixture_render_fields(str(unit["repo"])),
     }
 
 
@@ -365,6 +455,7 @@ def _harness_error_row(
     attempt: int,
     network_mode: str | None,
     exc: Exception,
+    app_port: int | None = None,
 ) -> dict[str, Any]:
     """A row for a side the harness itself failed before a
     provision result existed (the unit's cutoff fetch/read, or the
@@ -386,6 +477,7 @@ def _harness_error_row(
         "runtime_version": None,
         "package_manager": None,
         "app_path": None,
+        "app_port": app_port,
         "workspace_root": None,
         "npm_flags": [],
         "regd": _regd_row(None),
@@ -396,6 +488,9 @@ def _harness_error_row(
         "network_mode": network_mode,
         "attempt": attempt,
         "submodules": [],
+        # REG-E item 6 (WO-1.14): the author-text render outcome,
+        # recorded per side on every row shape.
+        **fixture_render_fields(str(unit["repo"])),
     }
 
 
@@ -585,6 +680,7 @@ def provision_side(
     attempt: int,
     workdir: Path,
     network_mode: str | None,
+    app_port: int | None = None,
 ) -> dict[str, Any]:
     """Provision ONE side through the measured path's own method
     and return its readiness row. Never raises for a build/start
@@ -609,7 +705,8 @@ def provision_side(
         logs = list(side.provision.logs)
     except (FileNotFoundError, ValueError) as exc:
         row = row_from_exception(
-            unit, side_spec, harness_sha, attempt, network_mode, exc
+            unit, side_spec, harness_sha, attempt, network_mode, exc,
+            app_port=app_port,
         )
         logs = [f"readiness provision raised: {exc}"]
     finally:
@@ -647,12 +744,17 @@ def provision_repo(
     orch._resolve_run_network_mode()
     network_mode = orch._run_network_mode
     contract = contract_path(repo)
+    # Plan 1.2(o): the repo contract's declared app.port, carried on
+    # the rows of sides that never reach a provision result.
+    app_port = contract_app_port(repo)
     rows: list[dict[str, Any]] = []
 
     def record_harness_error(
         unit: dict[str, Any], side_spec: dict[str, Any], exc: Exception
     ) -> dict[str, Any]:
-        row = _harness_error_row(unit, side_spec, attempt, network_mode, exc)
+        row = _harness_error_row(
+            unit, side_spec, attempt, network_mode, exc, app_port=app_port
+        )
         dump_logs(
             f"readiness-{unit['unit_id']}-"
             f"{_TAG_BY_ROLE[str(side_spec['role'])]}-a{attempt}",
@@ -690,7 +792,7 @@ def provision_repo(
             try:
                 row = provision_side(
                     orch, clone, unit, side_spec, contract,
-                    attempt, workdir, network_mode,
+                    attempt, workdir, network_mode, app_port=app_port,
                 )
             except Exception as exc:
                 # A failure inside one side (its own fetch, its
