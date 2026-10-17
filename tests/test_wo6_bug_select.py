@@ -323,6 +323,25 @@ def test_check_c_tag_created_after_fix_rejected(tmp_path: Path) -> None:
     assert "at or after the fix" in entry["reason"]
 
 
+def test_check_c_tag_on_the_fix_itself_rejected(tmp_path: Path) -> None:
+    """D190 (2): the equality edge in check (c). A LIGHTWEIGHT tag
+    on the fix commit itself has creatordate == the fix's committer
+    date (a lightweight tag's creatordate is the tagged commit's
+    committer date, %(creatordate)). The tag contains B, but (c)
+    requires a containing tag created STRICTLY BEFORE the fix —
+    equality is not before — so with no earlier tag the candidate
+    is rejected at (c)."""
+    repo, _base, _b, _mid, fix = standard_history(tmp_path)
+    git(repo, "tag", "-d", "v1.0")
+    git(repo, "tag", "v-eq", fix)  # lightweight, on the fix itself
+    record = select(repo, fix, FakeReady())
+    entry = record["walked"][-1]
+    assert entry["failed_check"] == "c"
+    assert "at or after the fix" in entry["reason"]
+    assert "v-eq" in entry["reason"]
+    assert record["outcome"] == "exhausted"
+
+
 def two_blamed_commits_history(
     tmp_path: Path, *, tag_target: str
 ) -> tuple[Path, str, str, str]:
