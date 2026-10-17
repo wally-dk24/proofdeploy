@@ -685,3 +685,162 @@ def test_readiness_rows_carry_render_fields():
     )
     assert err_row["fixture_template"] == "fixture_template_nocredential.txt"
     assert "(our gap)" in err_row["fixture_render_error"]
+
+
+# ----------------------------------------------------------------------
+# D167: golden smoke units record measured_result False
+#
+# A sandboxed run records measured_result True — that is what makes
+# it a registered measurement. A golden unit (contract-store owner
+# `golden`, D154) is a known-answer SMOKE unit (D152): it runs
+# sandboxed through the real measured path, but its record must
+# never be a measured result. These tests drive the real record
+# path with a stub model (the O5/O6 pattern: gates stubbed, a faked
+# READY sandbox side whose target nothing listens on — probe
+# results are errors on every side, and the record is still
+# written by the normal path). The unit's contract resolves by the
+# real slug rule from a temporary store tree; the golden run and
+# its non-golden control differ ONLY in the store owner.
+# ----------------------------------------------------------------------
+
+
+def _prepare_sandboxed_store_run(tmp_path, monkeypatch, owner: str):
+    import proofdeploy.orchestrator as orch_mod
+    from proofdeploy.executor import Executor
+    from proofdeploy.orchestrator import _Side
+    from proofdeploy.runner import ProvisionResult, ProvisionStatus
+
+    monkeypatch.setattr(orch_mod, "assert_measurement_gate", lambda: {})
+    # The harness gate has its own tests (Addendum 24/25); stub it so
+    # this test does not depend on the working tree being clean.
+    monkeypatch.setattr(
+        orch_mod,
+        "assert_harness_commit_gate",
+        lambda: {
+            "commit": "0" * 40,
+            "source": "git",
+            "dirty": False,
+            "workflow_ref": None,
+        },
+    )
+    store_root = tmp_path / f"store-{owner}"
+    committed = store_root / "readiness" / "contracts" / f"{owner}__mini.yml"
+    committed.parent.mkdir(parents=True)
+    committed.write_text(STORE_YML, encoding="utf-8")
+    monkeypatch.setattr(
+        "proofdeploy.yml.proofdeploy_tree_root", lambda: store_root
+    )
+    monkeypatch.setattr(
+        "proofdeploy.orchestrator.proofdeploy_tree_root",
+        lambda: store_root,
+    )
+    info = make_mini_repo(tmp_path, in_tree=None)
+
+    def prepare(orch: Orchestrator) -> None:
+        contract = orch._load_unit_contract()
+
+        def fake_provision_sandbox(rev, port, unit_dir, name):
+            return _Side(
+                rev=rev,
+                sha=rev,
+                snapshot_dir=tmp_path / "snap",
+                contract=contract,
+                provision=ProvisionResult(
+                    status=ProvisionStatus.READY,
+                    target_url=f"http://127.0.0.1:{port}",
+                    run_id="fake",
+                    sandbox_evidence={"image": "fake"},
+                ),
+                sandbox_evidence={"image": "fake"},
+            )
+
+        orch._provision_side_sandbox = fake_provision_sandbox
+        orch._make_executor = (
+            lambda side: Executor(target_url=side.provision.target_url)
+        )
+
+    return info, prepare
+
+
+def _sandboxed_store_cfg(tmp_path, info, owner: str, **over) -> MeasureConfig:
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=tmp_path / "records",
+        workdir=tmp_path / "work",
+        skill_path=skill_path(),
+        bug_id="mini-bug",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=canned_probes_store,
+        public_contract_env_keys=["APP_ENV"],
+        sandbox=True,
+        allow_unsandboxed=False,
+        use_contract_store=True,
+        unit_repo=f"{owner}/mini",
+    )
+    for key, value in over.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+def test_golden_bug_unit_records_measured_result_false(
+    tmp_path, monkeypatch
+):
+    """D167 (a): a sandboxed golden BUG unit through the real record
+    path records measured_result False — sandboxed True, so only
+    the golden owner keeps it from counting as a measurement."""
+    info, prepare = _prepare_sandboxed_store_run(
+        tmp_path, monkeypatch, "golden"
+    )
+    orch = Orchestrator(_sandboxed_store_cfg(tmp_path, info, "golden"))
+    prepare(orch)
+    orch.measure_bug()
+    evidence = read_records(tmp_path / "records")[0]
+    assert evidence["sandboxed"] is True
+    assert evidence["contract_source"]["store_path"] == (
+        "readiness/contracts/golden__mini.yml"
+    )
+    assert evidence["measured_result"] is False
+
+
+def test_golden_clean_unit_records_measured_result_false(
+    tmp_path, monkeypatch
+):
+    """D167 (b): the same for a sandboxed golden CLEAN unit."""
+    info, prepare = _prepare_sandboxed_store_run(
+        tmp_path, monkeypatch, "golden"
+    )
+    cfg = _sandboxed_store_cfg(
+        tmp_path, info, "golden",
+        bug_id=None, rev_bug_base=None, rev_bug=None, rev_fix=None,
+        clean_id="mini-clean", rev_clean=info["fix"],
+    )
+    orch = Orchestrator(cfg)
+    prepare(orch)
+    orch.measure_clean()
+    evidence = read_records(tmp_path / "records")[0]
+    assert evidence["sandboxed"] is True
+    assert evidence["contract_source"]["store_path"] == (
+        "readiness/contracts/golden__mini.yml"
+    )
+    assert evidence["measured_result"] is False
+
+
+def test_non_golden_sandboxed_unit_still_records_measured_true(
+    tmp_path, monkeypatch
+):
+    """D167 (c): the control — identical setup, non-golden store
+    owner: a sandboxed unit still records measured_result True."""
+    info, prepare = _prepare_sandboxed_store_run(
+        tmp_path, monkeypatch, "mini"
+    )
+    orch = Orchestrator(_sandboxed_store_cfg(tmp_path, info, "mini"))
+    prepare(orch)
+    orch.measure_bug()
+    evidence = read_records(tmp_path / "records")[0]
+    assert evidence["sandboxed"] is True
+    assert evidence["contract_source"]["store_path"] == (
+        "readiness/contracts/mini__mini.yml"
+    )
+    assert evidence["measured_result"] is True
