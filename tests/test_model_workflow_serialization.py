@@ -4,8 +4,11 @@ verify.yml and measure.yml call the pinned model with GROQ_API_KEY
 from the `measurement` environment. Two model-calling runs at once
 would interleave their evidence and compete for the same gated key,
 so all model-calling workflows share ONE concurrency group with
-cancel-in-progress: false — runs queue repository-wide and are
-never cancelled mid-flight.
+cancel-in-progress: false and queue: max — runs are queued up to
+100, sequential, and never cancelled mid-flight. queue: max is
+required (D159): GitHub's default keeps one running + ONE pending
+run per group and cancels the older pending run when another
+arrives, which cancel-in-progress: false does not prevent.
 
 The guard is textual + structural: a workflow "can call the model"
 when its text references GROQ_API_KEY or invokes the measure/verify
@@ -59,6 +62,12 @@ def _violations(workflows_dir: Path) -> list[str]:
                 f"{path.name}: cancel-in-progress is "
                 f"{concurrency.get('cancel-in-progress')!r}, expected False"
             )
+        if concurrency.get("queue") != "max":
+            problems.append(
+                f"{path.name}: concurrency queue is "
+                f"{concurrency.get('queue')!r}, expected 'max' "
+                f"(queued up to 100, sequential)"
+            )
     return problems
 
 
@@ -105,7 +114,8 @@ def test_guard_fails_when_cancel_in_progress_is_true(tmp_path):
         "jobs:",
         "concurrency:\n"
         f"  group: {MODEL_CONCURRENCY_GROUP}\n"
-        "  cancel-in-progress: true\n\n"
+        "  cancel-in-progress: true\n"
+        "  queue: max\n\n"
         "jobs:",
         1,
     )
@@ -118,13 +128,30 @@ def test_guard_fails_when_cancel_in_progress_is_true(tmp_path):
 def test_guard_fails_on_a_different_group(tmp_path):
     body = _MODEL_STEP.replace(
         "jobs:",
-        "concurrency:\n  group: some-other-group\n  cancel-in-progress: false\n\njobs:",
+        "concurrency:\n  group: some-other-group\n  cancel-in-progress: false\n"
+        "  queue: max\n\njobs:",
         1,
     )
     _write_workflow(tmp_path, "fake.yml", body)
     problems = _violations(tmp_path)
     assert len(problems) == 1
     assert "some-other-group" in problems[0]
+
+
+def test_guard_fails_when_queue_is_not_max(tmp_path):
+    # D159: a concurrency block without queue: max must be reported —
+    # GitHub would keep only one pending run and cancel the older
+    # pending one when another arrives.
+    body = _MODEL_STEP.replace(
+        "jobs:",
+        f"concurrency:\n  group: {MODEL_CONCURRENCY_GROUP}\n  cancel-in-progress: false\n\njobs:",
+        1,
+    )
+    _write_workflow(tmp_path, "fake.yml", body)
+    problems = _violations(tmp_path)
+    assert len(problems) == 1
+    assert "queue" in problems[0]
+    assert "'max'" in problems[0]
 
 
 def test_guard_ignores_a_non_model_workflow_without_the_group(tmp_path):
