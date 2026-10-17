@@ -41,11 +41,15 @@
 # provision only), the pass provisions exactly that pair for the
 # dispatched repo as one synthetic unit (roles fix^ and fix) with
 # the repo's registered contract-store entry, instead of the
-# manifest's units; when either is empty, behaviour is unchanged
-# (manifest-driven). Each value must be exactly 40 lowercase hex
-# characters — the workflow validates them before provisioning
-# and fails closed on anything else. The values travel via step
-# env only, never interpolated into run: text.
+# manifest's units; when BOTH are empty, behaviour is unchanged
+# (manifest-driven). The pair is all-or-nothing (D196): exactly
+# one set fails closed rather than silently falling back to the
+# manifest, and either set with mode auth-proof fails closed —
+# the pair means nothing outside a provision pass. Each value
+# must be exactly 40 lowercase hex characters — the workflow
+# validates them before provisioning and fails closed on
+# anything else. The values travel via step env only, never
+# interpolated into run: text.
 name: readiness
 
 on:
@@ -125,12 +129,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-      - name: Validate pair SHAs (D194, fail closed)
-        if: inputs.mode == 'provision'
+      - name: Validate pair SHAs (D194/D196, fail closed)
         env:
+          PD_MODE: ${{ inputs.mode }}
           PD_FIX_PARENT_SHA: ${{ inputs.fix_parent_sha }}
           PD_FIX_SHA: ${{ inputs.fix_sha }}
         run: |
+          if [ "$PD_MODE" = "auth-proof" ] && { [ -n "$PD_FIX_PARENT_SHA" ] || [ -n "$PD_FIX_SHA" ]; }; then
+            echo "::error::pair SHAs are provision-mode only (D194): unset fix_parent_sha/fix_sha for an auth-proof run"
+            exit 1
+          fi
+          if { [ -n "$PD_FIX_PARENT_SHA" ] && [ -z "$PD_FIX_SHA" ]; } || { [ -z "$PD_FIX_PARENT_SHA" ] && [ -n "$PD_FIX_SHA" ]; }; then
+            echo "::error::fix_parent_sha and fix_sha must be set together (D196): exactly one was given"
+            exit 1
+          fi
           for value in "$PD_FIX_PARENT_SHA" "$PD_FIX_SHA"; do
             if [ -n "$value" ] && [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
               echo "::error::pair SHAs must be exactly 40 lowercase hex characters"
