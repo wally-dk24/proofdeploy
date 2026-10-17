@@ -81,6 +81,6 @@ auth:
 fixture:
   repo_name: "paperless-ngx/paperless-ngx"
   seed_note: "The app's own first database migration created one user named AnonymousUser with an unusable password, Django's built-in permission records and one application-settings record holding the app's defaults; ProofDeploy's setup then ran the app's own manage_superuser command, which created one superuser whose username and password are generated fresh for each run and whose email is root@localhost. No groups and no content were created."
-  auth_mechanism: "a token obtained by POST /api/token/ with the superuser's username and password in the request body; the response field token holds it, and it is sent as the Authorization header value 'Token <token>'"
+  auth_mechanism: "the token is presented in the Authorization header in the form 'Token <token>'"
   auth_scope: "the API token belonging to the generated superuser, obtained by signing in as that user"
   flags_note: "application settings are at this version's defaults except the run's deployment choices (SQLite database, in-memory cache and channel layer) and the token sign-in rate limit, raised to 600 per minute (PAPERLESS_TOKEN_THROTTLE_RATE); no feature flags were changed"
