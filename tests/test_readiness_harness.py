@@ -567,15 +567,36 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
     # from its approved fixture, and Ghost's (ghost_jwt, approved
     # D87: without it the checkpoint's Ghost unit could not have
     # authenticated in a measured run either). Both name env NAMES
-    # only — values are generated per run.
+    # only — values are generated per run. Vendure's is the third
+    # (login with the D120 token_header, approved D120/D131): its
+    # login body names upstream's published core-default superadmin
+    # credentials — the same on every instance, not per-run secrets.
     for path in sorted(rp.CONTRACTS_DIR.glob("*.yml")):
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         if path.name == "directus__directus.yml":
             assert data.get("auth", {}).get("mode") == "refresh"
         elif path.name == "TryGhost__Ghost.yml":
             assert data.get("auth", {}).get("mode") == "ghost_jwt"
+        elif path.name == "vendure-ecommerce__vendure.yml":
+            assert data.get("auth", {}).get("mode") == "login"
         else:
             assert "auth" not in data, path.name
+
+
+def test_vendure_login_query_loads_with_plain_quotes() -> None:
+    # PR #133 (reviewer): the committed Vendure login query sits in a
+    # YAML single-quoted string, which does not process backslash
+    # escapes — a \" in the source would load as a literal backslash,
+    # the GraphQL parser rejects it ("Unexpected character: '\'"),
+    # and every Vendure login would fail. Pin the LOADED string
+    # character-for-character so the quoting cannot regress.
+    contract = load_contract(rp.CONTRACTS_DIR / "vendure-ecommerce__vendure.yml")
+    query = contract.auth["body"]["query"]
+    assert "\\" not in query
+    assert query == (
+        'mutation { login(username: "superadmin", password: "superadmin") '
+        "{ ... on CurrentUser { id identifier } } }"
+    )
 
 
 # --- the real-git path -------------------------------------------------
@@ -1460,7 +1481,7 @@ GHOST_UNIT: dict[str, Any] = {
 
 def test_redactor_scrubs_by_value_then_by_shape() -> None:
     redactor = ap.Redactor()
-    redactor.add("admin_key", _FAKE_ADMIN_KEY)
+    redactor.add("key_file", _FAKE_ADMIN_KEY)
     redactor.add("bootstrap_value", _FAKE_BOOTSTRAP)
     out = redactor.scrub(
         f"key={_FAKE_ADMIN_KEY} pw={_FAKE_BOOTSTRAP} "
@@ -1472,9 +1493,9 @@ def test_redactor_scrubs_by_value_then_by_shape() -> None:
     # The JWT was never registered as a value, so the shape sweep
     # is what caught it — the counts keep the two apart.
     assert redactor.counts == {
-        "admin_key": 2,
+        "key_file": 2,
         "bootstrap_value": 1,
-        "minted_jwt": 0,
+        "acquired_token": 0,
         "jwt_shape": 1,
     }
 
@@ -1627,6 +1648,7 @@ def test_auth_proof_side_proves_auth_through_the_engine(
     # The seed's traces in the snapshot: key file present, and the
     # SQLite file the app side serves from is named.
     assert row["seed"]["key_file_present"] is True
+    assert row["seed"]["key_file"] == ".pd-auth/admin_key"
     assert row["seed"]["sqlite_files"] == [
         "ghost/core/content/data/ghost.db (12 bytes)"
     ]
@@ -1636,10 +1658,16 @@ def test_auth_proof_side_proves_auth_through_the_engine(
     assert auth["status"] == "PROVEN"
     assert auth["endpoint"] == "/ghost/api/admin/tags/"
     assert [r["http_status"] for r in auth["requests"]] == [200, 200, 403]
-    assert [r["mints"] for r in auth["requests"]] == [1, 1, 0]
-    assert auth["mint_count_after_two_authenticated"] == 2
+    assert [r["acquisitions"] for r in auth["requests"]] == [1, 1, 0]
+    assert [r["acquisition_kinds"] for r in auth["requests"]] == [
+        {"mint": 1},
+        {"mint": 1},
+        {},
+    ]
+    assert auth["acquisitions_after_two_authenticated"] == 2
+    assert auth["acquisition_kinds"] == {"mint": 2}
     assert auth["requests"][0]["authorization"] == (
-        "Ghost <redacted:minted_jwt>"
+        "Ghost <redacted:acquired_token>"
     )
     assert auth["requests"][2]["authorization"] is None
     # The probes the executor actually received: two carrying the
@@ -1664,7 +1692,7 @@ def test_auth_proof_side_proves_auth_through_the_engine(
     assert _FAKE_ADMIN_KEY not in blob
     assert _FAKE_JWT not in blob
     assert _FAKE_BOOTSTRAP not in blob
-    assert row["redactions"]["minted_jwt"] == 2
+    assert row["redactions"]["acquired_token"] == 2
     assert row["redactions"]["bootstrap_value"] == 1
     log_text = (
         tmp_path / "pd-logs" / "authproof-checkpoint-bug-ghost-1-fix-a1.log"
@@ -1676,22 +1704,72 @@ def test_auth_proof_side_proves_auth_through_the_engine(
 
 
 def _proof_record(
-    http_status: int, *, verdict: str = "pass", mints: int = 0
+    http_status: int,
+    *,
+    verdict: str = "pass",
+    acquisitions: int = 0,
+    kinds: dict[str, int] | None = None,
+    authorization: str | None = None,
+    body: Any = None,
 ) -> dict[str, Any]:
     """One request record as _request_record shapes it, for
     driving the pure verdict directly (D106)."""
-    return {"http_status": http_status, "verdict": verdict, "mints": mints}
+    return {
+        "http_status": http_status,
+        "verdict": verdict,
+        "acquisitions": acquisitions,
+        "acquisition_kinds": {} if kinds is None else kinds,
+        "authorization": authorization,
+        "body": body,
+    }
+
+
+_GHOST_SPEC = ap.spec_for_repo("TryGhost/Ghost")
+_DIRECTUS_SPEC = ap.spec_for_repo("directus/directus")
+_VENDURE_SPEC = ap.spec_for_repo("vendure-ecommerce/vendure")
+
+
+def _minted(http_status: int, **kw: Any) -> dict[str, Any]:
+    """An authenticated Ghost-shaped record: one mint."""
+    return _proof_record(
+        http_status,
+        acquisitions=1,
+        kinds={"mint": 1},
+        authorization="Ghost <redacted:acquired_token>",
+        **kw,
+    )
 
 
 def test_auth_proof_verdict_accepts_only_the_exact_proof() -> None:
     records = [
-        _proof_record(200, mints=1),
-        _proof_record(200, mints=1),
+        _minted(200),
+        _minted(200),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is True
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is True
     # The seed's key file missing fails the proof on its own.
-    assert ap._proof_passed(False, records) is False
+    assert ap._proof_passed(False, records, _GHOST_SPEC) is False
+
+
+def test_auth_proof_verdict_accepts_the_directus_shape() -> None:
+    # Directus (D113/D137): two authenticated 200s, each with its
+    # own fresh login, and the bare request refused with 401. No
+    # key file is declared, so the caller's seed conjunct is True.
+    records = [
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(401),
+    ]
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is True
+    # The same records under Ghost's spec fail: the expected
+    # unauthenticated status (and kind) are inputs, not constants.
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
 
 
 def test_auth_proof_verdict_fails_when_unauthenticated_accepted() -> None:
@@ -1699,53 +1777,189 @@ def test_auth_proof_verdict_fails_when_unauthenticated_accepted() -> None:
     # request answers 200. Every leg's own verdict still reads
     # "pass" here, so only the status conjunct can fail it.
     records = [
-        _proof_record(200, mints=1),
-        _proof_record(200, mints=1),
+        _minted(200),
+        _minted(200),
         _proof_record(200),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
 
 
-def test_auth_proof_verdict_fails_on_mint_count_one() -> None:
+def test_auth_proof_verdict_fails_on_acquisition_count_one() -> None:
     records = [
-        _proof_record(200, mints=1),
-        _proof_record(200, mints=0),
+        _minted(200),
+        _proof_record(200, authorization="Ghost <redacted:acquired_token>"),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
 
 
-def test_auth_proof_verdict_fails_on_mint_count_three() -> None:
+def test_auth_proof_verdict_fails_on_acquisition_count_three() -> None:
     records = [
-        _proof_record(200, mints=2),
-        _proof_record(200, mints=1),
+        _proof_record(
+            200, acquisitions=2, kinds={"mint": 2},
+            authorization="Ghost <redacted:acquired_token>",
+        ),
+        _minted(200),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
 
 
 def test_auth_proof_verdict_fails_on_authenticated_non_200() -> None:
     records = [
-        _proof_record(500, mints=1),
-        _proof_record(200, mints=1),
+        _minted(500),
+        _minted(200),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
     records = [
-        _proof_record(200, mints=1),
-        _proof_record(401, mints=1),
+        _minted(200),
+        _minted(401),
         _proof_record(403),
     ]
-    assert ap._proof_passed(True, records) is False
+    assert ap._proof_passed(True, records, _GHOST_SPEC) is False
+
+
+def test_auth_proof_verdict_fails_on_split_acquisitions() -> None:
+    # The summed-check hole (D137 reviewer): 2 acquisitions on leg
+    # 1 and 0 on leg 2 totals two, but leg 2 was served by a token
+    # it did not freshly acquire — each leg must show exactly one.
+    records = [
+        _proof_record(
+            200, acquisitions=2, kinds={"login": 2},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(
+            200, authorization="Bearer <redacted:acquired_token>"
+        ),
+        _proof_record(401),
+    ]
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+    # And the mirror image: 0 on leg 1, 2 on leg 2.
+    records = [
+        _proof_record(
+            200, authorization="Bearer <redacted:acquired_token>"
+        ),
+        _proof_record(
+            200, acquisitions=2, kinds={"login": 2},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(401),
+    ]
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+
+
+def test_auth_proof_verdict_fails_on_wrong_acquisition_kind() -> None:
+    # The right count with the wrong kind: a refresh is not the
+    # fresh login the Directus spec registers per leg.
+    records = [
+        _proof_record(
+            200, acquisitions=1, kinds={"refresh": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(401),
+    ]
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+
+
+def test_auth_proof_verdict_fails_when_bare_leg_acquires() -> None:
+    # The bare leg must be credential-free: an acquisition on it
+    # (the provider-configured executor's proactive ensure) or an
+    # Authorization header shape both void the leg.
+    records = [
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+        ),
+        _proof_record(401, acquisitions=1, kinds={"login": 1}),
+    ]
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+    records[2] = _proof_record(
+        401, authorization="Bearer <redacted:acquired_token>"
+    )
+    assert ap._proof_passed(True, records, _DIRECTUS_SPEC) is False
+
+
+def _vendure_records(
+    *,
+    me_id: Any = "1",
+    bare_body: Any = None,
+) -> list[dict[str, Any]]:
+    """Vendure-shaped records (D137): GraphQL answers refusals as
+    HTTP 200 with an error body, so the spec's body checks carry
+    what the status cannot."""
+    if bare_body is None:
+        bare_body = {
+            "errors": [
+                {
+                    "message": "Forbidden",
+                    "extensions": {"code": "FORBIDDEN"},
+                }
+            ]
+        }
+    authenticated = {
+        "data": {"me": {"id": me_id, "identifier": "superadmin"}}
+    }
+    return [
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+            body=authenticated,
+        ),
+        _proof_record(
+            200, acquisitions=1, kinds={"login": 1},
+            authorization="Bearer <redacted:acquired_token>",
+            body=authenticated,
+        ),
+        _proof_record(200, body=bare_body),
+    ]
+
+
+def test_auth_proof_verdict_accepts_the_vendure_shape() -> None:
+    assert (
+        ap._proof_passed(True, _vendure_records(), _VENDURE_SPEC)
+        is True
+    )
+
+
+def test_auth_proof_verdict_fails_when_vendure_me_is_null() -> None:
+    # A 200 whose data.me is null is the FORBIDDEN refusal wearing
+    # a success status; only the body check can fail it.
+    records = _vendure_records()
+    records[0]["body"] = {"data": {"me": None}}
+    assert ap._proof_passed(True, records, _VENDURE_SPEC) is False
+    records = _vendure_records(me_id=None)
+    assert ap._proof_passed(True, records, _VENDURE_SPEC) is False
+
+
+def test_auth_proof_verdict_fails_when_vendure_bare_lacks_forbidden() -> None:
+    # The bare leg at 200 without errors[0].extensions.code ==
+    # "FORBIDDEN" is not the registered refusal.
+    records = _vendure_records(bare_body={"data": {"me": None}})
+    assert ap._proof_passed(True, records, _VENDURE_SPEC) is False
+    records = _vendure_records(
+        bare_body={
+            "errors": [{"extensions": {"code": "INTERNAL_ERROR"}}]
+        }
+    )
+    assert ap._proof_passed(True, records, _VENDURE_SPEC) is False
 
 
 class _ScriptedExecutor:
     """The executor's shape with scripted per-leg outcomes:
-    legs are (http_status, mints) in call order. A leg's verdict
-    follows its own assertion exactly as the real executor's
-    does — PASS iff the observed status equals the asserted
-    one — so a wrong status also fails that leg; the composed
-    row must still read FAILED, never PROVEN (D106)."""
+    legs are (http_status, acquisitions) in call order. A leg's
+    verdict follows its own assertion exactly as the real
+    executor's does — PASS iff the observed status equals the
+    asserted one — so a wrong status also fails that leg; the
+    composed row must still read FAILED, never PROVEN (D106)."""
 
     def __init__(self, legs: list[tuple[int, int]]) -> None:
         self.legs = legs
@@ -1753,18 +1967,18 @@ class _ScriptedExecutor:
 
     def run_probe(self, probe: dict[str, Any], index: int = 0) -> ProbeResult:
         self.probes.append(probe)
-        status, mints = self.legs[index]
+        status, acquisitions = self.legs[index]
         expected = probe["assert"][0]["equals"]
         details = [
             "credential provider: minted ghost_jwt (ttl 300s)"
-        ] * mints
+        ] * acquisitions
         details.append(f"act: GET {probe['act']['path']} -> {status}")
         return ProbeResult(
             probe_index=index,
             verdict=Verdict.PASS if status == expected else Verdict.FAIL,
             details=details,
             http_status=status,
-            minted_tokens=[_FAKE_JWT] * mints,
+            minted_tokens=[_FAKE_JWT] * acquisitions,
         )
 
 
@@ -1805,24 +2019,24 @@ def test_auth_proof_side_fails_when_unauthenticated_accepted(
     assert row["auth"]["status"] == "FAILED"
 
 
-def test_auth_proof_side_fails_on_mint_count_one(
+def test_auth_proof_side_fails_on_acquisition_count_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     row = _scripted_proof_row(
         tmp_path, monkeypatch, [(200, 1), (200, 0), (403, 0)]
     )
-    assert row["auth"]["mint_count_after_two_authenticated"] == 1
+    assert row["auth"]["acquisitions_after_two_authenticated"] == 1
     assert row["auth"]["passed"] is False
     assert row["auth"]["status"] == "FAILED"
 
 
-def test_auth_proof_side_fails_on_mint_count_three(
+def test_auth_proof_side_fails_on_acquisition_count_three(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     row = _scripted_proof_row(
         tmp_path, monkeypatch, [(200, 2), (200, 1), (403, 0)]
     )
-    assert row["auth"]["mint_count_after_two_authenticated"] == 3
+    assert row["auth"]["acquisitions_after_two_authenticated"] == 3
     assert row["auth"]["passed"] is False
     assert row["auth"]["status"] == "FAILED"
 
@@ -1836,3 +2050,192 @@ def test_auth_proof_side_fails_on_authenticated_non_200(
     assert row["auth"]["requests"][0]["http_status"] == 500
     assert row["auth"]["passed"] is False
     assert row["auth"]["status"] == "FAILED"
+
+
+# ----------------------------------------------------------------------
+# The generic driver (D137): per-repo inputs are only the endpoint
+# + expected unauthenticated status; the provider and the token
+# presentation come from the repo's committed contract, and
+# acquisitions are counted by kind from the provider's details.
+# ----------------------------------------------------------------------
+
+
+def test_proof_specs_registered_for_the_three_checkpoint_repos() -> None:
+    ghost = ap.spec_for_repo("TryGhost/Ghost")
+    assert (ghost.method, ghost.path, ghost.unauthenticated_status) == (
+        "GET",
+        "/ghost/api/admin/tags/",
+        403,
+    )
+    directus = ap.spec_for_repo("directus/directus")
+    assert (directus.method, directus.path, directus.unauthenticated_status) == (
+        "GET",
+        "/users/me",
+        401,
+    )
+    vendure = ap.spec_for_repo("vendure-ecommerce/vendure")
+    assert vendure.method == "POST"
+    assert vendure.path == "/admin-api"
+    assert vendure.body == {"query": "query { me { id identifier } }"}
+    # The per-leg acquisition kinds each spec registers (D137).
+    assert ghost.acquisition_kind == "mint"
+    assert directus.acquisition_kind == "login"
+    assert vendure.acquisition_kind == "login"
+    # Vendure refuses as HTTP 200 + a FORBIDDEN GraphQL error
+    # body, so its bare-leg expectation is 200 PLUS the body
+    # check, and its authenticated legs carry the data.me.id
+    # non-null check. Ghost and Directus refuse with real HTTP
+    # statuses and register no body checks.
+    assert vendure.unauthenticated_status == 200
+    assert vendure.authenticated_body_path == "data.me.id"
+    assert vendure.unauthenticated_body_path == (
+        "errors[0].extensions.code"
+    )
+    assert vendure.unauthenticated_body_value == "FORBIDDEN"
+    assert ghost.authenticated_body_path is None
+    assert ghost.unauthenticated_body_path is None
+    assert directus.authenticated_body_path is None
+    assert directus.unauthenticated_body_path is None
+    with pytest.raises(ValueError, match="no auth-proof spec"):
+        ap.spec_for_repo("nestjs/nest")
+
+
+def test_presentation_scheme_comes_from_the_committed_contract() -> None:
+    from proofdeploy.yml import load_contract
+
+    ghost = load_contract(rp.contract_path("TryGhost/Ghost"))
+    assert ap.presentation_scheme(ghost) == "Ghost"
+    directus = load_contract(rp.contract_path("directus/directus"))
+    assert ap.presentation_scheme(directus) == "Bearer"
+
+
+def test_seed_snapshot_files_follow_the_contract_seed_command() -> None:
+    from proofdeploy.yml import load_contract
+
+    ghost = load_contract(rp.contract_path("TryGhost/Ghost"))
+    assert ap.seed_snapshot_files(ghost) == [ap.SEED_SOURCE]
+    # Directus declares no seed script; Vendure's seed names an
+    # in-tree command — neither adds a file to the harness commit.
+    directus = load_contract(rp.contract_path("directus/directus"))
+    assert ap.seed_snapshot_files(directus) == []
+    vendure = load_contract(rp.contract_path("vendure-ecommerce/vendure"))
+    assert ap.seed_snapshot_files(vendure) == []
+
+
+def test_acquisition_kinds_counted_by_kind_from_provider_details() -> None:
+    details = [
+        "credential provider: minted ghost_jwt (ttl 300s)",
+        "credential provider: POST /auth/login (login)",
+        "credential provider: POST /auth/refresh",
+        "credential provider: POST /register (register)",
+        # Not acquisitions: outcomes and failures are not counted.
+        "credential provider: token acquired",
+        "credential provider failed: login endpoint returned 500",
+        "act: GET /users/me -> 200",
+    ]
+    assert ap._acquisition_kinds(details) == {
+        "mint": 1,
+        "login": 1,
+        "refresh": 1,
+        "register": 1,
+    }
+    assert ap._acquisition_kinds([]) == {}
+
+
+_FAKE_DIRECTUS_TOKEN = "directus-fake-token-0123456789"
+
+
+class _LoginScriptedExecutor:
+    """The executor's shape for a login-mode proof (Directus):
+    each authenticated leg acquires by login (the measured path's
+    fresh context per probe) and one detail line echoes the token,
+    to prove the scrub; verdicts follow the legs' assertions."""
+
+    def __init__(self, statuses: list[int]) -> None:
+        self.statuses = statuses
+        self.probes: list[dict[str, Any]] = []
+
+    def run_probe(self, probe: dict[str, Any], index: int = 0) -> ProbeResult:
+        self.probes.append(probe)
+        status = self.statuses[index]
+        expected = probe["assert"][0]["equals"]
+        headers = probe["act"].get("headers") or {}
+        details = [f"act: GET {probe['act']['path']} -> {status}"]
+        minted: list[str] = []
+        if "Authorization" in headers:
+            details = [
+                "credential provider: POST /auth/login (login)",
+                "credential provider: token acquired",
+                f"sent authorization: Bearer {_FAKE_DIRECTUS_TOKEN}",
+            ] + details
+            minted = [_FAKE_DIRECTUS_TOKEN]
+        return ProbeResult(
+            probe_index=index,
+            verdict=Verdict.PASS if status == expected else Verdict.FAIL,
+            details=details,
+            http_status=status,
+            minted_tokens=minted,
+        )
+
+
+def test_auth_proof_side_proves_directus_with_login_acquisitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src, sha = _one_commit_src(tmp_path)
+    clone = _empty_clone(tmp_path, src)
+    side = _fake_auth_side(tmp_path)
+    executor = _LoginScriptedExecutor([200, 200, 401])
+    orch = SimpleNamespace(
+        _provision_side_sandbox=(
+            lambda rev, port, unit_dir, tag: side
+        ),
+        _make_executor=lambda s: executor,
+    )
+    monkeypatch.chdir(tmp_path)  # pd-logs/ land in tmp
+    manifest = rp.load_manifest(rp.DEFAULT_MANIFEST)
+    unit = next(
+        u
+        for u in rp.units_for_repo(manifest, "directus/directus")
+        if u["unit_id"] == "checkpoint-bug-directus-1"
+    )
+    row = ap.auth_proof_side(
+        orch,
+        clone,
+        unit,
+        {"role": "fix", "sha": sha},
+        rp.contract_path("directus/directus"),
+        1,
+        tmp_path / "work",
+        "isolated",
+    )
+    auth = row["auth"]
+    assert auth["passed"] is True
+    assert auth["status"] == "PROVEN"
+    assert auth["endpoint"] == "/users/me"
+    assert [r["http_status"] for r in auth["requests"]] == [200, 200, 401]
+    # Each authenticated request acquired by its own fresh login.
+    assert [r["acquisition_kinds"] for r in auth["requests"]] == [
+        {"login": 1},
+        {"login": 1},
+        {},
+    ]
+    assert auth["acquisitions_after_two_authenticated"] == 2
+    assert auth["acquisition_kinds"] == {"login": 2}
+    # Presentation read from the Directus contract: Bearer.
+    assert auth["requests"][0]["authorization"] == (
+        "Bearer <redacted:acquired_token>"
+    )
+    assert executor.probes[0]["act"]["headers"]["Authorization"] == (
+        "Bearer ${AUTH_TOKEN}"
+    )
+    assert [p["act"]["path"] for p in executor.probes] == ["/users/me"] * 3
+    assert executor.probes[2]["assert"] == [
+        {"type": "status", "equals": 401}
+    ]
+    # No key file is declared by the Directus contract: no seed
+    # conjunct, recorded as None.
+    assert row["seed"]["key_file_present"] is None
+    assert row["seed"]["key_file"] is None
+    # The acquired token's value never reaches the row.
+    assert _FAKE_DIRECTUS_TOKEN not in json.dumps(row)
+    assert side.provision.proc.stopped is True

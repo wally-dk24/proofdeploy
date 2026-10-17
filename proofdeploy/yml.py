@@ -78,11 +78,11 @@ _AUTH_MODE_KEYS: dict[str, set[str]] = {
     },
     "login": {
         "mode", "path", "method", "body", "token_json_path", "token_header",
-        "expires_in_json_path",
+        "expires_in_json_path", "expires_in_unit",
     },
     "refresh": {
         "mode", "path", "method", "body", "headers", "token_json_path",
-        "refresh_token_json_path", "expires_in_json_path",
+        "refresh_token_json_path", "expires_in_json_path", "expires_in_unit",
         "login_path", "login_method", "login_body",
     },
     "ghost_jwt": {"mode", "key", "key_file", "ttl_seconds"},
@@ -397,6 +397,37 @@ def _validate_bootstrap_env(auth: dict) -> list[str] | None:
     return names
 
 
+# The units `auth.expires_in_unit` may declare (D137): the value at
+# `expires_in_json_path` is a lifetime in seconds unless the contract
+# says milliseconds (Directus's `data.expires` is 900000 ms for a
+# 15-minute token). Undeclared means seconds.
+_EXPIRES_IN_UNITS = ("milliseconds", "seconds")
+
+
+def _validate_expires_unit(auth: dict[str, Any], out: dict[str, Any]) -> None:
+    """Validate + copy `expires_in_unit` (login/refresh modes).
+
+    A unit with no `expires_in_json_path` to apply to is a
+    contract error, refused at load: the declaration would
+    otherwise sit inert while the reader believes expiry is
+    unit-aware."""
+    unit = _auth_str(auth, "expires_in_unit", required=False)
+    if unit is None:
+        return
+    if unit not in _EXPIRES_IN_UNITS:
+        raise ValueError(
+            "proofdeploy.yml 'auth.expires_in_unit' must be one of "
+            f"{sorted(_EXPIRES_IN_UNITS)}, got: {unit!r}"
+        )
+    if not _auth_str(auth, "expires_in_json_path", required=False):
+        raise ValueError(
+            "proofdeploy.yml 'auth.expires_in_unit' requires "
+            "'auth.expires_in_json_path' (a unit with nothing to "
+            "apply to is a contract error)"
+        )
+    out["expires_in_unit"] = unit
+
+
 def _validate_auth(auth: Any) -> dict[str, Any]:
     """Validate the contract's `auth:` mapping (ADR-0010, WO-8.3).
 
@@ -454,6 +485,7 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
         expires = _auth_str(auth, "expires_in_json_path", required=False)
         if expires is not None:
             out["expires_in_json_path"] = expires
+        _validate_expires_unit(auth, out)
     elif mode == "refresh":
         out["path"] = _auth_path(auth, "path")
         out["token_json_path"] = _auth_str(auth, "token_json_path")
@@ -468,6 +500,7 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
             val = _auth_str(auth, key, required=False)
             if val is not None:
                 out[key] = val
+        _validate_expires_unit(auth, out)
         login_path = _auth_path(auth, "login_path", required=False)
         if login_path is not None:
             out["login_path"] = login_path
