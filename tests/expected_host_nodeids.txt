@@ -1019,6 +1019,9 @@ tests/test_wo6_bug_select.py::test_classify_path[src/test_app.py-TEST]
 tests/test_wo6_bug_select.py::test_classify_path[src/tests/x.py-TEST]
 tests/test_wo6_bug_select.py::test_classify_path[src/x_test.py-TEST]
 tests/test_wo6_bug_select.py::test_date_boundary_is_strict
+tests/test_wo6_bug_select.py::test_diff_non_ascii_path_parses
+tests/test_wo6_bug_select.py::test_diff_quoted_path_header_fails_closed
+tests/test_wo6_bug_select.py::test_diff_removed_line_starting_with_dashes_is_content
 tests/test_wo6_bug_select.py::test_exhaustion_at_200_walked
 tests/test_wo6_bug_select.py::test_journal_identity_mismatch_refuses
 tests/test_wo6_bug_select.py::test_journal_resume_reuses_entries

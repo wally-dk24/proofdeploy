@@ -341,6 +341,63 @@ def test_check_c_b_is_the_most_recent_blamed_commit_tagged(
     assert record["selected"]["tag"] == "v1.0"
 
 
+def test_diff_non_ascii_path_parses(tmp_path: Path) -> None:
+    """D177 (3): the diff is taken with core.quotePath=false, so a
+    path git would otherwise C-quote (non-ASCII) parses normally
+    and its removed lines reach check (c)."""
+    repo = init_repo(tmp_path)
+    path = "src/café.py"
+    commit(repo, "Initial commit", ts(2026, 1, 10),
+           {path: "l1\nl2\nl3\n"})
+    parent = commit(repo, "Introduce the counter", ts(2026, 2, 1),
+                    {path: "l1\nl2-bug\nl3\n"})
+    add_tag(repo, "v1.0", ts(2026, 2, 2))
+    fix = commit(repo, "Fix the counter", ts(2026, 8, 15),
+                 {path: "l1\nl2-fixed\nl3\n"})
+    app_repo = mod.AppRepo(repo)
+    assert app_repo.removed_or_changed_lines(parent, fix) == {path: [2]}
+    record = select(repo, fix, FakeReady({parent, fix}))
+    assert record["outcome"] == "selected"
+    assert record["selected"]["b"] == parent
+
+
+def test_diff_quoted_path_header_fails_closed(tmp_path: Path) -> None:
+    """D177 (3): a path containing a double quote is C-quoted by
+    git in the `--- ` header even with core.quotePath=false. The
+    parser raises HarnessError — it never silently skips the
+    file's removed lines (which would corrupt B)."""
+    repo = init_repo(tmp_path)
+    path = 'src/we"ird.py'
+    commit(repo, "Initial commit", ts(2026, 1, 10),
+           {path: "l1\nl2\n"})
+    parent = commit(repo, "Introduce the counter", ts(2026, 2, 1),
+                    {path: "l1\nl2-bug\n"})
+    fix = commit(repo, "Fix the counter", ts(2026, 8, 15),
+                 {path: "l1\nl2-fixed\n"})
+    app_repo = mod.AppRepo(repo)
+    with pytest.raises(mod.HarnessError):
+        app_repo.removed_or_changed_lines(parent, fix)
+
+
+def test_diff_removed_line_starting_with_dashes_is_content(
+    tmp_path: Path,
+) -> None:
+    """D177 (3): hunk bodies are consumed by their declared line
+    counts, so a removed content line that itself starts with
+    `-- ` is content — its line number is recorded — and is never
+    mistaken for a `--- ` header."""
+    repo = init_repo(tmp_path)
+    path = "src/notes.py"
+    commit(repo, "Initial commit", ts(2026, 1, 10),
+           {path: "l1\n-- old comment\nl3\n"})
+    parent = commit(repo, "Introduce the counter", ts(2026, 2, 1),
+                    {path: "l1\n-- old comment\nl3-bug\n"})
+    fix = commit(repo, "Fix the comment", ts(2026, 8, 15),
+                 {path: "l1\n-- new comment\nl3-bug\n"})
+    app_repo = mod.AppRepo(repo)
+    assert app_repo.removed_or_changed_lines(parent, fix) == {path: [2]}
+
+
 def test_check_d_requires_both_sides_ready(tmp_path: Path) -> None:
     repo, _base, _b, mid, fix = standard_history(tmp_path)
 

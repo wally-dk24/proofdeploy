@@ -355,7 +355,10 @@ class AppRepo:
 
     def changed_paths(self, parent: str | None, fix: str) -> list[str]:
         base = parent if parent is not None else EMPTY_TREE
-        out = self._git("diff", "--name-only", "--no-renames", base, fix)
+        out = self._git(
+            "-c", "core.quotePath=false",
+            "diff", "--name-only", "--no-renames", base, fix,
+        )
         return [ln for ln in out.splitlines() if ln]
 
     def removed_or_changed_lines(
@@ -363,25 +366,83 @@ class AppRepo:
     ) -> dict[str, list[int]]:
         """Old-side (fix^) line numbers the fix removes or changes,
         per old path. Pure additions contribute nothing. Parsed
-        from -U0 hunks; the hunk text itself is discarded."""
+        from -U0 hunks; the hunk text itself is discarded.
+
+        The parse FAILS CLOSED (D177): the diff is taken with
+        core.quotePath=false so ordinary paths are never C-quoted,
+        and any header the parser cannot account for raises
+        HarnessError instead of silently dropping removed lines —
+        a C-quoted path header (git C-quotes a path containing a
+        double quote or control characters even with quotePath
+        off), any other unparseable `--- ` header followed by a
+        hunk, a malformed hunk header, or a hunk claiming old-side
+        lines under a /dev/null (added-file) header. A silent drop
+        would corrupt the blamed set and steer check (c). Hunk
+        bodies are consumed by their declared line counts, so a
+        removed content line that itself starts with `-- ` is
+        content, never a header."""
         base = parent if parent is not None else EMPTY_TREE
-        out = self._git("diff", "-U0", "--no-renames", base, fix)
+        out = self._git(
+            "-c", "core.quotePath=false",
+            "diff", "-U0", "--no-renames", base, fix,
+        )
         result: dict[str, list[int]] = {}
         current: str | None = None
+        # The last `--- ` header's kind: "path", "devnull", "bad",
+        # or None before any file header.
+        header: str | None = None
+        hunk_left = 0  # content lines left in the current hunk
         for line in out.splitlines():
+            if hunk_left > 0:
+                if line.startswith("\\"):
+                    continue  # "\ No newline at end of file"
+                if line[:1] in ("-", "+"):
+                    hunk_left -= 1
+                    continue
+                raise HarnessError(
+                    f"unexpected line inside a diff hunk: {line[:80]}"
+                )
             if line.startswith("--- "):
                 rest = line[4:]
-                current = rest[2:] if rest.startswith("a/") else None
+                if rest.startswith('"'):
+                    raise HarnessError(
+                        "diff path header is C-quoted and cannot "
+                        f"be parsed safely: {line[:80]}"
+                    )
+                if rest == "/dev/null":
+                    current, header = None, "devnull"
+                elif rest.startswith("a/"):
+                    current, header = rest[2:], "path"
+                else:
+                    current, header = None, "bad"
             elif line.startswith("@@ "):
-                m = re.match(r"@@ -(\d+)(?:,(\d+))? \+", line)
-                if m is None or current is None:
-                    continue
+                if header == "bad":
+                    raise HarnessError(
+                        "unparseable diff --- header followed by "
+                        f"a hunk: {line[:80]}"
+                    )
+                m = re.match(
+                    r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line
+                )
+                if m is None:
+                    raise HarnessError(
+                        f"unparseable diff hunk header: {line[:80]}"
+                    )
                 start = int(m.group(1))
                 count = int(m.group(2)) if m.group(2) is not None else 1
+                new_count = (
+                    int(m.group(4)) if m.group(4) is not None else 1
+                )
                 if count > 0:
+                    if header != "path" or current is None:
+                        raise HarnessError(
+                            "diff hunk claims old-side lines under "
+                            "a /dev/null or missing --- header"
+                        )
                     result.setdefault(current, []).extend(
                         range(start, start + count)
                     )
+                hunk_left = count + new_count
         return result
 
     def blame_commit(self, rev: str, path: str, lineno: int) -> str:
