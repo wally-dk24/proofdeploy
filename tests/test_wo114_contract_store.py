@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,6 +52,9 @@ from proofdeploy.orchestrator import (
 from proofdeploy.runpair import read_records
 from proofdeploy.yml import load_contract
 from readiness import provision as rp
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "conformance"))
+import kit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -532,6 +536,67 @@ def test_dry_run_stops_before_the_model_call(tmp_path):
     ).hexdigest()
     assert summary["bundle_manifest"]["fixture_template"]["file"] == (
         "fixture_template_nocredential.txt"
+    )
+    # Nothing was measured: the records repo holds no records.
+    assert read_records(tmp_path / "records") == []
+
+
+# The approved renders (D146/D147, signed): a golden unit's rendered
+# author text must hash to exactly these.
+GOLDEN_APPROVED_RENDER_SHA256 = {
+    "node-express-sqlite": (
+        "c73cfe01ff4c010d9e90b58494155f246bad7f75a5fa64dc572bba8ced4ca9df"
+    ),
+    "python-flask-sqlite": (
+        "747581467b55d51800f3c7e6084837736675c27787a167ac7c7e176df3689e37"
+    ),
+}
+
+
+@pytest.mark.parametrize("app", sorted(GOLDEN_APPROVED_RENDER_SHA256))
+def test_golden_unit_dry_run_reaches_the_stop_from_the_store(
+    tmp_path, monkeypatch, app
+):
+    """D154's final item: a non-dispatched local run of measure.yml's
+    golden branch. The kit materializes the unit exactly as the
+    workflow's golden step does; the orchestrator runs with
+    --dry-run-before-model, no API key set and an exploding model
+    runner — and must reach the dry-run stop with contract_source
+    naming the committed golden store file (path + its sha256) and
+    the rendered author text equal to the app's approved render."""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    shas = kit.materialize_golden(app, tmp_path / "target")
+
+    def exploding(prompt: str) -> ModelResponse:
+        raise AssertionError("the model must not be called in a dry run")
+
+    cfg = MeasureConfig(
+        repo_dir=tmp_path / "target",
+        output_dir=tmp_path / "records",
+        workdir=tmp_path / "work",
+        no_skill=True,
+        bug_id=f"golden-{app}",
+        rev_bug_base=shas["base"],
+        rev_bug=shas["bug"],
+        rev_fix=shas["fix"],
+        model_runner=exploding,
+        allow_unsandboxed=True,
+        use_contract_store=True,
+        unit_repo=f"golden/{app}",
+        dry_run_before_model=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["dry_run"] is True
+    assert summary["stopped_before_model_call"] is True
+    store_file = (
+        REPO_ROOT / "readiness" / "contracts" / f"golden__{app}.yml"
+    )
+    assert summary["contract_source"] == {
+        "store_path": f"readiness/contracts/golden__{app}.yml",
+        "sha256": hashlib.sha256(store_file.read_bytes()).hexdigest(),
+    }
+    assert summary["rendered_fixture_sha256"] == (
+        GOLDEN_APPROVED_RENDER_SHA256[app]
     )
     # Nothing was measured: the records repo holds no records.
     assert read_records(tmp_path / "records") == []
