@@ -47,6 +47,13 @@ on:
 permissions:
   contents: read
 
+# D101 item 3a: serialize every model-calling workflow. verify and
+# measure share this one group, so model-calling runs queue
+# repository-wide and are never cancelled mid-flight.
+concurrency:
+  group: proofdeploy-model-calls
+  cancel-in-progress: false
+
 jobs:
   verify:
     runs-on: ubuntu-latest

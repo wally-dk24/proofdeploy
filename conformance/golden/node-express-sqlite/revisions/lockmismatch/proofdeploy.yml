@@ -9,15 +9,14 @@ database:
   kind: sqlite
   path: ./app.db
 auth:
-  mode: register
-  path: /register
+  mode: login
+  path: /login
   method: POST
-  username_field: username
-  password_field: password
+  body: {username: seeduser, password: seedpass}
   token_json_path: token
 fixture:
   repo_name: "node-express-sqlite"
-  seed_note: "seed user seeduser/seedpass owns note id 1 (done=false) after seed"
+  seed_note: "seed user seeduser/seedpass owns two notes after seed: id 1 (done=false) and id 2 (done=true)"
   auth_mechanism: "Bearer token from POST /register or /login in the Authorization header"
-  auth_scope: "a regular user token"
+  auth_scope: "a regular user token belonging to seeduser, obtained by signing in as seeduser"
   flags_note: "no feature flags"
