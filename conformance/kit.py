@@ -81,11 +81,21 @@ _COMMIT_MESSAGES = {
     "base": "base: notes app with register/login and seeded note",
     "bug": "return the note's done flag",
     "intermediate": "add GET /notes list endpoint",
-    "fix-parent": "seed a second, completed note",
+    "fix-parent": "fix parent: no tree change since seeds were made uniform (D146)",
     "fix": "fix the note done flag",
     "clean": "add a tag field to note responses",
     "lockmismatch": "bump a dependency (lockfile not updated)",
 }
+
+# D146/D150: D146 made the seeds uniform across every revision of
+# every golden app, so the fix-parent tree is byte-identical to the
+# intermediate tree BY DESIGN — fix-parent is an intentional empty
+# commit that keeps the history shape (fix^ distinct from B) the
+# measured runs expect. materialize_golden passes --allow-empty ONLY
+# for revisions in this set; an empty commit for any OTHER revision
+# still fails, so an accidental collapse of two distinct revisions
+# cannot slip through silently (D150 — not a blanket --allow-empty).
+EXPECTED_EMPTY_REVISIONS = {"fix-parent"}
 
 CANARY_PREFIX = "pdcanary-"
 
@@ -103,7 +113,9 @@ def materialize_golden(app: str, dest: Path) -> dict[str, str]:
 
     Returns {revision_name: commit_sha}. The working tree is reset to
     each revision tree in turn and committed, so consecutive commits
-    differ exactly as the trees differ.
+    differ exactly as the trees differ — except the revisions in
+    EXPECTED_EMPTY_REVISIONS, whose trees equal their predecessor's
+    by design and which are committed with --allow-empty (D146/D150).
     """
     src = GOLDEN_DIR / app / "revisions"
     dest.mkdir(parents=True, exist_ok=True)
@@ -127,7 +139,10 @@ def materialize_golden(app: str, dest: Path) -> dict[str, str]:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(f, target)
         _git(dest, "add", "-A")
-        _git(dest, "commit", "-q", "-m", _COMMIT_MESSAGES[rev])
+        # --allow-empty ONLY for the designed collapse (D150); every
+        # other revision must change the tree or the commit fails.
+        allow_empty = ["--allow-empty"] if rev in EXPECTED_EMPTY_REVISIONS else []
+        _git(dest, "commit", "-q", *allow_empty, "-m", _COMMIT_MESSAGES[rev])
         shas[rev] = _git(dest, "rev-parse", "HEAD")
     return shas
 

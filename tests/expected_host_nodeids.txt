@@ -328,6 +328,12 @@ tests/test_golden_fixture_truth.py::test_seeded_rows_equal_what_seed_note_states
 tests/test_golden_fixture_truth.py::test_seeded_rows_equal_what_seed_note_states[lockmismatch-node-pnpm-monorepo]
 tests/test_golden_fixture_truth.py::test_seeded_rows_equal_what_seed_note_states[lockmismatch-node-pnpm-sqlite]
 tests/test_golden_fixture_truth.py::test_seeded_rows_equal_what_seed_note_states[lockmismatch-python-flask-sqlite]
+tests/test_kit_materialize.py::test_collapsed_revision_outside_the_expected_set_fails
+tests/test_kit_materialize.py::test_materialized_history_shape[node-bun-sqlite]
+tests/test_kit_materialize.py::test_materialized_history_shape[node-express-sqlite]
+tests/test_kit_materialize.py::test_materialized_history_shape[node-pnpm-monorepo]
+tests/test_kit_materialize.py::test_materialized_history_shape[node-pnpm-sqlite]
+tests/test_kit_materialize.py::test_materialized_history_shape[python-flask-sqlite]
 tests/test_leakcheck.py::test_allowlist_backstop_refuses_fix_sha_prefix_in_prompt
 tests/test_leakcheck.py::test_allowlist_backstop_refuses_fix_subject_in_prompt
 tests/test_leakcheck.py::test_allowlist_bundle_with_gitlinks_passes
