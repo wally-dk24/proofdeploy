@@ -61,8 +61,9 @@ Check (d) failure classification (D48, per D177 — ProofDeploy's
 own defects must not steer the selection). Each not-READY side is
 classified from its readiness row (classify_side):
 
-- `not supported:` — a typed refusal (D18's mechanism, including
-  the exact typed reason "runtime not supported"): the app
+- `not supported:` — a typed refusal (D18's mechanism): only
+  the `not supported:` prefix is a genuine refusal (D190) — an
+  unprefixed reason falls through to unruled below. The app
   genuinely cannot be provisioned as committed. A genuine (d)
   failure: recorded, and the walk moves on.
 - `harness error:` rows, and rows whose reason carries an
@@ -594,7 +595,7 @@ def classify_side(outcome: dict[str, Any]) -> str:
     if outcome.get("ready"):
         return "ready"
     typed = outcome.get("typed_reason") or ""
-    if typed.startswith("not supported:") or typed == "runtime not supported":
+    if typed.startswith("not supported:"):
         return "not_supported"
     if typed.startswith("harness error:"):
         return "harness"

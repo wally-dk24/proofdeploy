@@ -482,7 +482,9 @@ def test_check_d_requires_both_sides_ready(tmp_path: Path) -> None:
         (side_outcome(ready=True), "ready"),
         (side_outcome(typed_reason="not supported: no frozen lockfile"),
          "not_supported"),
-        (side_outcome(typed_reason="runtime not supported"), "not_supported"),
+        # D190: only the `not supported:` prefix is a genuine
+        # refusal; the unprefixed string falls through to unruled.
+        (side_outcome(typed_reason="runtime not supported"), "unruled"),
         (side_outcome(typed_reason="harness error: git fetch failed"),
          "harness"),
         (side_outcome(
@@ -664,6 +666,46 @@ def test_check_d_unruled_class_stops_run(tmp_path: Path) -> None:
     assert record["stopped"]["class"] == "unruled"
     assert record["stopped"]["role"] == "fix"
     assert fix not in [e["sha"] for e in record["walked"]]
+
+
+def test_check_d_unprefixed_runtime_not_supported_stops_run(
+    tmp_path: Path,
+) -> None:
+    """D190 (1): a side whose typed reason is exactly "runtime not
+    supported" — WITHOUT the `not supported:` prefix — is not a
+    genuine refusal (D48 R1 / D98(7): only the prefix is). It
+    falls through to unruled and stops the run for a ruling: the
+    commit is NOT marked rejected (no walk entry, in the record
+    or the journal), and the stop is journaled."""
+    repo, _base, _b, mid, fix = standard_history(tmp_path)
+    journal, _, _ = _open_journal(tmp_path, fix)
+    fake = FakeReady(
+        ready={mid},
+        scripted={
+            fix: [side_outcome(typed_reason="runtime not supported")]
+        },
+    )
+    record = select(repo, fix, fake, journal=journal)
+    assert record["outcome"] == "stopped"
+    assert record["stopped"]["sha"] == fix
+    assert record["stopped"]["check"] == "d"
+    assert record["stopped"]["role"] == "fix"
+    assert record["stopped"]["class"] == "unruled"
+    assert record["stopped"]["retries_exhausted"] is False
+    assert fix not in [e["sha"] for e in record["walked"]]
+    assert fix not in [e["sha"] for e in journal.read_walk()]
+    events = [
+        json.loads(ln)
+        for ln in (journal.dir / "events.jsonl").read_text().splitlines()
+        if ln.strip()
+    ]
+    assert any(
+        e.get("type") == "stop" and e.get("class") == "unruled"
+        and e.get("sha") == fix
+        for e in events
+    )
+    assert [a["class"] for a in journal.read_attempts()
+            if a["role"] == "fix"] == ["unruled"]
 
 
 def test_check_d_retries_exhausted_stops_run(tmp_path: Path) -> None:
