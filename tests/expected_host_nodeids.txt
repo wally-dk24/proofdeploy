@@ -990,6 +990,71 @@ tests/test_wo114_contract_store.py::test_side_contract_identity_violation_raises
 tests/test_wo114_contract_store.py::test_slug_resolution_names_the_committed_store_file
 tests/test_wo114_contract_store.py::test_unparseable_store_contract_refuses_with_record
 tests/test_wo114_contract_store.py::test_unrenderable_fixture_refuses_with_record
+tests/test_wo6_bug_select.py::test_check_a_failure_is_recorded_first
+tests/test_wo6_bug_select.py::test_check_b_docs_and_tests_only_fix_rejected
+tests/test_wo6_bug_select.py::test_check_c_add_only_fix_has_no_b
+tests/test_wo6_bug_select.py::test_check_c_b_in_no_tag_rejected
+tests/test_wo6_bug_select.py::test_check_c_b_is_the_most_recent_blamed_commit_tagged
+tests/test_wo6_bug_select.py::test_check_c_b_is_the_most_recent_blamed_commit_untagged
+tests/test_wo6_bug_select.py::test_check_c_tag_created_after_fix_rejected
+tests/test_wo6_bug_select.py::test_check_c_tag_on_the_fix_itself_rejected
+tests/test_wo6_bug_select.py::test_check_d_not_supported_moves_to_next_candidate
+tests/test_wo6_bug_select.py::test_check_d_our_gap_stops_run_not_rejected
+tests/test_wo6_bug_select.py::test_check_d_requires_both_sides_ready
+tests/test_wo6_bug_select.py::test_check_d_retries_exhausted_stops_run
+tests/test_wo6_bug_select.py::test_check_d_retryable_failure_retries_then_selects[SandboxError: measured run refused: no bridge network for the install phase-environment]
+tests/test_wo6_bug_select.py::test_check_d_retryable_failure_retries_then_selects[harness error: git fetch failed in the clone: stub-harness]
+tests/test_wo6_bug_select.py::test_check_d_unprefixed_runtime_not_supported_stops_run
+tests/test_wo6_bug_select.py::test_check_d_unruled_class_stops_run
+tests/test_wo6_bug_select.py::test_classify_path[.github/workflows/x.yml-OTHER]
+tests/test_wo6_bug_select.py::test_classify_path[CHANGELOG-DOC]
+tests/test_wo6_bug_select.py::test_classify_path[README.md-DOC]
+tests/test_wo6_bug_select.py::test_classify_path[docker-compose.yml-OTHER]
+tests/test_wo6_bug_select.py::test_classify_path[docs/x.po-DOC]
+tests/test_wo6_bug_select.py::test_classify_path[docs/x.py-DOC]
+tests/test_wo6_bug_select.py::test_classify_path[package.json-OTHER]
+tests/test_wo6_bug_select.py::test_classify_path[requirements.txt-OTHER]
+tests/test_wo6_bug_select.py::test_classify_path[src-ui/src/app/x.spec.ts-TEST]
+tests/test_wo6_bug_select.py::test_classify_path[src-ui/src/app/x.ts-SOURCE]
+tests/test_wo6_bug_select.py::test_classify_path[src/Makefile-OTHER]
+tests/test_wo6_bug_select.py::test_classify_path[src/app.py-SOURCE]
+tests/test_wo6_bug_select.py::test_classify_path[src/conftest.py-TEST]
+tests/test_wo6_bug_select.py::test_classify_path[src/contest/x.py-SOURCE]
+tests/test_wo6_bug_select.py::test_classify_path[src/locale/x.po-OTHER]
+tests/test_wo6_bug_select.py::test_classify_path[src/notes.txt-OTHER]
+tests/test_wo6_bug_select.py::test_classify_path[src/paperless_testing/x.py-TEST]
+tests/test_wo6_bug_select.py::test_classify_path[src/test_app.py-TEST]
+tests/test_wo6_bug_select.py::test_classify_path[src/tests/x.py-TEST]
+tests/test_wo6_bug_select.py::test_classify_path[src/x_test.py-TEST]
+tests/test_wo6_bug_select.py::test_classify_side[outcome0-ready]
+tests/test_wo6_bug_select.py::test_classify_side[outcome1-not_supported]
+tests/test_wo6_bug_select.py::test_classify_side[outcome2-unruled]
+tests/test_wo6_bug_select.py::test_classify_side[outcome3-harness]
+tests/test_wo6_bug_select.py::test_classify_side[outcome4-environment]
+tests/test_wo6_bug_select.py::test_classify_side[outcome5-environment]
+tests/test_wo6_bug_select.py::test_classify_side[outcome6-our_gap]
+tests/test_wo6_bug_select.py::test_classify_side[outcome7-unruled]
+tests/test_wo6_bug_select.py::test_classify_side[outcome8-unruled]
+tests/test_wo6_bug_select.py::test_date_boundary_is_strict
+tests/test_wo6_bug_select.py::test_diff_non_ascii_path_parses
+tests/test_wo6_bug_select.py::test_diff_quoted_path_header_fails_closed
+tests/test_wo6_bug_select.py::test_diff_removed_line_starting_with_dashes_is_content
+tests/test_wo6_bug_select.py::test_exhaustion_at_200_walked
+tests/test_wo6_bug_select.py::test_journal_identity_mismatch_refuses
+tests/test_wo6_bug_select.py::test_journal_resume_reuses_entries
+tests/test_wo6_bug_select.py::test_journal_torn_final_line_is_dropped
+tests/test_wo6_bug_select.py::test_record_carries_identity_and_full_walk
+tests/test_wo6_bug_select.py::test_script_sha256_is_the_file_itself
+tests/test_wo6_bug_select.py::test_selects_first_passing_fix
+tests/test_wo6_bug_select.py::test_side_branch_fix_is_not_walked_its_merge_is
+tests/test_wo6_bug_select.py::test_single_writer_lock
+tests/test_wo6_bug_select.py::test_subject_matches[A FIX for the counter-True]
+tests/test_wo6_bug_select.py::test_subject_matches[Fix the counter-True]
+tests/test_wo6_bug_select.py::test_subject_matches[Fixed the counter-True]
+tests/test_wo6_bug_select.py::test_subject_matches[Prefix the parser-False]
+tests/test_wo6_bug_select.py::test_subject_matches[Repair the counter-False]
+tests/test_wo6_bug_select.py::test_subject_matches[fixes #12: the counter-True]
+tests/test_wo6_bug_select.py::test_subject_matches[hotfix the parser-False]
 tests/test_wo6_regc_add2.py::test_both_stacks_passed_flag
 tests/test_wo6_regc_add2.py::test_error_text_containing_404_is_not_treated_as_absent
 tests/test_wo6_regc_add2.py::test_errored_repo_retried_and_recovers_with_real_verdict
