@@ -70,7 +70,19 @@ HARNESS_VERSION = "1.0.0"
 # response carried neither, or no model call completed). Recorded,
 # never scored; records at 1.0.0–1.6.0 still load (readers default
 # the new keys).
-SCHEMA_VERSION = "1.7.0"
+# 1.8.0 (D220/D221): evidence records carry container_env_keys —
+# the contract env key NAMES the run's sandbox install and app
+# containers received (names only, never values; empty when no
+# container was provisioned) — and dry_run, the dry-run marking
+# (null on real runs; "provision" on a provision-rehearsal record,
+# D221). The bump accompanies the container-env fix: on the
+# contract-store (measured) path the containers receive the
+# contract's full env, as readiness always passed for the same
+# contract, instead of only the leak gate's declared-public subset.
+# The leak gate's exemption list is unchanged. Recorded, never
+# scored; records at 1.0.0–1.7.0 still load (readers default the
+# new keys).
+SCHEMA_VERSION = "1.8.0"
 
 # HTTP methods the schema allows. No CONNECT, TRACE, or custom verbs.
 ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})

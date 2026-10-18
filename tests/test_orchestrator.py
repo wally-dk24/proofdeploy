@@ -2144,7 +2144,7 @@ def _measure_evidence(tmp_path, runner):
 
 def test_measure_records_model_finish_reason_and_usage(tmp_path):
     evidence = _measure_evidence(tmp_path, _probes_stop_with_usage)
-    assert evidence["schema_version"] == "1.7.0"
+    assert evidence["schema_version"] == "1.8.0"
     assert evidence["model_finish_reason"] == "stop"
     assert evidence["model_usage"] == _D211_USAGE
 

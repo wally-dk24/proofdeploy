@@ -26,6 +26,16 @@
 # proofdeploy/cli.py): credential-shaped names and the contract's
 # auth.bootstrap_env names can never be declared public.
 #
+# Dry run (D222): the dry_run input's "provision" choice runs the
+# provision rehearsal instead of a measured run — both sides are
+# provisioned through the measured path, the unit's fixed rehearsal
+# probe set (readiness/rehearsal/<owner>__<repo>.json) runs through
+# the real executor on both sides, an evidence record marked
+# dry_run=provision is written, and the run stops before any model
+# call (the rehearsal does not read the API key). The job stays in
+# the measurement environment and in the serialization group
+# either way.
+#
 # DO NOT TRIGGER before the reviewer has seen the exact contents.
 # Any change to this workflow goes back to review.
 
@@ -83,6 +93,14 @@ on:
         required: false
         default: ""
         type: string
+      dry_run:
+        description: "Dry run mode: none = the full measured run; provision = provision rehearsal only (both sides provisioned, the unit's fixed rehearsal probe set run on both sides, record written, no model call)"
+        required: false
+        default: "none"
+        type: choice
+        options:
+          - none
+          - provision
 
 # Least privilege: only need to push records to this repo.
 permissions:
@@ -224,6 +242,7 @@ jobs:
           CLEAN_ID: ${{ inputs.clean_id }}
           CLEAN: ${{ steps.golden.outputs.clean || inputs.clean }}
           PUBLIC_ENV_KEYS: ${{ inputs.public_env_keys }}
+          DRY_RUN: ${{ inputs.dry_run }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_ID: ${{ github.run_id }}
           # Note: $ImageOS/$ImageVersion are available in the runner env;
@@ -260,6 +279,14 @@ jobs:
           for key in $PUBLIC_ENV_KEYS; do
             PUBLIC_ENV_ARGS="$PUBLIC_ENV_ARGS --public-env-key $key"
           done
+          # D221: the provision rehearsal flag. "none" (the default)
+          # expands to nothing and leaves the command line a plain
+          # measured run.
+          if [ "$DRY_RUN" = "provision" ]; then
+            DRY_RUN_ARGS="--dry-run-provision"
+          else
+            DRY_RUN_ARGS=""
+          fi
           if [ -n "$BUG_ID" ]; then
             OUTPUT=$(python -m proofdeploy.cli measure \
               --repo /tmp/target-repo \
@@ -268,6 +295,7 @@ jobs:
               $SKILL_ARGS \
               $UNIT_ARGS \
               $PUBLIC_ENV_ARGS \
+              $DRY_RUN_ARGS \
               --bug-id "$BUG_ID" \
               --base "$BASE" \
               --bug "$BUG" \
@@ -281,6 +309,7 @@ jobs:
               $SKILL_ARGS \
               $UNIT_ARGS \
               $PUBLIC_ENV_ARGS \
+              $DRY_RUN_ARGS \
               --clean-id "$CLEAN_ID" \
               --clean "$CLEAN" \
               $PROV_ARGS 2>&1)

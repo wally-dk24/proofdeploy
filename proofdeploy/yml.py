@@ -585,6 +585,35 @@ def contract_store_path(
     return root / "readiness" / "contracts" / f"{owner}__{name}.yml"
 
 
+def rehearsal_set_path(
+    repo_slug: str, *, tree_root: Path | None = None
+) -> Path:
+    """The committed rehearsal probe set for a measured unit's repo.
+
+    D222: the provision rehearsal's FIXED probe set lives OUTSIDE
+    the contract — ``readiness/rehearsal/<owner>__<repo>.json``
+    beside the contract store, resolved against the same tree.
+    The contract file itself (and its recorded sha256) is never
+    touched by the rehearsal. The slug is validated exactly as
+    for the contract store: it becomes a file name, so it must
+    carry no separators or traversal.
+    """
+    owner, sep, name = repo_slug.partition("/")
+    if (
+        not sep
+        or not owner
+        or not name
+        or "/" in name
+        or owner in (".", "..")
+        or name in (".", "..")
+    ):
+        raise ValueError(
+            f"repo slug must be 'owner/repo', got: {repo_slug!r}"
+        )
+    root = tree_root if tree_root is not None else proofdeploy_tree_root()
+    return root / "readiness" / "rehearsal" / f"{owner}__{name}.json"
+
+
 def find_contract(repo_root: str | Path) -> Path | None:
     """Locate proofdeploy.yml at the repo root; None if absent."""
     p = Path(repo_root) / "proofdeploy.yml"

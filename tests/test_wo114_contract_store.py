@@ -236,7 +236,7 @@ def test_measure_bug_uses_store_contract_with_no_in_tree_contract(tmp_path):
     records = read_records(tmp_path / "records")
     assert [r["record_type"] for r in records] == ["evidence", "score"]
     evidence = records[0]
-    assert evidence["schema_version"] == "1.7.0"
+    assert evidence["schema_version"] == "1.8.0"
     assert evidence["contract_source"] == {
         "store_path": str(contract),
         "sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),
@@ -621,6 +621,37 @@ def test_cli_measure_dry_run_flags_parse():
     assert args.unit_repo == "directus/directus"
     assert args.contract == "/tmp/store.yml"
     assert args.dry_run_before_model is True
+
+
+def test_cli_measure_dry_run_provision_flag_parses():
+    """D222: --dry-run-provision parses onto the namespace the
+    measure command reads (a dropped flag would silently rehearse
+    nothing — cmd_measure reads it via getattr)."""
+    from proofdeploy.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "measure",
+            "--repo", "/tmp/target",
+            "--workdir", "/tmp/work",
+            "--output-dir", "/tmp/out",
+            "--bug-id", "b1",
+            "--base", "a", "--bug", "b", "--fix", "c",
+            "--dry-run-provision",
+        ]
+    )
+    assert args.dry_run_provision is True
+    plain = build_parser().parse_args(
+        [
+            "measure",
+            "--repo", "/tmp/target",
+            "--workdir", "/tmp/work",
+            "--output-dir", "/tmp/out",
+            "--bug-id", "b1",
+            "--base", "a", "--bug", "b", "--fix", "c",
+        ]
+    )
+    assert plain.dry_run_provision is False
 
 
 # ----------------------------------------------------------------------
@@ -1010,3 +1041,637 @@ def test_non_golden_sandboxed_unit_still_records_measured_true(
     assert evidence["inconclusive_cause"] is None
     assert evidence["crash_probe_results"] is None
     assert evidence["fix_results"]
+
+
+# ----------------------------------------------------------------------
+# D220/D221/D222: the container env, the leak gate, and the
+# provision rehearsal.
+#
+# Blind run 39149875917 came back INCONCLUSIVE (environment): the
+# measured path built the sandbox containers' env from ONLY the
+# leak gate's declared-public keys, so the paperless contract's
+# non-public config (its secret key, DB engine, data dir, throttle)
+# never reached the container and both sides failed Django's boot
+# check — while readiness, which passes every contract key, had
+# proved the same contract READY. One list carried two meanings.
+# D220 separates them: on the contract-store path the containers
+# receive the contract's FULL env (readiness parity); off the store
+# the public-keys filter stands; the leak gate's exemption list is
+# unchanged either way. D221 adds the redaction registration for
+# every non-public value. D222 (replacing D221's item 3) adds the
+# --dry-run-provision rehearsal: both sides provisioned, the unit's
+# FIXED rehearsal probe set run through the real executor, a
+# record marked dry_run="provision", no model call.
+#
+# Plants (each run by hand against this file; see the PR body):
+#   P1 the public-keys filter restored on the store path -> the
+#      store-env and readiness-parity tests FAIL;
+#   P2 the leak exemption widened to every contract key -> the
+#      leak-gate test FAILS;
+#   P3 the sandbox redaction registration skipped -> the redaction
+#      test FAILS;
+#   P4 the rehearsal calling the model -> the rehearsal test FAILS
+#      (its model runner raises on any call).
+# ----------------------------------------------------------------------
+
+D220_ENV = {
+    "APP_ENV": "test",
+    "APP_BACKEND_PATH": "acme.backends.PublicBackend",
+    "APP_SECRET_KEY": "d220-throwaway-secret-value",
+    "APP_DBENGINE": "sqlite",
+    "APP_DATA_DIR": "/checkout/data",
+    "APP_THROTTLE_RATE": "600/min",
+}
+D220_PUBLIC_KEYS = ["APP_ENV", "APP_BACKEND_PATH"]
+D220_SECRET_VALUE = D220_ENV["APP_SECRET_KEY"]
+
+D220_STORE_YML = """\
+repo_name: store-mini-app
+app:
+  path: "."
+build: "python -m py_compile app.py"
+start: "python app.py"
+readiness: "/health"
+env:
+  APP_ENV: "test"
+  APP_BACKEND_PATH: "acme.backends.PublicBackend"
+  APP_SECRET_KEY: "d220-throwaway-secret-value"
+  APP_DBENGINE: "sqlite"
+  APP_DATA_DIR: "/checkout/data"
+  APP_THROTTLE_RATE: "600/min"
+fixture:
+  repo_name: "store-mini-app"
+  seed_note: "The app starts empty; GET /value reports the build's constant."
+  auth_mechanism: "There are no user accounts and no login."
+  flags_note: "There are no feature flags."
+"""
+
+
+def _d220_caps():
+    from proofdeploy.sandbox import SandboxCapabilities
+
+    return SandboxCapabilities(
+        podman=True,
+        podman_version="podman version 4.9.3",
+        isolated_network=False,
+        build_network=True,
+        userns_remap=True,
+        reason="",
+    )
+
+
+def _d220_drive(monkeypatch, tmp_path, *, store: bool, echo_secret: bool = False):
+    """Drive the REAL Orchestrator._provision_side_sandbox
+    podman-free (the Addendum 18 pattern, as in
+    test_provisioning_sandbox.py) with a six-key contract env of
+    which only two keys are declared public. The fake install
+    captures its env; the fake start captures its env and stops the
+    side there. Returns (install_env, start_env, side)."""
+    from proofdeploy import orchestrator as orch_mod
+    from proofdeploy.provisioning import select_image
+    from proofdeploy.sandbox import Sandbox, SandboxError
+    from proofdeploy.yml import RepoContract
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "requirements.txt").write_text(
+        "six==1.17.0 \\\n"
+        "    --hash=sha256:ff703d0fc3e08526949441584fca3fc209d20cf45a3f"
+        "54c0fb84f79a80d0d95b1\n"
+    )
+    (snap / "app.py").write_text("VALUE = 1\n")
+
+    row = select_image("python", None)
+    assert row is not None
+    monkeypatch.setattr(orch_mod, "_git", lambda *a: "fakesha1234567890abcdef")
+    monkeypatch.setattr(
+        orch_mod, "create_snapshot", lambda **kw: SimpleNamespace(dir=snap)
+    )
+    monkeypatch.setattr(orch_mod, "check_podman", lambda: (True, ""))
+    monkeypatch.setattr(
+        orch_mod,
+        "check_sandbox_runtime",
+        lambda *a: (row.version, row.digest, None),
+    )
+    monkeypatch.setattr(Sandbox, "_capabilities", lambda self: _d220_caps())
+
+    captured: dict[str, dict] = {}
+
+    def fake_install(self, checkout, steps, env, proxy_env, timeout=600):
+        captured["install_env"] = dict(env)
+        if echo_secret:
+            # A -e KEY=VALUE command echo landing in the sandbox
+            # log, carrying the raw non-public value verbatim.
+            self.log.append(
+                f"install env echo: APP_SECRET_KEY={env['APP_SECRET_KEY']}"
+            )
+        return [{"phase": s["phase"], "exit_code": 0} for s in steps]
+
+    def fake_start(self, checkout, command, env, port, **kw):
+        captured["start_env"] = dict(env)
+        raise SandboxError("d220 test stops after capturing the app env")
+
+    monkeypatch.setattr(Sandbox, "install_steps", fake_install)
+    monkeypatch.setattr(Sandbox, "start", fake_start)
+
+    if store:
+        contract_file = tmp_path / "d220-store.yml"
+        contract_file.write_text(D220_STORE_YML, encoding="utf-8")
+        cfg = MeasureConfig(
+            repo_dir=snap,
+            output_dir=tmp_path / "out",
+            workdir=tmp_path / "work",
+            no_skill=True,
+            public_contract_env_keys=list(D220_PUBLIC_KEYS),
+            use_contract_store=True,
+            contract_path=contract_file,
+        )
+    else:
+        contract = RepoContract(
+            build="",
+            start="python app.py",
+            readiness="/health",
+            env=dict(D220_ENV),
+        )
+        monkeypatch.setattr(orch_mod, "load_contract", lambda p: contract)
+        cfg = MeasureConfig(
+            repo_dir=snap,
+            output_dir=tmp_path / "out",
+            workdir=tmp_path / "work",
+            no_skill=True,
+            public_contract_env_keys=list(D220_PUBLIC_KEYS),
+        )
+    orch = Orchestrator(cfg)
+    unit_dir = tmp_path / "unit"
+    unit_dir.mkdir(exist_ok=True)
+    side = orch._provision_side_sandbox("fakerev", 18099, unit_dir, "d220")
+    return captured["install_env"], captured["start_env"], side
+
+
+def test_store_contract_provisions_full_env_to_install_and_app(
+    monkeypatch, tmp_path
+):
+    """D220 (a): a store-contract side's install AND app containers
+    receive the contract's full env — every key, with its value —
+    even though only two keys are declared public. Plant P1
+    (filter restored on the store path) fails this test."""
+    from proofdeploy.runner import ProvisionStatus
+
+    install_env, start_env, side = _d220_drive(
+        monkeypatch, tmp_path, store=True
+    )
+    assert side.provision.status == ProvisionStatus.START_FAILED
+    for env in (install_env, start_env):
+        assert {k: env[k] for k in D220_ENV} == D220_ENV
+
+
+def test_non_store_provisioning_still_filters_to_public_keys(
+    monkeypatch, tmp_path
+):
+    """D220 (b): off the store (the verify/dev shape), provisioning
+    still filters the container env to the declared public keys —
+    the non-public keys never reach either container."""
+    install_env, start_env, _side = _d220_drive(
+        monkeypatch, tmp_path, store=False
+    )
+    for env in (install_env, start_env):
+        assert {k for k in env if k in D220_ENV} == set(D220_PUBLIC_KEYS)
+        assert env["APP_ENV"] == "test"
+        assert "APP_SECRET_KEY" not in env
+
+
+def test_non_public_contract_value_registered_for_sandbox_redaction(
+    monkeypatch, tmp_path
+):
+    """D221 item 2: every non-public contract env value is
+    registered with the sandbox redaction, exactly as the
+    bootstrap values are — a log line echoing the value verbatim
+    (a -e KEY=VALUE command echo) reaches the side's provision
+    logs only in redacted form. Plant P3 (registration skipped)
+    fails this test."""
+    _install_env, _start_env, side = _d220_drive(
+        monkeypatch, tmp_path, store=True, echo_secret=True
+    )
+    provision_logs = "\n".join(side.provision.logs)
+    assert D220_SECRET_VALUE not in provision_logs
+    # The echo line itself is present — redacted, not dropped.
+    assert "install env echo: APP_SECRET_KEY=" in provision_logs
+
+
+def test_readiness_and_measured_env_names_match_for_paperless(tmp_path):
+    """D220 (c) PARITY: for the same store contract — the real
+    paperless-ngx contract — readiness and the measured path
+    produce the same container env NAMES: the six keys readiness
+    proved READY with. Plant P1 fails this test."""
+    readiness_names = rp.contract_env_keys("paperless-ngx/paperless-ngx")
+    assert readiness_names == [
+        "PAPERLESS_CACHE_BACKEND",
+        "PAPERLESS_CHANNELS_BACKEND",
+        "PAPERLESS_DATA_DIR",
+        "PAPERLESS_DBENGINE",
+        "PAPERLESS_SECRET_KEY",
+        "PAPERLESS_TOKEN_THROTTLE_RATE",
+    ]
+    cfg = MeasureConfig(
+        repo_dir=tmp_path,
+        output_dir=tmp_path / "out",
+        workdir=tmp_path / "work",
+        no_skill=True,
+        public_contract_env_keys=[
+            "PAPERLESS_CHANNELS_BACKEND",
+            "PAPERLESS_CACHE_BACKEND",
+        ],
+        use_contract_store=True,
+        contract_path=(
+            REPO_ROOT
+            / "readiness"
+            / "contracts"
+            / "paperless-ngx__paperless-ngx.yml"
+        ),
+    )
+    orch = Orchestrator(cfg)
+    contract = orch._load_unit_contract()
+    measured_names = sorted(orch._container_contract_env(contract))
+    assert measured_names == readiness_names
+
+
+def test_leak_gate_still_refuses_non_public_contract_value(
+    monkeypatch, tmp_path
+):
+    """D220 (d): the leak gate is unchanged — only the declared
+    public keys are exempt. A non-public contract value (the
+    secret key's value) in the prompt OR in a bundle file is
+    refused; a declared-public value is not. Plant P2 (exemption
+    widened to all contract keys) fails this test."""
+    from proofdeploy.leakcheck import SecretLeakError
+    from proofdeploy.yml import RepoContract
+
+    cfg = MeasureConfig(
+        repo_dir=tmp_path,
+        output_dir=tmp_path / "out",
+        workdir=tmp_path / "work",
+        no_skill=True,
+        public_contract_env_keys=list(D220_PUBLIC_KEYS),
+    )
+    orch = Orchestrator(cfg)
+    contract = RepoContract(
+        build="", start="python app.py", readiness="/health",
+        env=dict(D220_ENV),
+    )
+    snap = tmp_path / "snapshot"
+    snap.mkdir()
+    diff = tmp_path / "diff.patch"
+    diff.write_text("benign diff text\n", encoding="utf-8")
+    description = tmp_path / "description.txt"
+    description.write_text("benign fixture text\n", encoding="utf-8")
+    bundle = SimpleNamespace(
+        diff=diff, description=description, skill=None, snapshot=snap
+    )
+
+    with pytest.raises(SecretLeakError):
+        orch._leak_check_bundle(
+            bundle, f"the prompt mentions {D220_SECRET_VALUE}", contract
+        )
+    diff.write_text(
+        f"the diff mentions {D220_SECRET_VALUE}\n", encoding="utf-8"
+    )
+    with pytest.raises(SecretLeakError):
+        orch._leak_check_bundle(bundle, "a clean prompt", contract)
+    diff.write_text("benign diff text\n", encoding="utf-8")
+    # Declared-public values are config the app itself prints:
+    # exempt, exactly as before D220.
+    orch._leak_check_bundle(
+        bundle,
+        "backend acme.backends.PublicBackend, env test",
+        contract,
+    )
+
+
+def _d220_sandboxed_prepare(tmp_path, monkeypatch, owner="acme"):
+    """The D171 sandboxed-store scaffolding, with the six-key
+    contract: gates stubbed, the store resolved by the real slug
+    rule from a temporary store tree, _provision_side_sandbox
+    faked READY. Returns (info, prepare)."""
+    import proofdeploy.orchestrator as orch_mod
+    from proofdeploy.orchestrator import _Side
+    from proofdeploy.runner import ProvisionResult, ProvisionStatus
+
+    monkeypatch.setattr(orch_mod, "assert_measurement_gate", lambda: {})
+    monkeypatch.setattr(
+        orch_mod,
+        "assert_harness_commit_gate",
+        lambda: {
+            "commit": "0" * 40,
+            "source": "git",
+            "dirty": False,
+            "workflow_ref": None,
+        },
+    )
+    # The capability probe has its own tests (test_sandbox.py);
+    # stub it so the run's network-mode resolution does not shell
+    # out to podman here (the test_sandbox.py pattern).
+    monkeypatch.setattr(
+        "proofdeploy.sandbox.check_sandbox_capabilities",
+        lambda: _d220_caps(),
+    )
+    store_root = tmp_path / f"store-{owner}"
+    committed = store_root / "readiness" / "contracts" / f"{owner}__mini.yml"
+    committed.parent.mkdir(parents=True)
+    committed.write_text(D220_STORE_YML, encoding="utf-8")
+    monkeypatch.setattr(
+        "proofdeploy.yml.proofdeploy_tree_root", lambda: store_root
+    )
+    monkeypatch.setattr(
+        "proofdeploy.orchestrator.proofdeploy_tree_root",
+        lambda: store_root,
+    )
+    info = make_mini_repo(tmp_path, in_tree=None)
+
+    def prepare(orch: Orchestrator) -> None:
+        contract = orch._load_unit_contract()
+
+        def fake_provision_sandbox(rev, port, unit_dir, name):
+            return _Side(
+                rev=rev,
+                sha=rev,
+                snapshot_dir=tmp_path / "snap",
+                contract=contract,
+                provision=ProvisionResult(
+                    status=ProvisionStatus.READY,
+                    target_url=f"http://127.0.0.1:{port}",
+                    run_id="fake",
+                ),
+                sandbox_evidence={"image": "fake"},
+            )
+
+        orch._provision_side_sandbox = fake_provision_sandbox
+
+    return info, prepare
+
+
+def _d220_sandboxed_cfg(tmp_path, info, owner="acme", **over):
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=tmp_path / "records",
+        workdir=tmp_path / "work",
+        skill_path=skill_path(),
+        bug_id="mini-bug",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=over.pop("model_runner", canned_probes_store),
+        public_contract_env_keys=list(D220_PUBLIC_KEYS),
+        sandbox=True,
+        allow_unsandboxed=False,
+        use_contract_store=True,
+        unit_repo=f"{owner}/mini",
+    )
+    for key, value in over.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+def test_store_measure_record_carries_container_env_keys(
+    tmp_path, monkeypatch
+):
+    """D220 (a, record half): a sandboxed store measure's evidence
+    record names every contract env key in container_env_keys
+    (names only), is stamped 1.8.0, and is not a dry run. The
+    non-public VALUE appears nowhere in the written record."""
+    info, prepare = _d220_sandboxed_prepare(tmp_path, monkeypatch)
+    orch = Orchestrator(_d220_sandboxed_cfg(tmp_path, info))
+    prepare(orch)
+    summary = orch.measure_bug()
+    assert "cause" not in summary
+    evidence = read_records(tmp_path / "records")[0]
+    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["container_env_keys"] == sorted(D220_ENV)
+    assert evidence["dry_run"] is None
+    assert evidence["contract_source"]["store_path"] == (
+        "readiness/contracts/acme__mini.yml"
+    )
+    raw = (tmp_path / "records" / "runs.jsonl").read_text(encoding="utf-8")
+    assert D220_SECRET_VALUE not in raw
+
+
+def _exploding_runner(prompt: str) -> ModelResponse:
+    raise AssertionError("the provision rehearsal called the model")
+
+
+# The mini unit's fixed rehearsal set (written into the temporary
+# store tree by the prepare below): the app's health endpoint and
+# its value endpoint, through the real executor.
+MINI_REHEARSAL = [
+    {
+        "setup": [],
+        "act": {"method": "GET", "path": "/health"},
+        "assert": [{"type": "status", "equals": 200}],
+    },
+    {
+        "setup": [],
+        "act": {"method": "GET", "path": "/value"},
+        "assert": [
+            {"type": "status", "equals": 200},
+            {
+                "type": "body",
+                "json_path": {"path": "value", "equals": 1},
+            },
+        ],
+    },
+]
+
+
+def _d222_prepare(tmp_path, monkeypatch, owner="acme"):
+    """The D222 rehearsal scaffolding: the D220 sandboxed-store
+    prepare, except the fake provision STARTS the mini app for
+    real (the rehearsal runs its probes through the real executor
+    against a live target) and the store tree also carries the
+    unit's fixed rehearsal set. Returns (info, servers) — the
+    caller terminates the servers."""
+    import json as _json
+    import os
+    import urllib.request
+
+    import proofdeploy.orchestrator as orch_mod
+    from proofdeploy.orchestrator import _Side
+    from proofdeploy.runner import ProvisionResult, ProvisionStatus
+
+    monkeypatch.setattr(orch_mod, "assert_measurement_gate", lambda: {})
+    monkeypatch.setattr(
+        orch_mod,
+        "assert_harness_commit_gate",
+        lambda: {
+            "commit": "0" * 40,
+            "source": "git",
+            "dirty": False,
+            "workflow_ref": None,
+        },
+    )
+    # The capability probe has its own tests (test_sandbox.py);
+    # stub it so the run's network-mode resolution does not shell
+    # out to podman here (the test_sandbox.py pattern).
+    monkeypatch.setattr(
+        "proofdeploy.sandbox.check_sandbox_capabilities",
+        lambda: _d220_caps(),
+    )
+    store_root = tmp_path / f"store-{owner}"
+    committed = store_root / "readiness" / "contracts" / f"{owner}__mini.yml"
+    committed.parent.mkdir(parents=True)
+    committed.write_text(D220_STORE_YML, encoding="utf-8")
+    rehearsal = store_root / "readiness" / "rehearsal" / f"{owner}__mini.json"
+    rehearsal.parent.mkdir(parents=True)
+    rehearsal.write_text(_json.dumps(MINI_REHEARSAL), encoding="utf-8")
+    monkeypatch.setattr(
+        "proofdeploy.yml.proofdeploy_tree_root", lambda: store_root
+    )
+    monkeypatch.setattr(
+        "proofdeploy.orchestrator.proofdeploy_tree_root",
+        lambda: store_root,
+    )
+    info = make_mini_repo(tmp_path, in_tree=None)
+    servers: list = []
+
+    def prepare(orch: Orchestrator) -> None:
+        contract = orch._load_unit_contract()
+
+        def fake_provision_sandbox(rev, port, unit_dir, name):
+            proc = subprocess.Popen(
+                [sys.executable, "app.py"],
+                cwd=info["repo"],
+                env={**os.environ, "PORT": str(port)},
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                # The real runner starts targets in their own
+                # session (stop_target kills the process GROUP).
+                start_new_session=True,
+            )
+            servers.append(proc)
+            url = f"http://127.0.0.1:{port}"
+            for _ in range(100):
+                try:
+                    with urllib.request.urlopen(
+                        f"{url}/health", timeout=1
+                    ) as resp:
+                        if resp.status == 200:
+                            break
+                except Exception:
+                    import time
+
+                    time.sleep(0.05)
+            else:
+                raise RuntimeError("mini app did not become ready")
+            return _Side(
+                rev=rev,
+                sha=rev,
+                snapshot_dir=tmp_path / "snap",
+                contract=contract,
+                provision=ProvisionResult(
+                    status=ProvisionStatus.READY,
+                    target_url=url,
+                    run_id=f"fake-{name}",
+                    proc=proc,
+                ),
+                sandbox_evidence={"image": "fake"},
+            )
+
+        orch._provision_side_sandbox = fake_provision_sandbox
+
+    return info, prepare, servers
+
+
+def test_dry_run_provision_rehearses_without_a_model_call(
+    tmp_path, monkeypatch
+):
+    """D222 item 3: --dry-run-provision provisions BOTH sides
+    through the measured path, runs the unit's FIXED rehearsal
+    probe set through the REAL executor on both sides, writes a
+    record marked dry_run="provision" carrying container_env_keys,
+    per-side READY, and the per-probe rehearsal results in the
+    per-side result fields — and never calls the model (the runner
+    raises on any call: plant P4, the mode calling the model,
+    fails this test by construction). No score record exists."""
+    info, prepare, servers = _d222_prepare(tmp_path, monkeypatch)
+    orch = Orchestrator(
+        _d220_sandboxed_cfg(
+            tmp_path, info,
+            model_runner=_exploding_runner,
+            dry_run_provision=True,
+        )
+    )
+    prepare(orch)
+    try:
+        summary = orch.measure_bug()
+    finally:
+        for proc in servers:
+            proc.terminate()
+    assert summary["dry_run"] == "provision"
+    assert summary["stopped_before_model_call"] is True
+    assert summary["provision_rehearsal_ok"] is True
+    assert summary["measured_result"] is False
+    assert summary["container_env_keys"] == sorted(D220_ENV)
+    for side_name in ("fix_parent", "fix"):
+        assert summary["sides"][side_name]["ready"] is True
+        assert summary["sides"][side_name]["all_passed"] is True
+        assert summary["sides"][side_name]["probes"] == [
+            {"index": 0, "verdict": "pass"},
+            {"index": 1, "verdict": "pass"},
+        ]
+
+    records = read_records(tmp_path / "records")
+    assert [r["record_type"] for r in records] == ["evidence"]
+    evidence = records[0]
+    assert evidence["dry_run"] == "provision"
+    assert evidence["measured_result"] is False
+    assert evidence["container_env_keys"] == sorted(D220_ENV)
+    assert evidence["fix_parent_provision"]["status"] == "ready"
+    assert evidence["fix_provision"]["status"] == "ready"
+    # The per-probe rehearsal results ride the per-side result
+    # fields, as full probe results from the real executor.
+    for field in ("fix_parent_results", "fix_results"):
+        assert [r["verdict"] for r in evidence[field]] == ["pass", "pass"]
+
+
+def test_paperless_rehearsal_set_loads_through_the_probe_schema():
+    """D222: the committed paperless rehearsal set
+    (readiness/rehearsal/paperless-ngx__paperless-ngx.json, OUTSIDE
+    the contract) loads through the REAL production probe parser —
+    every probe validates — and carries exactly the ruled set:
+    (a) authenticated GET /api/profile/ -> 200; (b) setup POST
+    /api/tags/ capturing id, act GET /api/tags/${id}/ -> 200;
+    (c) a db assertion over auth_user."""
+    import json as _json
+
+    from proofdeploy.probe import validate_probe
+
+    path = (
+        REPO_ROOT
+        / "readiness"
+        / "rehearsal"
+        / "paperless-ngx__paperless-ngx.json"
+    )
+    probes = _json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(probes, list) and len(probes) == 3
+    for probe in probes:
+        validate_probe(probe)
+
+    a, b, c = probes
+    assert a["act"]["method"] == "GET"
+    assert a["act"]["path"] == "/api/profile/"
+    assert a["act"]["headers"]["Authorization"] == "Token ${AUTH_TOKEN}"
+    assert a["assert"] == [{"type": "status", "equals": 200}]
+
+    (step,) = b["setup"]
+    assert step["type"] == "http"
+    assert step["act"]["method"] == "POST"
+    assert step["act"]["path"] == "/api/tags/"
+    assert step["act"]["body"] == {"name": "pd-rehearsal"}
+    assert step["capture"] == {"id": {"from": "body", "json_path": "id"}}
+    assert b["act"]["method"] == "GET"
+    assert b["act"]["path"] == "/api/tags/${id}/"
+    assert b["assert"] == [{"type": "status", "equals": 200}]
+
+    (db_assert,) = c["assert"]
+    assert db_assert["type"] == "db"
+    assert "auth_user" in db_assert["query"]
+    assert db_assert["query"].startswith("SELECT COUNT(*) FROM auth_user")
+    assert db_assert["count"] == 1

@@ -380,6 +380,14 @@ class _VerifyRun:
             contract_env=contract_env,
             public_fixture_keys=list(PUBLIC_FIXTURE_KEYS),
             public_contract_env_keys=list(self.cfg.public_contract_env_keys),
+            # D220: verify never uses the contract store, so its
+            # helper yields the declared-public subset its containers
+            # were filtered to; no side = no container = empty.
+            container_env_keys=(
+                sorted(orch._container_contract_env(side.contract))
+                if side is not None
+                else []
+            ),
             inconclusive_cause=inconclusive_cause,
             inconclusive_error=inconclusive_error,
         )

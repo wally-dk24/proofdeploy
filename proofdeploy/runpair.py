@@ -670,6 +670,22 @@ def build_evidence_record(
     contract_env: dict[str, Any] | None = None,
     public_fixture_keys: list[str] | None = None,
     public_contract_env_keys: list[str] | None = None,
+    # D220 (schema 1.8.0): the contract env key NAMES the run's
+    # sandbox install and app containers received — names only,
+    # never values. On the contract-store (measured) path this is
+    # the contract's full env key set; on verify/dev paths it is
+    # the declared-public subset the containers were filtered to.
+    # Empty when no container was provisioned. Recorded, never
+    # scored.
+    container_env_keys: list[str] | None = None,
+    # D222 (schema 1.8.0): the dry-run marking. None on every real
+    # run; "provision" on a provision-rehearsal record (the bundle
+    # was assembled and leak-checked, both sides provisioned, and
+    # the unit's fixed rehearsal probe set ran through the real
+    # executor — its per-probe results ride the per-side result
+    # fields — with no model call made). A rehearsal record is
+    # never scored and never counts as a measured result.
+    dry_run: str | None = None,
     # Every capture binding collected during the run. A name bound
     # once maps to its value; a name bound more than once (several
     # probes, both sides, a re-login) maps to the list of its distinct
@@ -813,6 +829,8 @@ def build_evidence_record(
         "contract_env": contract_env or {},
         "public_fixture_keys": public_fixture_keys or [],
         "public_contract_env_keys": public_contract_env_keys or [],
+        "container_env_keys": container_env_keys or [],
+        "dry_run": dry_run,
         "captured_values": merged_captured,
         "minted_tokens": merged_minted,
         "auth_bootstrap": auth_bootstrap or {},

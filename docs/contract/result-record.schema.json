@@ -2,7 +2,7 @@
   "$defs": {
     "evidence_record": {
       "additionalProperties": false,
-      "description": "Built by build_evidence_record() and written BEFORE any scoring. All 58 keys are always present; fields that do not apply to the run are null or empty, never absent.",
+      "description": "Built by build_evidence_record() and written BEFORE any scoring. All 60 keys are always present; fields that do not apply to the run are null or empty, never absent.",
       "properties": {
         "auth_bootstrap": {
           "additionalProperties": {
@@ -57,6 +57,13 @@
         "clean_id": {
           "$ref": "#/$defs/string_or_null"
         },
+        "container_env_keys": {
+          "description": "D220 (1.8.0): the contract env key NAMES the run's sandbox install and app containers received — names only, never values. The contract's full env key set on the contract-store (measured) path; the declared-public subset on paths that filter. Empty when no container was provisioned.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "contract_env": {
           "description": "Contract env values used by the run; same redaction rule as fixture, via public_contract_env_keys.",
           "type": "object"
@@ -73,6 +80,10 @@
         },
         "crash_provisioning": {
           "type": "object"
+        },
+        "dry_run": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "D222 (1.8.0): the dry-run marking. Null on every real run; \"provision\" on a provision-rehearsal record (bundle assembled and leak-checked, both sides provisioned, the unit's fixed rehearsal probe set run through the real executor with its per-probe results in the per-side result fields, no model call). A rehearsal record is never scored and never counts as a measured result."
         },
         "fix_parent_provision": {
           "type": "object"
@@ -246,7 +257,7 @@
           "type": "boolean"
         },
         "schema_version": {
-          "const": "1.7.0"
+          "const": "1.8.0"
         },
         "scoring_version": {
           "description": "The scoring rule version; the only value the code produces is v2-per-probe.",
@@ -323,6 +334,8 @@
         "contract_env",
         "public_fixture_keys",
         "public_contract_env_keys",
+        "container_env_keys",
+        "dry_run",
         "captured_values",
         "minted_tokens",
         "auth_bootstrap",
@@ -424,7 +437,7 @@
           ]
         },
         "schema_version": {
-          "const": "1.7.0"
+          "const": "1.8.0"
         },
         "score_record_id": {
           "$ref": "#/$defs/record_id"
@@ -520,7 +533,7 @@
           "description": "The act request actually sent; null when no request was sent."
         },
         "schema_version": {
-          "const": "1.7.0"
+          "const": "1.8.0"
         },
         "sent": {
           "description": "Whether the probe was actually sent to the target.",
@@ -648,7 +661,7 @@
           ]
         },
         "schema_version": {
-          "const": "1.7.0"
+          "const": "1.8.0"
         },
         "scoring_version": {
           "type": "string"
@@ -699,7 +712,7 @@
   },
   "$id": "proofdeploy/docs/contract/result-record.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The record format written to runs.jsonl by proofdeploy/runpair.py at SCHEMA_VERSION 1.7.0 (proofdeploy/probe.py). One JSON object per line; exactly three record types: evidence, score, judgment. This schema uses only the keyword subset enforced by the stdlib validator in tests/test_runpair.py (type, enum, const, required, properties, additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref); every other keyword is annotation only. See docs/contract/result-contract.md for the prose contract.",
+  "description": "The record format written to runs.jsonl by proofdeploy/runpair.py at SCHEMA_VERSION 1.8.0 (proofdeploy/probe.py). One JSON object per line; exactly three record types: evidence, score, judgment. This schema uses only the keyword subset enforced by the stdlib validator in tests/test_runpair.py (type, enum, const, required, properties, additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref); every other keyword is annotation only. See docs/contract/result-contract.md for the prose contract.",
   "oneOf": [
     {
       "$ref": "#/$defs/evidence_record"
@@ -711,5 +724,5 @@
       "$ref": "#/$defs/judgment_record"
     }
   ],
-  "title": "ProofDeploy result record, schema_version 1.7.0"
+  "title": "ProofDeploy result record, schema_version 1.8.0"
 }

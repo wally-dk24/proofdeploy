@@ -1,0 +1,46 @@
+[
+  {
+    "setup": [],
+    "act": {
+      "method": "GET",
+      "path": "/api/profile/",
+      "headers": {"Authorization": "Token ${AUTH_TOKEN}"}
+    },
+    "assert": [{"type": "status", "equals": 200}]
+  },
+  {
+    "setup": [
+      {
+        "type": "http",
+        "act": {
+          "method": "POST",
+          "path": "/api/tags/",
+          "headers": {"Authorization": "Token ${AUTH_TOKEN}"},
+          "body": {"name": "pd-rehearsal"}
+        },
+        "capture": {"id": {"from": "body", "json_path": "id"}}
+      }
+    ],
+    "act": {
+      "method": "GET",
+      "path": "/api/tags/${id}/",
+      "headers": {"Authorization": "Token ${AUTH_TOKEN}"}
+    },
+    "assert": [{"type": "status", "equals": 200}]
+  },
+  {
+    "setup": [],
+    "act": {
+      "method": "GET",
+      "path": "/api/profile/",
+      "headers": {"Authorization": "Token ${AUTH_TOKEN}"}
+    },
+    "assert": [
+      {
+        "type": "db",
+        "query": "SELECT COUNT(*) FROM auth_user HAVING COUNT(*) >= 1",
+        "count": 1
+      }
+    ]
+  }
+]
