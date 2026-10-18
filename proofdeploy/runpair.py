@@ -611,6 +611,12 @@ def build_evidence_record(
     # hashes, seed/tools as sent). None when the model was not called
     # through the in-repo client.
     model_request: dict[str, Any] | None = None,
+    # D211 (schema 1.7.0): the model response's finish reason and
+    # usage accounting, exactly as returned by the provider. None
+    # when the response carried neither (or no model call
+    # completed). Recorded for audit; never used to score.
+    model_finish_reason: str | None = None,
+    model_usage: dict[str, Any] | None = None,
     # SHA-256 of the frozen author-prompt template file
     # (proofdeploy/author_prompt_v4.md). The template is versioned and
     # must be registered before any measured run.
@@ -780,6 +786,8 @@ def build_evidence_record(
         "model_attempts": model_attempts,
         "model_call_attempts": model_call_attempts,
         "model_request": model_request or {},
+        "model_finish_reason": model_finish_reason,
+        "model_usage": model_usage,
         "author_prompt_sha256": author_prompt_sha256,
         "author_prompt_builder_sha256": author_prompt_builder_sha256,
         "truncation_flags": truncation_flags or {},

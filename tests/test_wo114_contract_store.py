@@ -236,7 +236,7 @@ def test_measure_bug_uses_store_contract_with_no_in_tree_contract(tmp_path):
     records = read_records(tmp_path / "records")
     assert [r["record_type"] for r in records] == ["evidence", "score"]
     evidence = records[0]
-    assert evidence["schema_version"] == "1.6.0"
+    assert evidence["schema_version"] == "1.7.0"
     assert evidence["contract_source"] == {
         "store_path": str(contract),
         "sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),

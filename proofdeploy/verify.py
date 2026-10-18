@@ -361,6 +361,10 @@ class _VerifyRun:
             model_attempts=max(1, len(self.attempts)),
             model_call_attempts=self.attempts or None,
             model_request=raw.request_record if raw is not None else {},
+            model_finish_reason=(
+                raw.finish_reason if raw is not None else None
+            ),
+            model_usage=raw.usage if raw is not None else None,
             author_prompt_sha256=author_prompt_sha256(),
             author_prompt_builder_sha256=author_prompt_builder_sha256(),
             skill_sha256=None,

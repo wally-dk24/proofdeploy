@@ -500,7 +500,7 @@ def test_write_grant_and_mode_in_evidence_on_both_sides(
     assert evidence["write_grants"]["fix"] == expected
     assert evidence["sandbox_evidence"]["fix_parent"]["app_network_mode"] == "isolated"
     assert evidence["sandbox_evidence"]["fix"]["app_network_mode"] == "isolated"
-    assert evidence["schema_version"] == "1.6.0"
+    assert evidence["schema_version"] == "1.7.0"
 
 
 def test_write_grant_not_invented_for_unready_side(
@@ -563,7 +563,7 @@ def test_clean_run_records_write_grant(monkeypatch, tmp_path, app_server):
 
 # ---------------------------------------------------------------------------
 # Schema 1.3.0: new fields land; older records still load. (The
-# current-version pins below move with each bump — 1.6.0 (WO-1.14);
+# current-version pins below move with each bump — 1.7.0 (D211);
 # the downgrade-to-1.0.0 path further down is the old-record check.)
 # ---------------------------------------------------------------------------
 
@@ -572,11 +572,11 @@ def test_schema_130_and_old_records_still_load(tmp_path):
     from proofdeploy.probe import SCHEMA_VERSION
     from proofdeploy.runpair import build_evidence_record, read_records
 
-    # Schema 1.6.0 (WO-1.14 adds contract_source);
+    # Schema 1.7.0 (D211 adds model_finish_reason / model_usage);
     # the 1.3.0 write_grants behavior pinned here is unchanged.
-    assert SCHEMA_VERSION == "1.6.0"
+    assert SCHEMA_VERSION == "1.7.0"
     record = build_evidence_record(run_kind="bug", bug_id="WO73-SCHEMA")
-    assert record["schema_version"] == "1.6.0"
+    assert record["schema_version"] == "1.7.0"
     # Callers that do not pass grants get an empty mapping, never a
     # missing key crash for readers.
     assert record["write_grants"] == {}
