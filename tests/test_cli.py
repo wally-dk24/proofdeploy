@@ -1,6 +1,13 @@
 """Tests for the CLI surface (PRD FR-6)."""
 
-from proofdeploy.cli import build_parser, main
+import pytest
+
+from proofdeploy.cli import (
+    build_parser,
+    contract_bootstrap_env_names,
+    main,
+    validate_public_env_keys,
+)
 
 
 def test_verify_flags_match_prd():
@@ -163,3 +170,88 @@ def test_cmd_measure_bug_drives_orchestrator(tmp_path, monkeypatch, capsys):
     assert "def456" in out  # score SHA printed
     assert called["cfg"].bug_id == "cli-test-001"
     assert called["cfg"].no_skill is True
+
+
+# ----------------------------------------------------------------------
+# D203: public env key validation (measure.yml's public_env_keys).
+#
+# A contract env key may be declared public (--public-env-key) only
+# when its value is benign config the app itself prints in its own
+# files. Declared for a credential, the declaration would disarm
+# the bundle leak check for a real secret, so the workflow runs
+# validate_public_env_keys before the measure step and fails the
+# job on any refusal. These tests pin the ruled accept/refuse set.
+# ----------------------------------------------------------------------
+
+PAPERLESS_BOOTSTRAP = ["PAPERLESS_ADMIN_USER", "PAPERLESS_ADMIN_PASSWORD"]
+
+
+def test_public_env_keys_accept_the_paperless_backend_keys():
+    # The two keys D203 names: Django backend class paths copied
+    # from paperless's own pyproject test config — public config,
+    # not secrets.
+    assert validate_public_env_keys(
+        ["PAPERLESS_CHANNELS_BACKEND", "PAPERLESS_CACHE_BACKEND"],
+        bootstrap_env_names=PAPERLESS_BOOTSTRAP,
+    ) == ["PAPERLESS_CHANNELS_BACKEND", "PAPERLESS_CACHE_BACKEND"]
+
+
+def test_public_env_keys_accept_an_empty_list():
+    assert validate_public_env_keys([]) == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "PAPERLESS_SECRET_KEY",  # the one real secret in the contract
+        "PAPERLESS_ADMIN_PASSWORD",  # a generated bootstrap credential
+        "MY_API_KEY",
+        "SERVICE_TOKEN",
+        "DB_PASSWD",
+        "APP_CREDENTIAL_ID",
+    ],
+)
+def test_public_env_keys_refuse_credential_shaped_names(key):
+    with pytest.raises(ValueError):
+        validate_public_env_keys([key], bootstrap_env_names=[])
+
+
+def test_public_env_keys_refuse_a_lowercase_key():
+    with pytest.raises(ValueError):
+        validate_public_env_keys(["paperless_cache_backend"])
+
+
+def test_public_env_keys_refuse_an_empty_token():
+    with pytest.raises(ValueError):
+        validate_public_env_keys([""])
+
+
+def test_public_env_keys_refuse_a_bootstrap_name():
+    # PAPERLESS_ADMIN_USER matches no credential pattern; only the
+    # contract's auth.bootstrap_env listing refuses it — its value
+    # is a generated per-run credential.
+    with pytest.raises(ValueError):
+        validate_public_env_keys(
+            ["PAPERLESS_ADMIN_USER"],
+            bootstrap_env_names=PAPERLESS_BOOTSTRAP,
+        )
+
+
+def test_contract_bootstrap_env_names_resolves_the_store_entry():
+    # By slug (a dispatched unit_repo) and by target URL (the D202
+    # empty-unit_repo path) — the same committed paperless entry.
+    assert contract_bootstrap_env_names(
+        "paperless-ngx/paperless-ngx", None
+    ) == PAPERLESS_BOOTSTRAP
+    assert contract_bootstrap_env_names(
+        None, "https://github.com/paperless-ngx/paperless-ngx"
+    ) == PAPERLESS_BOOTSTRAP
+    assert contract_bootstrap_env_names(
+        None, "https://github.com/paperless-ngx/paperless-ngx.git"
+    ) == PAPERLESS_BOOTSTRAP
+
+
+def test_contract_bootstrap_env_names_unresolvable_is_none():
+    assert contract_bootstrap_env_names("no-such-owner/no-such-repo", None) is None
+    assert contract_bootstrap_env_names(None, "https://example.com/a/b") is None
+    assert contract_bootstrap_env_names(None, None) is None

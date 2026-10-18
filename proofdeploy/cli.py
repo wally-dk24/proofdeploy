@@ -11,10 +11,121 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+from collections.abc import Iterable
 from typing import Any
 
 from proofdeploy import __version__
+
+# ----------------------------------------------------------------------
+# D203: public env keys (measure.yml's `public_env_keys` input).
+#
+# A contract env value is a forbidden value for the bundle leak
+# check unless its key is declared public (--public-env-key). That
+# declaration is only ever legitimate for benign config the app
+# itself prints in its own files (e.g. Django backend class paths);
+# declared for a credential, it would disarm the leak check for a
+# real secret. The workflow therefore validates every dispatched key
+# with validate_public_env_keys BEFORE the measure step, failing the
+# job on any refusal. The CLI flag itself stays a plain repeatable
+# option; the gate lives here so it is unit-tested, not only shell.
+# ----------------------------------------------------------------------
+
+PUBLIC_ENV_KEY_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+# Anything named like a credential can never be declared public:
+# a secret/password/passwd/credential mention anywhere in the name,
+# or a name ending in a token / api-key / _key suffix.
+PUBLIC_ENV_KEY_REFUSAL_RE = re.compile(
+    r"secret|password|passwd|credential|token$|api_?key|_key$",
+    re.IGNORECASE,
+)
+
+
+def validate_public_env_keys(
+    keys: Iterable[str],
+    *,
+    bootstrap_env_names: Iterable[str] = (),
+) -> list[str]:
+    """Validate keys proposed for --public-env-key (D203).
+
+    Returns the keys, in order, when every one is acceptable.
+    Raises ValueError on the first refusal: the key is not a
+    well-formed env name (^[A-Z][A-Z0-9_]*$ — this refuses lowercase
+    names and empty tokens), it is named like a credential, or it
+    is one of the contract's auth.bootstrap_env names (whose values
+    are generated per run and are secrets by construction).
+    """
+    bootstrap = set(bootstrap_env_names)
+    accepted: list[str] = []
+    for key in keys:
+        if not PUBLIC_ENV_KEY_NAME_RE.match(key):
+            raise ValueError(
+                f"public env key {key!r} is not a valid env name "
+                "(^[A-Z][A-Z0-9_]*$)"
+            )
+        if PUBLIC_ENV_KEY_REFUSAL_RE.search(key):
+            raise ValueError(
+                f"public env key {key!r} is named like a credential "
+                "and can never be declared public"
+            )
+        if key in bootstrap:
+            raise ValueError(
+                f"public env key {key!r} is declared in the "
+                "contract's auth.bootstrap_env; its value is a "
+                "generated credential and can never be public"
+            )
+        accepted.append(key)
+    return accepted
+
+
+def _slug_from_repo_url(url: str) -> str | None:
+    """The "owner/repo" a GitHub URL names, parsed the way the
+    orchestrator's _repo_slug parses a clone's origin URL; None
+    when the URL names no GitHub owner/repo."""
+    marker = "github.com"
+    idx = url.find(marker)
+    if idx < 0:
+        return None
+    rest = url[idx + len(marker):].lstrip(":/")
+    if rest.endswith(".git"):
+        rest = rest[:-4]
+    parts = rest.split("/")
+    if len(parts) != 2 or not all(parts):
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def contract_bootstrap_env_names(
+    unit_repo: str | None,
+    target_repo: str | None,
+) -> list[str] | None:
+    """The dispatched unit contract's auth.bootstrap_env names.
+
+    The contract resolves exactly as the measured path resolves it
+    (REG-E): the unit_repo slug when one is dispatched, else the
+    owner/repo parsed from the target repo URL (the D202 path), and
+    the committed contract-store file for that slug. None when no
+    contract can be named or loaded — the caller fails closed.
+    """
+    from proofdeploy.yml import contract_store_path, load_contract
+
+    slug = unit_repo or (
+        _slug_from_repo_url(target_repo) if target_repo else None
+    )
+    if slug is None:
+        return None
+    try:
+        path = contract_store_path(slug)
+        contract = load_contract(path)
+    except (ValueError, FileNotFoundError, OSError):
+        return None
+    auth = contract.auth or {}
+    names = auth.get("bootstrap_env")
+    if not isinstance(names, list):
+        return []
+    return [str(n) for n in names]
 
 
 def build_parser() -> argparse.ArgumentParser:
