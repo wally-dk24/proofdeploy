@@ -614,7 +614,7 @@ def test_host_run_via_cli_json(tmp_path, monkeypatch, capsys):
     # INCONCLUSIVE (class environment, cause model_transport),
     # JSON on stdout, schema-valid.
     def _no_model(prompt: str, runner=None) -> ModelResponse:
-        raise RuntimeError("Groq credential unavailable (test)")
+        raise RuntimeError("model credential unavailable (test)")
 
     monkeypatch.setattr("proofdeploy.orchestrator.call_model", _no_model)
     repo, sha1, sha2 = _make_repo(tmp_path)
@@ -711,7 +711,7 @@ def test_model_runtime_error_normalized_to_transport(tmp_path):
 
     def runner(prompt: str) -> ModelResponse:
         calls.append(prompt)
-        raise RuntimeError("Groq API call failed: connection reset")
+        raise RuntimeError("model API call failed: connection reset")
 
     output, code = verify_mod.run_verify(
         repo_dir=repo, from_ref=sha1, to_ref=sha2,
@@ -727,7 +727,7 @@ def test_model_runtime_error_normalized_to_transport(tmp_path):
         for r in read_records(tmp_path / "records")
         if r["record_id"] == output["evidence_record"]["record_id"]
     )
-    assert "Groq API call failed" in (record["inconclusive_error"] or "")
+    assert "model API call failed" in (record["inconclusive_error"] or "")
 
 
 def test_author_output_invalid_is_inconclusive_probe(tmp_path, no_sandbox):
@@ -821,7 +821,7 @@ def test_inconclusive_matrix_class_and_cause(tmp_path, no_sandbox):
     repo, sha1, sha2 = _repo("runtime")
 
     def _runtime(prompt: str) -> ModelResponse:
-        raise RuntimeError("Groq API call failed: connection reset")
+        raise RuntimeError("model API call failed: connection reset")
 
     output, code = verify_mod.run_verify(
         repo_dir=repo, from_ref=sha1, to_ref=sha2,

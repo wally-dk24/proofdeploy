@@ -144,7 +144,7 @@ def sandbox_home_dir(checkout: Path) -> Path:
     return checkout.parent / f"{checkout.name}.pd-home"
 
 # Env vars that must never enter a container, even if present in the
-# caller's environment or contract env. The Groq key authenticates the
+# caller's environment or contract env. The model API key authenticates the
 # model client on the host; the container has no use for it and must
 # never see it.
 _SECRET_ENV_BLOCKLIST = frozenset({"GROQ_API_KEY"})

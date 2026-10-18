@@ -1,7 +1,7 @@
 """Blind probe-author model client (WO-5).
 
 Registered measurement configuration (do not change per-run):
-- model: ``openai/gpt-oss-120b`` through Groq
+- model: ``gpt-oss-120b`` through Cerebras (provider id ``cerebras``)
 - temperature: 0.2
 - exactly one attempt, no seed, no tools, no web
 
@@ -24,9 +24,9 @@ fail-closed leak check from ``proofdeploy.leakcheck`` over the prompt
 and every bundle file BEFORE calling the model.
 
 ``call_model`` takes an injectable ``runner`` so tests can substitute a
-canned response. The default runner calls Groq's chat-completions API
-directly over HTTPS (stdlib urllib) with the stored credential
-surrogate; it does not shell out.
+canned response. The default runner calls the provider's
+chat-completions API directly over HTTPS (stdlib urllib) with the
+stored credential surrogate; it does not shell out.
 """
 
 from __future__ import annotations
@@ -35,6 +35,8 @@ import hashlib
 import json
 import os
 import re
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -46,18 +48,22 @@ from proofdeploy import __version__
 # Registered measurement configuration. These are constants, not
 # parameters: a different model or temperature is a different
 # measurement and must be registered, not passed at call time.
-MODEL_ID = "openai/gpt-oss-120b"
+MODEL_ID = "gpt-oss-120b"
+# Provider id recorded in every evidence record (D206). The model is
+# the same weights as the previous registration; only the host — and
+# with it the model id string and the endpoint — changed.
+PROVIDER = "cerebras"
 TEMPERATURE = 0.2
 
 # Frozen author-prompt template. The file is versioned; its hash is in
 # every evidence record.
 PROMPT_TEMPLATE_FILENAME = "author_prompt_v7.md"
 
-_GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
-_GROQ_ALLOWED_HOSTS = ["api.groq.com"]
-# Groq's edge WAF 403s requests without a real User-Agent (2026-10-08).
+_MODEL_API = "https://api.cerebras.ai/v1/chat/completions"
+_MODEL_ALLOWED_HOSTS = ["api.cerebras.ai"]
+# The provider's edge 403s requests without a real User-Agent (2026-10-08).
 # Derived from the package version, never hardcoded.
-_GROQ_USER_AGENT = f"proofdeploy/{__version__}"
+_MODEL_USER_AGENT = f"proofdeploy/{__version__}"
 
 _DIFF_FILE_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
 
@@ -404,7 +410,7 @@ ModelRunner = Callable[[str], ModelResponse]
 
 
 def _credential_surrogate() -> Callable[[urllib.request.Request], None]:
-    """The stored-credential injector (same mechanism as the Groq skill)."""
+    """The stored-credential injector (authd surrogate mechanism)."""
     import sys
 
     sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
@@ -412,20 +418,21 @@ def _credential_surrogate() -> Callable[[urllib.request.Request], None]:
 
     def apply(req: urllib.request.Request) -> None:
         add_surrogate_to_request(
-            req, "custom.groq", allowed_hosts=_GROQ_ALLOWED_HOSTS
+            req, "custom.groq", allowed_hosts=_MODEL_ALLOWED_HOSTS
         )
 
     return apply
 
 
 def _apply_credential(req: urllib.request.Request) -> str:
-    """Attach the Groq credential to the request; return its source.
+    """Attach the model credential to the request; return its source.
 
-    Primary path is the authd surrogate (the same mechanism as the Groq
-    skill): the raw key never exists in this process. On hosts without
-    authd (e.g. GitHub Actions), fall back to the ``GROQ_API_KEY``
-    environment variable. The key value is never logged and never
-    enters the request record; only the source is recorded.
+    Primary path is the authd surrogate: the raw key never exists in
+    this process. On hosts without authd (e.g. GitHub Actions), fall
+    back to the ``GROQ_API_KEY`` environment variable (the env var
+    keeps its historical name; the sandbox blocklist and the CLI
+    redaction are keyed to it). The key value is never logged and
+    never enters the request record; only the source is recorded.
     """
     try:
         _credential_surrogate()(req)
@@ -435,55 +442,90 @@ def _apply_credential(req: urllib.request.Request) -> str:
     key = os.environ.get("GROQ_API_KEY", "")
     if not key:
         raise RuntimeError(
-            "Groq credential unavailable: no authd surrogate and "
+            "model credential unavailable: no authd surrogate and "
             "GROQ_API_KEY is not set"
         )
     req.add_header("Authorization", f"Bearer {key}")
     return "env"
 
 
-def groq_runner(prompt: str) -> ModelResponse:
-    """Default runner: the registered model via Groq's API, in-repo.
+def _assert_allowed_endpoint(url: str) -> None:
+    """Fail closed: the model request may only go to an allowlisted host."""
+    host = urllib.parse.urlparse(url).hostname
+    if host not in _MODEL_ALLOWED_HOSTS:
+        raise RuntimeError(f"model endpoint host not allowlisted: {host}")
 
-    One attempt, temperature 0.2, no seed, no tools, no web. The HTTPS
-    call is made directly (stdlib urllib); nothing is shelled out.
+
+def _error_body_excerpt(exc: urllib.error.HTTPError) -> str:
+    """Up to 500 chars of an HTTP error's response body, redacted.
+
+    D205(a): the status alone ("HTTP Error 413") hid the provider's
+    actual reason; the body excerpt carries it. A body can echo
+    request material, so the excerpt passes through the record
+    redactor (by value for the env credential, plus the JWT/Bearer
+    pattern backstops) before it can land in any record or log.
+    """
+    try:
+        raw = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    from proofdeploy.runpair import redact_secrets
+
+    secrets = [v for v in [os.environ.get("GROQ_API_KEY")] if v]
+    return str(redact_secrets(raw[:500], secrets))
+
+
+def model_runner(prompt: str) -> ModelResponse:
+    """Default runner: the registered model via the provider's API, in-repo.
+
+    One attempt, temperature 0.2, no seed, no tools, no web, no
+    reasoning_effort (the provider default applies). The HTTPS call
+    is made directly (stdlib urllib); nothing is shelled out.
     Raises RuntimeError if the call fails.
     """
+    _assert_allowed_endpoint(_MODEL_API)
     messages = [{"role": "user", "content": prompt}]
     body: dict[str, Any] = {
         "model": MODEL_ID,
         "messages": messages,
         "temperature": TEMPERATURE,
-        # seed and tools are deliberately ABSENT: the registered config
-        # sends neither. Their absence is recorded, not assumed.
+        # seed, tools and reasoning_effort are deliberately ABSENT:
+        # the registered config sends none of them. Their absence is
+        # recorded, not assumed.
     }
     request_record: dict[str, Any] = {
+        "provider": PROVIDER,
         "model": MODEL_ID,
         "temperature": TEMPERATURE,
         "seed": None,  # not sent
         "tools": None,  # not sent
+        "reasoning_effort": None,  # not sent (provider default)
         "message_hashes": _message_hashes(messages),
-        "endpoint": _GROQ_API,
+        "endpoint": _MODEL_API,
     }
     req = urllib.request.Request(
-        _GROQ_API,
+        _MODEL_API,
         data=json.dumps(body).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "User-Agent": _GROQ_USER_AGENT,
+            "User-Agent": _MODEL_USER_AGENT,
         },
     )
     request_record["credential_source"] = _apply_credential(req)
     try:
         with urllib.request.urlopen(req, timeout=240) as resp:
             out = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"model API call failed: HTTP {e.code}: {_error_body_excerpt(e)}"
+        ) from e
     except Exception as e:
-        raise RuntimeError(f"Groq API call failed: {e}") from e
+        raise RuntimeError(f"model API call failed: {e}") from e
     try:
         choice = out["choices"][0]
         msg = choice["message"]
     except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Groq API returned unexpected shape: {e}") from e
+        raise RuntimeError(f"model API returned unexpected shape: {e}") from e
     return ModelResponse(
         content=msg.get("content") or "",
         finish_reason=choice.get("finish_reason"),
@@ -494,4 +536,4 @@ def groq_runner(prompt: str) -> ModelResponse:
 
 def call_model(prompt: str, runner: ModelRunner | None = None) -> ModelResponse:
     """Call the registered model exactly once with the prompt."""
-    return (runner or groq_runner)(prompt)
+    return (runner or model_runner)(prompt)

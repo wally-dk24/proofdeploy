@@ -438,7 +438,7 @@ def cmd_measure(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    # The Groq key (when provided via env for CI) is redacted by value
+    # The model API key (when provided via env for CI) is redacted by value
     # in every record. It never enters a prompt or a container; this is
     # defense in depth so no accidental serialization can leak it.
     extra_secrets = [v for v in [os.environ.get("GROQ_API_KEY")] if v]
