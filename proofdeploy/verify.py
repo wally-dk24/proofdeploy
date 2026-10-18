@@ -628,7 +628,7 @@ class _VerifyRun:
         """One author call through the orchestrator.
 
         The pinned client's own transport failure surfaces as a bare
-        RuntimeError ("Groq API call failed: ..."); normalize it to
+        RuntimeError ("model API call failed: ..."); normalize it to
         the registered taxonomy — ModelCallError, cause
         model_transport — so the retry rule and the INCONCLUSIVE
         record see the same shape a measured run sees. An

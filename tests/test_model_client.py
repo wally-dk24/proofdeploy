@@ -4,6 +4,7 @@ import json
 
 from proofdeploy.model_client import (
     MODEL_ID,
+    PROVIDER,
     TEMPERATURE,
     ModelResponse,
     build_author_prompt,
@@ -14,7 +15,8 @@ from proofdeploy.model_client import (
 
 def test_registered_model_config():
     # The registered measurement configuration is fixed in code.
-    assert MODEL_ID == "openai/gpt-oss-120b"
+    assert MODEL_ID == "gpt-oss-120b"
+    assert PROVIDER == "cerebras"
     assert TEMPERATURE == 0.2
 
 
@@ -165,7 +167,7 @@ def test_call_model_uses_injected_runner():
     assert resp.finish_reason == "stop"
 
 
-def test_call_model_default_runner_is_groq(monkeypatch):
+def test_call_model_default_runner_is_cerebras(monkeypatch):
     import proofdeploy.model_client as mc
 
     seen: dict = {}
@@ -204,30 +206,114 @@ def test_call_model_default_runner_is_groq(monkeypatch):
     resp = call_model("the prompt")
     assert resp.content == "resp"
     assert resp.finish_reason == "stop"
-    assert seen["url"] == "https://api.groq.com/openai/v1/chat/completions"
+    assert seen["url"] == "https://api.cerebras.ai/v1/chat/completions"
     body = seen["body"]
-    assert body["model"] == "openai/gpt-oss-120b"
+    assert body["model"] == "gpt-oss-120b"
     assert body["temperature"] == 0.2
     assert body["messages"] == [{"role": "user", "content": "the prompt"}]
-    # No seed, no tools: the request sends exactly model + messages + temperature.
+    # The request body carries exactly these keys: no seed, no tools,
+    # no reasoning_effort is sent (the provider default applies).
+    assert set(body) == {"model", "messages", "temperature"}
     assert "seed" not in body
     assert "tools" not in body
-    # Groq's WAF requires a real User-Agent, derived from the package version.
+    assert "reasoning_effort" not in body
+    # The provider's edge requires a real User-Agent, derived from the
+    # package version.
     from proofdeploy import __version__
 
     assert seen["ua"] == f"proofdeploy/{__version__}"
     assert seen["cred_applied"]
     # The exact request is recorded for evidence.
     rec = resp.request_record
-    assert rec["model"] == "openai/gpt-oss-120b"
+    assert rec["provider"] == "cerebras"
+    assert rec["endpoint"] == "https://api.cerebras.ai/v1/chat/completions"
+    assert rec["model"] == "gpt-oss-120b"
     assert rec["temperature"] == 0.2
     assert rec["seed"] is None
     assert rec["tools"] is None
+    assert rec["reasoning_effort"] is None
     assert len(rec["message_hashes"]) == 1 and len(rec["message_hashes"][0]) == 64
 
 
+def test_runner_refuses_non_allowlisted_host(monkeypatch):
+    """The request may only go to api.cerebras.ai: an endpoint on any
+    other host is refused before anything is sent (D206)."""
+    import proofdeploy.model_client as mc
+
+    monkeypatch.setattr(
+        mc, "_MODEL_API", "https://api.groq.com/openai/v1/chat/completions"
+    )
+    called: dict = {}
+
+    def fake_urlopen(req, timeout=None):
+        called["url"] = req.full_url
+        raise AssertionError("urlopen must not be called for a refused host")
+
+    monkeypatch.setattr(mc.urllib.request, "urlopen", fake_urlopen)
+    try:
+        call_model("the prompt")
+    except RuntimeError as e:
+        assert "not allowlisted" in str(e)
+        assert "api.groq.com" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError for a non-allowlisted host")
+    assert called == {}
+
+
+def test_http_error_carries_status_and_redacted_body(monkeypatch):
+    """D205(a): an HTTP failure's error carries the status plus up to
+    500 chars of the response body — with secrets redacted before the
+    text can land in any record or log (D206)."""
+    import io
+    import urllib.error
+
+    import pytest
+
+    import proofdeploy.model_client as mc
+
+    key = "sk-test-key-123"
+
+    def no_authd():
+        raise RuntimeError("no authd here")
+
+    monkeypatch.setattr(mc, "_credential_surrogate", no_authd)
+    monkeypatch.setenv("GROQ_API_KEY", key)
+    body_text = (
+        f'{{"error": "key {key} rejected", '
+        '"echo": "Bearer tok-abcdef-123456", '
+        '"jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signaturepart", '
+        '"detail": "' + ("x" * 400) + 'TAILMARKER"}'
+    )
+    assert len(body_text) > 500
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            413,
+            "Payload Too Large",
+            hdrs=None,
+            fp=io.BytesIO(body_text.encode("utf-8")),
+        )
+
+    monkeypatch.setattr(mc.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError) as excinfo:
+        call_model("the prompt")
+    msg = str(excinfo.value)
+    # Status and the body's (redacted) reason survive.
+    assert "model API call failed: HTTP 413" in msg
+    # No secret material survives: not the env key by value, not the
+    # Bearer token, not the JWT.
+    assert key not in msg
+    assert "tok-abcdef-123456" not in msg
+    assert "eyJ" not in msg
+    assert "***REDACTED***" in msg
+    # The excerpt is capped at 500 body chars: the tail marker, placed
+    # beyond the cap, never appears.
+    assert "TAILMARKER" not in msg
+
+
 def test_credential_env_fallback(monkeypatch):
-    """Without authd, the Groq key comes from GROQ_API_KEY; the key value
+    """Without authd, the model key comes from GROQ_API_KEY; the key value
     never enters the request record, only the source is recorded."""
     import urllib.request
 
@@ -238,7 +324,7 @@ def test_credential_env_fallback(monkeypatch):
 
     monkeypatch.setattr(mc, "_credential_surrogate", no_authd)
     monkeypatch.setenv("GROQ_API_KEY", "sk-test-key-123")
-    req = urllib.request.Request("https://api.groq.com/openai/v1/chat/completions")
+    req = urllib.request.Request("https://api.cerebras.ai/v1/chat/completions")
     assert mc._apply_credential(req) == "env"
     assert req.get_header("Authorization") == "Bearer sk-test-key-123"
 
@@ -253,7 +339,7 @@ def test_credential_unavailable_raises(monkeypatch):
 
     monkeypatch.setattr(mc, "_credential_surrogate", no_authd)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    req = urllib.request.Request("https://api.groq.com/openai/v1/chat/completions")
+    req = urllib.request.Request("https://api.cerebras.ai/v1/chat/completions")
     try:
         mc._apply_credential(req)
     except RuntimeError as e:

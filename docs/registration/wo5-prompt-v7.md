@@ -146,7 +146,7 @@ Write your probes now: one fenced ```json block per probe.
 ## 2. Prompt builder
 
 - **Path:** `proofdeploy/model_client.py`
-- **SHA-256:** `55b7d93283d511b681f7af24dd78aafc0cc750d652ed965f94fe7a4ab1d28598`
+- **SHA-256:** `a35238a5a38b36ae691ab97861a064938787c5b14a49c380c009067a99f3785b`
   (at the commit that will merge; see below)
 
 **Statement:** Any change to the template (`proofdeploy/author_prompt_v7.md`)
