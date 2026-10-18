@@ -17,6 +17,15 @@
 # evidence record carries the Actions run URL/ID, runner image, and the
 # capability probe output.
 #
+# Public env keys (D203): the optional public_env_keys input names
+# contract env keys whose values are benign public config (e.g.
+# Django backend class paths the app itself prints in its own
+# files), so the bundle leak check does not refuse the run on them.
+# A validation step checks every key BEFORE the measure step and
+# fails the job on any refusal (see validate_public_env_keys in
+# proofdeploy/cli.py): credential-shaped names and the contract's
+# auth.bootstrap_env names can never be declared public.
+#
 # DO NOT TRIGGER before the reviewer has seen the exact contents.
 # Any change to this workflow goes back to review.
 
@@ -69,6 +78,11 @@ on:
         description: "C: the clean-diff commit"
         required: false
         type: string
+      public_env_keys:
+        description: "Contract env keys whose values are benign public config, not secrets (space-separated; validated fail-closed before the measure step)"
+        required: false
+        default: ""
+        type: string
 
 # Least privilege: only need to push records to this repo.
 permissions:
@@ -111,6 +125,44 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
+
+      - name: Validate public env keys (D203, fail closed)
+        if: ${{ inputs.public_env_keys != '' }}
+        env:
+          PUBLIC_ENV_KEYS: ${{ inputs.public_env_keys }}
+          UNIT_REPO: ${{ inputs.unit_repo }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          from proofdeploy.cli import (
+              contract_bootstrap_env_names,
+              validate_public_env_keys,
+          )
+
+          keys = os.environ["PUBLIC_ENV_KEYS"].split()
+          bootstrap = contract_bootstrap_env_names(
+              os.environ.get("UNIT_REPO") or None,
+              os.environ.get("TARGET_REPO") or None,
+          )
+          if bootstrap is None:
+              print(
+                  "public_env_keys: the dispatched unit's contract "
+                  "could not be resolved; refusing to validate",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          try:
+              accepted = validate_public_env_keys(
+                  keys, bootstrap_env_names=bootstrap
+              )
+          except ValueError as exc:
+              print(f"public_env_keys: {exc}", file=sys.stderr)
+              sys.exit(1)
+          print("public env keys accepted:", " ".join(accepted))
+          PY
 
       - name: Check out target repo
         # D154: golden units are materialized, not cloned.
@@ -171,6 +223,7 @@ jobs:
           FIX: ${{ steps.golden.outputs.fix || inputs.fix }}
           CLEAN_ID: ${{ inputs.clean_id }}
           CLEAN: ${{ steps.golden.outputs.clean || inputs.clean }}
+          PUBLIC_ENV_KEYS: ${{ inputs.public_env_keys }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_ID: ${{ github.run_id }}
           # Note: $ImageOS/$ImageVersion are available in the runner env;
@@ -199,6 +252,14 @@ jobs:
           else
             UNIT_ARGS=""
           fi
+          # D203: --public-env-key for each dispatched key. The keys
+          # were validated fail-closed by the step above (a bad key
+          # already failed the job); empty input expands to nothing
+          # and leaves the command line unchanged.
+          PUBLIC_ENV_ARGS=""
+          for key in $PUBLIC_ENV_KEYS; do
+            PUBLIC_ENV_ARGS="$PUBLIC_ENV_ARGS --public-env-key $key"
+          done
           if [ -n "$BUG_ID" ]; then
             OUTPUT=$(python -m proofdeploy.cli measure \
               --repo /tmp/target-repo \
@@ -206,6 +267,7 @@ jobs:
               --output-dir /tmp/output \
               $SKILL_ARGS \
               $UNIT_ARGS \
+              $PUBLIC_ENV_ARGS \
               --bug-id "$BUG_ID" \
               --base "$BASE" \
               --bug "$BUG" \
@@ -218,6 +280,7 @@ jobs:
               --output-dir /tmp/output \
               $SKILL_ARGS \
               $UNIT_ARGS \
+              $PUBLIC_ENV_ARGS \
               --clean-id "$CLEAN_ID" \
               --clean "$CLEAN" \
               $PROV_ARGS 2>&1)

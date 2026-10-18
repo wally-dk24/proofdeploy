@@ -283,3 +283,60 @@ def test_real_repo_path_commands_are_unchanged():
         '--clean "$CLEAN"',
     ):
         assert line in run, line
+
+
+# ----------------------------------------------------------------------
+# D203: measure.yml's public_env_keys input — workflow shape.
+#
+# The blind run on paperless stopped pre-measurement: the bundle
+# leak check found two contract env VALUES inside the app's own
+# pyproject.toml — Django backend class paths the contract copies
+# from the app's own test config. The values are benign public
+# config, but the run had no way to say so: --public-env-key
+# existed in the CLI and measure.yml could not pass it. D203 adds
+# the input, a fail-closed validation step ahead of the measure
+# step, and the flag on both measure invocations. The validator
+# itself is unit-tested in test_cli.py; these tests pin the
+# workflow's shape only.
+# ----------------------------------------------------------------------
+
+VALIDATE_STEP = "Validate public env keys (D203, fail closed)"
+
+
+def test_public_env_keys_input_shape():
+    data = _measure_workflow()
+    on = data.get("on", data.get(True))
+    keys = on["workflow_dispatch"]["inputs"]["public_env_keys"]
+    assert keys["type"] == "string"
+    assert keys["required"] is False
+    assert keys["default"] == ""
+
+
+def test_public_env_keys_validation_step_runs_before_measure():
+    names = [step.get("name") for step in _measure_steps()]
+    assert names.index(VALIDATE_STEP) < names.index("Run measured unit")
+    step = _measure_step(VALIDATE_STEP)
+    # Skipped entirely when the input is empty: behaviour is then
+    # exactly as before D203.
+    assert step["if"] == "${{ inputs.public_env_keys != '' }}"
+    env = step["env"]
+    assert env["PUBLIC_ENV_KEYS"] == "${{ inputs.public_env_keys }}"
+    assert env["UNIT_REPO"] == "${{ inputs.unit_repo }}"
+    assert env["TARGET_REPO"] == "${{ inputs.target_repo }}"
+    run = step["run"]
+    assert "from proofdeploy.cli import" in run
+    assert "contract_bootstrap_env_names" in run
+    assert "validate_public_env_keys" in run
+    # An unresolvable contract fails the job, never waves keys past.
+    assert "sys.exit(1)" in run
+
+
+def test_measure_step_passes_public_env_keys_on_both_invocations():
+    measure = _measure_step("Run measured unit")
+    assert measure["env"]["PUBLIC_ENV_KEYS"] == "${{ inputs.public_env_keys }}"
+    run = measure["run"]
+    assert 'PUBLIC_ENV_ARGS=""' in run
+    assert 'PUBLIC_ENV_ARGS="$PUBLIC_ENV_ARGS --public-env-key $key"' in run
+    assert "for key in $PUBLIC_ENV_KEYS; do" in run
+    # Expanded in BOTH measure invocations (bug and clean).
+    assert run.count("$PUBLIC_ENV_ARGS \\") == 2
