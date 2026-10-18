@@ -1402,41 +1402,49 @@ def test_result_contract_rejects_corrupted_records():
 
 
 # ---------------------------------------------------------------------------
-# D211 (schema 1.7.0): model_finish_reason / model_usage are recorded
-# (never scored); a stored 1.6.0 record still loads.
+# D220/D221 (schema 1.8.0): container_env_keys / dry_run are recorded
+# (never scored); a stored 1.7.0 record still loads. The D211 fields
+# (model_finish_reason / model_usage) ride along below.
 # ---------------------------------------------------------------------------
 
-def test_schema_170_record_validates_and_160_record_still_loads(tmp_path):
+def test_schema_180_record_validates_and_170_record_still_loads(tmp_path):
     schema = _load_contract_schema()
     usage = {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
     record = build_evidence_record(
         run_kind="bug",
-        bug_id="D211-SCHEMA",
+        bug_id="D220-SCHEMA",
         model_finish_reason="stop",
         model_usage=usage,
+        container_env_keys=["APP_ENV", "APP_SECRET_KEY"],
+        dry_run="provision",
     )
-    assert SCHEMA_VERSION == "1.7.0"
-    assert record["schema_version"] == "1.7.0"
+    assert SCHEMA_VERSION == "1.8.0"
+    assert record["schema_version"] == "1.8.0"
     assert record["model_finish_reason"] == "stop"
     assert record["model_usage"] == usage
+    assert record["container_env_keys"] == ["APP_ENV", "APP_SECRET_KEY"]
+    assert record["dry_run"] == "provision"
     errors = _contract_errors(record, schema, schema)
     assert errors == [], errors
 
-    # Defaults: no model response values -> both fields present, null.
-    bare = build_evidence_record(run_kind="bug", bug_id="D211-SCHEMA-BARE")
+    # Defaults: no values passed -> fields present, empty / null.
+    bare = build_evidence_record(run_kind="bug", bug_id="D220-SCHEMA-BARE")
     assert bare["model_finish_reason"] is None
     assert bare["model_usage"] is None
+    assert bare["container_env_keys"] == []
+    assert bare["dry_run"] is None
     assert _contract_errors(bare, schema, schema) == []
 
-    # A stored 1.6.0 record (neither key present) still loads.
+    # A stored 1.7.0 record (neither new key present) still loads.
     old = dict(record)
-    old["schema_version"] = "1.6.0"
-    del old["model_finish_reason"]
-    del old["model_usage"]
+    old["schema_version"] = "1.7.0"
+    del old["container_env_keys"]
+    del old["dry_run"]
     (tmp_path / "runs.jsonl").write_text(
         json.dumps(old) + "\n", encoding="utf-8"
     )
     loaded = read_records(tmp_path)
     assert loaded[0]["record_id"] == record["record_id"]
-    assert loaded[0].get("model_finish_reason") is None
-    assert loaded[0].get("model_usage") is None
+    assert loaded[0].get("container_env_keys") is None
+    assert loaded[0].get("dry_run") is None
+    assert loaded[0].get("model_finish_reason") == "stop"

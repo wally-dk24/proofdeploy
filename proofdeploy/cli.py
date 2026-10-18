@@ -284,6 +284,23 @@ def build_parser() -> argparse.ArgumentParser:
             "sha256 and the bundle manifest."
         ),
     )
+    m.add_argument(
+        "--dry-run-provision",
+        action="store_true",
+        help=(
+            "Provision rehearsal (D222): assemble and leak-check the "
+            "author bundle, provision BOTH sides of a bug unit "
+            "through the measured path (seed included), run the "
+            "unit's fixed rehearsal probe set "
+            "(readiness/rehearsal/<owner>__<repo>.json) through the "
+            "real executor on both sides, write an evidence record "
+            "marked dry_run=provision (per-side READY, per-probe "
+            "rehearsal results, container env key names), then stop. "
+            "No model call is made and the model API key is not "
+            "read. Exits non-zero unless every side is READY and "
+            "every rehearsal probe passes on both sides."
+        ),
+    )
     return p
 
 
@@ -438,10 +455,18 @@ def cmd_measure(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # D221: the provision rehearsal makes no model call, so the key
+    # is not even READ in that mode — a rehearsal must be runnable
+    # in an environment where the key is absent or unapproved.
+    dry_run_provision = bool(getattr(args, "dry_run_provision", False))
     # The model API key (when provided via env for CI) is redacted by value
     # in every record. It never enters a prompt or a container; this is
     # defense in depth so no accidental serialization can leak it.
-    extra_secrets = [v for v in [os.environ.get("GROQ_API_KEY")] if v]
+    extra_secrets = (
+        []
+        if dry_run_provision
+        else [v for v in [os.environ.get("GROQ_API_KEY")] if v]
+    )
     cfg = MeasureConfig(
         repo_dir=Path(args.repo),
         output_dir=Path(args.output_dir),
@@ -473,6 +498,7 @@ def cmd_measure(args: argparse.Namespace) -> int:
         dry_run_before_model=bool(
             getattr(args, "dry_run_before_model", False)
         ),
+        dry_run_provision=dry_run_provision,
     )
     orch = Orchestrator(cfg)
     try:
@@ -483,6 +509,13 @@ def cmd_measure(args: argparse.Namespace) -> int:
     import json
 
     print(json.dumps(summary, indent=2))
+    # D222: a provision rehearsal that did not get every side READY
+    # with every rehearsal probe passing is a FAILED rehearsal —
+    # the exit code carries it, so a workflow gate cannot miss it.
+    if summary.get("dry_run") == "provision" and not summary.get(
+        "provision_rehearsal_ok"
+    ):
+        return 1
     return 0
 
 

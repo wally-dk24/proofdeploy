@@ -65,15 +65,19 @@ install steps therefore pin the store into /pd-home through pnpm's
 env config channel, unless the app declares its own store location
 (install_steps, _pnpm_store_dir_declared).
 
-Customer secrets never enter the container environment. The contract
-env passed to the sandbox must already be secret-free (the
-orchestrator passes only declared-public config); auth tokens travel
-over HTTP, not env. The one exception is per-run credentials
-ProofDeploy itself generates for the disposable instance (WO-8.3,
-under Master's rule-9 clarification in ADR-0009 / Addendum 43): the
-orchestrator merges that side's generated bootstrap values into the
-install and app env — fresh per side and per run, redacted from every
-record, never committed.
+HOST secrets never enter the container environment: this module
+strips its blocklist (the model API key) from every env it is
+handed, whatever the caller passes. The contract env itself is the
+CALLER's decision (D220): on the measured (contract-store) path the
+orchestrator passes the target app's own declared contract env in
+full — the app's configuration for itself, which its install steps
+require — while other paths pass only the declared-public subset.
+Either way, the orchestrator registers every non-public contract
+value, and per-run credentials ProofDeploy itself generates for the
+disposable instance (WO-8.3, under Master's rule-9 clarification in
+ADR-0009 / Addendum 43), with this sandbox's log redaction
+(register_secret_values), so no command echo or log line can carry
+them; auth tokens travel over HTTP, not env.
 
 Python is supported (venv inside the checkout), and Node too
 (node_modules inside the checkout, frozen installs from the lockfile,
@@ -1112,7 +1116,8 @@ class Sandbox:
     ) -> bool:
         """Run install/build commands WITH network (proxy enabled).
 
-        ``env`` is the secret-free contract env. ``proxy_env`` carries
+        ``env`` is the container contract env (D220; host secrets are
+        stripped below). ``proxy_env`` carries
         the egress proxy for the install only.
         """
         steps = [{"phase": "install", "command": c} for c in commands]
@@ -1139,7 +1144,8 @@ class Sandbox:
         Returns ``[{"phase": ..., "exit_code": int}]`` for the steps
         ATTEMPTED, stopping after the first failure: a step that
         never ran is not reported as run (Addendum 31).
-        ``env`` is the secret-free contract env; ``proxy_env`` carries
+        ``env`` is the container contract env (D220; host secrets are
+        stripped below); ``proxy_env`` carries
         the egress proxy for the install only.
         """
         self._prepare_checkout(checkout)

@@ -79,7 +79,7 @@ from proofdeploy.model_client import (
     build_author_prompt,
     call_model,
 )
-from proofdeploy.probe import ProbeSet
+from proofdeploy.probe import ProbeRejected, ProbeSet, validate_probe
 from proofdeploy.provisioning import (
     InstallPlan,
     build_backend_evidence,
@@ -121,6 +121,7 @@ from proofdeploy.yml import (
     contract_store_path,
     load_contract,
     proofdeploy_tree_root,
+    rehearsal_set_path,
 )
 
 # Fixture keys rendered into the author-facing description by design.
@@ -441,6 +442,16 @@ class MeasureConfig:
     # immediately before the model call (no spend, no provisioning,
     # no records). Set by `measure --dry-run-before-model`.
     dry_run_before_model: bool = False
+    # Provision rehearsal (D222): assemble and leak-check the
+    # bundle, provision BOTH sides of a bug unit through the
+    # measured path (seed included), run the unit's FIXED
+    # rehearsal probe set through the real executor on both
+    # sides, write an evidence record marked dry_run="provision"
+    # (per-side READY + per-probe rehearsal results +
+    # container_env_keys), then stop — no model call, and the
+    # CLI does not even read the model API key in this mode.
+    # Set by `measure --dry-run-provision`.
+    dry_run_provision: bool = False
 
     @property
     def run_kind(self) -> str:
@@ -846,6 +857,44 @@ class Orchestrator:
             return dict(self._unit_contract_source)
         return None
 
+    def _container_contract_env(self, contract: RepoContract) -> dict[str, str]:
+        """The contract env a side's sandbox install and app
+        containers receive (D220).
+
+        One list used to carry two meanings. ``public_contract_env_keys``
+        is the LEAK-GATE exemption — the contract env keys whose
+        values may appear in the author bundle — and it still governs
+        only that (see ``_leak_check_bundle``). The CONTAINER env is
+        a different question: what the app itself needs in its
+        environment to install and run. On the measured path the
+        contract comes from the committed store, and readiness has
+        always provisioned the same store contract with its FULL
+        env (readiness hands the loader every contract key as its
+        run's public list, so its containers received all of them).
+        The blind run (39149875917) declared only its two leak-gate
+        keys, so PAPERLESS_SECRET_KEY, PAPERLESS_DBENGINE,
+        PAPERLESS_DATA_DIR and PAPERLESS_TOKEN_THROTTLE_RATE never
+        reached the container and both sides died at install —
+        INCONCLUSIVE (environment), our gap.
+
+        Rule: when the unit's contract comes from the contract
+        store (``contract_source`` set — the measured path), the
+        containers receive the contract's full env. Every other
+        path (verify, dev — no store contract) keeps the
+        declared-public filter exactly as before. Contract values
+        stay secret-collected for record redaction unless declared
+        public, whichever path supplies them, and the record names
+        the keys the containers received (``container_env_keys``,
+        names only).
+        """
+        if self._unit_contract_source is not None:
+            return dict(contract.env)
+        return {
+            k: v
+            for k, v in contract.env.items()
+            if k in self.cfg.public_contract_env_keys
+        }
+
     def _measured_result(self, use_sandbox: bool) -> bool:
         """Whether this run's record counts as a measured result
         (D167). A sandboxed run counts — except a smoke run: a unit
@@ -963,6 +1012,259 @@ class Orchestrator:
             "bundle_manifest_sha256": manifest_sha,
             "bundle_manifest": manifest,
         }
+
+    def _load_rehearsal_probes(self) -> list[dict[str, Any]]:
+        """The unit's FIXED rehearsal probe set (D222).
+
+        Committed per unit at readiness/rehearsal/<owner>__<repo>.json
+        — OUTSIDE the contract (the contract file and its recorded
+        sha256 are untouched by the rehearsal). The file is a JSON
+        array of probes in the production probe schema; every probe
+        is validated with the production parser (validate_probe)
+        before anything is provisioned. A unit with no committed
+        set, an unreadable or unparseable file, or a probe the
+        schema rejects is a typed refusal (OrchestratorError): the
+        rehearsal never improvises probes.
+        """
+        slug = self._repo_slug()
+        if slug is None:
+            raise OrchestratorError(
+                "provision rehearsal: no rehearsal probe set can be "
+                "named for this unit: unit_repo is unset and the "
+                "target repo's origin remote does not name a "
+                "GitHub owner/repo"
+            )
+        try:
+            path = rehearsal_set_path(slug)
+        except ValueError as exc:
+            raise OrchestratorError(
+                f"provision rehearsal: no rehearsal probe set can "
+                f"be named for this unit: {exc}"
+            ) from exc
+        display = self._store_display_path(path)
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise OrchestratorError(
+                f"provision rehearsal: rehearsal probe set not "
+                f"readable at {display}: {exc}"
+            ) from exc
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise OrchestratorError(
+                f"provision rehearsal: rehearsal probe set at "
+                f"{display} is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(data, list) or not data:
+            raise OrchestratorError(
+                f"provision rehearsal: rehearsal probe set at "
+                f"{display} must be a non-empty JSON array of probes"
+            )
+        probes: list[dict[str, Any]] = []
+        for i, probe in enumerate(data):
+            try:
+                probes.append(validate_probe(probe))
+            except ProbeRejected as exc:
+                raise OrchestratorError(
+                    f"provision rehearsal: probe {i} in {display} "
+                    f"fails the probe schema: {exc}"
+                ) from exc
+        return probes
+
+    def _dry_run_provision_bug(
+        self,
+        cfg: MeasureConfig,
+        unit_dir: Path,
+        repo: Path,
+        *,
+        bundle: Any,
+        manifest: dict[str, Any],
+        manifest_sha: str,
+        prompt: str,
+        use_sandbox: bool,
+        capability_probe: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Provision rehearsal (--dry-run-provision, D222).
+
+        The bundle is already assembled and leak-checked (the caller
+        is measure_bug, past _build_bundle and the answer-key check).
+        This provisions BOTH sides through the measured code path —
+        the same revs, the same lock cutoff, the same provisioning
+        functions the scored run uses, seed included (the seed is an
+        install-phase step) — then runs the unit's FIXED rehearsal
+        probe set (readiness/rehearsal/<owner>__<repo>.json, loaded
+        and schema-validated by _load_rehearsal_probes) through the
+        REAL executor on both sides, writes an evidence record
+        marked dry_run="provision", and stops. The record holds the
+        per-side provision results (READY or not), the per-probe
+        rehearsal results in the usual per-side result fields, and
+        container_env_keys. No model call is made — the author is
+        never invoked on this path, and the CLI does not even read
+        the API key in this mode — no score record is written, and
+        the record never counts as a measured result. The
+        rehearsal's writes go through the executor's ordinary write
+        grant: a refused write is reported in the probe result,
+        never granted around. The point (D67): prove the SAME bug's
+        environment end to end — provisioning, seed, auth, and real
+        requests — before spending the blind run on it.
+        """
+        probes = self._load_rehearsal_probes()
+        if not cfg.rev_fix:
+            raise OrchestratorError("provision rehearsal needs rev_fix")
+        fix_rev = cfg.rev_fix
+        prov_workdir = cfg.workdir / "provisioner"
+        prov_workdir.mkdir(parents=True, exist_ok=True)
+        runner = Provisioner(workdir=prov_workdir)
+        # The pair the scored run compares: fix^ vs fix (never B).
+        fix_parent_rev = f"{fix_rev}^"
+        repo_dir = self.cfg.repo_dir
+        b_sha = _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_bug}^{{commit}}")
+        b_parent_sha = _git(
+            repo_dir, "rev-parse", "--verify", f"{cfg.rev_bug_base}^{{commit}}"
+        )
+        fix_sha = _git(repo_dir, "rev-parse", "--verify", f"{cfg.rev_fix}^{{commit}}")
+        fix_parent_sha = _git(
+            repo_dir, "rev-parse", "--verify", f"{fix_parent_rev}^{{commit}}"
+        )
+        sides: list[_Side] = []
+        if use_sandbox:
+            self._resolve_run_network_mode()
+        try:
+            self._run_lock_cutoff = self._commit_cutoff(fix_sha)
+            if use_sandbox:
+                sides.append(
+                    self._provision_side_sandbox(
+                        fix_parent_rev, _free_port(), unit_dir, "fix-parent"
+                    )
+                )
+                sides.append(
+                    self._provision_side_sandbox(
+                        fix_rev, _free_port(), unit_dir, "fix"
+                    )
+                )
+            else:
+                sides.append(
+                    self._provision_side(
+                        runner, fix_parent_rev, _free_port(), unit_dir, "fix-parent"
+                    )
+                )
+                sides.append(
+                    self._provision_side(
+                        runner, fix_rev, _free_port(), unit_dir, "fix"
+                    )
+                )
+            parent, fix = sides
+            self._check_single_network_mode(sides)
+            rehearsal: dict[str, dict[str, Any]] = {}
+            side_results: dict[str, list[Any]] = {}
+            for name, side in (("fix_parent", parent), ("fix", fix)):
+                results: list[Any] = []
+                if side.provision.ready:
+                    side.executor = self._make_executor(side)
+                    try:
+                        results = [
+                            side.executor.run_probe(p, i)
+                            for i, p in enumerate(probes)
+                        ]
+                    finally:
+                        side.executor.close()
+                side_results[name] = results
+                entry: dict[str, Any] = {
+                    "ready": bool(side.provision.ready),
+                    "probes": [
+                        {"index": r.probe_index, "verdict": r.verdict.value}
+                        for r in results
+                    ],
+                    "all_passed": bool(results)
+                    and all(r.verdict.value == "pass" for r in results),
+                }
+                self._say(
+                    f"provision rehearsal {name}: "
+                    f"{'READY' if entry['ready'] else 'NOT READY'}; "
+                    f"probes "
+                    f"{[p['verdict'] for p in entry['probes']]}"
+                )
+                rehearsal[name] = entry
+            container_env_keys = sorted(
+                set(self._container_contract_env(parent.contract))
+                | set(self._container_contract_env(fix.contract))
+            )
+            record = build_evidence_record(
+                run_kind="bug",
+                bug_id=cfg.bug_id,
+                fix_sha=fix_sha,
+                fix_parent_sha=fix_parent_sha,
+                b_sha=b_sha,
+                b_parent_sha=b_parent_sha,
+                prompt=prompt,
+                bundle_manifest=manifest,
+                bundle_manifest_sha256=manifest_sha,
+                sandbox_evidence={
+                    "fix_parent": parent.sandbox_evidence or {},
+                    "fix": fix.sandbox_evidence or {},
+                },
+                write_grants={
+                    "fix_parent": self._write_grant(parent),
+                    "fix": self._write_grant(fix),
+                },
+                auth_bootstrap={
+                    "fix_parent": self._auth_bootstrap(parent),
+                    "fix": self._auth_bootstrap(fix),
+                },
+                sandboxed=use_sandbox,
+                measured_result=False,
+                provenance=self._provenance(capability_probe),
+                contract_source=self._contract_source_record(),
+                fix_parent_provision=parent.provision.to_dict(),
+                fix_provision=fix.provision.to_dict(),
+                fix_parent_results=side_results["fix_parent"],
+                fix_results=side_results["fix"],
+                runner_log=list(self.log),
+                fixture=dict(parent.contract.fixture),
+                contract_env=dict(parent.contract.env),
+                public_fixture_keys=list(PUBLIC_FIXTURE_KEYS),
+                public_contract_env_keys=list(self.cfg.public_contract_env_keys),
+                container_env_keys=container_env_keys,
+                dry_run="provision",
+            )
+            secret_values = self._record_secret_values([parent, fix])
+            record_id, _, evidence_sha = write_evidence_record(
+                record, repo, repo, secret_values=secret_values
+            )
+            self._say(f"evidence committed: {evidence_sha[:12]}")
+            rehearsal_ok = all(
+                entry["ready"] and entry["all_passed"]
+                for entry in rehearsal.values()
+            )
+            return {
+                "run_kind": "bug",
+                "bug_id": cfg.bug_id,
+                "dry_run": "provision",
+                "stopped_before_model_call": True,
+                "evidence_record_id": record_id,
+                "evidence_commit": evidence_sha,
+                "contract_source": self._contract_source_record(),
+                "container_env_keys": container_env_keys,
+                "sides": rehearsal,
+                "provision_rehearsal_ok": rehearsal_ok,
+                "measured_result": False,
+            }
+        finally:
+            # Addendum 46: the run cutoff dies with the run; the
+            # rehearsal's apps stop on every exit path, as the scored
+            # run's do.
+            self._run_lock_cutoff = None
+            for side in sides:
+                if side.provision and side.provision.ready and side.provision.run_id:
+                    proc = side.provision.proc
+                    if isinstance(proc, SandboxApp):
+                        proc.stop()
+                        self._say(f"sandbox stop: {side.provision.run_id}")
+                    else:
+                        runner.stop_target(proc, self.log)
+                        runner.cleanup_run(side.provision.run_id, self.log)
+                        self._say(f"cleanup_run: {side.provision.run_id}")
 
     # ------------------------------------------------------------------
     # Bundle and authoring (steps a-c).
@@ -1287,6 +1589,14 @@ class Orchestrator:
             runner_log=list(runner_log) if runner_log else list(self.log),
             crash_provisioning=provisioning or {},
             crash_probe_results=probe_results,
+            # D220: sides are not in scope on this path; when the
+            # store contract was loaded, its container keys are the
+            # run's (the provisioning that crashed used them).
+            container_env_keys=(
+                sorted(self._container_contract_env(self._unit_contract))
+                if self._unit_contract is not None
+                else []
+            ),
         )
         # WO-8.3: a crash after provisioning can carry generated
         # bootstrap values in its logs/results; the callers pass the
@@ -1533,8 +1843,10 @@ class Orchestrator:
         # exactly this way). The exemption is scoped to that one file
         # and those declared values: the values stay forbidden in the
         # prompt (checked above), in the diff, and in every other
-        # bundle file, and they are still redacted from records and
-        # kept out of container environments downstream.
+        # bundle file, and they are still redacted from records.
+        # D220 does not widen this gate: the container env is a
+        # separate list (see _container_contract_env); only the
+        # declared public keys are exempt here, on every path.
         declared_env_values = {
             v for v in contract.env.values() if isinstance(v, str)
         }
@@ -1656,7 +1968,10 @@ class Orchestrator:
 
         The app is installed with network, then run in a de-privileged
         container with no external network, only the checkout mounted,
-        and no secrets in the container environment (WO-5 brief).
+        and no HOST secrets in the container environment (WO-5 brief;
+        the sandbox strips the model key by blocklist). The contract
+        env the containers receive follows D220 — see
+        _container_contract_env.
         """
         repo = self.cfg.repo_dir
         sha = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
@@ -1802,11 +2117,15 @@ class Orchestrator:
                 network_mode=self._run_network_mode or self.cfg.network_mode,
             )
         )
-        # Secret-free contract env only; never the full env.
-        secret_free_env = {
-            k: v for k, v in contract.env.items()
-            if k in cfg.public_contract_env_keys
-        }
+        # D220: the env this side's install and app containers
+        # receive — the contract's FULL env when the contract comes
+        # from the store (the measured path, exactly as readiness
+        # provisions the same contract), the declared-public subset
+        # on every other path. This is NOT the leak-gate list: the
+        # gate keeps exempting only the declared public keys, and
+        # every non-public value is registered for redaction below.
+        # See _container_contract_env.
+        container_env = self._container_contract_env(contract)
         # WO-8.3 (Addenda 43/44): per-run bootstrap credentials for
         # THIS side. The contract declares env names only; the values
         # are generated fresh here, per side and per run, and are the
@@ -1814,8 +2133,6 @@ class Orchestrator:
         # credentials ProofDeploy itself generated for this disposable
         # instance, injected into its install and app containers below
         # and recorded only as "generated" with their env names.
-        # Customer secrets still never enter any container: the base
-        # env above stays the declared-public contract env only.
         bootstrap = self._side_bootstrap(contract)
         if bootstrap:
             logs.append(
@@ -1825,6 +2142,19 @@ class Orchestrator:
             # registered with the sandbox so its logs (command echoes
             # carry -e KEY=VALUE) can never hold them.
             sb.register_secret_values(bootstrap.values())
+        # D221 item 2: every NON-public contract env value is
+        # registered with the sandbox redaction on the same terms —
+        # on the store path those values now ride the container env
+        # (D220), so a -e KEY=VALUE command echo, an install log, or
+        # an app log must never carry one. Public values are config
+        # the app itself prints; they are not registered.
+        non_public_values = [
+            v
+            for k, v in contract.env.items()
+            if k not in cfg.public_contract_env_keys and isinstance(v, str)
+        ]
+        if non_public_values:
+            sb.register_secret_values(non_public_values)
 
         # S1 (Addendum 15): one install path, now the adapter's plan.
         # The old sandbox code ran `pip install` in a --rm install
@@ -1958,7 +2288,7 @@ class Orchestrator:
         # WO-8.3: the install phase (build/migrate/seed) runs with this
         # side's generated bootstrap values in its env — the seed is
         # what bootstraps the instance's first credential from them.
-        install_env = dict(secret_free_env)
+        install_env = dict(container_env)
         install_env.update(bootstrap)
         if runtime_name == "python":
             install_env["PIP_NO_CACHE_DIR"] = "1"
@@ -2135,12 +2465,13 @@ class Orchestrator:
         try:
             # WO-8.3: the app container also gets this side's generated
             # bootstrap values (e.g. an instance that reads its admin
-            # credentials from env on every boot), over the secret-free
-            # public contract env.
+            # credentials from env on every boot), over the container
+            # contract env (D220: the full contract env on the store
+            # path, the declared-public subset elsewhere).
             app = sb.start(
                 snapshot.dir,
                 start_cmd,
-                {**secret_free_env, **bootstrap},
+                {**container_env, **bootstrap},
                 port,
                 name=app_name,
                 # Plan 1.2(o): the contract's declared app.port, when
@@ -2486,6 +2817,20 @@ class Orchestrator:
                 manifest=manifest,
                 manifest_sha=manifest_sha,
             )
+        if cfg.dry_run_provision:
+            # D222: provision rehearsal — both sides provisioned,
+            # the fixed rehearsal probe set run on both, record
+            # written, and the run stops here: the model is never
+            # called on this path.
+            return self._dry_run_provision_bug(
+                cfg, unit_dir, repo,
+                bundle=bundle,
+                manifest=manifest,
+                manifest_sha=manifest_sha,
+                prompt=prompt,
+                use_sandbox=use_sandbox,
+                capability_probe=capability_probe,
+            )
         # Model call with retry per the registered rule:
         # - model_transport: exactly one retry, both attempts in evidence.
         # - model_overflow: no retry.
@@ -2673,6 +3018,10 @@ class Orchestrator:
                 contract_env=dict(parent.contract.env),
                 public_fixture_keys=list(PUBLIC_FIXTURE_KEYS),
                 public_contract_env_keys=list(self.cfg.public_contract_env_keys),
+                container_env_keys=sorted(
+                    set(self._container_contract_env(parent.contract))
+                    | set(self._container_contract_env(fix.contract))
+                ),
             )
             record_id, _, evidence_sha = write_evidence_record(
                 record,
@@ -2822,6 +3171,14 @@ class Orchestrator:
         manifest_sha = self._check_answer_key(
             bundle, prompt, base_sha, tip_sha, fix_rev=None
         )
+        if cfg.dry_run_provision:
+            # D221: the rehearsal provisions a bug unit's TWO sides;
+            # a clean unit has one side and no rehearsal mode.
+            raise OrchestratorError(
+                "--dry-run-provision is a bug-unit mode (it rehearses "
+                "both sides of the pair); clean units have no "
+                "provision rehearsal"
+            )
         if cfg.dry_run_before_model:
             return self._dry_run_summary(
                 run_kind="clean",
@@ -2964,6 +3321,9 @@ class Orchestrator:
                 contract_env=dict(side.contract.env),
                 public_fixture_keys=list(PUBLIC_FIXTURE_KEYS),
                 public_contract_env_keys=list(self.cfg.public_contract_env_keys),
+                container_env_keys=sorted(
+                    self._container_contract_env(side.contract)
+                ),
             )
             record_id, _, evidence_sha = write_evidence_record(
                 record, repo, repo, secret_values=self._record_secret_values([side])

@@ -340,3 +340,38 @@ def test_measure_step_passes_public_env_keys_on_both_invocations():
     assert "for key in $PUBLIC_ENV_KEYS; do" in run
     # Expanded in BOTH measure invocations (bug and clean).
     assert run.count("$PUBLIC_ENV_ARGS \\") == 2
+
+
+# ----------------------------------------------------------------------
+# D222: measure.yml's dry_run input — workflow shape.
+#
+# The provision rehearsal (--dry-run-provision) is dispatched
+# through measure.yml so it runs under the same gates as a measured
+# run: the measurement environment (Master's approval) and the
+# proofdeploy-model-calls serialization group. The dry_run choice
+# input (none / provision) reaches the measure step via env only,
+# like every other input, and expands to --dry-run-provision on
+# both measure invocations; "none" leaves the command line a plain
+# measured run.
+# ----------------------------------------------------------------------
+
+
+def test_dry_run_input_shape():
+    data = _measure_workflow()
+    on = data.get("on", data.get(True))
+    dry_run = on["workflow_dispatch"]["inputs"]["dry_run"]
+    assert dry_run["type"] == "choice"
+    assert dry_run["options"] == ["none", "provision"]
+    assert dry_run["required"] is False
+    assert dry_run["default"] == "none"
+
+
+def test_measure_step_passes_dry_run_on_both_invocations():
+    measure = _measure_step("Run measured unit")
+    assert measure["env"]["DRY_RUN"] == "${{ inputs.dry_run }}"
+    run = measure["run"]
+    assert 'if [ "$DRY_RUN" = "provision" ]; then' in run
+    assert 'DRY_RUN_ARGS="--dry-run-provision"' in run
+    assert 'DRY_RUN_ARGS=""' in run
+    # Expanded in BOTH measure invocations (bug and clean).
+    assert run.count("$DRY_RUN_ARGS \\") == 2
