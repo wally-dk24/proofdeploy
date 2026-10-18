@@ -57,6 +57,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -270,16 +271,37 @@ def _do_http(
 
 
 def _do_db_query(db_path: str, query: str, timeout: int = 30) -> tuple[Any, list[str]]:
-    """Run a read-only DB query. Returns (result, log lines)."""
+    """Run a read-only DB query against a snapshot copy. Returns (result, logs).
+
+    The live database file is never opened. Opening it read-only
+    (``mode=ro``) fails against WAL databases whose ``-shm`` is owned by
+    another user — e.g. a sandbox container's remapped uid — with
+    "attempt to write a readonly database" (D225: paperless forces WAL),
+    and opening it read-write would lock and mutate the app's own files.
+    Instead the db file — plus its ``-wal``, when present — is copied
+    into a fresh private temp dir and the query runs against the copy,
+    opened normally with ``PRAGMA query_only=ON``. The ``-shm`` is
+    deliberately NOT copied: SQLite rebuilds it from the WAL on open.
+    The temp dir is deleted afterwards, whatever happens.
+    """
     logs: list[str] = []
     # Fail closed: only SELECT (and read-only pragmas) allowed.
     stripped = query.strip().upper()
     if not (stripped.startswith("SELECT") or stripped.startswith("PRAGMA")):
         logs.append(f"rejected non-read-only query: {query[:80]}")
         return None, logs
+    tmpdir: str | None = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=timeout)
+        tmpdir = tempfile.mkdtemp(prefix="pd-db-snapshot-")
+        src = Path(db_path)
+        snapshot = Path(tmpdir) / src.name
+        shutil.copyfile(src, snapshot)
+        wal = src.with_name(src.name + "-wal")
+        if wal.exists():
+            shutil.copyfile(wal, Path(tmpdir) / wal.name)
+        conn = sqlite3.connect(str(snapshot), timeout=timeout)
         try:
+            conn.execute("PRAGMA query_only=ON")
             cur = conn.execute(query)
             rows = cur.fetchall()
             return rows, logs
@@ -288,6 +310,9 @@ def _do_db_query(db_path: str, query: str, timeout: int = 30) -> tuple[Any, list
     except Exception as e:
         logs.append(f"DB query failed: {e}")
         return None, logs
+    finally:
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _get_json_path(body: str, path: str) -> tuple[Any, bool]:

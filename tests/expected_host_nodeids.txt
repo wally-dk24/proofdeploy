@@ -95,6 +95,11 @@ tests/test_executor.py::test_capture_from_header
 tests/test_executor.py::test_capture_schema_rejected
 tests/test_executor.py::test_db_assertion_count
 tests/test_executor.py::test_db_assertions_get_independent_results
+tests/test_executor.py::test_db_query_leaves_live_files_untouched
+tests/test_executor.py::test_db_query_non_wal_database_still_works
+tests/test_executor.py::test_db_query_rejects_delete
+tests/test_executor.py::test_db_query_sees_uncheckpointed_wal_row
+tests/test_executor.py::test_db_query_unwritable_directory_still_works
 tests/test_executor.py::test_db_rejects_write
 tests/test_executor.py::test_db_select
 tests/test_executor.py::test_ghost_jwt_minted_per_request

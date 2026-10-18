@@ -159,6 +159,176 @@ def test_db_select(tmp_path):
     assert rows == [(1,)]
 
 
+def _write_wal_db_hard_exit(db, value):
+    """Create a WAL database with one committed row, leaving db + -wal
+    (+ -shm) behind: the child commits and exits WITHOUT closing, like
+    a live (or crashed) app whose rows are not yet checkpointed."""
+    import subprocess
+    import sys
+
+    child = (
+        "import sqlite3, sys, os\n"
+        "c = sqlite3.connect(sys.argv[1])\n"
+        "c.execute('PRAGMA journal_mode=WAL')\n"
+        "c.execute('CREATE TABLE t (a INT)')\n"
+        "c.execute('INSERT INTO t VALUES (?)', (int(sys.argv[2]),))\n"
+        "c.commit()\n"
+        "os._exit(0)\n"
+    )
+    subprocess.run(
+        [sys.executable, "-c", child, str(db), str(value)], check=True
+    )
+
+
+def test_db_query_sees_uncheckpointed_wal_row(tmp_path):
+    """(i) D225: a committed row living only in the -wal is visible."""
+    import sqlite3
+
+    from proofdeploy.executor import _do_db_query
+
+    db = tmp_path / "live.db"
+    writer = sqlite3.connect(str(db))
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE t (a INT)")
+        writer.execute("INSERT INTO t VALUES (7)")
+        writer.commit()
+        # Writer still open, nothing checkpointed: the row is only
+        # in the -wal file at this point.
+        assert (tmp_path / "live.db-wal").exists()
+        rows, logs = _do_db_query(str(db), "SELECT a FROM t")
+    finally:
+        writer.close()
+    assert rows == [(7,)]
+    assert logs == []
+
+
+def test_db_query_leaves_live_files_untouched(tmp_path):
+    """(ii) D225: the query never opens, locks or modifies the live files."""
+    import hashlib
+
+    from proofdeploy.executor import _do_db_query
+
+    db = tmp_path / "live.db"
+    _write_wal_db_hard_exit(db, 3)
+    shm = tmp_path / "live.db-shm"
+    if shm.exists():
+        shm.unlink()
+    wal = tmp_path / "live.db-wal"
+    assert wal.exists()
+
+    def digest(p):
+        return hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns
+
+    before_db = digest(db)
+    before_wal = digest(wal)
+    rows, logs = _do_db_query(str(db), "SELECT a FROM t")
+    assert rows == [(3,)]
+    assert logs == []
+    assert digest(db) == before_db
+    assert digest(wal) == before_wal
+    # The reader built its own -shm inside the snapshot dir, not here.
+    assert not shm.exists()
+
+
+def test_db_query_unwritable_directory_still_works(tmp_path):
+    """(iii) D225: the rehearsal failure shape, end to end. A writer
+    process holds the WAL database open (the running app); the -shm's
+    on-disk wal-index header is not valid for a fresh reader (in the
+    rehearsal it was written inside the sandbox by the container's
+    remapped user), and the reader cannot write the directory or the
+    files (0555 dir, 0444 files). A live read-only open must WRITE the
+    wal-index to recover and fails with "attempt to write a readonly
+    database"; the snapshot copy of db + -wal reads fine."""
+    import os
+    import subprocess
+    import sys
+
+    from proofdeploy.executor import _do_db_query
+
+    db = tmp_path / "live.db"
+    writer_code = (
+        "import sqlite3, sys, time\n"
+        "c = sqlite3.connect(sys.argv[1])\n"
+        "c.execute('PRAGMA journal_mode=WAL')\n"
+        "c.execute('CREATE TABLE t (a INT)')\n"
+        "c.execute('INSERT INTO t VALUES (42)')\n"
+        "c.commit()\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    writer = subprocess.Popen(
+        [sys.executable, "-c", writer_code, str(db)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert writer.stdout is not None
+        assert writer.stdout.readline().strip() == "ready"
+        # The wal-index header on disk is unusable by a fresh reader:
+        # both header copies are invalid, so recovery would have to
+        # rewrite them — a write this reader cannot make.
+        with open(tmp_path / "live.db-shm", "r+b") as f:
+            f.write(b"\x00" * 96)
+        wal = tmp_path / "live.db-wal"
+        shm = tmp_path / "live.db-shm"
+        assert wal.exists() and shm.exists()
+        os.chmod(db, 0o444)
+        os.chmod(wal, 0o444)
+        os.chmod(shm, 0o444)
+        os.chmod(tmp_path, 0o555)
+        try:
+            rows, logs = _do_db_query(str(db), "SELECT a FROM t")
+        finally:
+            os.chmod(tmp_path, 0o755)
+    finally:
+        writer.terminate()
+        writer.wait()
+    assert rows == [(42,)]
+    assert logs == []
+
+
+def test_db_query_non_wal_database_still_works(tmp_path):
+    """(iv) D225: rollback-journal (non-WAL) databases are unaffected."""
+    import sqlite3
+
+    from proofdeploy.executor import _do_db_query
+
+    db = tmp_path / "plain.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode == "delete"
+        conn.execute("CREATE TABLE t (a INT)")
+        conn.execute("INSERT INTO t VALUES (5)")
+        conn.commit()
+    finally:
+        conn.close()
+    rows, logs = _do_db_query(str(db), "SELECT a FROM t")
+    assert rows == [(5,)]
+    assert logs == []
+    assert not (tmp_path / "plain.db-wal").exists()
+
+
+def test_db_query_rejects_delete(tmp_path):
+    """(v) D225: the SELECT/PRAGMA-only guard still rejects writes."""
+    import sqlite3
+
+    from proofdeploy.executor import _do_db_query
+
+    db = tmp_path / "t.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE t (a INT)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.commit()
+    conn.close()
+    result, logs = _do_db_query(str(db), "DELETE FROM t")
+    assert result is None
+    assert any("non-read-only" in log for log in logs)
+    rows, _ = _do_db_query(str(db), "SELECT a FROM t")
+    assert rows == [(1,)]
+
+
 def test_db_assertion_count(tmp_path, server):
     import sqlite3
 
