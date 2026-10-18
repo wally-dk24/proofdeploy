@@ -2081,3 +2081,83 @@ def test_unreachable_target_with_invalid_block_scores_inconclusive(tmp_path, mon
     parent = [ProbeResult.from_dict(r) for r in evidence["fix_parent_results"]]
     fix = [ProbeResult.from_dict(r) for r in evidence["fix_results"]]
     assert score_run_pair(parent, fix) == RunPairVerdict.INCONCLUSIVE
+
+
+# ---------------------------------------------------------------------------
+# D211 (schema 1.7.0): every evidence record carries the model
+# response's finish reason and usage accounting, exactly as the
+# provider returned them; null when the response carried neither.
+# Recorded, never scored.
+# ---------------------------------------------------------------------------
+
+_D211_USAGE = {"prompt_tokens": 111, "completion_tokens": 22, "total_tokens": 133}
+
+_D211_PROBE_CONTENT = (
+    "```json\n"
+    '{"setup": [], '
+    '"act": {"method": "GET", "path": "/value"}, '
+    '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+    "\n```\n"
+)
+
+
+def _probes_stop_with_usage(prompt: str) -> ModelResponse:
+    assert "mini-app" in prompt
+    return ModelResponse(
+        content=_D211_PROBE_CONTENT,
+        finish_reason="stop",
+        usage=dict(_D211_USAGE),
+    )
+
+
+def _probes_length_no_usage(prompt: str) -> ModelResponse:
+    assert "mini-app" in prompt
+    return ModelResponse(content=_D211_PROBE_CONTENT, finish_reason="length")
+
+
+def _probes_bare(prompt: str) -> ModelResponse:
+    assert "mini-app" in prompt
+    return ModelResponse(content=_D211_PROBE_CONTENT)
+
+
+def _measure_evidence(tmp_path, runner):
+    info = make_mini_repo(tmp_path)
+    out = tmp_path / "records"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=tmp_path / "work",
+        skill_path=skill_path(),
+        bug_id="mini",
+        rev_bug_base=info["base"],
+        rev_bug=info["bug"],
+        rev_fix=info["fix"],
+        model_runner=runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "candidate_catch"
+    records = read_records(out)
+    return next(r for r in records if r["record_type"] == "evidence")
+
+
+def test_measure_records_model_finish_reason_and_usage(tmp_path):
+    evidence = _measure_evidence(tmp_path, _probes_stop_with_usage)
+    assert evidence["schema_version"] == "1.7.0"
+    assert evidence["model_finish_reason"] == "stop"
+    assert evidence["model_usage"] == _D211_USAGE
+
+
+def test_measure_records_model_finish_reason_length(tmp_path):
+    evidence = _measure_evidence(tmp_path, _probes_length_no_usage)
+    assert evidence["model_finish_reason"] == "length"
+    assert evidence["model_usage"] is None
+
+
+def test_measure_records_null_finish_reason_and_usage_when_absent(tmp_path):
+    evidence = _measure_evidence(tmp_path, _probes_bare)
+    assert "model_finish_reason" in evidence
+    assert evidence["model_finish_reason"] is None
+    assert "model_usage" in evidence
+    assert evidence["model_usage"] is None

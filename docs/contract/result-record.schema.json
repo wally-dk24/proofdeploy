@@ -2,7 +2,7 @@
   "$defs": {
     "evidence_record": {
       "additionalProperties": false,
-      "description": "Built by build_evidence_record() and written BEFORE any scoring. All 56 keys are always present; fields that do not apply to the run are null or empty, never absent.",
+      "description": "Built by build_evidence_record() and written BEFORE any scoring. All 58 keys are always present; fields that do not apply to the run are null or empty, never absent.",
       "properties": {
         "auth_bootstrap": {
           "additionalProperties": {
@@ -148,6 +148,10 @@
             "null"
           ]
         },
+        "model_finish_reason": {
+          "$ref": "#/$defs/string_or_null",
+          "description": "The model response's finish reason exactly as returned by the provider (D211); null when the response carried none or no model call completed. Recorded, never scored."
+        },
         "model_id": {
           "$ref": "#/$defs/string_or_null"
         },
@@ -160,6 +164,17 @@
             "number",
             "null"
           ]
+        },
+        "model_usage": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object"
+            }
+          ],
+          "description": "The model response's usage accounting exactly as returned by the provider (D211); null when the response carried none or no model call completed. Recorded, never scored."
         },
         "parsed_probes": {
           "description": "The parsed probes, stored VERBATIM and never redacted; parsed_probes_sha256 must still match them.",
@@ -231,7 +246,7 @@
           "type": "boolean"
         },
         "schema_version": {
-          "const": "1.6.0"
+          "const": "1.7.0"
         },
         "scoring_version": {
           "description": "The scoring rule version; the only value the code produces is v2-per-probe.",
@@ -287,6 +302,8 @@
         "model_attempts",
         "model_call_attempts",
         "model_request",
+        "model_finish_reason",
+        "model_usage",
         "author_prompt_sha256",
         "author_prompt_builder_sha256",
         "truncation_flags",
@@ -407,7 +424,7 @@
           ]
         },
         "schema_version": {
-          "const": "1.6.0"
+          "const": "1.7.0"
         },
         "score_record_id": {
           "$ref": "#/$defs/record_id"
@@ -503,7 +520,7 @@
           "description": "The act request actually sent; null when no request was sent."
         },
         "schema_version": {
-          "const": "1.6.0"
+          "const": "1.7.0"
         },
         "sent": {
           "description": "Whether the probe was actually sent to the target.",
@@ -631,7 +648,7 @@
           ]
         },
         "schema_version": {
-          "const": "1.6.0"
+          "const": "1.7.0"
         },
         "scoring_version": {
           "type": "string"
@@ -682,7 +699,7 @@
   },
   "$id": "proofdeploy/docs/contract/result-record.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The record format written to runs.jsonl by proofdeploy/runpair.py at SCHEMA_VERSION 1.6.0 (proofdeploy/probe.py). One JSON object per line; exactly three record types: evidence, score, judgment. This schema uses only the keyword subset enforced by the stdlib validator in tests/test_runpair.py (type, enum, const, required, properties, additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref); every other keyword is annotation only. See docs/contract/result-contract.md for the prose contract.",
+  "description": "The record format written to runs.jsonl by proofdeploy/runpair.py at SCHEMA_VERSION 1.7.0 (proofdeploy/probe.py). One JSON object per line; exactly three record types: evidence, score, judgment. This schema uses only the keyword subset enforced by the stdlib validator in tests/test_runpair.py (type, enum, const, required, properties, additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref); every other keyword is annotation only. See docs/contract/result-contract.md for the prose contract.",
   "oneOf": [
     {
       "$ref": "#/$defs/evidence_record"
@@ -694,5 +711,5 @@
       "$ref": "#/$defs/judgment_record"
     }
   ],
-  "title": "ProofDeploy result record, schema_version 1.6.0"
+  "title": "ProofDeploy result record, schema_version 1.7.0"
 }

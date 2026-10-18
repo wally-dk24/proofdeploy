@@ -64,7 +64,13 @@ HARNESS_VERSION = "1.0.0"
 # loaded from and that file's sha256 (null on paths that do not load
 # a contract from the store). Non-scoring provenance; records at
 # 1.0.0–1.5.0 still load (readers default the new key).
-SCHEMA_VERSION = "1.6.0"
+# 1.7.0 (D211): evidence records carry model_finish_reason and
+# model_usage — the model response's finish reason and usage
+# accounting exactly as returned by the provider (null when the
+# response carried neither, or no model call completed). Recorded,
+# never scored; records at 1.0.0–1.6.0 still load (readers default
+# the new keys).
+SCHEMA_VERSION = "1.7.0"
 
 # HTTP methods the schema allows. No CONNECT, TRACE, or custom verbs.
 ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})

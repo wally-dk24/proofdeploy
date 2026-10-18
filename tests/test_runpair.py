@@ -1399,3 +1399,44 @@ def test_result_contract_rejects_corrupted_records():
     extra_key = json.loads(json.dumps(evidence))
     extra_key["surprise"] = True
     assert _contract_errors(extra_key, schema, schema) != []
+
+
+# ---------------------------------------------------------------------------
+# D211 (schema 1.7.0): model_finish_reason / model_usage are recorded
+# (never scored); a stored 1.6.0 record still loads.
+# ---------------------------------------------------------------------------
+
+def test_schema_170_record_validates_and_160_record_still_loads(tmp_path):
+    schema = _load_contract_schema()
+    usage = {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    record = build_evidence_record(
+        run_kind="bug",
+        bug_id="D211-SCHEMA",
+        model_finish_reason="stop",
+        model_usage=usage,
+    )
+    assert SCHEMA_VERSION == "1.7.0"
+    assert record["schema_version"] == "1.7.0"
+    assert record["model_finish_reason"] == "stop"
+    assert record["model_usage"] == usage
+    errors = _contract_errors(record, schema, schema)
+    assert errors == [], errors
+
+    # Defaults: no model response values -> both fields present, null.
+    bare = build_evidence_record(run_kind="bug", bug_id="D211-SCHEMA-BARE")
+    assert bare["model_finish_reason"] is None
+    assert bare["model_usage"] is None
+    assert _contract_errors(bare, schema, schema) == []
+
+    # A stored 1.6.0 record (neither key present) still loads.
+    old = dict(record)
+    old["schema_version"] = "1.6.0"
+    del old["model_finish_reason"]
+    del old["model_usage"]
+    (tmp_path / "runs.jsonl").write_text(
+        json.dumps(old) + "\n", encoding="utf-8"
+    )
+    loaded = read_records(tmp_path)
+    assert loaded[0]["record_id"] == record["record_id"]
+    assert loaded[0].get("model_finish_reason") is None
+    assert loaded[0].get("model_usage") is None

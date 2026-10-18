@@ -898,7 +898,8 @@ def test_host_provision_missing_generated_lock_fails(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Schema 1.6.0: WO-1.14 adds contract_source; older records still load.
+# Schema 1.7.0: D211 adds model_finish_reason / model_usage; older
+# records still load.
 # ---------------------------------------------------------------------------
 
 
@@ -906,9 +907,9 @@ def test_schema_140_and_old_records_still_load(tmp_path):
     from proofdeploy.probe import SCHEMA_VERSION
     from proofdeploy.runpair import build_evidence_record, read_records
 
-    assert SCHEMA_VERSION == "1.6.0"
+    assert SCHEMA_VERSION == "1.7.0"
     record = build_evidence_record(run_kind="bug", bug_id="WO81-SCHEMA")
-    assert record["schema_version"] == "1.6.0"
+    assert record["schema_version"] == "1.7.0"
     # A 1.3.0-shaped record (provisions without lock fields) loads.
     old = dict(record)
     old["schema_version"] = "1.3.0"
