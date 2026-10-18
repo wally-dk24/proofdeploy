@@ -26,11 +26,15 @@ A4. When the diff's new behavior contradicts those sources, assert the behavior 
 
 A5. When those sources do not settle what is correct, the diff is the only evidence of intent: probe it as written, and do not invent a correct behavior (see item 23).
 
+A6. The fixture's statements about the instance are facts; the diff is a claim. When a probe reads a record or setting the fixture describes, its expected values come from the fixture, never from what the changed code would return.
+
 ## 1b. Check the format before you answer
 
 B1. Every assertion must use one of the types the schema allows: status, header, body, db. To check a field in a JSON response body, use type body with a json_path object, for example {"type": "body", "json_path": {"path": "status", "equals": "active"}}. There is no assertion type named json_path.
 
 B2. Before answering, re-read every probe against the schema. A probe that does not match is never sent, and it counts against you as if it had failed.
+
+B3. Before answering, check the direction of every assertion. For each expected value, name its source: the fixture, a name, untouched code, a doc or test, or only the diff. If a value comes only from the diff and one of the other sources says otherwise, change it to what that source says.
 
 ---
 
