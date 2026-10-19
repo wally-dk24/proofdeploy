@@ -115,6 +115,15 @@ stop rules apply unchanged. The walk, the journal and the lock
 stay on this host either way; the local sandboxed checker
 remains the default.
 
+Check (e), R-SIZE (docs/registration/r-size-author-prompt-size.md,
+signed 2026-10-19; D251, D253): after (a)-(d), the blind author's
+prompt for B^..B is built through the orchestrator's own bundle code
+(registered store contract, registered skill author copy, frozen
+template and caps; no model call) and its length in characters must
+be at most R_SIZE_MAX_PROMPT_CHARS (80,000). The size, and only the
+size, is recorded as author_prompt_chars for every commit that
+reaches (e).
+
 CONTAMINATION GUARD: this script records commit metadata and check
 outcomes only. It never prints or writes the fix's diff, any file
 content, test content, or any commit message body — to stdout, to
@@ -590,6 +599,21 @@ ReadyPairCheck = Callable[
     [str, str, tuple[str, ...]], dict[str, dict[str, Any]]
 ]
 
+# Check (e), R-SIZE (docs/registration/r-size-author-prompt-size.md,
+# signed by Master 2026-10-19; D251, D253): the blind author's prompt
+# for B^..B, built exactly as the measured bug path builds it with no
+# model call, must be at most this many characters (Python str
+# length = code points). Changed only by a new signed entry; never
+# adjusted after seeing which commit a walk would select (item 4).
+R_SIZE_MAX_PROMPT_CHARS = 80000
+
+# Check (e) size function: (B^ sha, B sha) -> length in characters of
+# the blind author's prompt for that range. It returns ONLY the
+# integer: the prompt, the diff and every file content stay inside
+# the builder and are never printed, logged or journaled. Tests
+# inject a fake; the live run wires make_author_prompt_size_builder.
+PromptSizeCheck = Callable[[str, str], int]
+
 # Check (d) attempts per side: the first attempt plus up to 2
 # retries of a harness/environment-class failure (D177).
 MAX_READY_ATTEMPTS = 3
@@ -820,6 +844,7 @@ def evaluate_commit(
     repo: AppRepo,
     meta: CommitMeta,
     ready_pair: ReadyPairCheck,
+    prompt_size: PromptSizeCheck,
     journal: Journal | None = None,
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
@@ -919,6 +944,26 @@ def evaluate_commit(
         else:
             reason = "fix is not READY"
         return reject("d", reason)
+
+    # (e) R-SIZE (D253): the blind author's prompt for B^..B is at
+    # most R_SIZE_MAX_PROMPT_CHARS characters. Evaluated only for a
+    # commit that passed (a)-(d); the size is recorded for every
+    # commit that reaches (e), pass or fail. B^ is B's first parent.
+    b_parent = repo.first_parent(b_sha)
+    if b_parent is None:
+        raise HarnessError(
+            f"check (e) refused: B {b_sha} has no parent, so the "
+            "author range B^..B does not exist (ruling required; "
+            "the commit is not rejected)"
+        )
+    n = prompt_size(b_parent, b_sha)
+    entry["author_prompt_chars"] = n
+    if n > R_SIZE_MAX_PROMPT_CHARS:
+        return reject(
+            "e",
+            f"e: author prompt too large ({n} chars > "
+            f"{R_SIZE_MAX_PROMPT_CHARS})",
+        )
 
     entry["outcome"] = "selected"
     return entry
@@ -1109,11 +1154,28 @@ class SingleWriterLock:
 # ---------------------------------------------------------------------
 
 
+CHECKS = ("a", "b", "c", "d", "e")
+
+
+def check_tally(entries: list[dict[str, Any]]) -> dict[str, int]:
+    """How many walked commits failed each check (a)-(e), and how
+    many were selected. Counts only: no subject or content."""
+    tally = {c: 0 for c in CHECKS}
+    tally["selected"] = 0
+    for e in entries:
+        if e["outcome"] == "selected":
+            tally["selected"] += 1
+        else:
+            tally[e["failed_check"]] += 1
+    return tally
+
+
 def select_fix(
     *,
     repo: AppRepo,
     app: dict[str, Any],
     ready_pair: ReadyPairCheck,
+    prompt_size: PromptSizeCheck,
     journal: Journal | None = None,
     main_sha: str | None,
     script_sha256: str,
@@ -1142,7 +1204,7 @@ def select_fix(
         if entry is None:
             try:
                 entry = evaluate_commit(
-                    repo, meta, ready_pair, journal=journal
+                    repo, meta, ready_pair, prompt_size, journal=journal
                 )
             except StopForRuling as stop_exc:
                 stopped = {
@@ -1188,6 +1250,7 @@ def select_fix(
             if selected is not None
             else "exhausted"
         ),
+        "rejected_by_check": check_tally(entries),
         "walked": entries,
         "selected": None,
     }
@@ -1251,6 +1314,76 @@ def load_candidate(survivors_path: Path, repo_name: str) -> dict[str, Any]:
 # The real readiness pair check (live run only; imported lazily so
 # the offline tests never pull the orchestrator stack).
 # ---------------------------------------------------------------------
+
+
+def make_author_prompt_size_builder(
+    *,
+    repo_name: str,
+    repo: AppRepo,
+    contract_path: Path | None = None,
+    skill_path: Path | None = None,
+) -> PromptSizeCheck:
+    """Check (e) through the orchestrator's own bundle code (R-SIZE
+    item 1): Orchestrator._build_bundle, the function the measured
+    bug path calls, with the registered store contract
+    (readiness/contracts/<owner>__<repo>.yml), the registered skill
+    author copy (the skill arm), the frozen template and its caps.
+    No sandbox, no provisioning and no model call: no app code runs.
+
+    Returns the prompt's length in characters and nothing else. The
+    unit directory (diff, snapshot, bundle) is a temporary directory
+    removed on return; nothing of it is printed or journaled. An
+    environment or contract failure raises HarnessError — the walk
+    stops, it never rejects a candidate on its way through."""
+    from proofdeploy.orchestrator import (
+        ContractRefusal,
+        MeasureConfig,
+        Orchestrator,
+        OrchestratorError,
+    )
+
+    root = Path(__file__).resolve().parents[2]
+    skill = skill_path or root / "docs" / "evaluation" / "skill" / "skill-author.md"
+
+    def size(b_parent: str, b_sha: str) -> int:
+        with tempfile.TemporaryDirectory(prefix="r-size-") as tmp:
+            tmp_path = Path(tmp)
+            cfg = MeasureConfig(
+                repo_dir=repo.path,
+                output_dir=tmp_path / "records",
+                workdir=tmp_path / "work",
+                skill_path=skill,
+                bug_id="r-size",
+                rev_bug_base=b_parent,
+                rev_bug=b_sha,
+                sandbox=False,
+                allow_unsandboxed=True,
+                use_contract_store=True,
+                unit_repo=repo_name,
+                contract_path=contract_path,
+                dry_run_before_model=True,
+            )
+            unit_dir = tmp_path / "unit"
+            unit_dir.mkdir()
+            try:
+                built = Orchestrator(cfg)._build_bundle(
+                    unit_dir,
+                    unit_id="r-size",
+                    rev_base=b_parent,
+                    rev_tip=b_sha,
+                )
+            except (ContractRefusal, OrchestratorError) as exc:
+                # The message is the orchestrator's own refusal text
+                # (paths, hashes, git errors); bundle content is not
+                # part of it.
+                raise HarnessError(
+                    f"check (e) refused at B={b_sha}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            prompt = built[2]
+            return len(prompt)
+
+    return size
 
 
 def _network_none_evidence(network_mode: str | None) -> str:
@@ -1839,6 +1972,9 @@ def main(argv: list[str] | None = None) -> int:
                 repo=repo,
                 app=app,
                 ready_pair=ready_pair,
+                prompt_size=make_author_prompt_size_builder(
+                    repo_name=app["repo"], repo=repo
+                ),
                 journal=journal,
                 main_sha=main_sha,
                 script_sha256=script_sha256,
@@ -1873,6 +2009,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"walked {entry['sha'][:12]} -> rejected at check "
                 f"{entry['failed_check']}: {entry['reason']}"
             )
+    tally = record["rejected_by_check"]
+    print(
+        "tally: "
+        + " ".join(f"{c}={tally[c]}" for c in CHECKS)
+        + f" selected={tally['selected']}"
+    )
     if record["outcome"] == "selected":
         sel = record["selected"]
         print(

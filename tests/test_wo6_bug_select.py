@@ -160,7 +160,13 @@ def app_dict(head: str) -> dict[str, Any]:
     }
 
 
+def small_prompt(_parent: str, _b: str) -> int:
+    """Injected check (e): a prompt well under the R-SIZE budget."""
+    return 1234
+
+
 def select(repo_path: Path, head: str, ready: FakeReady, **kw: Any) -> dict[str, Any]:
+    kw.setdefault("prompt_size", small_prompt)
     return mod.select_fix(
         repo=mod.AppRepo(repo_path),
         app=app_dict(head),
@@ -911,7 +917,7 @@ def test_record_carries_identity_and_full_walk(tmp_path: Path) -> None:
     assert record["walk"] == "first-parent"
     for entry in record["walked"]:
         if entry["outcome"] == "rejected":
-            assert entry["failed_check"] in ("a", "b", "c", "d")
+            assert entry["failed_check"] in ("a", "b", "c", "d", "e")
             assert entry["reason"]
 
 
@@ -1289,3 +1295,166 @@ def test_gh_fetch_rows_list_and_other_shapes(
     assert d.fetch_rows("1", repo="o/r") is None
     monkeypatch.setattr(mod, "_gh", make('"x"'))
     assert d.fetch_rows("1", repo="o/r") is None
+
+
+# ---------------------------------------------------------------------
+# R-SIZE (D253): check (e), the author prompt size budget.
+# ---------------------------------------------------------------------
+
+
+def two_fix_history(tmp_path: Path) -> tuple[Path, str, str, str, str]:
+    """base -> B (two buggy lines, tagged) -> fix1 (Aug 1) -> fix2
+    (Aug 15). Both fixes blame B and both pass (a)-(c)."""
+    repo = init_repo(tmp_path)
+    base = commit(repo, "Initial commit", ts(2026, 1, 10),
+                  {"src/app.py": "l1\nl2\nl3\nl4\n"})
+    b = commit(repo, "Introduce the counter", ts(2026, 2, 1),
+               {"src/app.py": "l1\nl2-bug\nl3\nl4-bug\n"})
+    add_tag(repo, "v1.0", ts(2026, 2, 2))
+    fix1 = commit(repo, "Fix the first counter", ts(2026, 8, 1),
+                  {"src/app.py": "l1\nl2-fixed\nl3\nl4-bug\n"})
+    fix2 = commit(repo, "Fix the second counter", ts(2026, 8, 15),
+                  {"src/app.py": "l1\nl2-fixed\nl3\nl4-fixed\n"})
+    return repo, base, b, fix1, fix2
+
+
+class SizeScript:
+    """Injected check (e): returns the scripted sizes in order and
+    records the (B^, B) range each call was made for."""
+
+    def __init__(self, sizes: list[int]) -> None:
+        self.sizes = list(sizes)
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, parent: str, b: str) -> int:
+        self.calls.append((parent, b))
+        return self.sizes.pop(0)
+
+
+def test_r_size_budget_constant_is_the_signed_80000() -> None:
+    assert mod.R_SIZE_MAX_PROMPT_CHARS == 80000
+
+
+def test_check_e_boundary_80000_selected_80001_rejected(
+    tmp_path: Path,
+) -> None:
+    repo, base, b, fix1, fix2 = two_fix_history(tmp_path)
+    # fix1's parent is B; fix2's parent is fix1.
+    ready = FakeReady({b, fix1, fix2})
+    script = SizeScript([80001, 80000])
+    record = select(repo, fix2, ready, prompt_size=script)
+
+    walked = {e["sha"]: e for e in record["walked"]}
+    over = walked[fix1]
+    assert over["outcome"] == "rejected"
+    assert over["failed_check"] == "e"
+    assert over["reason"] == "e: author prompt too large (80001 chars > 80000)"
+    assert over["author_prompt_chars"] == 80001
+    # The walk continued to the next commit and selected it.
+    fits = walked[fix2]
+    assert fits["outcome"] == "selected"
+    assert fits["author_prompt_chars"] == 80000
+    assert record["outcome"] == "selected"
+    assert record["selected"]["fix"] == fix2
+    # The range handed to the builder is B^..B (B's first parent).
+    assert script.calls == [(base, b), (base, b)]
+    assert record["rejected_by_check"]["e"] == 1
+
+
+def test_check_e_not_evaluated_for_commits_failing_a_to_d(
+    tmp_path: Path,
+) -> None:
+    repo, _base, _b, mid, fix = standard_history(tmp_path)
+    script = SizeScript([])  # any call would raise IndexError
+    # mid fails (a); fix fails (d) because nothing is READY.
+    record = select(repo, fix, FakeReady(), prompt_size=script)
+    assert script.calls == []
+    for entry in record["walked"]:
+        assert "author_prompt_chars" not in entry
+    assert record["walked"][-1]["failed_check"] == "d"
+    assert record["rejected_by_check"]["e"] == 0
+
+
+def test_check_e_size_recorded_without_content(tmp_path: Path) -> None:
+    repo, _base, _b, mid, fix = standard_history(tmp_path)
+    record = select(repo, fix, FakeReady({mid, fix}),
+                    prompt_size=SizeScript([42]))
+    assert record["walked"][-1]["author_prompt_chars"] == 42
+    tally = record["rejected_by_check"]
+    assert tally == {"a": 1, "b": 0, "c": 0, "d": 0, "e": 0, "selected": 1}
+
+
+def test_main_prints_tally_with_e_and_no_subject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Build the real history and drive main() with injected pieces.
+    root = tmp_path / "hist"
+    root.mkdir()
+    repo, _base, b, fix1, fix2 = two_fix_history(root)
+    survivors = tmp_path / "survivors.json"
+    survivors.write_text(json.dumps([{
+        "full_name": "o/r", "head_sha": fix2, "default_branch": "main",
+        "stacks": {"python": {"passed": True, "app_path": "src"}},
+    }]))
+    monkeypatch.setattr(mod, "_clone_app",
+                        lambda *a, **k: mod.AppRepo(repo))
+    monkeypatch.setattr(mod, "make_provision_pair_checker",
+                        lambda **k: FakeReady({b, fix1, fix2}))
+    monkeypatch.setattr(mod, "make_author_prompt_size_builder",
+                        lambda **k: SizeScript([90000, 10]))
+    rc = mod.main([
+        "--repo", "o/r", "--survivors", str(survivors),
+        "--out", str(tmp_path / "out" / "rec.json"),
+        "--main-sha", "f" * 40,
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "tally: a=0 b=0 c=0 d=0 e=1 selected=1" in out
+    assert "Fix the" not in out
+    assert "author prompt too large (90000 chars > 80000)" in out
+
+
+def test_default_builder_builds_prompt_through_orchestrator(
+    tmp_path: Path,
+) -> None:
+    """The real (e) builder runs Orchestrator._build_bundle for a
+    tiny synthetic repo and a temporary contract-store entry:
+    positive int, no network, no model, no sandbox."""
+    root = Path(__file__).resolve().parents[1]
+    store = tmp_path / "store" / "golden__node-express-sqlite.yml"
+    store.parent.mkdir()
+    store.write_bytes(
+        (root / "readiness" / "contracts"
+         / "golden__node-express-sqlite.yml").read_bytes()
+    )
+    repo = init_repo(tmp_path)
+    base = commit(repo, "Initial commit", ts(2026, 1, 10),
+                  {"server.js": "const a = 1;\n", "package.json": "{}\n"})
+    b = commit(repo, "Introduce the counter", ts(2026, 2, 1),
+               {"server.js": "const a = 2;\nconst b = 3;\n"})
+    builder = mod.make_author_prompt_size_builder(
+        repo_name="golden/node-express-sqlite",
+        repo=mod.AppRepo(repo),
+        contract_path=store,
+    )
+    n = builder(base, b)
+    assert isinstance(n, int) and n > 0
+    # Deterministic: the same range builds the same prompt length.
+    assert builder(base, b) == n
+
+
+def test_default_builder_refusal_stops_the_walk_not_rejects(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path)
+    base = commit(repo, "Initial commit", ts(2026, 1, 10), {"a.js": "1\n"})
+    builder = mod.make_author_prompt_size_builder(
+        repo_name="o/r",
+        repo=mod.AppRepo(repo),
+        contract_path=tmp_path / "missing.yml",
+    )
+    # An empty range (and a missing contract) is an environment/our-gap
+    # refusal: HarnessError, never a size.
+    with pytest.raises(mod.HarnessError, match="check \\(e\\) refused"):
+        builder(base, base)
