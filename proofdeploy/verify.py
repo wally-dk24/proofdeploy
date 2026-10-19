@@ -350,6 +350,9 @@ class _VerifyRun:
             c_results=results,
             prompt=prompt,
             raw_model_response=raw.content if raw is not None else None,
+            author_evidence=(
+                (probeset.author_evidence or None) if probeset is not None else None
+            ),
             parsed_probes=probeset.probes if probeset is not None else [],
             invalid_probe_blocks=(
                 probeset.invalid_blocks if probeset is not None else []
@@ -458,7 +461,10 @@ class _VerifyRun:
         # fail-closed before any model call).
         t0 = time.monotonic()
         try:
-            bundle, manifest, prompt, _diff, _base, _tip, truncation_flags = (
+            (
+                bundle, manifest, prompt, _diff, _base, _tip,
+                truncation_flags, sources,
+            ) = (
                 orch._build_bundle(
                     self.unit_dir,
                     unit_id=self.unit_id,
@@ -505,13 +511,13 @@ class _VerifyRun:
         probeset = None
         raw = None
         try:
-            probeset, raw = self._call_author(prompt)
+            probeset, raw = self._call_author(prompt, sources)
             self.attempts.append("attempt_1: success")
         except ModelCallError as exc:
             self.attempts.append(f"attempt_1: {exc.cause}: {exc}")
             if exc.cause == "model_transport":
                 try:
-                    probeset, raw = self._call_author(prompt)
+                    probeset, raw = self._call_author(prompt, sources)
                     self.attempts.append("attempt_2: success")
                 except ModelCallError as exc2:
                     self.attempts.append(f"attempt_2: {exc2.cause}: {exc2}")
@@ -636,7 +642,7 @@ class _VerifyRun:
         )
         return out, _VERDICT_EXIT_CODES[verdict]
 
-    def _call_author(self, prompt: str) -> Any:
+    def _call_author(self, prompt: str, sources: dict[str, Any]) -> Any:
         """One author call through the orchestrator.
 
         The pinned client's own transport failure surfaces as a bare
@@ -648,7 +654,7 @@ class _VerifyRun:
         failure and propagates untouched.
         """
         try:
-            return self.orch._author_probes(prompt)
+            return self.orch._author_probes(prompt, sources)
         except OrchestratorError:
             raise
         except ModelCallError:

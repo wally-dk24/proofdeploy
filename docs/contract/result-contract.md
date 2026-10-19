@@ -1,4 +1,4 @@
-# The versioned result contract — record format at `SCHEMA_VERSION` 1.8.0
+# The versioned result contract — record format at `SCHEMA_VERSION` 1.9.0
 
 Plan line 1.4(a) (D23). This document is the prose contract for the
 records ProofDeploy writes for every measured run. The machine-readable
@@ -8,7 +8,7 @@ it; the validation test in `tests/test_runpair.py`
 the code's own builders produce conform to it.
 
 Everything here describes what the code **does today** at
-`SCHEMA_VERSION = "1.8.0"` (`proofdeploy/probe.py`), as implemented by
+`SCHEMA_VERSION = "1.9.0"` (`proofdeploy/probe.py`), as implemented by
 `proofdeploy/runpair.py` (record builders, redaction, log writes) and
 `proofdeploy/executor.py` (per-probe results). Where the code is
 ambiguous, this document says so under
@@ -56,7 +56,7 @@ Every record carries:
 | `record_id` | string (32 hex) | Unique id minted by the builder. |
 | `timestamp` | string | UTC ISO-8601, `datetime.now(timezone.utc).isoformat()`. |
 | `record_type` | string | `"evidence"`, `"score"`, or `"judgment"`. |
-| `schema_version` | string | The record format version; `"1.8.0"` at this contract. Also stamped on every per-probe result. |
+| `schema_version` | string | The record format version; `"1.9.0"` at this contract. Also stamped on every per-probe result. |
 | `run_kind` | string | `"bug"` or `"clean"`. |
 | `bug_id` | string \| null | Set on bug runs, null on clean runs. |
 | `clean_id` | string \| null | Set on clean runs, null on bug runs. |
@@ -163,6 +163,7 @@ score and judgment records.
 |---|---|
 | `fixture`, `contract_env` | The fixture and contract-env values used by the run. |
 | `contract_source` | Where the measured unit's contract was loaded from (WO-1.14 / REG-E): `{store_path, sha256}` — the committed contract store path relative to the ProofDeploy tree and that file's sha256. `sha256` is null when the store file could not be read (a contract refusal record); the whole field is null on paths that do not load a contract from the store. |
+| `author_evidence` | How the final author answer came about (1.9.0, D242, R-METHOD): `{correction_used, correction_prompt_sha256, correction_call_attempts, correction_call_error, final_answer, first_answer, second_answer, checks}` — both raw answers with their finish reason and usage, the sha256 of the one correction prompt, and the per-assertion evidence-check results (`checks.r1`, `checks.r2`). Null when the evidence check did not run. Recorded, never scored. |
 | `public_fixture_keys`, `public_contract_env_keys` | The keys explicitly declared public; every other fixture/env value is treated as a secret for redaction (fail-closed). This list is the leak gate's exemption list and the record's redaction list — it is **not** the container env allow-list (see `container_env_keys`). |
 | `container_env_keys` | The contract env key **names** the run's sandbox install and app containers received — names only, never values (1.8.0, D220). On the contract-store (measured) path this is the contract's full env key set, the same set readiness provisions for that contract; on paths without a store contract it is the declared-public subset the containers were filtered to. Empty when no container was provisioned. |
 | `dry_run` | The dry-run marking (1.8.0, D222): null on every real run; `"provision"` on a provision-rehearsal record — the bundle was assembled and leak-checked, both sides of a bug unit were provisioned through the measured path, and the unit's **fixed rehearsal probe set** (`readiness/rehearsal/<owner>__<repo>.json`, outside the contract) ran through the real executor on both sides; the run stopped with **no model call**. The per-probe rehearsal results ride the ordinary per-side result fields (`fix_parent_results` / `fix_results`). A rehearsal record has no score record, is never a measured result, and must never be replayed as one. |
@@ -319,7 +320,7 @@ handled under D8's five conditions; in record terms:
   format changes.** `HARNESS_VERSION` (probe schema) and
   `SCORING_VERSION` (scoring rule) are separate versions with their own
   bump rules; neither is the record version.
-- A reader may assume a record stamped `1.8.0` has exactly the field
+- A reader may assume a record stamped `1.9.0` has exactly the field
   sets in the JSON Schema: builders emit fixed key sets, and fields
   that do not apply are null/empty rather than absent.
 - **History** (from the comments at the constant; all changes were
@@ -336,11 +337,12 @@ handled under D8's five conditions; in record terms:
   | 1.6.0 | Evidence records carry `contract_source` (WO-1.14 / REG-E): the committed contract store path the measured unit's contract was loaded from and that file's sha256. Non-scoring provenance. |
   | 1.7.0 | Evidence records carry `model_finish_reason` and `model_usage` (D211): the model response's finish reason and usage accounting exactly as returned by the provider; null when the response carried neither. Recorded, never scored. |
   | 1.8.0 | Evidence records carry `container_env_keys` (D220) — the contract env key names the run's containers received (full contract env on the contract-store path; the declared-public subset elsewhere; names only) — and `dry_run` (D222), the dry-run marking: null on real runs, `"provision"` on a provision-rehearsal record (no model call; the fixed rehearsal probe set's results ride the per-side result fields; never scored, never a measured result). Recorded, never scored. |
+  | 1.9.0 | Evidence records carry `author_evidence` (D242, R-METHOD): both raw author answers, the correction prompt's sha256, `correction_used`, the per-assertion evidence-check results of both answers, and both answers' finish reason and usage; the bundle manifest (inside `bundle_manifest`) carries `route_map` (R-BUNDLE: the route-declaration files shown, omitted and "shown above") and `truncation_flags` carries `route_map_truncated`. Assertions carry a top-level `evidence` object. Recorded, never scored. |
 
 - **Reader compatibility, as the code behaves today:** readers default
   absent keys (`ProbeResult.from_dict` defaults `sent` to true and
   `assertions_evaluated` to false, and the loaders default the rest),
-  so records at 1.0.0–1.7.0 still load and re-score. A format change
+  so records at 1.0.0–1.8.0 still load and re-score. A format change
   that alters the **meaning** of an existing field, rather than adding
   fields with defaults, is the kind of change this defaulting cannot
   absorb — it needs a bump and, per the registered-rule discipline, a
@@ -449,7 +451,7 @@ run records it).
 ## The schema and its test
 
 - [`result-record.schema.json`](result-record.schema.json) — JSON
-  Schema (draft 2020-12) for the three record types at 1.8.0. Where a
+  Schema (draft 2020-12) for the three record types at 1.9.0. Where a
   builder guarantees a value by construction, the schema pins it:
   `record_id` is 32 lowercase hex chars (uuid4 hex);
   `prompt_sha256`/`parsed_probes_sha256` are 64-hex digests computed

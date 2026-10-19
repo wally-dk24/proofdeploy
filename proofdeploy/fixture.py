@@ -442,6 +442,7 @@ def assemble_author_bundle(
     skill_path: str | Path | None = None,
     no_skill: bool = False,
     gitlinks: dict[str, str] | None = None,
+    app_path: str | None = None,
 ) -> AuthorBundle:
     """Assemble the blind author's input bundle from the allowlist.
 
@@ -481,6 +482,13 @@ def assemble_author_bundle(
     declared gitlink path is not a directory in the snapshot or if any
     file sits at or under it (submodule contents never enter the
     bundle; D46 materialisation stays on the provisioning path).
+
+    R-BUNDLE (D242): the route-declaration files the author is shown are
+    selected mechanically from the snapshot within `app_path` (the unit
+    contract's app.path; None means the whole tree) and recorded in the
+    manifest as `route_map` -- the included, omitted and "shown above"
+    paths and the route_map_truncated flag. The answer-key check
+    recomputes the selection from B and compares.
 
     Fail-closed throughout: template hash mismatch, skill hash mismatch,
     non-empty output dir, `.git` at any depth in the snapshot, a symlink
@@ -602,6 +610,16 @@ def assemble_author_bundle(
             "fixture-description.txt": _sha256_file(out_desc),
         },
     }
+    # R-BUNDLE: the route-declaration selection (included / omitted /
+    # shown-above paths, route_map_truncated). The same function the
+    # prompt builder uses, so manifest and prompt cannot disagree.
+    from proofdeploy.model_client import route_selection_for
+
+    manifest["route_map"] = route_selection_for(
+        diff_text=diff_p.read_text(encoding="utf-8"),
+        snapshot_dir=out_snap,
+        app_path=app_path,
+    ).manifest()
     if skill_hash is not None:
         manifest["skill_sha256"] = skill_hash
         manifest["files"]["skill-author.md"] = skill_hash
