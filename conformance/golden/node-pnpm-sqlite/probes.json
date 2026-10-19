@@ -30,13 +30,21 @@
       "assert": [
         {
           "type": "status",
-          "equals": 200
+          "equals": 200,
+          "evidence": {
+            "source": "fixture",
+            "quote": "id 1 (done=false)"
+          }
         },
         {
           "type": "body",
           "json_path": {
             "path": "done",
             "equals": false
+          },
+          "evidence": {
+            "source": "fixture",
+            "quote": "id 1 (done=false)"
           }
         }
       ]
@@ -73,13 +81,21 @@
       "assert": [
         {
           "type": "status",
-          "equals": 200
+          "equals": 200,
+          "evidence": {
+            "source": "fixture",
+            "quote": "id 1 (done=false)"
+          }
         },
         {
           "type": "body",
           "json_path": {
             "path": "done",
             "equals": false
+          },
+          "evidence": {
+            "source": "fixture",
+            "quote": "id 1 (done=false)"
           }
         }
       ]

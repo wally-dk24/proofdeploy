@@ -64,6 +64,13 @@
           },
           "type": "array"
         },
+        "author_evidence": {
+          "description": "D242 (1.9.0, R-METHOD): how the final author answer came about — {correction_used, correction_prompt_sha256, correction_call_attempts, correction_call_error, final_answer (first|second), first_answer and second_answer ({content, sha256, finish_reason, usage, request}; second null when no correction answer was used), checks ({r1, r2}: per assertion {probe, assertion, type, result} with result ok or an evidence_* rejection; r2 null when none)}. Null when the evidence check did not run (no author answer). Recorded, never scored.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "contract_env": {
           "description": "Contract env values used by the run; same redaction rule as fixture, via public_contract_env_keys.",
           "type": "object"
@@ -257,7 +264,7 @@
           "type": "boolean"
         },
         "schema_version": {
-          "const": "1.8.0"
+          "const": "1.9.0"
         },
         "scoring_version": {
           "description": "The scoring rule version; the only value the code produces is v2-per-probe.",
@@ -344,6 +351,7 @@
         "crash_provisioning",
         "crash_probe_results",
         "contract_source",
+        "author_evidence",
         "verdict"
       ],
       "type": "object"
@@ -437,7 +445,7 @@
           ]
         },
         "schema_version": {
-          "const": "1.8.0"
+          "const": "1.9.0"
         },
         "score_record_id": {
           "$ref": "#/$defs/record_id"
@@ -533,7 +541,7 @@
           "description": "The act request actually sent; null when no request was sent."
         },
         "schema_version": {
-          "const": "1.8.0"
+          "const": "1.9.0"
         },
         "sent": {
           "description": "Whether the probe was actually sent to the target.",
@@ -661,7 +669,7 @@
           ]
         },
         "schema_version": {
-          "const": "1.8.0"
+          "const": "1.9.0"
         },
         "scoring_version": {
           "type": "string"
@@ -712,7 +720,7 @@
   },
   "$id": "proofdeploy/docs/contract/result-record.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The record format written to runs.jsonl by proofdeploy/runpair.py at SCHEMA_VERSION 1.8.0 (proofdeploy/probe.py). One JSON object per line; exactly three record types: evidence, score, judgment. This schema uses only the keyword subset enforced by the stdlib validator in tests/test_runpair.py (type, enum, const, required, properties, additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref); every other keyword is annotation only. See docs/contract/result-contract.md for the prose contract.",
+  "description": "The record format written to runs.jsonl by proofdeploy/runpair.py at SCHEMA_VERSION 1.9.0 (proofdeploy/probe.py). One JSON object per line; exactly three record types: evidence, score, judgment. This schema uses only the keyword subset enforced by the stdlib validator in tests/test_runpair.py (type, enum, const, required, properties, additionalProperties, items, pattern, oneOf, anyOf, $defs/$ref); every other keyword is annotation only. See docs/contract/result-contract.md for the prose contract.",
   "oneOf": [
     {
       "$ref": "#/$defs/evidence_record"
@@ -724,5 +732,5 @@
       "$ref": "#/$defs/judgment_record"
     }
   ],
-  "title": "ProofDeploy result record, schema_version 1.8.0"
+  "title": "ProofDeploy result record, schema_version 1.9.0"
 }

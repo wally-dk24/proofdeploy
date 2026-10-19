@@ -358,15 +358,32 @@ def check_bundle_answer_key(
 
     # 6. The prompt is built only from verified files: re-derive it from
     #    the verified bundle files and require byte equality.
+    #    R-BUNDLE: the route-declaration section is part of the prompt,
+    #    selected from the verified snapshot within the contract's
+    #    app.path, so its files are covered by the snapshot equality
+    #    above; the manifest's route_map must equal the recomputation.
     verified_prompt, _ = build_author_prompt(
         skill_text=skill_text,
         fixture_description=actual_desc,
         diff_text=actual_diff,
         snapshot_dir=snapshot_dir,
+        app_path=getattr(contract, "app_path", None),
     )
     if prompt != verified_prompt:
         raise AnswerKeyLeakError(
             "answer-key check: prompt was not built from the verified bundle files"
+        )
+    from proofdeploy.model_client import route_selection_for
+
+    expected_route_map = route_selection_for(
+        diff_text=actual_diff,
+        snapshot_dir=snapshot_dir,
+        app_path=getattr(contract, "app_path", None),
+    ).manifest()
+    if manifest.get("route_map") != expected_route_map:
+        raise AnswerKeyLeakError(
+            "answer-key check: manifest route_map does not match the route "
+            "declarations selected from B"
         )
 
     # 7. Backstop on the final prompt: any fix-SHA prefix from 7

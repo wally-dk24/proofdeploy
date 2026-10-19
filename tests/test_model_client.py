@@ -151,10 +151,11 @@ def test_build_author_prompt_contains_bundle_only(tmp_path):
     )
     assert "SKILL TEXT" in prompt
     assert "Repository: demo" in prompt
-    assert "SECRET_MARKER = 1" in prompt  # touched file content inlined
+    # touched file content inlined; the changed line carries the marker
+    assert "<<CHANGED>> SECRET_MARKER = 1" in prompt
     assert "untouched.py" in prompt  # file list mentions it
     assert "x = 1" not in prompt  # untouched content not inlined
-    assert "Output contract" in prompt
+    assert "## Output format" in prompt
 
 
 def test_call_model_uses_injected_runner():
@@ -348,34 +349,34 @@ def test_credential_unavailable_raises(monkeypatch):
         raise AssertionError("expected RuntimeError")
 
 
-def test_template_v7_hash_and_content():
-    """The v7 template is the registered file: hash matches, the
-    harness example shows python|node, and the assertion wording is
-    Master-approved v5 text (v4 wording plus caps placeholder)."""
+def test_template_v8_hash_and_content():
+    """The v8 template is the registered file (D242): the filename is
+    pinned, the hash the record carries is the file's, the harness
+    example shows python|node, and v7 is still on disk, untouched."""
     import hashlib
-    import re
     from pathlib import Path
 
     import proofdeploy.model_client as mc
 
-    assert mc.PROMPT_TEMPLATE_FILENAME == "author_prompt_v7.md"
-    path = Path(mc.__file__).with_name("author_prompt_v7.md")
+    assert mc.PROMPT_TEMPLATE_FILENAME == "author_prompt_v8.md"
+    path = Path(mc.__file__).with_name("author_prompt_v8.md")
     text = path.read_text(encoding="utf-8")
     assert hashlib.sha256(text.encode("utf-8")).hexdigest() == mc.author_prompt_sha256()
-    assert '"language": "python|node"' in text
-    flat = re.sub(r"\s+", " ", text)
-    # v4 assertion wording (Master-approved).
-    want = (
-        "Each probe should exercise behavior the diff changed and assert the "
-        "behavior the change is intended to produce, as inferred from the diff, "
-        "the code and any docs. A probe should pass on a correct implementation "
-        "and fail on an incorrect one."
+    assert '"language": "python" or "node"' in text
+    # The caps the registration names.
+    caps = mc.load_prompt_template()["caps"]
+    assert caps == {
+        "max_diff_files": 20,
+        "max_file_bytes": 100000,
+        "max_listed_files": 200,
+        "max_route_bytes": 32768,
+    }
+    # v7 is frozen and untouched: its registered hash still matches.
+    v7 = Path(mc.__file__).with_name("author_prompt_v7.md")
+    assert (
+        hashlib.sha256(v7.read_bytes()).hexdigest()
+        == "fa72a0e6c4a1fa9fb204986e08c8eef4b11fc13786f41389ecf2f42ea8555cf3"
     )
-    assert want in flat
-    # v4 framing sentence.
-    assert "a list of the repository's files at the changed commit" in flat
-    # v4 credential wording.
-    assert "You may choose credentials for users you create in setup." in flat
 
 
 def test_fence_minimum_length_three(tmp_path):

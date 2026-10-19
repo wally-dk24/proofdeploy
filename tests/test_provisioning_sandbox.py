@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (long embedded stub JSON / fixture lines)
 """WO-7 PR 1: both executors run the adapter's plan, and the evidence
 records the plan.
 
@@ -429,7 +430,7 @@ env:
   APP_ENV: verification
 fixture:
   repo_name: "mini-app"
-  seed_note: "empty; create users with POST /register"
+  seed_note: "empty; create users with POST /register; GET /value reports v equal to 1 on a correct build"
   auth_mechanism: "Bearer token in the Authorization header"
   auth_scope: "a regular user token"
   flags_note: "no feature flags"
@@ -470,7 +471,7 @@ def _canned_probes(prompt: str):
             "```json\n"
             '{"setup": [], '
             '"act": {"method": "GET", "path": "/value"}, '
-            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}, "evidence": {"source": "fixture", "quote": "GET /value reports v equal to 1"}}]}'
             "\n```\n"
         ),
         finish_reason="stop",

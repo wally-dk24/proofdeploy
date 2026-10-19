@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (long embedded stub JSON / fixture lines)
 """Addendum 23 — WO-5.2 R1 at the orchestrator level.
 
 A full measured run (real provisioning of both sides, real probe
@@ -75,7 +76,7 @@ env:
   APP_ENV: verification
 fixture:
   repo_name: "mini-login"
-  seed_note: "empty; log in with POST /login"
+  seed_note: "empty; log in with POST /login; GET /me/ echoes the session; v equal to 1 on a correct build"
   auth_mechanism: "session token returned by POST /login"
   auth_scope: "a regular user session"
   flags_note: "no feature flags"
@@ -128,10 +129,18 @@ def _probe_block(user: str) -> str:
         ],
         "act": {"method": "GET", "path": "/me/${SESSION}"},
         "assert": [
-            {"type": "status", "equals": 200},
+            {
+                "type": "status",
+                "equals": 200,
+                "evidence": {"source": "fixture", "quote": "Repository: mini-login"},
+            },
             {
                 "type": "body",
-                "json_path": {"path": "session_echo", "equals": "${SESSION}"},
+                "json_path": {"path": "v", "equals": 1},
+                "evidence": {
+                    "source": "fixture",
+                    "quote": "v equal to 1 on a correct build",
+                },
             },
         ],
     }

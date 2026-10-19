@@ -288,6 +288,69 @@ def test_check_b_docs_and_tests_only_fix_rejected(tmp_path: Path) -> None:
     }
 
 
+# ---------------------------------------------------------------------
+# R-SEL (D242): migration paths and check (b).
+# ---------------------------------------------------------------------
+
+PAPERLESS_FIX_PATHS = [
+    "src/paperless_mail/migrations/0001_1_clamp_mailrule_maximum_age.py",
+    "src/paperless_mail/migrations/0002_optimize_integer_field_sizes.py",
+    "src/paperless_mail/tests/test_migrations.py",
+]
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("src/app/migrations/0001_x.py", True),
+        ("alembic/versions/abc.py", True),
+        ("db/migrate/20240101_add.rb", True),
+        ("lib/migrator.py", True),           # file name contains `migrat`
+        ("src/App/Migrations/0001_x.py", True),   # case-insensitive
+        ("src/app/migration/x.py", True),
+        ("src/app/models.py", False),
+    ],
+)
+def test_is_migration_path(path: str, expected: bool) -> None:
+    assert mod.is_migration_path(path) is expected
+
+
+def test_paperless_wo6_fix_paths_fail_check_b_upgrade_path_only(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path)
+    commit(repo, "Initial commit", ts(2026, 1, 10),
+           {p: "l1\n" for p in PAPERLESS_FIX_PATHS})
+    head = commit(repo, "Fix the mail rule migration", ts(2026, 8, 1),
+                  {p: "l1\nl2\n" for p in PAPERLESS_FIX_PATHS})
+    record = select(repo, head, FakeReady())
+    entry = record["walked"][-1]
+    assert entry["failed_check"] == "b"
+    assert "upgrade-path only" in entry["reason"]
+    assert entry["changed_classes"] == {
+        "SOURCE": 2, "TEST": 1, "DOC": 0, "OTHER": 0,
+    }
+
+
+def test_migration_plus_non_migration_source_passes_check_b(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path)
+    commit(repo, "Initial commit", ts(2026, 1, 10),
+           {"src/app/migrations/0001_x.py": "m1\n",
+            "src/app.py": "l1\nl2\nl3\n"})
+    b = commit(repo, "Introduce the counter", ts(2026, 2, 1),
+               {"src/app.py": "l1\nl2-bug\nl3\n"})
+    add_tag(repo, "v1.0", ts(2026, 2, 2))
+    fix = commit(repo, "Fix the counter", ts(2026, 8, 15),
+                 {"src/app.py": "l1\nl2-fixed\nl3\n",
+                  "src/app/migrations/0001_x.py": "m1\nm2\n"})
+    record = select(repo, fix, FakeReady({b, fix}))
+    entry = record["walked"][-1]
+    assert entry["failed_check"] != "b"
+    assert record["outcome"] == "selected"
+
+
 def test_check_c_add_only_fix_has_no_b(tmp_path: Path) -> None:
     repo, _base, _b, _mid, _fix = standard_history(tmp_path)
     head = commit(repo, "Fix by adding a guard line", ts(2026, 8, 20),
