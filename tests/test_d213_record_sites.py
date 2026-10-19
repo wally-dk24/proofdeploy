@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (long embedded stub JSON / fixture lines)
 """D213 (follow-up to D211, D57 cleanup): per-site tests for the
 ``model_finish_reason`` / ``model_usage`` record fields, D171 pattern.
 
@@ -98,7 +99,7 @@ env:
   APP_ENV: verification
 fixture:
   repo_name: "mini-app"
-  seed_note: "empty; create users with POST /register"
+  seed_note: "empty; create users with POST /register; GET /value reports v equal to 1 on a correct build"
   auth_mechanism: "Bearer token in the Authorization header"
   auth_scope: "a regular user token"
   flags_note: "no feature flags"
@@ -110,7 +111,7 @@ _PROBE_CONTENT = (
     "```json\n"
     '{"setup": [], '
     '"act": {"method": "GET", "path": "/value"}, '
-    '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+    '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}, "evidence": {"source": "fixture", "quote": "GET /value reports v equal to 1"}}]}'
     "\n```\n"
 )
 
@@ -201,13 +202,13 @@ def _evidence(out: Path) -> dict[str, Any]:
 
 
 def _assert_stop_and_usage(evidence: dict[str, Any]) -> None:
-    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["schema_version"] == "1.9.0"
     assert evidence["model_finish_reason"] == "stop"
     assert evidence["model_usage"] == _USAGE
 
 
 def _assert_null_fields(evidence: dict[str, Any]) -> None:
-    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["schema_version"] == "1.9.0"
     assert "model_finish_reason" in evidence
     assert evidence["model_finish_reason"] is None
     assert "model_usage" in evidence
@@ -339,7 +340,13 @@ _VERIFY_CONTRACT = (
 _VERIFY_PROBE = {
     "setup": [],
     "act": {"method": "GET", "path": "/health"},
-    "assert": [{"type": "status", "equals": 200}],
+    "assert": [
+        {
+            "type": "status",
+            "equals": 200,
+            "evidence": {"source": "fixture", "quote": "no seed data"},
+        }
+    ],
 }
 
 

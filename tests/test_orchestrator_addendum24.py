@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (long embedded stub JSON / fixture lines)
 """Addendum 24 — WO-5.2 round 2: harness provenance on every record path.
 
 Round 1's R2 test only exercised ``build_evidence_record`` directly.
@@ -63,7 +64,7 @@ env:
   APP_ENV: verification
 fixture:
   repo_name: "mini-app"
-  seed_note: "empty"
+  seed_note: "empty; GET /value reports v equal to 1 on a correct build"
   auth_mechanism: "none"
   auth_scope: "none"
   flags_note: "no feature flags"
@@ -110,7 +111,7 @@ def _canned_probes(prompt: str) -> ModelResponse:
     assert "mini-app" in prompt  # the author really saw the bundle
     probe = {
         "act": {"method": "GET", "path": "/value"},
-        "assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}],
+        "assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}, "evidence": {"source": "fixture", "quote": "GET /value reports v equal to 1"}}],
     }
     import json as _json
 

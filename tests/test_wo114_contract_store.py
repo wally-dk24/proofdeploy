@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (long embedded stub JSON / fixture lines)
 """WO-1.14 Part 1 (D103) — the contract store is the measured path's
 contract source (REG-E).
 
@@ -104,7 +105,7 @@ env:
   APP_ENV: "test"
 fixture:
   repo_name: "store-mini-app"
-  seed_note: "The app starts empty; GET /value reports the build's constant."
+  seed_note: "The app starts empty; GET /value reports the build's constant; GET /value reports v equal to 1 on a correct build."
   auth_mechanism: "There are no user accounts and no login."
   flags_note: "There are no feature flags."
 """
@@ -184,7 +185,8 @@ def canned_probes_store(prompt: str) -> ModelResponse:
             '{"setup": [], '
             '"act": {"method": "GET", "path": "/value"}, '
             '"assert": [{"type": "body", "json_path": '
-            '{"path": "value", "equals": 1}}]}'
+            '{"path": "value", "equals": 1}, '
+            '"evidence": {"source": "fixture", "quote": "GET /value reports v equal to 1"}}]}'
             "\n```\n"
         )
     )
@@ -236,7 +238,7 @@ def test_measure_bug_uses_store_contract_with_no_in_tree_contract(tmp_path):
     records = read_records(tmp_path / "records")
     assert [r["record_type"] for r in records] == ["evidence", "score"]
     evidence = records[0]
-    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["schema_version"] == "1.9.0"
     assert evidence["contract_source"] == {
         "store_path": str(contract),
         "sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),
@@ -685,7 +687,8 @@ def test_readiness_render_fields_success(monkeypatch, tmp_path):
             "repo_name": "store-mini-app",
             "seed_note": (
                 "The app starts empty; GET /value reports the "
-                "build's constant."
+                "build's constant; GET /value reports v equal to 1 "
+                "on a correct build."
             ),
             "auth_mechanism": "There are no user accounts and no login.",
             "flags_note": "There are no feature flags.",
@@ -1101,7 +1104,7 @@ env:
   APP_THROTTLE_RATE: "600/min"
 fixture:
   repo_name: "store-mini-app"
-  seed_note: "The app starts empty; GET /value reports the build's constant."
+  seed_note: "The app starts empty; GET /value reports the build's constant; GET /value reports v equal to 1 on a correct build."
   auth_mechanism: "There are no user accounts and no login."
   flags_note: "There are no feature flags."
 """
@@ -1444,7 +1447,7 @@ def test_store_measure_record_carries_container_env_keys(
     summary = orch.measure_bug()
     assert "cause" not in summary
     evidence = read_records(tmp_path / "records")[0]
-    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["schema_version"] == "1.9.0"
     assert evidence["container_env_keys"] == sorted(D220_ENV)
     assert evidence["dry_run"] is None
     assert evidence["contract_source"]["store_path"] == (

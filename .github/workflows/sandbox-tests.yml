@@ -108,7 +108,7 @@ jobs:
                 # is sha256-checked in tests/test_leakcheck.py).
                 # Every other docs/evaluation file is inert, like
                 # the rest of docs/.
-                docs/evaluation/scoring-rule-run-pair-2026-10-09.md|docs/evaluation/skill/skill-author.md|docs/evaluation/skill/skill.md) echo "NON-INERT (test input): $f"; heavy=true ;;
+                docs/evaluation/o21/prompt-v8-header.md|docs/evaluation/o21/skill-v5-author.md|docs/evaluation/scoring-rule-run-pair-2026-10-09.md|docs/evaluation/skill/skill-author.md|docs/evaluation/skill/skill.md) echo "NON-INERT (test input): $f"; heavy=true ;;
                 docs/*) echo "inert: $f" ;;
                 README.md|CONTRIBUTING.md|SECURITY.md|CHANGELOG.md|CODE_OF_CONDUCT.md) echo "inert: $f" ;;
                 LICENSE|LICENSE.*) echo "inert: $f" ;;

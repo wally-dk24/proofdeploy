@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (long embedded stub JSON / fixture lines)
 """WO-8.1 (REG-A): the registered Python lock rule in code.
 
 The rule (docs/registration/python-lock-rule.md items 1-6):
@@ -414,7 +415,7 @@ env:
   APP_ENV: verification
 fixture:
   repo_name: "mini-app"
-  seed_note: "empty; create users with POST /register"
+  seed_note: "empty; create users with POST /register; GET /value reports v equal to 1 on a correct build"
   auth_mechanism: "Bearer token in the Authorization header"
   auth_scope: "a regular user token"
   flags_note: "no feature flags"
@@ -526,7 +527,7 @@ def _canned_probes(prompt: str):
             "```json\n"
             '{"setup": [], '
             '"act": {"method": "GET", "path": "/value"}, '
-            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}, "evidence": {"source": "fixture", "quote": "GET /value reports v equal to 1"}}]}'
             "\n```\n"
         ),
         finish_reason="stop",
@@ -907,9 +908,9 @@ def test_schema_140_and_old_records_still_load(tmp_path):
     from proofdeploy.probe import SCHEMA_VERSION
     from proofdeploy.runpair import build_evidence_record, read_records
 
-    assert SCHEMA_VERSION == "1.8.0"
+    assert SCHEMA_VERSION == "1.9.0"
     record = build_evidence_record(run_kind="bug", bug_id="WO81-SCHEMA")
-    assert record["schema_version"] == "1.8.0"
+    assert record["schema_version"] == "1.9.0"
     # A 1.3.0-shaped record (provisions without lock fields) loads.
     old = dict(record)
     old["schema_version"] = "1.3.0"
