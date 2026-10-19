@@ -1215,3 +1215,77 @@ def test_github_check_d_run_ids_journaled_per_attempt(
     assert [a["workflow_run_id"] for a in fix_side["attempts"]] == [
         "7000", "7001",
     ]
+
+
+REAL_ROWS_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "readiness_rows_real.json"
+)
+REAL_CONTRACT_SHA = (
+    "eb60559b9fdd879e5cb8ca30d16c7cbfb1cea356e9385b8e367a249ab7c19e6a"
+)
+
+
+def _patch_gh_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_gh(*args: str) -> subprocess.CompletedProcess[str]:
+        dest = Path(args[args.index("--dir") + 1])
+        (dest / "rows-attempt1.json").write_text(
+            REAL_ROWS_FIXTURE.read_text()
+        )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(mod, "_gh", fake_gh)
+
+
+def test_gh_fetch_rows_reads_real_rows_artifact_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real artifact is an object {kind, repo, attempt,
+    network_mode, rows, regd_summaries}; the reader must return
+    its rows list, not treat it as unreadable."""
+    _patch_gh_download(monkeypatch)
+    rows = mod.GhReadinessDispatcher().fetch_rows(
+        "39321472420", repo="paperless-ngx/paperless-ngx"
+    )
+    assert rows is not None
+    assert [r["role"] for r in rows] == ["fix^", "fix"]
+
+
+def test_gh_check_d_real_rows_artifact_both_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gh_download(monkeypatch)
+    real = mod.GhReadinessDispatcher()
+
+    class RealParseDispatcher(FakeDispatcher):
+        def fetch_rows(
+            self, run_id: str, *, repo: str
+        ) -> list[dict[str, Any]] | None:
+            return real.fetch_rows(run_id, repo=repo)
+
+    fake = RealParseDispatcher([{"wait": True}])
+    outcomes = github_checker(fake)("a" * 40, "b" * 40, ("fix^", "fix"))
+    for role in ("fix^", "fix"):
+        assert outcomes[role]["ready"] is True
+        assert outcomes[role]["isolation_mode"] == "userns-remap"
+        assert outcomes[role]["network_mode"] == "none+socket"
+        assert outcomes[role]["contract_store_sha256"] == REAL_CONTRACT_SHA
+
+
+def test_gh_fetch_rows_list_and_other_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def make(payload: str) -> Any:
+        def fake_gh(*args: str) -> subprocess.CompletedProcess[str]:
+            dest = Path(args[args.index("--dir") + 1])
+            (dest / "rows-attempt1.json").write_text(payload)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        return fake_gh
+
+    d = mod.GhReadinessDispatcher()
+    monkeypatch.setattr(mod, "_gh", make('[{"role": "fix"}]'))
+    assert d.fetch_rows("1", repo="o/r") == [{"role": "fix"}]
+    monkeypatch.setattr(mod, "_gh", make('{"rows": "x"}'))
+    assert d.fetch_rows("1", repo="o/r") is None
+    monkeypatch.setattr(mod, "_gh", make('"x"'))
+    assert d.fetch_rows("1", repo="o/r") is None

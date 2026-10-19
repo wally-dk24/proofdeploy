@@ -1582,6 +1582,9 @@ class GhReadinessDispatcher:
                 data = json.loads(path.read_text())
             except (OSError, json.JSONDecodeError):
                 return None
+        if isinstance(data, dict):
+            rows = data.get("rows")
+            return rows if isinstance(rows, list) else None
         return data if isinstance(data, list) else None
 
 
