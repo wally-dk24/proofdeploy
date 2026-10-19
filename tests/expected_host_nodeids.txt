@@ -1204,6 +1204,7 @@ tests/test_wo6_bug_select.py::test_classify_side[outcome7-unruled]
 tests/test_wo6_bug_select.py::test_classify_side[outcome8-unruled]
 tests/test_wo6_bug_select.py::test_date_boundary_is_strict
 tests/test_wo6_bug_select.py::test_default_builder_builds_prompt_through_orchestrator
+tests/test_wo6_bug_select.py::test_default_builder_declares_benign_contract_env_keys_public
 tests/test_wo6_bug_select.py::test_default_builder_refusal_stops_the_walk_not_rejects
 tests/test_wo6_bug_select.py::test_diff_non_ascii_path_parses
 tests/test_wo6_bug_select.py::test_diff_quoted_path_header_fails_closed

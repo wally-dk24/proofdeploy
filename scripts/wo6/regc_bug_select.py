@@ -1322,6 +1322,7 @@ def make_author_prompt_size_builder(
     repo: AppRepo,
     contract_path: Path | None = None,
     skill_path: Path | None = None,
+    public_env_keys: list[str] | None = None,
 ) -> PromptSizeCheck:
     """Check (e) through the orchestrator's own bundle code (R-SIZE
     item 1): Orchestrator._build_bundle, the function the measured
@@ -1332,16 +1333,48 @@ def make_author_prompt_size_builder(
 
     Returns the prompt's length in characters and nothing else. The
     unit directory (diff, snapshot, bundle) is a temporary directory
-    removed on return; nothing of it is printed or journaled. An
+    removed on return; nothing of it is printed or journaled.
+
+    The bundle's leak gate (_leak_check_bundle) runs unchanged, as on
+    the measured path, where the dispatch declares benign contract
+    env keys public (D203). Here `public_env_keys` is that
+    declaration; when None it is every key of the unit's store
+    contract that the CLI's own validate_public_env_keys accepts
+    (credential-named and auth.bootstrap_env keys are never public),
+    so a benign class path found in the app's own files (D203) does
+    not stop the walk. An
     environment or contract failure raises HarnessError — the walk
     stops, it never rejects a candidate on its way through."""
+    from proofdeploy.cli import (
+        contract_bootstrap_env_names,
+        validate_public_env_keys,
+    )
+    from proofdeploy.leakcheck import SecretLeakError
     from proofdeploy.orchestrator import (
         ContractRefusal,
         MeasureConfig,
         Orchestrator,
         OrchestratorError,
     )
+    from proofdeploy.yml import contract_store_path, load_contract
 
+    if public_env_keys is None:
+        try:
+            store = contract_path or contract_store_path(repo_name)
+            env_keys = sorted(load_contract(store).env)
+        except (ValueError, FileNotFoundError, OSError):
+            env_keys = []  # the bundle build surfaces the refusal
+        bootstrap = contract_bootstrap_env_names(repo_name, None) or []
+        public_env_keys = []
+        for key in env_keys:
+            try:
+                public_env_keys += validate_public_env_keys(
+                    [key], bootstrap_env_names=bootstrap
+                )
+            except ValueError:
+                continue  # credential-named: stays forbidden
+
+    public_keys: list[str] = list(public_env_keys)
     root = Path(__file__).resolve().parents[2]
     skill = skill_path or root / "docs" / "evaluation" / "skill" / "skill-author.md"
 
@@ -1361,6 +1394,7 @@ def make_author_prompt_size_builder(
                 use_contract_store=True,
                 unit_repo=repo_name,
                 contract_path=contract_path,
+                public_contract_env_keys=public_keys,
                 dry_run_before_model=True,
             )
             unit_dir = tmp_path / "unit"
@@ -1372,7 +1406,7 @@ def make_author_prompt_size_builder(
                     rev_base=b_parent,
                     rev_tip=b_sha,
                 )
-            except (ContractRefusal, OrchestratorError) as exc:
+            except (ContractRefusal, OrchestratorError, SecretLeakError) as exc:
                 # The message is the orchestrator's own refusal text
                 # (paths, hashes, git errors); bundle content is not
                 # part of it.

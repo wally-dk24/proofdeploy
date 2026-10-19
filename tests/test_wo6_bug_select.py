@@ -1458,3 +1458,42 @@ def test_default_builder_refusal_stops_the_walk_not_rejects(
     # refusal: HarnessError, never a size.
     with pytest.raises(mod.HarnessError, match="check \\(e\\) refused"):
         builder(base, base)
+
+
+def test_default_builder_declares_benign_contract_env_keys_public(
+    tmp_path: Path,
+) -> None:
+    """D203 class: a benign contract env value that also appears in
+    the app's own files must not trip the bundle leak gate, while a
+    credential-named key stays forbidden."""
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "readiness" / "contracts"
+            / "golden__node-express-sqlite.yml").read_text()
+    text = text.replace(
+        "env:\n",
+        "env:\n  APP_BACKEND_CLASS: \"pkg.backends.BenignBackendClass\"\n",
+        1,
+    )
+    store = tmp_path / "store.yml"
+    store.write_text(text)
+    repo = init_repo(tmp_path)
+    base = commit(repo, "Initial commit", ts(2026, 1, 10),
+                  {"server.js": "x\n", "package.json": "{}\n"})
+    b = commit(repo, "Introduce the counter", ts(2026, 2, 1),
+               {"server.js": "// pkg.backends.BenignBackendClass\n"})
+    builder = mod.make_author_prompt_size_builder(
+        repo_name="golden/node-express-sqlite",
+        repo=mod.AppRepo(repo),
+        contract_path=store,
+    )
+    assert builder(base, b) > 0
+    # With nothing declared public the same range is refused by the
+    # leak gate (a harness stop, never a size or a rejection).
+    strict = mod.make_author_prompt_size_builder(
+        repo_name="golden/node-express-sqlite",
+        repo=mod.AppRepo(repo),
+        contract_path=store,
+        public_env_keys=[],
+    )
+    with pytest.raises(mod.HarnessError, match="secret leak"):
+        strict(base, b)
