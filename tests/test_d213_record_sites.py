@@ -36,7 +36,11 @@ from typing import Any
 import pytest
 
 from proofdeploy.model_client import ModelCallError, ModelResponse
-from proofdeploy.orchestrator import MeasureConfig, Orchestrator
+from proofdeploy.orchestrator import (
+    MeasureConfig,
+    Orchestrator,
+    OrchestratorError,
+)
 from proofdeploy.runpair import read_records
 from proofdeploy.verify import run_verify
 
@@ -319,6 +323,127 @@ def test_s5_model_call_failure_records_null_finish_and_usage(
     assert summary["verdict"] == "inconclusive"
     assert summary["cause"] == "model_transport"
     _assert_null_fields(_evidence(out))
+
+
+# ---------------------------------------------------------------------------
+# D251: the pinned client's bare RuntimeError is normalized on the
+# measured path (one retry, then an INCONCLUSIVE record).
+# ---------------------------------------------------------------------------
+
+_HTTP_429 = "model API call failed: HTTP 429: rate limited (test)"
+
+
+def _http_429_always(prompt: str) -> ModelResponse:
+    raise RuntimeError(_HTTP_429)
+
+
+def _http_429_once_then_ok(calls: list[str]) -> Callable[[str], ModelResponse]:
+
+    def runner(prompt: str) -> ModelResponse:
+        calls.append(prompt)
+        if len(calls) == 1:
+            raise RuntimeError(_HTTP_429)
+        return _stop_with_usage(prompt)
+
+    return runner
+
+
+def _clean_cfg(
+    tmp_path: Path, info: dict[str, str], runner: Callable[[str], ModelResponse]
+) -> tuple[MeasureConfig, Path]:
+    out = tmp_path / "records"
+    cfg = MeasureConfig(
+        repo_dir=Path(info["repo"]),
+        output_dir=out,
+        workdir=tmp_path / "work",
+        skill_path=skill_path(),
+        clean_id="mini-d251-clean",
+        rev_clean=info["fix"],
+        model_runner=runner,
+        public_contract_env_keys=["APP_ENV"],
+        allow_unsandboxed=True,
+    )
+    return cfg, out
+
+
+def _assert_two_failed_attempts(evidence: dict[str, Any]) -> None:
+    attempts = evidence["model_call_attempts"]
+    assert len(attempts) == 2
+    assert attempts[0].startswith("attempt_1: model_transport:")
+    assert attempts[1].startswith("attempt_2: model_transport:")
+    assert "HTTP 429" in attempts[0]
+
+
+def test_d251_bug_bare_runtimeerror_records_inconclusive_after_one_retry(
+    tmp_path: Path,
+) -> None:
+    info = make_mini_repo(tmp_path)
+    cfg, out = _bug_cfg(tmp_path, info, _http_429_always)
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "model_transport"
+    _assert_two_failed_attempts(_evidence(out))
+
+
+def test_d251_clean_bare_runtimeerror_records_inconclusive_after_one_retry(
+    tmp_path: Path,
+) -> None:
+    info = make_mini_repo(tmp_path)
+    cfg, out = _clean_cfg(tmp_path, info, _http_429_always)
+    summary = Orchestrator(cfg).measure_clean()
+    assert summary["verdict"] == "inconclusive"
+    assert summary["cause"] == "model_transport"
+    _assert_two_failed_attempts(_evidence(out))
+
+
+def test_d251_bug_transient_runtimeerror_then_success_proceeds(
+    tmp_path: Path,
+) -> None:
+    info = make_mini_repo(tmp_path)
+    calls: list[str] = []
+    cfg, _ = _bug_cfg(tmp_path, info, _http_429_once_then_ok(calls))
+    summary = Orchestrator(cfg).measure_bug()
+    assert summary["verdict"] == "candidate_catch"
+    # Exactly one retry. (The completion record does not carry the
+    # attempts list; only the INCONCLUSIVE record does.)
+    assert len(calls) == 2
+
+
+def test_d251_clean_transient_runtimeerror_then_success_proceeds(
+    tmp_path: Path,
+) -> None:
+    info = make_mini_repo(tmp_path)
+    calls: list[str] = []
+    cfg, _ = _clean_cfg(tmp_path, info, _http_429_once_then_ok(calls))
+    summary = Orchestrator(cfg).measure_clean()
+    assert summary["run_kind"] == "clean"
+    assert summary["false_alarm"] is False
+    # Exactly one retry. (The completion record does not carry the
+    # attempts list; only the INCONCLUSIVE record does.)
+    assert len(calls) == 2
+
+
+def test_d251_orchestrator_error_and_model_call_error_propagate_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    info = make_mini_repo(tmp_path)
+    cfg, _ = _bug_cfg(tmp_path, info, _stop_with_usage)
+    orch = Orchestrator(cfg)
+
+    def raise_orch(prompt: str, sources: Any) -> Any:
+        raise OrchestratorError("internal (test)")
+
+    monkeypatch.setattr(orch, "_author_probes", raise_orch)
+    with pytest.raises(OrchestratorError, match="internal"):
+        orch._call_author_probes("p", {})
+
+    def raise_overflow(prompt: str, sources: Any) -> Any:
+        raise ModelCallError("too big (test)", cause="model_overflow")
+
+    monkeypatch.setattr(orch, "_author_probes", raise_overflow)
+    with pytest.raises(ModelCallError) as ei:
+        orch._call_author_probes("p", {})
+    assert ei.value.cause == "model_overflow"
 
 
 # ---------------------------------------------------------------------------

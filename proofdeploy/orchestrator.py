@@ -1902,6 +1902,27 @@ class Orchestrator:
             assert_no_secrets(text, values, where=f"bundle file {f.name}")
         self._say("leak check passed: prompt and bundle carry no secret values")
 
+    def _call_author_probes(
+        self, prompt: str, sources: dict[str, ShownSource]
+    ) -> tuple[ProbeSet, ModelResponse]:
+        """``_author_probes`` with the model failure taxonomy normalized.
+
+        The pinned model client raises a bare ``RuntimeError("model API
+        call failed: ...")`` on an HTTP or transport failure. Convert it
+        to ``ModelCallError`` (cause ``model_transport``) so the
+        registered rule (one retry, then an INCONCLUSIVE record) runs on
+        the measured path, as ``verify._call_author`` already does for
+        the verify path. ``OrchestratorError`` (a ``RuntimeError``
+        subclass) is not a model failure and propagates unchanged, as
+        does ``ModelCallError``.
+        """
+        try:
+            return self._author_probes(prompt, sources)
+        except (OrchestratorError, ModelCallError):
+            raise
+        except RuntimeError as exc:
+            raise ModelCallError(str(exc), cause="model_transport") from exc
+
     def _author_probes(
         self, prompt: str, sources: dict[str, ShownSource]
     ) -> tuple[ProbeSet, ModelResponse]:
@@ -2960,7 +2981,7 @@ class Orchestrator:
         # - model_overflow: no retry.
         attempts: list[str] = []
         try:
-            probeset, raw = self._author_probes(prompt, sources)
+            probeset, raw = self._call_author_probes(prompt, sources)
             attempts.append("attempt_1: success")
         except ModelCallError as e:
             attempts.append(f"attempt_1: {e.cause}: {e}")
@@ -2968,7 +2989,7 @@ class Orchestrator:
                 # Exactly one retry for transport failures.
                 self._say("model transport failed; retrying once")
                 try:
-                    probeset, raw = self._author_probes(prompt, sources)
+                    probeset, raw = self._call_author_probes(prompt, sources)
                     attempts.append("attempt_2: success")
                 except ModelCallError as e2:
                     attempts.append(f"attempt_2: {e2.cause}: {e2}")
@@ -3316,7 +3337,7 @@ class Orchestrator:
         # - model_overflow: no retry.
         attempts: list[str] = []
         try:
-            probeset, raw = self._author_probes(prompt, sources)
+            probeset, raw = self._call_author_probes(prompt, sources)
             attempts.append("attempt_1: success")
         except ModelCallError as e:
             attempts.append(f"attempt_1: {e.cause}: {e}")
@@ -3324,7 +3345,7 @@ class Orchestrator:
                 # Exactly one retry for transport failures.
                 self._say("model transport failed; retrying once")
                 try:
-                    probeset, raw = self._author_probes(prompt, sources)
+                    probeset, raw = self._call_author_probes(prompt, sources)
                     attempts.append("attempt_2: success")
                 except ModelCallError as e2:
                     attempts.append(f"attempt_2: {e2.cause}: {e2}")
