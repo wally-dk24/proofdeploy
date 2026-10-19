@@ -1170,6 +1170,9 @@ tests/test_wo6_bug_select.py::test_check_d_retryable_failure_retries_then_select
 tests/test_wo6_bug_select.py::test_check_d_retryable_failure_retries_then_selects[harness error: git fetch failed in the clone: stub-harness]
 tests/test_wo6_bug_select.py::test_check_d_unprefixed_runtime_not_supported_stops_run
 tests/test_wo6_bug_select.py::test_check_d_unruled_class_stops_run
+tests/test_wo6_bug_select.py::test_check_e_boundary_80000_selected_80001_rejected
+tests/test_wo6_bug_select.py::test_check_e_not_evaluated_for_commits_failing_a_to_d
+tests/test_wo6_bug_select.py::test_check_e_size_recorded_without_content
 tests/test_wo6_bug_select.py::test_classify_path[.github/workflows/x.yml-OTHER]
 tests/test_wo6_bug_select.py::test_classify_path[CHANGELOG-DOC]
 tests/test_wo6_bug_select.py::test_classify_path[README.md-DOC]
@@ -1200,6 +1203,9 @@ tests/test_wo6_bug_select.py::test_classify_side[outcome6-our_gap]
 tests/test_wo6_bug_select.py::test_classify_side[outcome7-unruled]
 tests/test_wo6_bug_select.py::test_classify_side[outcome8-unruled]
 tests/test_wo6_bug_select.py::test_date_boundary_is_strict
+tests/test_wo6_bug_select.py::test_default_builder_builds_prompt_through_orchestrator
+tests/test_wo6_bug_select.py::test_default_builder_declares_benign_contract_env_keys_public
+tests/test_wo6_bug_select.py::test_default_builder_refusal_stops_the_walk_not_rejects
 tests/test_wo6_bug_select.py::test_diff_non_ascii_path_parses
 tests/test_wo6_bug_select.py::test_diff_quoted_path_header_fails_closed
 tests/test_wo6_bug_select.py::test_diff_removed_line_starting_with_dashes_is_content
@@ -1230,8 +1236,10 @@ tests/test_wo6_bug_select.py::test_is_migration_path[src/app/models.py-False]
 tests/test_wo6_bug_select.py::test_journal_identity_mismatch_refuses
 tests/test_wo6_bug_select.py::test_journal_resume_reuses_entries
 tests/test_wo6_bug_select.py::test_journal_torn_final_line_is_dropped
+tests/test_wo6_bug_select.py::test_main_prints_tally_with_e_and_no_subject
 tests/test_wo6_bug_select.py::test_migration_plus_non_migration_source_passes_check_b
 tests/test_wo6_bug_select.py::test_paperless_wo6_fix_paths_fail_check_b_upgrade_path_only
+tests/test_wo6_bug_select.py::test_r_size_budget_constant_is_the_signed_80000
 tests/test_wo6_bug_select.py::test_record_carries_identity_and_full_walk
 tests/test_wo6_bug_select.py::test_script_sha256_is_the_file_itself
 tests/test_wo6_bug_select.py::test_selects_first_passing_fix
