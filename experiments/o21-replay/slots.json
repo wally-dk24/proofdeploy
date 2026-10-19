@@ -1,0 +1,14 @@
+{"note": "The 11 golden bug runs that missed. Each slot re-asks the same app material with the v8 header + skill v5 draft. App material sha256 (from '## Fixture' on): node 27f28c3de139..., python 3f723e164fa8...",
+ "slots": [
+  {"slot": 1,  "replaces_run": "39064060901", "prompt": "node_bug.v8.txt"},
+  {"slot": 2,  "replaces_run": "39129231446", "prompt": "node_bug.v8.txt"},
+  {"slot": 3,  "replaces_run": "39130431803", "prompt": "node_bug.v8.txt"},
+  {"slot": 4,  "replaces_run": "39130446817", "prompt": "node_bug.v8.txt"},
+  {"slot": 5,  "replaces_run": "39141910203", "prompt": "node_bug.v8.txt"},
+  {"slot": 6,  "replaces_run": "39141926098", "prompt": "node_bug.v8.txt"},
+  {"slot": 7,  "replaces_run": "39141933558", "prompt": "node_bug.v8.txt"},
+  {"slot": 8,  "replaces_run": "39064086675", "prompt": "python_bug.v8.txt"},
+  {"slot": 9,  "replaces_run": "39130464436", "prompt": "python_bug.v8.txt"},
+  {"slot": 10, "replaces_run": "39130487509", "prompt": "python_bug.v8.txt"},
+  {"slot": 11, "replaces_run": "39130495691", "prompt": "python_bug.v8.txt"}
+ ]}
