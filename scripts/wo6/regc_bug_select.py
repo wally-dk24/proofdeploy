@@ -45,7 +45,9 @@ rule-text change):
 The checks, in order (the record names the FIRST failing one):
 
   a. the subject matches (?i)\\bfix(e[sd])?\\b;
-  b. at least one changed path classifies SOURCE;
+  b. at least one changed path classifies SOURCE and is not a
+     migration path (R-SEL, D242: a fix whose SOURCE changes are
+     all migration paths fails as `b: upgrade-path only`);
   c. B exists (the fix removes or changes at least one line, and
      git blame at fix^ attributes those lines), and B is contained
      in a release tag whose creation date is strictly before the
@@ -353,6 +355,20 @@ def classify_path(path: str) -> str:
     if _is_other_path(segments, basename):
         return "OTHER"
     return "SOURCE"
+
+
+MIGRATION_SEGMENTS = frozenset({"migrations", "migration", "migrate", "alembic"})
+MIGRATION_NAME_SUBSTRING = "migrat"
+
+
+def is_migration_path(path: str) -> bool:
+    """R-SEL item 1 (signed D242): a path is a migration path when,
+    case-insensitively, any path segment is `migrations`, `migration`,
+    `migrate` or `alembic`, or its file name contains `migrat`."""
+    segments = path.lower().split("/")
+    if any(seg in MIGRATION_SEGMENTS for seg in segments):
+        return True
+    return MIGRATION_NAME_SUBSTRING in segments[-1]
 
 
 def subject_matches(subject: str) -> bool:
@@ -836,6 +852,20 @@ def evaluate_commit(
         return reject(
             "b",
             "no SOURCE file changed (changed classes: "
+            + ", ".join(f"{k}={v}" for k, v in counts.items())
+            + ")",
+        )
+    # R-SEL item 2 (D242): at least one SOURCE path must not be a
+    # migration path; otherwise the fix is observable only on an
+    # upgrade path.
+    if not any(
+        c == "SOURCE" and not is_migration_path(p)
+        for p, c in zip(paths, classes, strict=True)
+    ):
+        return reject(
+            "b",
+            "b: upgrade-path only (every SOURCE path is a migration "
+            "path; changed classes: "
             + ", ".join(f"{k}={v}" for k, v in counts.items())
             + ")",
         )
