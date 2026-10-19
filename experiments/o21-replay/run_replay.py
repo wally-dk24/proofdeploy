@@ -21,6 +21,7 @@ REPO = HERE.parent.parent
 OUT = HERE / "out"
 CLIENT_SHA256 = "a35238a5a38b36ae691ab97861a064938787c5b14a49c380c009067a99f3785b"
 RETRY_WAIT_S = 60
+PACE_S = 20  # v2 (D240): pause between model calls to stay under the tokens-per-minute limit
 
 sys.path.insert(0, str(HERE))
 import check  # noqa: E402
@@ -72,8 +73,10 @@ def make_call(stub_reply: str | None):
     return lambda prompt: call_model(prompt)
 
 
-def call_with_retry(call, prompt: str):
+def call_with_retry(call, prompt: str, pace: bool = True):
     """Returns (response, retries, error_string). One retry after 60 s."""
+    if pace:
+        time.sleep(PACE_S)
     try:
         return call(prompt), 0, None
     except RuntimeError as e:
@@ -106,6 +109,9 @@ def main() -> int:
     head = git_head()
     slots = json.loads((HERE / "slots.json").read_text())["slots"]
     call = make_call(stub_reply)
+    global PACE_S
+    if args.stub:
+        PACE_S = 0
     OUT.mkdir(exist_ok=True)
 
     results = []

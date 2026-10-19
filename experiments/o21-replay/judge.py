@@ -6,12 +6,30 @@ import json, sys
 import os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from check import surviving
 
+def authed_as_seed(p):
+    """v2 (D240): the request is made as seeduser, either with the provided ${AUTH_TOKEN}
+    or with a token captured from a setup POST /login (or /register) as seeduser/seedpass."""
+    auth = json.dumps(p.get('act', {}).get('headers', {}))
+    if 'Bearer ${AUTH_TOKEN}' in auth:
+        return True
+    for s in p.get('setup', []):
+        sa = s.get('act', {})
+        body = sa.get('body') or {}
+        if (sa.get('method') == 'POST' and sa.get('path') in ('/login', '/register')
+                and isinstance(body, dict) and body.get('username') == 'seeduser'
+                and body.get('password') == 'seedpass'):
+            for name in (s.get('capture') or {}):
+                if 'Bearer ${' + name + '}' in auth:
+                    return True
+    return False
+
+
 def judge(prompt_path, final_reply):
     probes, res = surviving(prompt_path, final_reply)
     right = wrong = 0
     for p in probes:
         a = p.get('act', {})
-        if a.get('method') != 'GET' or 'Bearer ${AUTH_TOKEN}' not in json.dumps(a.get('headers', {})):
+        if a.get('method') != 'GET' or not authed_as_seed(p):
             continue
         for x in p.get('assert', []):
             jp = x.get('json_path') or {}

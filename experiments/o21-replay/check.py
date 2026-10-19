@@ -15,7 +15,9 @@ def literal_ok(a, quote):
     q = quote.lower()
     t = a.get('type')
     if t == 'status':
-        return str(a.get('equals')) in quote
+        # v2 (D240): status codes are rarely quotable as digits; the quote must be real and
+        # not self-justifying (checked by the caller), but no literal is required.
+        return True
     if t == 'db':
         return str(a.get('count')) in quote
     if t == 'body' and 'json_path' in a:
@@ -76,11 +78,15 @@ def correction_message(res):
     lines = [f"- probe {i + 1}, {tag} assertion: {reason}" for i, tag, reason in res if reason != 'ok']
     if not lines:
         return None
-    return ("Some assertions were rejected by the evidence check:\n" + "\n".join(lines) +
+    return ("Some assertions were rejected by the evidence check. Only these assertions are affected; "
+            "keep every other assertion and probe exactly as it was.\n" + "\n".join(lines) +
             "\nReasons: evidence_missing = no evidence object; evidence_not_found = the quote is not in the "
             "named source as shown; evidence_self_justifying = the quote comes from a changed line; "
             "evidence_direction_mismatch = the quote does not contain the expected value; evidence_ambiguous = "
             "the quote contains both true and false; invalid_json/empty_capture = format error.\n"
+            "For each listed assertion, fix its evidence: quote a shorter exact passage, from outside the changed "
+            "lines, that contains the expected value for this record only (for example the part about this one id, "
+            "not a sentence about several). Remove an assertion only if no such passage exists.\n"
             "Return the complete corrected set of probes, in the same format. This is your only correction.")
 
 
@@ -89,13 +95,21 @@ def surviving(prompt_path, reply_text):
     import tempfile, os
     fd, tmp = tempfile.mkstemp(); os.write(fd, reply_text.encode()); os.close(fd)
     blocks, res = check(prompt_path, tmp); os.unlink(tmp)
-    bad = {i for i, _, r in res if r != 'ok'}
+    # v2 (D240): drop only the rejected assertions, not the whole probe; a probe left with
+    # no assertion (or invalid JSON / empty capture) is dropped.
     out = []
     for i, b in enumerate(blocks):
-        if i in bad:
-            continue
         try:
-            out.append(json.loads(b))
+            p = json.loads(b)
         except Exception:
-            pass
+            continue
+        mine = [r for r in res if r[0] == i]
+        if any(r[2] in ('invalid_json', 'empty_capture') for r in mine):
+            continue
+        verdicts = [r[2] for r in mine if r[1] != 'setup']
+        kept = [a for a, v in zip(p.get('assert', []), verdicts) if v == 'ok']
+        if not kept:
+            continue
+        p['assert'] = kept
+        out.append(p)
     return out, res
