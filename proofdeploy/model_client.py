@@ -44,6 +44,8 @@ from pathlib import Path
 from typing import Any
 
 from proofdeploy import __version__
+from proofdeploy.evidence import ShownSource, changed_lines_by_file
+from proofdeploy.routemap import RouteSelection, select_route_files
 
 # Registered measurement configuration. These are constants, not
 # parameters: a different model or temperature is a different
@@ -57,7 +59,7 @@ TEMPERATURE = 0.2
 
 # Frozen author-prompt template. The file is versioned; its hash is in
 # every evidence record.
-PROMPT_TEMPLATE_FILENAME = "author_prompt_v7.md"
+PROMPT_TEMPLATE_FILENAME = "author_prompt_v8.md"
 
 _MODEL_API = "https://api.cerebras.ai/v1/chat/completions"
 _MODEL_ALLOWED_HOSTS = ["api.cerebras.ai"]
@@ -98,6 +100,9 @@ _TEMPLATE_SECTIONS = (
     "More files",
     "Caps line",
     "Diff files omitted",
+    "Route shown above",
+    "Route files omitted",
+    "No route declarations",
     "Closing",
 )
 
@@ -115,11 +120,14 @@ _PLACEHOLDERS = (
     "max_diff_files",
     "max_file_bytes",
     "max_listed_files",
+    "max_route_kb",
+    "max_route_bytes",
     "remaining",
     "diff_fence_open",
     "diff_fence_close",
     "snapshot_file_list",
     "touched_file_contents",
+    "route_declarations",
 )
 
 
@@ -150,7 +158,7 @@ def _parse_template(text: str) -> dict[str, Any]:
         m = re.match(r"\s*-\s*`([^`]+)`\s*:\s*(\d+)", line)
         if m:
             caps[m.group(1)] = int(m.group(2))
-    for key in ("max_diff_files", "max_file_bytes", "max_listed_files"):
+    for key in ("max_diff_files", "max_file_bytes", "max_listed_files", "max_route_bytes"):
         if key not in caps:
             raise ValueError(f"prompt template caps missing {key}")
     # Every placeholder used in the Body must be a known one; an unknown
@@ -169,6 +177,9 @@ def _parse_template(text: str) -> dict[str, Any]:
         "more_files": "\n".join(sections["More files"]).strip(),
         "caps_line": "\n".join(sections["Caps line"]).strip(),
         "diff_files_omitted": "\n".join(sections["Diff files omitted"]).strip(),
+        "route_shown_above": "\n".join(sections["Route shown above"]).strip(),
+        "route_files_omitted": "\n".join(sections["Route files omitted"]).strip(),
+        "no_route_declarations": "\n".join(sections["No route declarations"]).strip(),
         "closing": "\n".join(sections["Closing"]).strip(),
         "caps": caps,
     }
@@ -229,14 +240,65 @@ def _fence_for(content: str, info: str = "") -> tuple[str, str]:
     return opening, fence
 
 
-def build_author_prompt(
+@dataclass
+class PromptBuild:
+    """Everything one prompt build produces.
+
+    ``sources`` are the texts the prompt shows as quote sources
+    (R-METHOD): ``"fixture"``, each touched file shown in full (with
+    its changed lines marked) and each included route declaration
+    file, keyed by the name an assertion's evidence ``source`` must
+    give. ``routes`` is the mechanical route-declaration selection
+    (R-BUNDLE).
+    """
+
+    prompt: str
+    truncation_flags: dict[str, object]
+    sources: dict[str, ShownSource]
+    routes: RouteSelection
+
+
+def route_selection_for(
+    *,
+    diff_text: str,
+    snapshot_dir: str | Path,
+    app_path: str | None,
+    template_path: str | Path | None = None,
+) -> RouteSelection:
+    """The route-declaration selection for a bundle (R-BUNDLE).
+
+    The single place the selection is computed: the prompt builder
+    renders it, the bundle assembler records it in the manifest, and
+    the answer-key check recomputes it. A touched file counts as
+    "shown above" only when its full text is in the prompt (within the
+    touched-file cap, readable and not oversized).
+    """
+    caps = load_prompt_template(template_path)["caps"]
+    snap = Path(snapshot_dir)
+    all_touched = diff_touched_files(diff_text)
+    shown = {
+        rel
+        for rel in all_touched[: caps["max_diff_files"]]
+        if _read_text_capped(snap / rel, caps["max_file_bytes"]) is not None
+    }
+    return select_route_files(
+        snap,
+        app_path=app_path,
+        touched=all_touched,
+        shown_touched=shown,
+        max_route_bytes=caps["max_route_bytes"],
+    )
+
+
+def build_author_prompt_full(
     *,
     skill_text: str | None,
     fixture_description: str,
     diff_text: str,
     snapshot_dir: str | Path,
     template_path: str | Path | None = None,
-) -> tuple[str, dict[str, object]]:
+    app_path: str | None = None,
+) -> PromptBuild:
     """Compose the blind author's prompt from bundle inputs only.
 
     The builder is the single source for the no-skill rendering: a None
@@ -245,17 +307,23 @@ def build_author_prompt(
 
     Framing, output contract, and truncation caps come from the frozen
     template file. Deterministic: same bundle in, same prompt out. The
-    snapshot contributes its file list and the full content of every
-    file the diff touches (capped); nothing else on the machine is read.
+    snapshot contributes its file list, the full content of every
+    file the diff touches (capped; every line the diff adds or changes
+    is prefixed with ``<<CHANGED>> ``, computed from the diff's hunk
+    headers) and the app's route declarations (R-BUNDLE: selected
+    mechanically within ``app_path``, the unit contract's app.path);
+    nothing else on the machine is read.
 
     The prompt is a pure function of the verified bundle plus the
     frozen template. There is deliberately no channel for run metadata
     (no "run kind", no unit id): anything outside the bundle would let
     the orchestrator's knowledge leak to the model.
 
-    Returns (prompt, truncation_flags). The flags record which caps
-    applied (diff_files_truncated, file_bytes_truncated, listed_files_truncated);
-    the caller records them in the evidence record.
+    Returns a PromptBuild: the prompt, the truncation flags (which caps
+    applied: diff_files_truncated, file_bytes_truncated,
+    listed_files_truncated, route_map_truncated; the caller records
+    them in the evidence record), the shown quote sources and the
+    route selection.
     """
     tpl = load_prompt_template(template_path)
     caps = tpl["caps"]
@@ -264,27 +332,16 @@ def build_author_prompt(
         "diff_files_truncated": False,
         "file_bytes_truncated": False,
         "listed_files_truncated": False,
+        "route_map_truncated": False,
     }
+    sources: dict[str, ShownSource] = {}
 
     # Touched files in diff order; cap with explicit marker.
     all_touched = diff_touched_files(diff_text)
     if len(all_touched) > caps["max_diff_files"]:
         truncation_flags["diff_files_truncated"] = True
     touched = all_touched[: caps["max_diff_files"]]
-
-    # File list sorted by path; cap with explicit marker.
-    all_files = sorted(
-        p.relative_to(snap).as_posix()
-        for p in snap.rglob("*")
-        if p.is_file() and not p.is_symlink()
-    )
-    if len(all_files) > caps["max_listed_files"]:
-        truncation_flags["listed_files_truncated"] = True
-    listed = all_files[: caps["max_listed_files"]]
-    file_list = "\n".join(listed)
-    if truncation_flags["listed_files_truncated"]:
-        remaining = len(all_files) - caps["max_listed_files"]
-        file_list += "\n" + tpl["more_files"].replace("[[remaining]]", str(remaining))
+    changed_by_file = changed_lines_by_file(diff_text)
 
     # Touched file contents; cap bytes with explicit marker.
     touched_parts: list[str] = []
@@ -300,13 +357,18 @@ def build_author_prompt(
                 pass
             entry = tpl["unavailable_file"].replace("[[path]]", rel)
         else:
-            file_open, file_close = _fence_for(content)
+            src = ShownSource.from_text(
+                rel, "touched", content, changed_by_file.get(rel, frozenset())
+            )
+            sources[rel] = src
+            shown = src.shown_text
+            file_open, file_close = _fence_for(shown)
             entry = (
                 tpl["file_entry"]
                 .replace("[[path]]", rel)
                 .replace("[[file_fence_open]]", file_open)
                 .replace("[[file_fence_close]]", file_close)
-                .replace("[[content]]", content.rstrip())
+                .replace("[[content]]", shown)
             )
         touched_parts.append(entry)
     touched_text = "\n\n".join(touched_parts)
@@ -319,6 +381,58 @@ def build_author_prompt(
         marker = marker.replace("[[max_diff_files]]", str(caps["max_diff_files"]))
         touched_text += "\n\n" + marker
 
+    # Route declarations (R-BUNDLE): selected mechanically from the
+    # snapshot within app.path; a route file that is already a touched
+    # file shown in full is named "shown above", not repeated.
+    routes = select_route_files(
+        snap,
+        app_path=app_path,
+        touched=all_touched,
+        shown_touched={r for r, s_ in sources.items() if s_.kind == "touched"},
+        max_route_bytes=caps["max_route_bytes"],
+    )
+    truncation_flags["route_map_truncated"] = routes.truncated
+    route_parts: list[str] = []
+    for ent in routes.entries:
+        if ent.kind == "shown_above":
+            route_parts.append(tpl["route_shown_above"].replace("[[path]]", ent.path))
+        elif ent.kind == "included":
+            assert ent.text is not None
+            rsrc = ShownSource.from_text(ent.path, "route", ent.text)
+            sources[ent.path] = rsrc
+            r_open, r_close = _fence_for(rsrc.shown_text)
+            route_parts.append(
+                tpl["file_entry"]
+                .replace("[[path]]", ent.path)
+                .replace("[[file_fence_open]]", r_open)
+                .replace("[[file_fence_close]]", r_close)
+                .replace("[[content]]", rsrc.shown_text)
+            )
+    if routes.omitted:
+        route_parts.append(
+            tpl["route_files_omitted"]
+            .replace("[[remaining]]", str(len(routes.omitted)))
+            .replace("[[max_route_bytes]]", str(caps["max_route_bytes"]))
+        )
+    route_text = "\n\n".join(route_parts) if route_parts else tpl["no_route_declarations"]
+
+    # File list sorted by path; cap with explicit marker. The included
+    # route files are always listed, whatever the cap (R-BUNDLE item 2).
+    all_files = sorted(
+        p.relative_to(snap).as_posix()
+        for p in snap.rglob("*")
+        if p.is_file() and not p.is_symlink()
+    )
+    if len(all_files) > caps["max_listed_files"]:
+        truncation_flags["listed_files_truncated"] = True
+    listed_set = set(all_files[: caps["max_listed_files"]])
+    listed_set.update(e.path for e in routes.included)
+    listed = sorted(listed_set)
+    file_list = "\n".join(listed)
+    if truncation_flags["listed_files_truncated"]:
+        remaining = len(all_files) - len(listed)
+        file_list += "\n" + tpl["more_files"].replace("[[remaining]]", str(remaining))
+
     # Diff fence adapts to backtick runs in the diff.
     diff_open, diff_close = _fence_for(diff_text, "diff")
 
@@ -327,6 +441,8 @@ def build_author_prompt(
     # so content containing [[...]] (e.g. in a diff) is not expanded.
     # Single source for no-skill rendering: None/empty -> "(none)".
     rendered_skill = "(none)" if not skill_text or not skill_text.strip() else skill_text.rstrip()
+    fixture_src = ShownSource.from_text("fixture", "fixture", fixture_description.rstrip())
+    sources["fixture"] = fixture_src
     values = {
         "framing": tpl["framing"],
         "contract": tpl["contract"],
@@ -338,14 +454,16 @@ def build_author_prompt(
             .replace("[[max_diff_files]]", str(caps["max_diff_files"]))
             .replace("[[max_file_bytes]]", str(caps["max_file_bytes"]))
             .replace("[[max_listed_files]]", str(caps["max_listed_files"]))
+            .replace("[[max_route_kb]]", str(caps["max_route_bytes"] // 1024))
         ),
         "skill_text": rendered_skill,
-        "fixture_description": fixture_description.rstrip(),
+        "fixture_description": fixture_src.shown_text,
         "diff_fence_open": diff_open,
         "diff_fence_close": diff_close,
         "diff_text": diff_text.rstrip(),
         "snapshot_file_list": file_list,
         "touched_file_contents": touched_text,
+        "route_declarations": route_text,
     }
     # Fail-closed: every [[...]] in the template must be a known placeholder.
     # Check the template, not the output: values may legitimately contain
@@ -360,7 +478,33 @@ def build_author_prompt(
         v: str = values[m.group(1)]
         return v
     prompt = re.sub(r"\[\[([a-z_]+)\]\]", _sub, tpl["body"])
-    return prompt, truncation_flags
+    return PromptBuild(
+        prompt=prompt,
+        truncation_flags=truncation_flags,
+        sources=sources,
+        routes=routes,
+    )
+
+
+def build_author_prompt(
+    *,
+    skill_text: str | None,
+    fixture_description: str,
+    diff_text: str,
+    snapshot_dir: str | Path,
+    template_path: str | Path | None = None,
+    app_path: str | None = None,
+) -> tuple[str, dict[str, object]]:
+    """The prompt and the truncation flags (see build_author_prompt_full)."""
+    built = build_author_prompt_full(
+        skill_text=skill_text,
+        fixture_description=fixture_description,
+        diff_text=diff_text,
+        snapshot_dir=snapshot_dir,
+        template_path=template_path,
+        app_path=app_path,
+    )
+    return built.prompt, built.truncation_flags
 
 
 def _message_hashes(messages: list[dict[str, Any]]) -> list[str]:

@@ -1404,7 +1404,9 @@ def test_result_contract_rejects_corrupted_records():
 # ---------------------------------------------------------------------------
 # D220/D221 (schema 1.8.0): container_env_keys / dry_run are recorded
 # (never scored); a stored 1.7.0 record still loads. The D211 fields
-# (model_finish_reason / model_usage) ride along below.
+# (model_finish_reason / model_usage) ride along below. The current
+# version is 1.9.0 (D242: author_evidence); the record built here is
+# stamped with it and still validates against the contract schema.
 # ---------------------------------------------------------------------------
 
 def test_schema_180_record_validates_and_170_record_still_loads(tmp_path):
@@ -1418,8 +1420,8 @@ def test_schema_180_record_validates_and_170_record_still_loads(tmp_path):
         container_env_keys=["APP_ENV", "APP_SECRET_KEY"],
         dry_run="provision",
     )
-    assert SCHEMA_VERSION == "1.8.0"
-    assert record["schema_version"] == "1.8.0"
+    assert SCHEMA_VERSION == "1.9.0"
+    assert record["schema_version"] == "1.9.0"
     assert record["model_finish_reason"] == "stop"
     assert record["model_usage"] == usage
     assert record["container_env_keys"] == ["APP_ENV", "APP_SECRET_KEY"]

@@ -211,7 +211,13 @@ def _make_repo(
 _SIMPLE_PROBE = {
     "setup": [],
     "act": {"method": "GET", "path": "/health"},
-    "assert": [{"type": "status", "equals": 200}],
+    "assert": [
+        {
+            "type": "status",
+            "equals": 200,
+            "evidence": {"source": "fixture", "quote": "no seed data"},
+        }
+    ],
 }
 
 

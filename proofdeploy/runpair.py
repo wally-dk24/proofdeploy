@@ -710,6 +710,13 @@ def build_evidence_record(
     # could not be read (a contract refusal record). None on paths
     # that do not load a contract from the store.
     contract_source: dict[str, Any] | None = None,
+    # D242 (R-METHOD, schema 1.9.0): how the final author answer came
+    # about -- both raw answers, the correction prompt's sha256,
+    # correction_used, the per-assertion evidence-check results of
+    # both answers, both answers' finish_reason and usage. None when
+    # the evidence check did not run (no model answer). Recorded,
+    # never scored.
+    author_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the evidence record for a run pair (before scoring).
 
@@ -841,6 +848,7 @@ def build_evidence_record(
         "crash_probe_results": crash_probe_results,
         # WO-1.14 (REG-E): the contract store source, as above.
         "contract_source": contract_source,
+        "author_evidence": author_evidence,
         "verdict": None,
     }
     return record

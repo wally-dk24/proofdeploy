@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (long embedded stub JSON / fixture lines)
 """WO-7.3 (Addendum 40): writes granted by provenance; one network
 mode per measured run.
 
@@ -242,7 +243,7 @@ env:
   APP_ENV: verification
 fixture:
   repo_name: "mini-app"
-  seed_note: "empty; create users with POST /register"
+  seed_note: "empty; create users with POST /register; GET /value reports v equal to 1 on a correct build"
   auth_mechanism: "Bearer token in the Authorization header"
   auth_scope: "a regular user token"
   flags_note: "no feature flags"
@@ -283,7 +284,7 @@ def _canned_probes(prompt: str):
             "```json\n"
             '{"setup": [], '
             '"act": {"method": "GET", "path": "/value"}, '
-            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}, "evidence": {"source": "fixture", "quote": "GET /value reports v equal to 1"}}]}'
             "\n```\n"
         ),
         finish_reason="stop",
@@ -500,7 +501,7 @@ def test_write_grant_and_mode_in_evidence_on_both_sides(
     assert evidence["write_grants"]["fix"] == expected
     assert evidence["sandbox_evidence"]["fix_parent"]["app_network_mode"] == "isolated"
     assert evidence["sandbox_evidence"]["fix"]["app_network_mode"] == "isolated"
-    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["schema_version"] == "1.9.0"
 
 
 def test_write_grant_not_invented_for_unready_side(
@@ -574,9 +575,9 @@ def test_schema_130_and_old_records_still_load(tmp_path):
 
     # Schema 1.8.0 (D220/D221 add container_env_keys / dry_run);
     # the 1.3.0 write_grants behavior pinned here is unchanged.
-    assert SCHEMA_VERSION == "1.8.0"
+    assert SCHEMA_VERSION == "1.9.0"
     record = build_evidence_record(run_kind="bug", bug_id="WO73-SCHEMA")
-    assert record["schema_version"] == "1.8.0"
+    assert record["schema_version"] == "1.9.0"
     # Callers that do not pass grants get an empty mapping, never a
     # missing key crash for readers.
     assert record["write_grants"] == {}

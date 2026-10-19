@@ -82,7 +82,17 @@ HARNESS_VERSION = "1.0.0"
 # The leak gate's exemption list is unchanged. Recorded, never
 # scored; records at 1.0.0–1.7.0 still load (readers default the
 # new keys).
-SCHEMA_VERSION = "1.8.0"
+# 1.9.0 (D242, R-METHOD / R-BUNDLE): assertions carry a top-level
+# `evidence` object ({source, quote}); evidence records carry
+# author_evidence (both raw author answers, the correction prompt's
+# sha256, correction_used, the per-assertion evidence-check results
+# of both answers, and both answers' finish_reason and usage), and
+# the bundle manifest carries route_map (the route-declaration files
+# the author was shown, and those omitted by the 32 KB cap). The
+# probe-schema scan for code content skips `evidence` text (quotes of
+# source code are expected). Recorded, never scored; records at
+# 1.0.0-1.8.0 still load (readers default the new keys).
+SCHEMA_VERSION = "1.9.0"
 
 # HTTP methods the schema allows. No CONNECT, TRACE, or custom verbs.
 ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
@@ -189,7 +199,10 @@ def _validate_assertion(a: Any, i: int) -> None:
         query = a.get("query")
         if not isinstance(query, str) or not _READONLY_SQL.match(query):
             _reject(f"{where}: db assertion needs a read-only SELECT query")
-    _check_no_code_probe(a, where)
+    # R-METHOD item 5: `evidence` quotes source code by design, so the
+    # code-content scan skips the assertion's top-level evidence value
+    # (and only that: every other field is still scanned).
+    _check_no_code_probe({k: v for k, v in a.items() if k != "evidence"}, where)
 
 
 def _validate_setup_step(s: Any, i: int, allow_harness_app: bool = False) -> None:
@@ -334,6 +347,11 @@ def validate_probe(probe: Any, allow_harness_app: bool = False) -> dict[str, Any
     for step in scrubbed.get("setup", []):
         if isinstance(step, dict) and step.get("type") == "harness_app":
             step["source"] = ""
+    # Same exemption as in _validate_assertion: an assertion's top-level
+    # evidence is a quote of source text, not code meant to run.
+    for a in scrubbed.get("assert", []):
+        if isinstance(a, dict):
+            a.pop("evidence", None)
     _check_no_code_probe(scrubbed, "probe")
     return probe  # type: ignore[no-any-return]
 
@@ -370,6 +388,47 @@ def harness_app_hash(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
+@dataclass
+class ParsedBlock:
+    """One fenced ```json block of author output, parsed and validated.
+
+    Exactly one of ``probe`` / ``rejection_reason`` is set. ``index`` is
+    the block's position among all fenced json blocks (0-based), valid
+    or not, so a harness message can name "probe N" the way the author
+    counts its own blocks.
+    """
+
+    index: int
+    raw_text: str
+    probe: dict | None = None
+    rejection_reason: str | None = None
+
+
+def parse_probe_blocks(text: str, allow_harness_app: bool = False) -> list[ParsedBlock]:
+    """Every fenced ```json block of ``text``, each validated on its own.
+
+    Returns [] when the text has no fenced json block. Never raises for
+    author-output problems.
+    """
+    blocks = re.findall(r"```json\s*\n(.*?)```", text, re.DOTALL)
+    out: list[ParsedBlock] = []
+    for i, block in enumerate(blocks):
+        try:
+            probe = json.loads(block)
+        except json.JSONDecodeError as e:
+            out.append(
+                ParsedBlock(i, block, rejection_reason=f"block {i}: invalid JSON: {e}")
+            )
+            continue
+        try:
+            validate_probe(probe, allow_harness_app=allow_harness_app)
+        except ProbeRejected as e:
+            out.append(ParsedBlock(i, block, rejection_reason=f"block {i}: {e}"))
+            continue
+        out.append(ParsedBlock(i, block, probe=probe))
+    return out
+
+
 def parse_probes_lenient(
     text: str, allow_harness_app: bool = False
 ) -> tuple[list[dict], list[dict]]:
@@ -383,8 +442,8 @@ def parse_probes_lenient(
 
     Never raises for author-output problems.
     """
-    blocks = re.findall(r"```json\s*\n(.*?)```", text, re.DOTALL)
-    if not blocks:
+    parsed = parse_probe_blocks(text, allow_harness_app=allow_harness_app)
+    if not parsed:
         return [], [
             {
                 "block_index": -1,
@@ -394,30 +453,17 @@ def parse_probes_lenient(
         ]
     valid: list[dict] = []
     invalid: list[dict] = []
-    for i, block in enumerate(blocks):
-        try:
-            probe = json.loads(block)
-        except json.JSONDecodeError as e:
+    for b in parsed:
+        if b.probe is not None:
+            valid.append(b.probe)
+        else:
             invalid.append(
                 {
-                    "block_index": i,
-                    "raw_text": block,
-                    "rejection_reason": f"block {i}: invalid JSON: {e}",
+                    "block_index": b.index,
+                    "raw_text": b.raw_text,
+                    "rejection_reason": b.rejection_reason,
                 }
             )
-            continue
-        try:
-            validate_probe(probe, allow_harness_app=allow_harness_app)
-        except ProbeRejected as e:
-            invalid.append(
-                {
-                    "block_index": i,
-                    "raw_text": block,
-                    "rejection_reason": f"block {i}: {e}",
-                }
-            )
-            continue
-        valid.append(probe)
     return valid, invalid
 
 
@@ -433,6 +479,11 @@ class ProbeSet:
     invalid_blocks: list[dict] = field(default_factory=list)
     harness_version: str = HARNESS_VERSION
     harness_app_hashes: list[str] = field(default_factory=list)
+    # R-METHOD (schema 1.9.0): how the final answer came about -- both
+    # raw author answers, the correction prompt hash, the per-assertion
+    # evidence-check results. Empty for a set built without the
+    # evidence check (from_author_output on its own).
+    author_evidence: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_valid_probes(self) -> bool:

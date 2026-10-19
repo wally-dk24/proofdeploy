@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (long embedded stub JSON / fixture lines)
 """Tests for proofdeploy.orchestrator (WO-5).
 
 The model call is stubbed (injected runner); everything else is real:
@@ -75,7 +76,7 @@ env:
   APP_ENV: verification
 fixture:
   repo_name: "mini-app"
-  seed_note: "empty; create users with POST /register"
+  seed_note: "empty; create users with POST /register; GET /value reports v equal to 1 on a correct build"
   auth_mechanism: "Bearer token in the Authorization header"
   auth_scope: "a regular user token"
   flags_note: "no feature flags"
@@ -121,7 +122,7 @@ def canned_probes(prompt: str) -> ModelResponse:
             "```json\n"
             '{"setup": [], '
             '"act": {"method": "GET", "path": "/value"}, '
-            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}, "evidence": {"source": "fixture", "quote": "GET /value reports v equal to 1"}}]}'
             "\n```\n"
         ),
         finish_reason="stop",
@@ -376,7 +377,7 @@ def test_measure_bug_refuses_seeded_fix_diff(tmp_path, monkeypatch):
     orig_build = orch._build_bundle
 
     def tampered_build(unit_dir: Path, **kwargs):
-        bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags = orig_build(
+        bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags, sources = orig_build(
             unit_dir, **kwargs
         )
         # Deliberately seed the fix diff into the bundle's diff.patch.
@@ -385,7 +386,7 @@ def test_measure_bug_refuses_seeded_fix_diff(tmp_path, monkeypatch):
             capture_output=True, text=True, check=True,
         ).stdout
         (bundle.root / "diff.patch").write_text(fix_diff, encoding="utf-8")
-        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags, sources
 
     monkeypatch.setattr(orch, "_build_bundle", tampered_build)
     with pytest.raises(AnswerKeyLeakError, match="byte-equal"):
@@ -418,7 +419,7 @@ def test_measure_bug_refuses_fix_sha_in_snapshot(tmp_path, monkeypatch):
     orig_build = orch._build_bundle
 
     def tampered_build(unit_dir: Path, **kwargs):
-        bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags = orig_build(
+        bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags, sources = orig_build(
             unit_dir, **kwargs
         )
         snap_file = bundle.root / "snapshot" / "app.py"
@@ -426,7 +427,7 @@ def test_measure_bug_refuses_fix_sha_in_snapshot(tmp_path, monkeypatch):
             snap_file.read_text(encoding="utf-8") + f"\n# fix {info['fix']}\n",
             encoding="utf-8",
         )
-        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags
+        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, flags, sources
 
     monkeypatch.setattr(orch, "_build_bundle", tampered_build)
     with pytest.raises(AnswerKeyLeakError, match="!= B version"):
@@ -856,7 +857,7 @@ env:
   APP_ENV: verification
 fixture:
   repo_name: "mini-app-no-auth"
-  seed_note: "empty"
+  seed_note: "empty; GET /value reports v equal to 1 on a correct build"
   auth_mechanism: "none"
   auth_scope: "no auth"
   flags_note: "no feature flags"
@@ -1849,7 +1850,7 @@ def _mixed_probes(prompt: str) -> ModelResponse:
             "```json\n"
             '{"setup": [], '
             '"act": {"method": "GET", "path": "/value"}, '
-            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+            '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}, "evidence": {"source": "fixture", "quote": "GET /value reports v equal to 1"}}]}'
             "\n```\n"
             "And a second one:\n"
             "```json\n"
@@ -2096,7 +2097,7 @@ _D211_PROBE_CONTENT = (
     "```json\n"
     '{"setup": [], '
     '"act": {"method": "GET", "path": "/value"}, '
-    '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}}]}'
+    '"assert": [{"type": "body", "json_path": {"path": "v", "equals": 1}, "evidence": {"source": "fixture", "quote": "GET /value reports v equal to 1"}}]}'
     "\n```\n"
 )
 
@@ -2144,7 +2145,7 @@ def _measure_evidence(tmp_path, runner):
 
 def test_measure_records_model_finish_reason_and_usage(tmp_path):
     evidence = _measure_evidence(tmp_path, _probes_stop_with_usage)
-    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["schema_version"] == "1.9.0"
     assert evidence["model_finish_reason"] == "stop"
     assert evidence["model_usage"] == _D211_USAGE
 

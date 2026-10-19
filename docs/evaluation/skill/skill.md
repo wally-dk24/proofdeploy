@@ -1,99 +1,85 @@
 # Probe-Authoring Skill
 
-**How to use this document:** Read it before opening the author bundle. It teaches how to probe, not what to find. Every numbered item carries a provenance tag: `[PROC]` (general procedure), `[DEV: T<n>]` (illustrated by TRAIN dev-set bug T<n>). An untagged item is a drafting error.
+**How to use this document:** Read all of it before opening the author bundle. It teaches how to decide what is correct and how to probe for it, not what bug to find. Every numbered item carries a provenance tag: `[PROC]` (general procedure), `[DEV: T<n>]` (illustrated by TRAIN dev-set bug T<n>). An untagged item is a drafting error.
 
 ---
 
-## 1. Your job
+## 0. The rule that decides every expected value
 
-1. You are not verifying that the feature works. Every probe must be able to fail if the behavior it checks were wrong. `[PROC]`
+R1. The change you are reviewing is a claim, not a fact. It may be the bug. Never use the changed lines as evidence that the new behavior is correct. `[PROC]`
 
-2. For each behavior the diff changes, write at least two probes: one for the expected case and one for an adversarial case (see section 3). If you only write expected-case probes, you have not done the job. `[PROC]`
+R2. Every expected value you assert, including status codes, must come from evidence outside the changed lines: the fixture's description of the instance and its data, unchanged tests, docs, comments, field and function names, or code the change did not touch. Tests the change adds or edits are part of the claim, not evidence. `[PROC]`
 
-3. Only assert on what you can observe from outside: HTTP status codes, headers, response bodies, and read-only database state. Never assert on internals (variable values, call counts, log lines). `[PROC]`
+R3. Quote that evidence word for word in the assertion's `evidence` field. The harness checks every quote before anything runs: it must exist in the bundle, it must not come from a changed line (marked `<<CHANGED>>`), and it must contain the value you expect. An assertion that fails this check is sent back to you once to fix; if it is still wrong, it is dropped and counts against you. `[PROC]`
 
----
-
-## 1a. The change can be the bug
-
-A1. You are reviewing a change before it ships. The diff shows what someone wrote, not what is correct. A change can introduce the very defect you are looking for, so never treat the diff's new behavior as the definition of correct.
-
-A2. Before writing probes, establish what correct behavior is from sources outside the changed lines: the fixture's description of the instance and its seeded data, the names of the fields, functions and routes involved, the neighboring code paths the diff did not touch, and any docs, comments or tests in the snapshot.
-
-A3. For each behavior the diff changes, ask whether the new behavior agrees with those sources. If the fixture states what a seeded record contains, a probe that reads that record should expect what the fixture states. If a name or the neighboring code says what a value means, the response should carry that meaning.
-
-A4. When the diff's new behavior contradicts those sources, assert the behavior the sources establish, not the behavior the diff produces. Such a probe fails if the change is wrong and passes if it is right.
-
-A5. When those sources do not settle what is correct, the diff is the only evidence of intent: probe it as written, and do not invent a correct behavior (see item 23).
-
-A6. The fixture's statements about the instance are facts; the diff is a claim. When a probe reads a record or setting the fixture describes, its expected values come from the fixture, never from what the changed code would return.
-
-## 1b. Check the format before you answer
-
-B1. Every assertion must use one of the types the schema allows: status, header, body, db. To check a field in a JSON response body, use type body with a json_path object, for example {"type": "body", "json_path": {"path": "status", "equals": "active"}}. There is no assertion type named json_path.
-
-B2. Before answering, re-read every probe against the schema. A probe that does not match is never sent, and it counts against you as if it had failed.
-
-B3. Before answering, check the direction of every assertion. For each expected value, name its source: the fixture, a name, untouched code, a doc or test, or only the diff. If a value comes only from the diff and one of the other sources says otherwise, change it to what that source says.
+R4. If nothing outside the changed lines tells you what a value should be, do not assert that value. Probe other behavior around it that the evidence does settle. `[PROC]`
 
 ---
 
-## 2. Procedure
+## 1. Procedure, in this order
 
-4. Read the diff first, before the snapshot. List each behavior it changes or adds, in your own words, one per line. If you cannot list them, re-read the diff. `[PROC]`
+1. **Facts first.** Before reading the diff, read the fixture and the unchanged code, tests and docs near the touched files. In your prose reasoning (before the JSON blocks), write down each fact you will rely on, with its exact quote and where it is. For example: *the fixture says "account 7 has balance 250"*. `[PROC]`
 
-5. For each listed behavior, ask: which actors can reach it, in which states, with which inputs? An actor is anyone or anything that can invoke the code path: an authenticated user, an unauthenticated request, a scheduled job, another service. A state is what must already be true (an existing record, a flag set, a prior request completed). `[PROC]`
+2. **Then the change.** Read the diff. List each behavior it changes or adds, one per line, in your own words. `[PROC]`
 
-6. Compare the changed code path with the unchanged paths next to it. The diff shows what is new; the surrounding code shows what the old behavior was and what neighboring behaviors still do. `[PROC]`
+3. **Compare.** For each listed behavior, check it against your facts. If the change agrees with them, your probes expect that behavior. If the change contradicts them, your probes expect what the facts say, and they should fail against this change. If no fact covers it, apply R4. `[PROC]`
 
-7. Trace each untrusted input from the boundary (HTTP request, query parameter, header, body field) to where it is used. Note every point where it is validated, normalized, escaped, or passed through unchanged. `[DEV: T1]`
+4. **Who and how.** For each behavior, ask which actors can reach it (an authenticated user, an unauthenticated request, a scheduled job, another service), in which states (an existing record, a flag set, a prior request completed) and with which inputs. Trace each untrusted input from the boundary (path, query, header, body) to where it is used, and note where it is validated, normalized, escaped or passed through unchanged. `[PROC]`
 
-8. When the diff adds a guard, check, or validation, probe both sides of it: an input that should pass the guard and an input that should be rejected by it. Then probe the boundary between them. `[PROC]`
+5. **Probe both sides.** When the change adds a guard, check or validation, probe an input that should pass it, an input that should be rejected, and the boundary between them. `[PROC]`
 
-9. Structure every probe as setup / act / assert, plus a negative case. Setup creates the preconditions. Act performs one operation. Assert checks the externally observable result. The negative case performs the same operation under adversarial conditions (different actor, malformed input) and asserts the result differs appropriately. `[PROC]`
+6. **Shape.** Every probe is setup / act / assert. Setup creates the preconditions; act performs one operation; assert checks only what is observable from outside: status codes, headers, response bodies, read-only database state. Never assert on internals (variables, call counts, log lines). `[PROC]`
 
----
-
-## 3. Adversarial questions
-
-Ask these about every behavior the diff touches. They are generic; the answers come from the bundle, not from this list.
-
-10. For batch operations, what happens when one record in the batch carries a hostile value? `[DEV: T1]`
-
-11. What happens with no authentication at all? `[DEV: T5]`
-
-12. What happens with an empty, missing, or malformed input where the code expects a well-formed one? Does it reach the same handler, a different handler, or an error path? `[DEV: T3]` `[DEV: T7]`
-
-13. When the diff introduces two or more new conditions, what happens when more than one applies at the same time? What happens when they disagree (one matches, the other does not)? Probe the combinations, not just each condition alone. `[DEV: T6]`
-
-14. What happens when the same logical input is represented differently — different case, different encoding — or arrives as an unexpected type — a dict where a string was expected, bytes where text was expected, a list where a scalar was expected? Does the code normalize before comparing, or does the representation leak through? `[DEV: T2]` `[DEV: T4]`
-
-15. Can the same request reach a different route or handler the diff did not change? If so, probe the behavior through that path too. `[DEV: T3]`
+7. **Pairs.** For each behavior, write at least two probes: the normal case and an adversarial case from section 2. A useful probe gives different results for the old and the new behavior; which result counts as a pass is decided only by the evidence, never by the diff. Each probe must exercise changed behavior, possibly reached through a route the change did not touch (item 13). `[PROC]`
 
 ---
 
-## 4. Worked examples
+## 2. Adversarial questions
 
-Each example is from the TRAIN dev set only, cited by commit SHA. Study the pattern, not the specific bug.
+Ask these about every behavior the change touches. The answers come from the bundle, not from this list.
 
-16. **Probe every input position in a batch.** In CodeIgniter4 `f5e463b9a3e986389ce285963e51a7f1fab6559f` (fix for deleteBatch() SQL injection, T1), the bug was that `deleteBatch()` with `where()` conditions substituted bind values raw into the DELETE SQL, ignoring the escape flag; the fix routes them through `convertWhereBindsForBatch()` which respects escaping. A probe that calls the batch operation with `where()` values containing SQL metacharacters, and checks whether the generated statement treats them as values or as code, would have caught it. Whenever a diff assembles a query or command from per-record inputs, probe each input position with a hostile value. `[DEV: T1]`
+8. For batch operations, what happens when one record in the batch carries a hostile value? `[PROC]`
 
-17. **Vary the representation.** In Fastify `179619c8e99d54924309b9933402151ef9af37e0` (fix for header schema bypass, T2), the bug was that mixed-case header names slipped past validation; the fix normalized names recursively before checking. A probe that sends the same header in different cases (`Content-Type` vs `content-type` vs `CONTENT-TYPE`) and checks whether validation treats them identically would have caught it. Whenever a diff compares or validates a string, probe with case, encoding, and whitespace variations of the same logical value. `[DEV: T2]`
+9. What happens with no authentication at all, or as a different user? `[PROC]`
 
-18. **Send the unexpected type.** In Django `ebcb13b327301f28cbc6cd5e4988a719f00575aa` (fix for GIS spatial lookup file write, T4), the bug was that dict and bytes values in spatial lookups reached code that treated them as file paths; the fix rejected unsafe types. A probe that submits a dict or bytes where the API documents a string, and checks whether it is rejected or mishandled, would have caught it. Whenever a diff processes a value, probe with a type the documentation does not promise. `[DEV: T4]`
+10. What happens with an empty, missing or malformed input where the code expects a well-formed one? Does it reach the same handler, a different handler or an error path? `[PROC]`
+
+11. When the change introduces two or more conditions, what happens when more than one applies, or when they disagree? Probe the combinations, not just each condition alone. `[PROC]`
+
+12. What happens when the same logical input is written differently (case, encoding, whitespace) or arrives as an unexpected type (a dict where a string was expected, bytes where text was expected, a list where a scalar was expected)? `[PROC]`
+
+13. Can the same request reach a route or handler the change did not touch? If so, probe that path too. `[PROC]`
+
+---
+
+## 3. Worked examples
+
+Study the pattern, not the specific bug. The first example is about deciding the expected value; the others are real bug fixes, cited by commit SHA.
+
+14. **Expect what the evidence says, not what the change does.** Suppose the fixture says *"account 7 has balance 250"*, and the change edits how balances are read, introducing a bug. Expect balance 250 for account 7, with evidence `"account 7 has balance 250"` (source: fixture). Do not expect whatever number the new code would compute. If the new code returns something else, your probe fails, which is exactly the point. `[PROC]`
+
+15. **Probe every input position in a batch.** In CodeIgniter4 `f5e463b9a3e986389ce285963e51a7f1fab6559f` (fix for deleteBatch() SQL injection, T1), `deleteBatch()` with `where()` conditions substituted bind values raw into the DELETE SQL, ignoring the escape flag; the fix routes them through `convertWhereBindsForBatch()`, which respects escaping. A probe that calls the batch operation with `where()` values containing SQL metacharacters, and checks whether they are treated as values or as code, would have caught it. Whenever a change assembles a query or command from per-record inputs, probe each input position with a hostile value. `[DEV: T1]`
+
+16. **Vary the representation.** In Fastify `179619c8e99d54924309b9933402151ef9af37e0` (fix for header schema bypass, T2), mixed-case header names slipped past validation; the fix normalized names before checking. A probe that sends the same header as `Content-Type`, `content-type` and `CONTENT-TYPE` and checks that validation treats them alike would have caught it. `[DEV: T2]`
+
+17. **Send the unexpected type.** In Django `ebcb13b327301f28cbc6cd5e4988a719f00575aa` (fix for GIS spatial lookup file write, T4), dict and bytes values in spatial lookups reached code that treated them as file paths; the fix rejected unsafe types. A probe that submits a dict or bytes where the API documents a string would have caught it. `[DEV: T4]`
 
 ---
 
-## 5. Anti-patterns
+## 4. Format (an invalid probe is never sent and counts against you)
 
-19. Do not write only happy-path probes. "The feature returns the right answer for valid input" is the starting point, not the probe. For every happy-path probe, write the adversarial twin. `[PROC]`
+18. Follow the output format at the top of this prompt exactly, copying the shapes in its complete example. The two most common slips: `evidence` goes at the top level of the assertion, never inside `json_path`; and `capture` is either omitted or maps a NAME to `{"from": "body", "json_path": "<dotted path>"}`, never an empty object. `[PROC]`
 
-20. Do not assert on things the diff did not change. If your probe would pass identically on the parent commit, it is not probing the diff. Each probe must exercise at least one behavior the diff added or modified. `[PROC]`
+19. Quote only text shown in this prompt. For a true/false value, quote only the part about the record you are checking, not a sentence that contains both values. `[PROC]`
 
-21. Do not invent domain rules. If the bundle does not say what the correct behavior is, derive it from the code and the snapshot: what does the changed path do, what do the neighboring paths do, and where do they disagree? Never import knowledge about the repository's domain that is not in the bundle. `[PROC]`
-
-22. Do not stop at the first probe that passes. A passing probe confirms the feature exists; it does not confirm the feature is correct. Keep probing until you have covered the adversarial questions in section 3 for each behavior you listed in item 4. `[PROC]`
-
-23. If the bundle doesn't establish what the correct behavior is, don't assert it. An unfounded assertion counts against you just as a missed bug does. `[PROC]`
+20. To check the value of a field in a JSON response, use a `json_path` assertion on that exact field, for example `{"type": "body", "json_path": {"path": "done", "equals": false}, ...}`. Do not use `body` `contains` or `matches` for a field's value: `contains "false"` also passes when a different field holds that text. `[PROC]`
 
 ---
+
+## 5. Final check before you answer
+
+21. For every assertion, status included: Is the expected value backed by a quote from outside the changed lines? Is the quote copied exactly? Does it contain the value, and only the value for this record? If not, fix it or remove the assertion (R4). `[PROC]`
+
+22. For every probe: Does it match the format in section 4? Is every field value checked with `json_path` (item 20)? Would it fail if the behavior it checks were wrong? `[PROC]`
+
+23. Do not write only happy-path probes, and do not stop at the first probe that passes. Cover section 2 for each behavior you listed in step 2. `[PROC]`

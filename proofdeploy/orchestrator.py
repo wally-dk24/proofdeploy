@@ -41,12 +41,21 @@ import json
 import shlex
 import socket
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from proofdeploy.evidence import (
+    ShownSource,
+    analyse_answer,
+    correction_message,
+    correction_prompt,
+    final_probeset,
+    sha256_text,
+)
 from proofdeploy.executor import (
     Executor,
     HarnessAppConfig,
@@ -76,7 +85,7 @@ from proofdeploy.model_client import (
     ModelRunner,
     author_prompt_builder_sha256,
     author_prompt_sha256,
-    build_author_prompt,
+    build_author_prompt_full,
     call_model,
 )
 from proofdeploy.probe import ProbeRejected, ProbeSet, validate_probe
@@ -127,6 +136,22 @@ from proofdeploy.yml import (
 # Fixture keys rendered into the author-facing description by design.
 # Every other fixture value is secret-collected and leak-checked.
 PUBLIC_FIXTURE_KEYS = ("repo_name", "seed_note", "auth_mechanism", "auth_scope", "flags_note")
+
+
+# R-METHOD item 4: a transport failure of the correction call is retried
+# once after this many seconds.
+CORRECTION_RETRY_WAIT_S = 60
+
+
+def _answer_record(raw: ModelResponse) -> dict[str, Any]:
+    """One author answer as the record keeps it (R-METHOD item 5)."""
+    return {
+        "content": raw.content,
+        "sha256": sha256_text(raw.content),
+        "finish_reason": raw.finish_reason,
+        "usage": raw.usage,
+        "request": raw.request_record,
+    }
 
 
 class OrchestratorError(RuntimeError):
@@ -1277,11 +1302,15 @@ class Orchestrator:
         unit_id: str,
         rev_base: str,
         rev_tip: str,
-    ) -> tuple[Any, dict[str, Any], str, str, str, str, dict[str, Any]]:
+    ) -> tuple[
+        Any, dict[str, Any], str, str, str, str, dict[str, Any], dict[str, ShownSource]
+    ]:
         """Assemble the author bundle.
 
         Returns (bundle, manifest, prompt, raw_diff, base_sha, tip_sha,
-        truncation_flags). The prompt is a pure function of the verified
+        truncation_flags, shown_sources). ``shown_sources`` are the
+        texts the prompt shows as quote sources (R-METHOD: the fixture,
+        each touched file, each included route file). The prompt is a pure function of the verified
         bundle plus the frozen template: no run metadata ("run kind",
         unit id) is included, so the orchestrator's knowledge cannot leak
         to the model through the prompt.
@@ -1337,6 +1366,9 @@ class Orchestrator:
             # re-derives them from B and cross-verifies path and
             # pinned commit.
             gitlinks=tree_gitlinks(repo, tip_sha),
+            # R-BUNDLE: route declarations are selected within the
+            # unit contract's app.path.
+            app_path=contract.app_path,
         )
         manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
         # Pass None for no-skill; the builder renders "(none)" itself.
@@ -1344,7 +1376,7 @@ class Orchestrator:
             bundle.skill.read_text(encoding="utf-8") if bundle.skill else None
         )
         description = bundle.description.read_text(encoding="utf-8")
-        prompt, truncation_flags = build_author_prompt(
+        built = build_author_prompt_full(
             skill_text=skill_text,
             fixture_description=description,
             diff_text=diff_text,
@@ -1354,10 +1386,15 @@ class Orchestrator:
             # the author through a link. For a link-free tree the copy
             # is byte-identical, so the rendered prompt is unchanged.
             snapshot_dir=bundle.snapshot,
+            app_path=contract.app_path,
         )
+        prompt, truncation_flags = built.prompt, built.truncation_flags
         self._say(f"bundle assembled at {bundle.root}")
         self._leak_check_bundle(bundle, prompt, contract)
-        return bundle, manifest, prompt, diff_text, base_sha, tip_sha, truncation_flags
+        return (
+            bundle, manifest, prompt, diff_text, base_sha, tip_sha,
+            truncation_flags, built.sources,
+        )
 
     def _check_answer_key(
         self,
@@ -1568,6 +1605,7 @@ class Orchestrator:
             clean_id=cfg.clean_id if run_kind == "clean" else None,
             prompt=prompt,
             raw_model_response=raw.content,
+            author_evidence=probeset.author_evidence or None,
             parsed_probes=probeset.probes,
             invalid_probe_blocks=probeset.invalid_blocks,
             bundle_manifest=manifest,
@@ -1724,6 +1762,7 @@ class Orchestrator:
             clean_id=cfg.clean_id if run_kind == "clean" else None,
             prompt=prompt,
             raw_model_response=raw.content,
+            author_evidence=probeset.author_evidence or None,
             parsed_probes=[],
             invalid_probe_blocks=probeset.invalid_blocks,
             bundle_manifest=manifest,
@@ -1863,19 +1902,74 @@ class Orchestrator:
             assert_no_secrets(text, values, where=f"bundle file {f.name}")
         self._say("leak check passed: prompt and bundle carry no secret values")
 
-    def _author_probes(self, prompt: str) -> tuple[ProbeSet, ModelResponse]:
-        """Call the model once and parse its probes (steps b-c).
+    def _author_probes(
+        self, prompt: str, sources: dict[str, ShownSource]
+    ) -> tuple[ProbeSet, ModelResponse]:
+        """Call the model and parse its probes (steps b-c), with the
+        evidence check and its one correction round (R-METHOD, D242).
+
+        The first answer is checked mechanically, assertion by
+        assertion, against the texts the prompt showed (``sources``).
+        If any assertion is rejected, or any block is invalid under
+        the probe schema, exactly ONE follow-up is sent (the original
+        prompt, the first answer, a message listing each problem); the
+        second answer is final. In the final answer a rejected
+        assertion is removed; a probe left with no assertion is an
+        invalid block. A transport failure of the correction call is
+        retried once after ``CORRECTION_RETRY_WAIT_S``; if it still
+        fails, the first answer is used minus its rejections and the
+        failure is recorded. Returns the probe set and the FINAL
+        answer's response; the full story (both answers, the
+        correction prompt's hash, the per-assertion results) is on
+        ``probeset.author_evidence``.
 
         Never raises for author-output problems (Addendum 11 rule 6):
         each block is validated on its own; valid blocks run as usual
         and each invalid block is kept on the ProbeSet to be recorded
-        as an INCONCLUSIVE probe result, never sent. Only a model-call
-        failure raises (handled by the caller with retry).
+        as an INCONCLUSIVE probe result, never sent. Only a failure of
+        the FIRST model call raises (handled by the caller with
+        retry).
         """
-        raw = call_model(prompt, runner=self.cfg.model_runner)
-        probeset = ProbeSet.from_author_output(
-            raw.content, allow_harness_app=self.cfg.allow_harness_app
-        )
+        raw1 = call_model(prompt, runner=self.cfg.model_runner)
+        allow = self.cfg.allow_harness_app
+        a1 = analyse_answer(raw1.content, sources, allow_harness_app=allow)
+        final, raw_final = a1, raw1
+        evidence: dict[str, Any] = {
+            "correction_used": False,
+            "correction_prompt_sha256": None,
+            "correction_call_attempts": [],
+            "correction_call_error": None,
+            "final_answer": "first",
+            "first_answer": _answer_record(raw1),
+            "second_answer": None,
+            "checks": {"r1": a1.checks, "r2": None},
+        }
+        msg = correction_message(a1) if a1.needs_correction else None
+        if msg is not None:
+            evidence["correction_used"] = True
+            p2 = correction_prompt(prompt, raw1.content, msg)
+            evidence["correction_prompt_sha256"] = sha256_text(p2)
+            self._say(
+                f"author answer: {len(a1.rejected)} assertion(s) rejected, "
+                f"{len(a1.schema_errors)} invalid block(s); sending the one correction"
+            )
+            raw2 = self._correction_call(p2, evidence["correction_call_attempts"])
+            if raw2 is None:
+                evidence["correction_call_error"] = "; ".join(
+                    evidence["correction_call_attempts"]
+                )
+                self._say(
+                    "correction call failed; using the first answer minus its "
+                    "rejections"
+                )
+            else:
+                a2 = analyse_answer(raw2.content, sources, allow_harness_app=allow)
+                final, raw_final = a2, raw2
+                evidence["final_answer"] = "second"
+                evidence["second_answer"] = _answer_record(raw2)
+                evidence["checks"]["r2"] = a2.checks
+        probeset = final_probeset(final)
+        probeset.author_evidence = evidence
         n_valid = len(probeset.probes)
         n_invalid = len(probeset.invalid_blocks)
         if n_valid:
@@ -1892,7 +1986,37 @@ class Orchestrator:
                 "author produced no valid probes "
                 f"({n_invalid} invalid block(s)); recording author_output_invalid"
             )
-        return probeset, raw
+        return probeset, raw_final
+
+    def _correction_call(
+        self, prompt: str, attempts: list[str]
+    ) -> ModelResponse | None:
+        """The correction round's single model call (R-METHOD item 4).
+
+        A transport failure is retried once after
+        ``CORRECTION_RETRY_WAIT_S`` seconds; an overflow is not
+        retried. Every failed attempt is appended to ``attempts``.
+        Returns None when the call could not be made (the caller then
+        falls back to the first answer).
+        """
+        for attempt in (1, 2):
+            try:
+                resp = call_model(prompt, runner=self.cfg.model_runner)
+                attempts.append(f"correction_attempt_{attempt}: success")
+                return resp
+            except OrchestratorError:
+                raise
+            except (ModelCallError, RuntimeError) as exc:
+                cause = exc.cause if isinstance(exc, ModelCallError) else "model_transport"
+                attempts.append(f"correction_attempt_{attempt}: {cause}: {exc}")
+                if cause != "model_transport" or attempt == 2:
+                    return None
+                self._say(
+                    f"correction call failed ({exc}); retrying once after "
+                    f"{CORRECTION_RETRY_WAIT_S}s"
+                )
+                time.sleep(CORRECTION_RETRY_WAIT_S)
+        return None
 
     # ------------------------------------------------------------------
     # Provisioning and execution (steps d-e).
@@ -2799,7 +2923,7 @@ class Orchestrator:
                     capability_probe=capability_probe,
                     refusal=refusal,
                 )
-        bundle, manifest, prompt, _, base_sha, tip_sha, truncation_flags = (
+        bundle, manifest, prompt, _, base_sha, tip_sha, truncation_flags, sources = (
             self._build_bundle(
                 unit_dir,
                 unit_id=cfg.bug_id,
@@ -2836,7 +2960,7 @@ class Orchestrator:
         # - model_overflow: no retry.
         attempts: list[str] = []
         try:
-            probeset, raw = self._author_probes(prompt)
+            probeset, raw = self._author_probes(prompt, sources)
             attempts.append("attempt_1: success")
         except ModelCallError as e:
             attempts.append(f"attempt_1: {e.cause}: {e}")
@@ -2844,7 +2968,7 @@ class Orchestrator:
                 # Exactly one retry for transport failures.
                 self._say("model transport failed; retrying once")
                 try:
-                    probeset, raw = self._author_probes(prompt)
+                    probeset, raw = self._author_probes(prompt, sources)
                     attempts.append("attempt_2: success")
                 except ModelCallError as e2:
                     attempts.append(f"attempt_2: {e2.cause}: {e2}")
@@ -2979,6 +3103,7 @@ class Orchestrator:
                 b_parent_sha=b_parent_sha,
                 prompt=prompt,
                 raw_model_response=raw.content,
+                author_evidence=probeset.author_evidence or None,
                 parsed_probes=probeset.probes,
             invalid_probe_blocks=probeset.invalid_blocks,
                 bundle_manifest=manifest,
@@ -3160,7 +3285,7 @@ class Orchestrator:
                     refusal=refusal,
                 )
         # The clean author bundle: C^->C diff + C snapshot.
-        bundle, manifest, prompt, _, base_sha, tip_sha, truncation_flags = (
+        bundle, manifest, prompt, _, base_sha, tip_sha, truncation_flags, sources = (
             self._build_bundle(
                 unit_dir,
                 unit_id=cfg.clean_id,
@@ -3191,7 +3316,7 @@ class Orchestrator:
         # - model_overflow: no retry.
         attempts: list[str] = []
         try:
-            probeset, raw = self._author_probes(prompt)
+            probeset, raw = self._author_probes(prompt, sources)
             attempts.append("attempt_1: success")
         except ModelCallError as e:
             attempts.append(f"attempt_1: {e.cause}: {e}")
@@ -3199,7 +3324,7 @@ class Orchestrator:
                 # Exactly one retry for transport failures.
                 self._say("model transport failed; retrying once")
                 try:
-                    probeset, raw = self._author_probes(prompt)
+                    probeset, raw = self._author_probes(prompt, sources)
                     attempts.append("attempt_2: success")
                 except ModelCallError as e2:
                     attempts.append(f"attempt_2: {e2.cause}: {e2}")
@@ -3295,6 +3420,7 @@ class Orchestrator:
                 c_results=c_results,
                 prompt=prompt,
                 raw_model_response=raw.content,
+                author_evidence=probeset.author_evidence or None,
                 parsed_probes=probeset.probes,
             invalid_probe_blocks=probeset.invalid_blocks,
                 bundle_manifest=manifest,
