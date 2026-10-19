@@ -909,3 +909,246 @@ def test_single_writer_lock(tmp_path: Path) -> None:
     first.release()
     second.acquire()
     second.release()
+
+
+# ---------------------------------------------------------------------
+# Check (d) through readiness.yml on the GitHub runners (D194).
+# The dispatcher is a fake: no network, no gh. Each scripted run
+# is one dispatch: {"wait": bool, "rows": list | None}.
+# ---------------------------------------------------------------------
+
+
+def gh_row(
+    role: str,
+    *,
+    status: str = "READY",
+    typed_reason: str | None = None,
+    last_error: str | None = None,
+) -> dict[str, Any]:
+    """One readiness row as the rows artifact carries it (the
+    pair-mode shape of D195: the row's own fields plus its
+    engine/isolation/network/contract evidence)."""
+    return {
+        "kind": "readiness",
+        "role": role,
+        "status": status,
+        "typed_reason": typed_reason,
+        "last_error": last_error,
+        "network_mode": "none+socket",
+        "engine": "podman 5.4.0 (fake runner)",
+        "isolation_mode": "userns-remap",
+        "contract_store_sha256": "d" * 64,
+    }
+
+
+class FakeDispatcher:
+    """A scripted readiness.yml dispatcher (D194).
+
+    dispatch_pair records the call and hands out run IDs in
+    order (7000, 7001, ...); wait and fetch_rows replay the
+    scripted run's outcome. An unscripted dispatch defaults to a
+    successful run with no rows."""
+
+    def __init__(self, scripted: list[dict[str, Any]] | None = None) -> None:
+        self.scripted = list(scripted or [])
+        self.dispatches: list[dict[str, Any]] = []
+        self._by_id: dict[str, dict[str, Any]] = {}
+
+    def dispatch_pair(
+        self,
+        *,
+        repo: str,
+        fix_parent_sha: str,
+        fix_sha: str,
+        ref: str,
+    ) -> str:
+        run_id = str(7000 + len(self.dispatches))
+        self.dispatches.append({
+            "repo": repo,
+            "fix_parent_sha": fix_parent_sha,
+            "fix_sha": fix_sha,
+            "ref": ref,
+            "run_id": run_id,
+        })
+        self._by_id[run_id] = (
+            self.scripted.pop(0)
+            if self.scripted
+            else {"wait": True, "rows": []}
+        )
+        return run_id
+
+    def wait(self, run_id: str) -> bool:
+        return bool(self._by_id[run_id].get("wait", True))
+
+    def fetch_rows(
+        self, run_id: str, *, repo: str
+    ) -> list[dict[str, Any]] | None:
+        return self._by_id[run_id].get("rows")
+
+
+def github_checker(fake: FakeDispatcher) -> Any:
+    return mod.make_github_pair_checker(
+        repo_name="paperless-ngx/paperless-ngx", dispatcher=fake
+    )
+
+
+def test_github_check_d_happy_path() -> None:
+    """Dispatch -> rows: both sides READY, the rows' evidence
+    carried through verbatim, the run ID on every outcome, and
+    the dispatch made from main with the pair inputs."""
+    fake = FakeDispatcher([
+        {"wait": True, "rows": [gh_row("fix^"), gh_row("fix")]},
+    ])
+    outcomes = github_checker(fake)("a" * 40, "b" * 40, ("fix^", "fix"))
+    assert fake.dispatches == [{
+        "repo": "paperless-ngx/paperless-ngx",
+        "fix_parent_sha": "a" * 40,
+        "fix_sha": "b" * 40,
+        "ref": "main",
+        "run_id": "7000",
+    }]
+    for role in ("fix^", "fix"):
+        outcome = outcomes[role]
+        assert outcome["ready"] is True
+        assert outcome["status"] == "READY"
+        assert mod.classify_side(outcome) == "ready"
+        assert outcome["engine"] == "podman 5.4.0 (fake runner)"
+        assert outcome["isolation_mode"] == "userns-remap"
+        assert outcome["network_mode"] == "none+socket"
+        assert "--net=none" in outcome["network_none_evidence"]
+        assert outcome["contract_store_sha256"] == "d" * 64
+        assert outcome["workflow_run_id"] == "7000"
+
+
+def test_github_check_d_not_ready_rows_classify() -> None:
+    """READY is read from the row's status: a BUILD_FAILED row
+    with a typed `not supported:` reason is not ready and
+    classifies as the genuine refusal it is."""
+    fake = FakeDispatcher([
+        {
+            "wait": True,
+            "rows": [
+                gh_row("fix^"),
+                gh_row(
+                    "fix",
+                    status="BUILD_FAILED",
+                    typed_reason="not supported: no frozen lockfile",
+                ),
+            ],
+        },
+    ])
+    outcomes = github_checker(fake)("a" * 40, "b" * 40, ("fix^", "fix"))
+    assert outcomes["fix^"]["ready"] is True
+    assert outcomes["fix"]["ready"] is False
+    assert outcomes["fix"]["status"] == "BUILD_FAILED"
+    assert mod.classify_side(outcomes["fix"]) == "not_supported"
+
+
+def test_github_check_d_failed_workflow_is_environment() -> None:
+    """A workflow run that does not complete successfully yields
+    environment-class outcomes (D194) — never a guessed READY —
+    with the failed run's ID still recorded."""
+    fake = FakeDispatcher([{"wait": False}])
+    outcomes = github_checker(fake)("a" * 40, "b" * 40, ("fix^", "fix"))
+    for role in ("fix^", "fix"):
+        assert outcomes[role]["ready"] is False
+        assert mod.classify_side(outcomes[role]) == "environment"
+        assert outcomes[role]["workflow_run_id"] == "7000"
+
+
+def test_github_check_d_missing_artifact_is_environment() -> None:
+    """A successful run whose rows artifact is missing or
+    unreadable yields environment-class outcomes (D194)."""
+    fake = FakeDispatcher([{"wait": True, "rows": None}])
+    outcomes = github_checker(fake)("a" * 40, "b" * 40, ("fix^", "fix"))
+    for role in ("fix^", "fix"):
+        assert outcomes[role]["ready"] is False
+        assert mod.classify_side(outcomes[role]) == "environment"
+        assert outcomes[role]["workflow_run_id"] == "7000"
+
+
+def test_github_check_d_dispatch_failure_is_environment() -> None:
+    """A dispatch that raises (gh down, workflow missing) yields
+    environment-class outcomes with no run ID — the ruled retry
+    path, not a crash and not a READY."""
+
+    class RaisingDispatcher(FakeDispatcher):
+        def dispatch_pair(self, **kw: Any) -> str:
+            raise RuntimeError("gh: executable not found (fake)")
+
+    outcomes = github_checker(RaisingDispatcher())(
+        "a" * 40, "b" * 40, ("fix^", "fix")
+    )
+    for role in ("fix^", "fix"):
+        assert outcomes[role]["ready"] is False
+        assert mod.classify_side(outcomes[role]) == "environment"
+        assert outcomes[role]["workflow_run_id"] is None
+
+
+@pytest.mark.parametrize(
+    "bad_sha",
+    ["abc123", "A" * 40, "g" * 40, "a" * 39, "a" * 41, ""],
+)
+def test_github_check_d_refuses_non_sha40(bad_sha: str) -> None:
+    """Fail closed before dispatch: a SHA that is not exactly 40
+    lowercase hex is refused (D194), on either side, and nothing
+    is dispatched."""
+    fake = FakeDispatcher()
+    checker = github_checker(fake)
+    with pytest.raises(mod.HarnessError):
+        checker(bad_sha, "b" * 40, ("fix^", "fix"))
+    with pytest.raises(mod.HarnessError):
+        checker("a" * 40, bad_sha, ("fix^", "fix"))
+    with pytest.raises(mod.HarnessError):
+        mod._validate_sha40(bad_sha, what="sha")
+    assert fake.dispatches == []
+
+
+def test_github_dispatch_ref_must_be_main() -> None:
+    """The real dispatcher refuses any ref but main before any
+    gh call is made (D194: dispatches come from main only)."""
+    dispatcher = mod.GhReadinessDispatcher()
+    with pytest.raises(mod.HarnessError):
+        dispatcher.dispatch_pair(
+            repo="paperless-ngx/paperless-ngx",
+            fix_parent_sha="a" * 40,
+            fix_sha="b" * 40,
+            ref="feat/not-main",
+        )
+
+
+def test_github_check_d_run_ids_journaled_per_attempt(
+    tmp_path: Path,
+) -> None:
+    """Through the walk: a failed workflow run is one journaled
+    attempt (class environment, its run ID recorded); the retry
+    is a NEW dispatch with a NEW run ID; READY on the retry
+    selects. The record's per-side attempts carry the run IDs."""
+    repo, _base, _b, mid, fix = standard_history(tmp_path)
+    journal, _, _ = _open_journal(tmp_path, fix)
+    fake = FakeDispatcher([
+        {"wait": False},
+        {"wait": True, "rows": [gh_row("fix^"), gh_row("fix")]},
+    ])
+    record = select(repo, fix, github_checker(fake), journal=journal)
+    assert record["outcome"] == "selected"
+    assert [d["run_id"] for d in fake.dispatches] == ["7000", "7001"]
+    assert all(d["ref"] == "main" for d in fake.dispatches)
+    journaled = journal.read_attempts()
+    assert [
+        (a["role"], a["class"], a["workflow_run_id"])
+        for a in journaled
+    ] == [
+        ("fix^", "environment", "7000"),
+        ("fix", "environment", "7000"),
+        ("fix^", "ready", "7001"),
+        ("fix", "ready", "7001"),
+    ]
+    entry = record["walked"][-1]
+    fix_side = entry["readiness"]["fix"]
+    assert [a["class"] for a in fix_side["attempts"]] == [
+        "environment", "ready",
+    ]
+    assert [a["workflow_run_id"] for a in fix_side["attempts"]] == [
+        "7000", "7001",
+    ]
