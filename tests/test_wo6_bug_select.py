@@ -1361,17 +1361,85 @@ def test_check_e_boundary_80000_selected_80001_rejected(
     assert record["rejected_by_check"]["e"] == 1
 
 
-def test_check_e_not_evaluated_for_commits_failing_a_to_d(
+def test_check_e_not_evaluated_for_commits_failing_a_to_c(
     tmp_path: Path,
 ) -> None:
-    repo, _base, _b, mid, fix = standard_history(tmp_path)
+    # Amendment 1 (D255): (e) runs after (c) and before (d), so a
+    # commit failing (a)-(c) never reaches it. (Was "a_to_d"; a
+    # commit failing (d) now reaches (e) first.)
+    repo = init_repo(tmp_path)
+    commit(repo, "Initial commit", ts(2026, 1, 10),
+           {"src/app.py": "l1\nl2\nl3\n"})
+    commit(repo, "Introduce the counter", ts(2026, 2, 1),
+           {"src/app.py": "l1\nl2-bug\nl3\n"})
+    add_tag(repo, "v1.0", ts(2026, 2, 2))
+    commit(repo, "Add other module", ts(2026, 8, 1),
+           {"src/other.py": "x = 1\n"})
+    head = commit(repo, "Fix by adding a guard line", ts(2026, 8, 20),
+                  {"src/app.py": "l1\nl2-bug\nl3\nguard\n"})
     script = SizeScript([])  # any call would raise IndexError
-    # mid fails (a); fix fails (d) because nothing is READY.
-    record = select(repo, fix, FakeReady(), prompt_size=script)
+    # head fails (c) (add-only); every older commit fails (a).
+    record = select(repo, head, FakeReady(), prompt_size=script)
+    assert {e["sha"]: e for e in record["walked"]}[head]["failed_check"] == "c"
     assert script.calls == []
     for entry in record["walked"]:
         assert "author_prompt_chars" not in entry
-    assert record["walked"][-1]["failed_check"] == "d"
+    assert record["rejected_by_check"]["e"] == 0
+
+
+def test_check_e_oversized_commit_rejected_at_e_without_readiness(
+    tmp_path: Path,
+) -> None:
+    repo, _base, b, fix1, _fix2 = two_fix_history(tmp_path)
+    ready = FakeReady({b, fix1})
+    script = SizeScript([80001])
+    record = select(repo, fix1, ready, prompt_size=script)
+    entry = record["walked"][-1]
+    assert entry["sha"] == fix1
+    assert entry["failed_check"] == "e"
+    assert entry["author_prompt_chars"] == 80001
+    assert "readiness" not in entry
+    # Amendment 1: no readiness dispatch for the oversized commit.
+    assert ready.calls == []
+    assert len(script.calls) == 1
+    assert record["rejected_by_check"]["e"] == 1
+    assert record["rejected_by_check"]["d"] == 0
+
+
+def test_check_e_fitting_commit_calls_e_then_d(tmp_path: Path) -> None:
+    repo, _base, b, fix1, _fix2 = two_fix_history(tmp_path)
+    order: list[str] = []
+    ready = FakeReady({b, fix1})
+    real_ready = ready.__call__
+
+    def ready_logged(*a: Any, **k: Any) -> dict[str, dict[str, Any]]:
+        order.append("d")
+        return real_ready(*a, **k)
+
+    def size_logged(parent: str, bb: str) -> int:
+        order.append("e")
+        return 80000
+
+    record = select(repo, fix1, ready_logged, prompt_size=size_logged)  # type: ignore[arg-type]
+    assert record["outcome"] == "selected"
+    assert order[0] == "e"
+    assert "d" in order[1:]
+    assert record["walked"][-1]["author_prompt_chars"] == 80000
+
+
+def test_check_e_fits_but_fails_d_rejected_at_d_with_size_recorded(
+    tmp_path: Path,
+) -> None:
+    repo, _base, _b, fix1, _fix2 = two_fix_history(tmp_path)
+    ready = FakeReady()  # nothing READY: genuine (d) failure
+    script = SizeScript([1234])
+    record = select(repo, fix1, ready, prompt_size=script)
+    entry = record["walked"][-1]
+    assert entry["failed_check"] == "d"
+    assert entry["author_prompt_chars"] == 1234
+    assert len(script.calls) == 1
+    assert len(ready.calls) >= 1
+    assert record["rejected_by_check"]["d"] == 1
     assert record["rejected_by_check"]["e"] == 0
 
 

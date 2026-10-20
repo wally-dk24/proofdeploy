@@ -116,13 +116,16 @@ stay on this host either way; the local sandboxed checker
 remains the default.
 
 Check (e), R-SIZE (docs/registration/r-size-author-prompt-size.md,
-signed 2026-10-19; D251, D253): after (a)-(d), the blind author's
+signed 2026-10-19; D251, D253), order per Amendment 1
+(docs/registration/r-size-amendment-1-check-order.md; D255): the
+check runs after (c) and BEFORE (d), so a commit failing (e) is
+rejected at "e" with no readiness dispatch. The blind author's
 prompt for B^..B is built through the orchestrator's own bundle code
 (registered store contract, registered skill author copy, frozen
 template and caps; no model call) and its length in characters must
 be at most R_SIZE_MAX_PROMPT_CHARS (80,000). The size, and only the
 size, is recorded as author_prompt_chars for every commit that
-reaches (e).
+reaches (e) (including one that then fails (d)).
 
 CONTAMINATION GUARD: this script records commit metadata and check
 outcomes only. It never prints or writes the fix's diff, any file
@@ -925,6 +928,29 @@ def evaluate_commit(
     entry["tag"] = tag_name
     entry["tag_created"] = _iso(tag_ts)
 
+    # (e) R-SIZE (D253), order per Amendment 1 (D255): the blind
+    # author's prompt for B^..B is at most R_SIZE_MAX_PROMPT_CHARS
+    # characters. Evaluated after (c) and BEFORE (d), so an oversized
+    # commit is rejected at "e" without a readiness dispatch. The
+    # size is recorded for every commit that reaches (e), pass or
+    # fail. B^ is B's first parent.
+    b_parent = repo.first_parent(b_sha)
+    if b_parent is None:
+        raise HarnessError(
+            f"check (e) refused: B {b_sha} has no parent, so the "
+            "author range B^..B does not exist (ruling required; "
+            "the commit is not rejected)"
+        )
+    n = prompt_size(b_parent, b_sha)
+    entry["author_prompt_chars"] = n
+    if n > R_SIZE_MAX_PROMPT_CHARS:
+        return reject(
+            "e",
+            f"e: author prompt too large ({n} chars > "
+            f"{R_SIZE_MAX_PROMPT_CHARS})",
+        )
+
+
     # (d) fix^ and fix both READY (provisioning-only), under the
     # D48 classification (D177): _run_check_d retries harness /
     # environment sides, returns genuine `not supported:` failures
@@ -944,26 +970,6 @@ def evaluate_commit(
         else:
             reason = "fix is not READY"
         return reject("d", reason)
-
-    # (e) R-SIZE (D253): the blind author's prompt for B^..B is at
-    # most R_SIZE_MAX_PROMPT_CHARS characters. Evaluated only for a
-    # commit that passed (a)-(d); the size is recorded for every
-    # commit that reaches (e), pass or fail. B^ is B's first parent.
-    b_parent = repo.first_parent(b_sha)
-    if b_parent is None:
-        raise HarnessError(
-            f"check (e) refused: B {b_sha} has no parent, so the "
-            "author range B^..B does not exist (ruling required; "
-            "the commit is not rejected)"
-        )
-    n = prompt_size(b_parent, b_sha)
-    entry["author_prompt_chars"] = n
-    if n > R_SIZE_MAX_PROMPT_CHARS:
-        return reject(
-            "e",
-            f"e: author prompt too large ({n} chars > "
-            f"{R_SIZE_MAX_PROMPT_CHARS})",
-        )
 
     entry["outcome"] = "selected"
     return entry
