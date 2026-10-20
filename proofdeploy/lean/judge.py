@@ -575,9 +575,15 @@ def check_evidence(
         if not absent_after and _canon(expected) == _canon(g.after):
             return False, "expected_equals_after", passed
         passed.append("expected_differs_from_after")
-        if not (_has_value(q, expected) or has_name):
-            return False, "quote_lacks_expected_or_field", passed
-        passed.append("quote_names_expected_or_field")
+        # A FAIL must rest on evidence of the correct value. Naming the field
+        # alone is enough only for a removed field (the quote establishes that
+        # the field should exist).
+        if g.kind == "removed_field":
+            if not (_has_value(q, expected) or has_name):
+                return False, "quote_lacks_expected_value", passed
+        elif not _has_value(q, expected):
+            return False, "quote_lacks_expected_value", passed
+        passed.append("quote_states_expected_value")
         return True, None, passed
 
     # verdict == "correct"

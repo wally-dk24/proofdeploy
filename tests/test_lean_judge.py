@@ -241,7 +241,7 @@ def test_ambiguous_boolean_quote_rejected():
         (answer("regression", expected=None), "missing_expected_value"),
         (
             answer("regression", quote="seeduser/seedpass owns two notes", expected=False),
-            "quote_lacks_expected_or_field",
+            "quote_lacks_expected_value",
         ),
         (answer("regression", source="schema"), "quote_not_in_source"),
         (answer("regression", source="bogus"), "bad_source"),
@@ -443,3 +443,19 @@ def test_replay_detects_tampering():
     bad2["inputs"]["context"]["intent"] = "something else"
     with pytest.raises(ReplayMismatch):
         replay(bad2)
+
+
+def test_regression_quote_naming_field_without_value_is_rejected():
+    c = JudgeContext(INTENT, HUNKS, FACTS, {"done": "done: whether the note is done"})
+    ans = answer("regression", source="schema", quote="done: whether the note is done")
+    rec = lean([diff()], Stub([ans]), c)
+    assert rec.groups[0]["judgment"]["cause"] == "evidence_rejected:quote_lacks_expected_value"
+    assert rec.verdict["status"] == INCONCLUSIVE and rec.verdict["cause"] == "needs_information"
+
+
+def test_removed_field_regression_may_quote_field_name_only():
+    c = JudgeContext(INTENT, HUNKS, FACTS, {"done": "done: whether the note is done"})
+    d = diff(before=False, after=None, kind="removed_field")
+    ans = answer("regression", source="schema", quote="done: whether the note is done")
+    rec = lean([d], Stub([ans]), c)
+    assert rec.verdict["status"] == FAIL and rec.verdict["cause"] == "judged_regression"

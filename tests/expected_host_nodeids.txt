@@ -467,11 +467,13 @@ tests/test_lean_judge.py::test_record_is_json_and_replay_matches
 tests/test_lean_judge.py::test_regression_beats_unexercised_and_hard_beats_regression
 tests/test_lean_judge.py::test_regression_evidence_rules[ans0-expected_equals_after]
 tests/test_lean_judge.py::test_regression_evidence_rules[ans1-missing_expected_value]
-tests/test_lean_judge.py::test_regression_evidence_rules[ans2-quote_lacks_expected_or_field]
+tests/test_lean_judge.py::test_regression_evidence_rules[ans2-quote_lacks_expected_value]
 tests/test_lean_judge.py::test_regression_evidence_rules[ans3-quote_not_in_source]
 tests/test_lean_judge.py::test_regression_evidence_rules[ans4-bad_source]
 tests/test_lean_judge.py::test_regression_evidence_rules[ans5-empty_quote]
 tests/test_lean_judge.py::test_regression_evidence_rules[ans6-no_evidence]
+tests/test_lean_judge.py::test_regression_quote_naming_field_without_value_is_rejected
+tests/test_lean_judge.py::test_removed_field_regression_may_quote_field_name_only
 tests/test_lean_judge.py::test_replay_detects_tampering
 tests/test_lean_judge.py::test_self_justifying_quote_is_rejected
 tests/test_lean_judge.py::test_token_budget_exhaustion_marks_remaining_ai_budget
