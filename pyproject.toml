@@ -9,7 +9,7 @@ description = "Diff in, verified out: probe what changed, render verdicts."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["pyyaml>=6.0"]
+dependencies = ["pyyaml>=6.0", "coverage==7.16.2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.8", "mypy>=1.10", "types-PyYAML>=6.0"]
