@@ -1,0 +1,92 @@
+# Lean P6b (D258): the Stage 2 Phase 0 gate. Runs experiments/lean-poc/gate.py.
+#
+# Model-calling (the lean judge, through the pinned client): it runs in the
+# `measurement` environment, so every dispatch waits for Master's approval, and
+# it shares the model-call serialization group with measure and verify. The key
+# (GROQ_API_KEY; the name is historical, it holds the Cerebras key) is in the
+# gate step only. Nothing is pushed: the results are uploaded as an artifact.
+# Nothing here is a measured result.
+#
+# Blindness: the driver logs ids, verdicts, causes and counts only; paperless
+# diffs, file contents and commit messages stay in the artifact.
+name: lean-poc
+
+on:
+  workflow_dispatch:
+    inputs:
+      units:
+        description: "Which gate units to run (all = 26: 2 golden, 20 mutants, 4 paperless)"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - golden
+          - mutants
+          - paperless
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proofdeploy-model-calls
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    environment: measurement
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Check out paperless-ngx (full history)
+        if: ${{ inputs.units == 'all' || inputs.units == 'paperless' }}
+        run: |
+          git clone --quiet https://github.com/paperless-ngx/paperless-ngx /tmp/paperless
+
+      - name: Capability probe (fail-closed gate)
+        run: |
+          python -c "
+          from proofdeploy.sandbox import assert_measurement_gate
+          assert_measurement_gate()
+          print('GATE PASSED')
+          "
+
+      - name: Run the gate
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          UNITS: ${{ inputs.units }}
+        run: |
+          mkdir -p /tmp/lean-poc-out /tmp/lean-poc-work
+          python experiments/lean-poc/gate.py \
+            --units "$UNITS" \
+            --out /tmp/lean-poc-out \
+            --workdir /tmp/lean-poc-work \
+            --paperless-repo /tmp/paperless
+
+      - name: Upload gate results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lean-poc-${{ github.run_id }}
+          path: /tmp/lean-poc-out/
+          retention-days: 30

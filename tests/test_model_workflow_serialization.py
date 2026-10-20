@@ -31,7 +31,9 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 
 MODEL_CONCURRENCY_GROUP = "proofdeploy-model-calls"
 
-_MODEL_CLI = re.compile(r"proofdeploy(?:\.cli)?\s+(?:measure|verify)\b")
+_MODEL_CLI = re.compile(
+    r"proofdeploy(?:\.cli)?\s+(?:measure|verify|lean-verify)\b|experiments/lean-poc/gate\.py"
+)
 
 
 def _can_call_model(text: str) -> bool:
@@ -77,14 +79,14 @@ def test_every_model_calling_workflow_shares_the_serialization_group():
 
 
 def test_the_known_model_workflows_are_detected():
-    # The detector must not silently match nothing: verify and
-    # measure are the two workflows that hold GROQ_API_KEY today.
+    # The detector must not silently match nothing: verify, measure and
+    # lean-poc (Lean P6b) are the workflows that hold GROQ_API_KEY today.
     detected = {
         path.name
         for path in sorted(WORKFLOWS.glob("*.yml"))
         if _can_call_model(path.read_text(encoding="utf-8"))
     }
-    assert {"verify.yml", "measure.yml"} <= detected
+    assert {"verify.yml", "measure.yml", "lean-poc.yml"} <= detected
 
 
 def _write_workflow(dir_: Path, name: str, body: str) -> None:
