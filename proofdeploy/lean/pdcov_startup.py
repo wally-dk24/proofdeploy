@@ -5,7 +5,9 @@ Starts coverage.py for this process (``coverage.process_startup`` reads
 ``context`` next to this file: whenever its content changes, the thread
 switches coverage's dynamic context to that content and then writes the same
 content to ``context.ack``, so the host knows the switch took effect before it
-sends the next request.
+sends the next request. A second control file ``flush`` works the same way:
+a new content makes the thread save the coverage data collected so far
+(``flush.ack`` echoes it), so the host can read coverage while the app runs.
 
 This file is copied verbatim into the pdcov tool directory by
 ``proofdeploy.lean.coverage.install_pdcov``; it must stay stdlib + coverage
@@ -37,7 +39,20 @@ def _write_atomic(path: Path, text: str) -> None:
 
 def _follow(cov: object, control: Path, ack: Path) -> None:
     last: str | None = None
+    flush = control.with_name("flush")
+    flush_ack = control.with_name("flush.ack")
+    last_flush: str | None = None
     while True:
+        token = _read(flush)
+        if token is not None and token != last_flush:
+            # Host asked for a mid-run snapshot (P3): write the data collected
+            # so far to the parallel data file, keep measuring, then ack.
+            try:
+                cov.save()  # type: ignore[attr-defined]
+                _write_atomic(flush_ack, token)
+                last_flush = token
+            except Exception:  # never kill the app; the host times out
+                pass
         content = _read(control)
         if content is not None and content != last:
             try:
