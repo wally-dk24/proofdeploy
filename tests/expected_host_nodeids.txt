@@ -393,6 +393,37 @@ tests/test_leakcheck.py::test_short_values_ignored
 tests/test_leakcheck.py::test_tampered_fixture_description_refused
 tests/test_leakcheck.py::test_tampered_skill_arm_copy_refused
 tests/test_leakcheck.py::test_tampered_skill_copy_refused
+tests/test_lean_coverage.py::test_added_lines_are_judged_on_new_side_only
+tests/test_lean_coverage.py::test_binary_files_are_listed_not_counted
+tests/test_lean_coverage.py::test_c_quoted_paths_fail_closed[diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n--- "a/caf\\303\\251.py"\n]
+tests/test_lean_coverage.py::test_c_quoted_paths_fail_closed[diff --git a/a.py b/b.py\nrename from a.py\nrename to "b\\tq.py"\n]
+tests/test_lean_coverage.py::test_c_quoted_paths_fail_closed[diff --git a/x.py b/x.py\n--- "a/we\\"ird.py"\n+++ b/x.py\n]
+tests/test_lean_coverage.py::test_clean_app_env_drops_host_coverage_variables
+tests/test_lean_coverage.py::test_collect_without_data_fails_closed
+tests/test_lean_coverage.py::test_django_settings_overlay
+tests/test_lean_coverage.py::test_django_settings_overlay_rejects_unsafe_input[fakeproj.settings-overrides1]
+tests/test_lean_coverage.py::test_django_settings_overlay_rejects_unsafe_input[fakeproj.settings-overrides2]
+tests/test_lean_coverage.py::test_django_settings_overlay_rejects_unsafe_input[fakeproj.settings-overrides3]
+tests/test_lean_coverage.py::test_django_settings_overlay_rejects_unsafe_input[os; import evil-overrides0]
+tests/test_lean_coverage.py::test_golden_flask_impact_end_to_end
+tests/test_lean_coverage.py::test_hunk_count_mismatch_and_combined_diffs_fail_closed
+tests/test_lean_coverage.py::test_impact_attributes_hits_to_requests_by_side
+tests/test_lean_coverage.py::test_install_pdcov_writes_rcfile_startup_and_coverage_copy
+tests/test_lean_coverage.py::test_missing_data_error_carries_exit_code_and_app_output
+tests/test_lean_coverage.py::test_modify_hunks_added_and_removed_sides
+tests/test_lean_coverage.py::test_new_file_and_deleted_file
+tests/test_lean_coverage.py::test_no_newline_marker_does_not_shift_lines
+tests/test_lean_coverage.py::test_plain_unified_diff_without_git_headers
+tests/test_lean_coverage.py::test_pure_additions_and_deletions_use_their_own_side
+tests/test_lean_coverage.py::test_pure_rename_has_empty_entry_and_mapping
+tests/test_lean_coverage.py::test_real_git_diff_matches_parser
+tests/test_lean_coverage.py::test_removed_line_that_looks_like_a_header_is_content
+tests/test_lean_coverage.py::test_removed_lines_are_judged_on_old_side_only
+tests/test_lean_coverage.py::test_rename_uses_old_path_on_old_side
+tests/test_lean_coverage.py::test_rename_with_edit_keys_by_new_path_and_records_old
+tests/test_lean_coverage.py::test_set_context_returns_when_ack_matches
+tests/test_lean_coverage.py::test_set_context_times_out_without_listener
+tests/test_lean_coverage.py::test_startup_context_does_not_count_as_a_request
 tests/test_lean_index.py::test_allof_merges_properties_required_and_sibling_description
 tests/test_lean_index.py::test_cache_round_trip
 tests/test_lean_index.py::test_fetch_openapi_json
