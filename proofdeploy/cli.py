@@ -3,6 +3,7 @@
 ``verify`` exit codes (plan 1.10, registered): 0 = PASS; 1 = FAIL;
 2 = INCONCLUSIVE; 3 = not supported (typed); 4 = usage/config
 error; 5 = internal error (our gap; traceback logged).
+``lean-verify`` uses the same codes as ``verify``.
 ``measure`` keeps its own codes: 0 = ran; 1 = measure failed;
 2 = tool error.
 """
@@ -301,6 +302,83 @@ def build_parser() -> argparse.ArgumentParser:
             "every rehearsal probe passes on both sides."
         ),
     )
+
+    lv = sub.add_parser(
+        "lean-verify",
+        help="Lean verdict for one change (base..head): impact, 2x2 runs, judge (Stage 2).",
+    )
+    lv.add_argument("--repo", required=True, help="App repo dir (must be a git checkout).")
+    lv.add_argument("--base", required=True, help="Base commit (the change's parent).")
+    lv.add_argument("--head", required=True, help="Head commit (the change).")
+    lv.add_argument(
+        "--contract",
+        default=None,
+        help="Explicit contract store file (wins over --unit-repo; default: head tree's own).",
+    )
+    lv.add_argument(
+        "--unit-repo",
+        default=None,
+        help=(
+            "Load the contract from the committed store (readiness/contracts/<owner>__<repo>.yml)."
+        ),
+    )
+    lv.add_argument(
+        "--intent",
+        default=None,
+        help="Intent text for the judge (default: the head commit's subject and body).",
+    )
+    lv.add_argument(
+        "--no-sandbox",
+        action="store_true",
+        help=(
+            "DEV/golden only: run both sides on the host. Marked unsandboxed; never a "
+            "measured result."
+        ),
+    )
+    lv.add_argument(
+        "--django-overlay",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Django setting override via a generated settings overlay "
+            "(e.g. CELERY_TASK_ALWAYS_EAGER=True); repeatable; applies only when the "
+            "contract env declares DJANGO_SETTINGS_MODULE."
+        ),
+    )
+    lv.add_argument(
+        "--budget-tokens",
+        type=int,
+        default=10_000,
+        help="Judge token budget (default: 10000).",
+    )
+    lv.add_argument(
+        "--budget-requests",
+        type=int,
+        default=200,
+        help="Request budget for the impact search per side (default: 200).",
+    )
+    lv.add_argument(
+        "--openapi-path",
+        default=None,
+        help=(
+            "Path where the app serves its OpenAPI document "
+            "(default: try /api/schema/, /openapi.json)."
+        ),
+    )
+    lv.add_argument(
+        "--flask-target",
+        default="app",
+        help="module[:attr] of the Flask app for the url_map fallback (default: app).",
+    )
+    lv.add_argument(
+        "--python",
+        default=None,
+        help="With --no-sandbox: interpreter that already has the app's dependencies.",
+    )
+    lv.add_argument(
+        "--output-dir", required=True, help="Where the record, manifest and exchanges are written."
+    )
     return p
 
 
@@ -525,6 +603,11 @@ def main(argv: list[str] | None = None) -> int:
         # cmd_verify maps every outcome onto the registered exit
         # codes itself (including internal errors, as exit 5).
         return cmd_verify(args)
+    if args.command == "lean-verify":
+        from proofdeploy.lean.run import cmd_lean_verify
+
+        # cmd_lean_verify maps every outcome onto verify's exit codes itself.
+        return cmd_lean_verify(args)
     if args.command == "measure":
         try:
             return cmd_measure(args)
