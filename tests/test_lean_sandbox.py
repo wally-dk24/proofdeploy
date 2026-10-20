@@ -120,7 +120,9 @@ def test_golden_bug_lean_verify_fails_in_the_sandbox_with_a_judged_regression(
     assert stub.prompts, "the judge ran on the real difference"
 
     # tool state stays outside the checked-out tree (plan 1.2(n)); no token in any output
-    for snap in (out / "work").rglob("snapshot-*"):
+    snaps = [s for s in (out / "work").rglob("snapshot-*") if not s.name.endswith(".pd-home")]
+    assert snaps, "the checked-out snapshots must be found"
+    for snap in snaps:
         assert not (snap / ".pd-tools").exists() and not (snap / ".venv").exists()
     for f in out.glob("*.json"):
         assert "pdcanary-" not in f.read_text(encoding="utf-8"), f.name
