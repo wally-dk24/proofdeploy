@@ -129,6 +129,8 @@ def run_cli(
         ]
     )
     code = lean_run.cmd_lean_verify(args, model_runner=runner)
+    if code == 5:
+        pytest.fail("lean-verify hit an internal error (exit 5); the traceback is in stderr")
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     return code, manifest
 
