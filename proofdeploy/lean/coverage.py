@@ -48,6 +48,8 @@ SANDBOX_TOOL_DIR = "/pd-home/.pd-tools/pdcov"
 
 CONTEXT_FILE = "context"
 ACK_FILE = "context.ack"
+FLUSH_FILE = "flush"
+FLUSH_ACK_FILE = "flush.ack"
 ACK_TIMEOUT_SECONDS = 2.0
 _POLL_SECONDS = 0.005
 _STARTUP_SOURCE = Path(__file__).with_name("pdcov_startup.py")
@@ -301,6 +303,14 @@ class PdCov:
     def ack_file(self) -> Path:
         return self.tool_dir / ACK_FILE
 
+    @property
+    def flush_file(self) -> Path:
+        return self.tool_dir / FLUSH_FILE
+
+    @property
+    def flush_ack_file(self) -> Path:
+        return self.tool_dir / FLUSH_ACK_FILE
+
     def env(self) -> dict[str, str]:
         """Environment additions for the app process (and nothing else)."""
         return {"COVERAGE_PROCESS_START": str(self.rcfile)}
@@ -380,7 +390,7 @@ def install_pdcov(
 def reset_runtime_state(pd: PdCov) -> None:
     for f in pd.data_dir.glob(".coverage*"):
         f.unlink()
-    for f in (pd.context_file, pd.ack_file):
+    for f in (pd.context_file, pd.ack_file, pd.flush_file, pd.flush_ack_file):
         f.unlink(missing_ok=True)
 
 
@@ -408,6 +418,7 @@ class CoverageSession:
     def __init__(self, pd: PdCov, *, ack_timeout: float = ACK_TIMEOUT_SECONDS) -> None:
         self.pd = pd
         self.ack_timeout = ack_timeout
+        self._flushes = 0
 
     def start(self) -> None:
         """Clear data and control files; call before starting the app."""
@@ -435,6 +446,35 @@ class CoverageSession:
                     f"within {self.ack_timeout}s (is the app running with pdcov injected?)"
                 )
             time.sleep(_POLL_SECONDS)
+
+    def flush(self) -> None:
+        """Make the running app save the coverage collected so far (P3).
+
+        Blocks until the in-app listener acknowledges; raises
+        CoverageHarnessError after ``ack_timeout`` seconds. Measurement
+        continues afterwards.
+        """
+        self._flushes += 1
+        token = f"{os.getpid()}-{self._flushes}-{time.time_ns()}"
+        _write_atomic(self.pd.flush_file, token)
+        deadline = time.monotonic() + self.ack_timeout
+        while True:
+            try:
+                if self.pd.flush_ack_file.read_text(encoding="utf-8") == token:
+                    return
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise CoverageHarnessError(
+                    f"coverage listener did not acknowledge flush within "
+                    f"{self.ack_timeout}s (is the app running with pdcov injected?)"
+                )
+            time.sleep(_POLL_SECONDS)
+
+    def snapshot(self, *, root_prefix: str = "") -> Coverage:
+        """Per-context coverage so far, read while the app keeps running."""
+        self.flush()
+        return collect_coverage(self.pd.data_dir, root_prefix=root_prefix)
 
     def stop_and_collect(
         self,
