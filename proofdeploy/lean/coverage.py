@@ -27,12 +27,14 @@ Pieces:
 from __future__ import annotations
 
 import ast
+import os
 import re
 import shutil
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -310,6 +312,32 @@ class PdCov:
         )
 
 
+# Variables the app may inherit from the host. Everything else is dropped:
+# the host (e.g. pytest-cov in CI) sets COVERAGE_FILE / COV_CORE_* which would
+# override the rcfile's data_file (COVERAGE_FILE wins over config) and send
+# the app's data somewhere the harness never looks.
+ENV_ALLOW = ("PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ")
+
+
+def clean_app_env(
+    pd: PdCov,
+    extra: Mapping[str, str] | None = None,
+    *,
+    base: Mapping[str, str] | None = None,
+    measured: bool = True,
+) -> dict[str, str]:
+    """Environment for the app: allow-list of ``base`` + ``extra`` (+ the coverage hook).
+
+    ``measured=False`` omits ``COVERAGE_PROCESS_START`` (for migrate/seed steps).
+    """
+    src = os.environ if base is None else base
+    env = {k: src[k] for k in ENV_ALLOW if k in src}
+    env.update(extra or {})
+    if measured:
+        env.update(pd.env())
+    return env
+
+
 def render_coveragerc(tool_dir: Path, source_root: str | Path) -> str:
     return (
         "[run]\n"
@@ -414,6 +442,7 @@ class CoverageSession:
         *,
         stop_timeout: float = 15.0,
         root_prefix: str = "",
+        log_path: str | Path | None = None,
     ) -> Coverage:
         """SIGTERM ``proc`` (if given), combine parallel data, return per-context lines.
 
@@ -431,7 +460,23 @@ class CoverageSession:
                 raise CoverageHarnessError(
                     "app did not exit on SIGTERM; coverage data unsafe"
                 ) from None
-        return collect_coverage(self.pd.data_dir, root_prefix=root_prefix)
+        try:
+            return collect_coverage(self.pd.data_dir, root_prefix=root_prefix)
+        except CoverageHarnessError as exc:
+            raise CoverageHarnessError(f"{exc}{_diagnostics(proc, log_path)}") from None
+
+
+def _diagnostics(proc: subprocess.Popen[Any] | None, log_path: str | Path | None) -> str:
+    parts = []
+    if proc is not None:
+        parts.append(f"app exit code: {proc.poll()}")
+    if log_path is not None:
+        try:
+            tail = Path(log_path).read_text(encoding="utf-8", errors="replace")[-2000:]
+        except OSError as exc:
+            tail = f"<unreadable: {exc}>"
+        parts.append(f"app output (tail):\n{tail}")
+    return ("\n" + "\n".join(parts)) if parts else ""
 
 
 def collect_coverage(data_dir: str | Path, *, root_prefix: str = "") -> Coverage:
@@ -440,7 +485,8 @@ def collect_coverage(data_dir: str | Path, *, root_prefix: str = "") -> Coverage
     if not parts:
         raise CoverageHarnessError(
             f"no coverage data files in {data_dir}: the app wrote none "
-            f"(pdcov.pth missing, COVERAGE_PROCESS_START unset, or app killed without SIGTERM)"
+            f"(pdcov.pth missing, COVERAGE_PROCESS_START unset, COVERAGE_FILE inherited\n"
+            f"and overriding data_file, or app killed without SIGTERM)"
         )
     data = CoverageData(basename=str(data_dir / ".coverage"))
     combine_parallel_data(data, data_paths=[str(data_dir)], strict=True, keep=True)

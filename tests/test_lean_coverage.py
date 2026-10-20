@@ -285,6 +285,37 @@ def test_set_context_returns_when_ack_matches(tmp_path: Path) -> None:
         CoverageSession(pd, ack_timeout=0.1).set_context("req-3")
 
 
+def test_clean_app_env_drops_host_coverage_variables(tmp_path: Path) -> None:
+    pd = lc.install_pdcov(tmp_path / "pdcov", tmp_path)
+    host = {
+        "PATH": "/bin",
+        "HOME": "/h",
+        "COVERAGE_FILE": "/x/.coverage.host",
+        "COVERAGE_PROCESS_START": "/other/rc",
+        "COV_CORE_SOURCE": "proofdeploy",
+        "SECRET_TOKEN": "nope",
+    }
+    env = lc.clean_app_env(pd, {"PORT": "1"}, base=host)
+    assert env == {
+        "PATH": "/bin",
+        "HOME": "/h",
+        "PORT": "1",
+        "COVERAGE_PROCESS_START": str(pd.rcfile),
+    }
+    assert "COVERAGE_PROCESS_START" not in lc.clean_app_env(pd, base=host, measured=False)
+
+
+def test_missing_data_error_carries_exit_code_and_app_output(tmp_path: Path) -> None:
+    pd = lc.install_pdcov(tmp_path / "pdcov", tmp_path)
+    log = tmp_path / "app.log"
+    log.write_text("Traceback: boom\n")
+    proc = subprocess.Popen([sys.executable, "-c", "raise SystemExit(3)"])
+    proc.wait()
+    with pytest.raises(CoverageHarnessError) as ei:
+        CoverageSession(pd).stop_and_collect(proc, log_path=log)
+    assert "exit code: 3" in str(ei.value) and "Traceback: boom" in str(ei.value)
+
+
 def test_collect_without_data_fails_closed(tmp_path: Path) -> None:
     pd = lc.install_pdcov(tmp_path / "pdcov", tmp_path)
     with pytest.raises(CoverageHarnessError, match="no coverage data"):
@@ -406,17 +437,15 @@ def _run_revision(env: dict[str, object], rev: str, tool_dir: Path) -> lc.Covera
     lc.install_pth(lc.app_site_packages(py), pd)
     session = CoverageSession(pd)
     session.start()
-    base_env = {**os.environ, "APP_DB": str(tree / "app.db")}
+    base_env = lc.clean_app_env(pd, {"APP_DB": str(tree / "app.db")}, measured=False)
     for step in ("migrate.py", "seed.py"):  # no coverage env: setup is not measured
         subprocess.run([str(py), step], cwd=tree, env=base_env, check=True, timeout=60)
     port = _free_port()
-    app_env = {**base_env, "PORT": str(port), **pd.env()}
+    app_env = lc.clean_app_env(pd, {"APP_DB": str(tree / "app.db"), "PORT": str(port)})
+    log = tree / "app.log"
+    logf = log.open("wb")
     proc = subprocess.Popen(
-        [str(py), "app.py"],
-        cwd=tree,
-        env=app_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        [str(py), "app.py"], cwd=tree, env=app_env, stdout=logf, stderr=subprocess.STDOUT
     )
     try:
         for _ in range(100):
@@ -435,7 +464,7 @@ def _run_revision(env: dict[str, object], rev: str, tool_dir: Path) -> lc.Covera
         session.set_context("ctx-get1")
         status, note = _http("GET", port, "/notes/1", token=token)
         assert status == 200 and note["id"] == 1
-        return session.stop_and_collect(proc)
+        return session.stop_and_collect(proc, log_path=log)
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -443,8 +472,16 @@ def _run_revision(env: dict[str, object], rev: str, tool_dir: Path) -> lc.Covera
 
 
 def test_golden_flask_impact_end_to_end(
-    golden_env: dict[str, object], tmp_path_factory: pytest.TempPathFactory
+    golden_env: dict[str, object],
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # CI regression: pytest-cov / the CI shard export these; inherited by the
+    # app, COVERAGE_FILE overrides the rcfile's data_file and the data went
+    # missing ("no coverage data files"). Always set them here.
+    monkeypatch.setenv("COVERAGE_FILE", str(tmp_path_factory.mktemp("stray") / ".coverage.host"))
+    monkeypatch.setenv("COV_CORE_SOURCE", "proofdeploy")
+    monkeypatch.setenv("COV_CORE_CONFIG", "x")
     t0 = time.perf_counter()
     repo: Path = golden_env["repo"]  # type: ignore[assignment]
     shas: dict[str, str] = golden_env["shas"]  # type: ignore[assignment]
