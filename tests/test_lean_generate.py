@@ -849,3 +849,82 @@ def test_golden_clean_change_adds_a_tag_field_and_both_lines_are_covered(
     assert [s.target_operation for s in res.impact_set] == ["GET /notes/{note_id}"]
     assert len(res.hits[res.impact_set[0].id]["hits_added"]) == 2
     print(f"golden clean: covered in {res.requests_to_cover} requests")
+
+
+def _bug_app_parts(golden: dict[str, Any], tmp: Path) -> tuple[Path, Any, Any, ChangedLines, str]:
+    tree = hostrun.add_worktree(
+        golden["repo"], golden["shas"]["bug"], golden["root"] / f"t-snap-{tmp.name}"
+    )
+    contract = tree / "proofdeploy.yml"
+    index = index_from_flask_url_map(
+        hostrun.flask_url_map(golden["py"], tree),
+        app=APP,
+        commit_sha=golden["shas"]["bug"],
+        seed_facts=seed_facts_from_contract(contract),
+    )
+    diff = _diff(golden, "base", "bug")
+    return tree, index, auth_from_contract(contract), ChangedLines.from_diff(diff), diff
+
+
+def test_snapshot_carries_coverage_while_the_app_is_still_running(
+    golden: dict[str, Any],
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp = _env(monkeypatch, tmp_path_factory)
+    tree, _, _, changed, _ = _bug_app_parts(golden, tmp)
+    (line,) = changed["app.py"]["added"]
+    client_login = Step(
+        "POST",
+        "/login",
+        body={"username": "seeduser", "password": "seedpass"},
+        content_type="application/json",
+        capture={"token": "token"},
+    )
+    with hostrun.running_app(golden["py"], tree, tmp / "pdcov") as app:
+        client = HttpClient(app.base_url)
+        runner = ScenarioRunner(client, session=app.session)
+        sc1 = Scenario(
+            [client_login, Step("GET", "/notes/{n}", {"n": 1}, auth=True)], "GET /notes/1"
+        )
+        runner(sc1)
+        first = app.session.snapshot()
+        assert app.proc.poll() is None  # still running
+        ctx1 = sc1.request_id(1)
+        assert line in first[ctx1]["app.py"]
+        assert sc1.request_id(0) in first and ctx1 in first
+        sc2 = Scenario(
+            [client_login, Step("GET", "/notes/{n}", {"n": 2}, auth=True)], "GET /notes/2"
+        )
+        runner(sc2)
+        second = app.session.snapshot()
+        assert line in second[ctx1]["app.py"]  # earlier context is kept
+        assert line in second[sc2.request_id(1)]["app.py"]  # and the new one added
+        assert sc2.request_id(1) not in first
+        app.stop_and_collect()
+
+
+def test_loop_stops_after_the_impacting_scenario_using_real_snapshots(
+    golden: dict[str, Any],
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp = _env(monkeypatch, tmp_path_factory)
+    tree, index, auth, changed, diff = _bug_app_parts(golden, tmp)
+    impacting = generate_scenarios(index, diff_text=diff, auth=auth)[0]
+    assert impacting.target_operation == "GET /notes/{note_id}"
+    later = [Scenario([Step("GET", "/health", query={"v": i})], "GET /health") for i in range(4)]
+    with hostrun.running_app(golden["py"], tree, tmp / "pdcov") as app:
+        runner = ScenarioRunner(
+            HttpClient(app.base_url), auth=auth, session=app.session, index=index
+        )
+        res = cover_change(
+            index, changed, runner, app.session, 20, diff_text=diff, auth=auth,
+            scenarios=[impacting, *later],
+        )  # fmt: skip
+        app.stop_and_collect()
+    assert res.covered and res.scenarios_run == 1
+    assert res.requests_used == len(impacting.steps) == 3  # login + create + get
+    ran = {e.scenario_id for e in res.exchanges}
+    assert ran == {impacting.id} and not ran & {s.id for s in later}
+    assert [s.id for s in res.impact_set] == [impacting.id]
