@@ -1,0 +1,7 @@
+{
+ "format": 1,
+ "script_sha256": "04f63dd146072c5115e87f79cc69f17f74bf343ff73bb1c872aeb53cafc9e162",
+ "main_sha": "d8e2ecb172a13bcf69993ec20aef31840662f79d",
+ "app_repo": "paperless-ngx/paperless-ngx",
+ "app_head_sha": "0cb2cdbfdd91a2078236f8851cd310261284591c"
+}

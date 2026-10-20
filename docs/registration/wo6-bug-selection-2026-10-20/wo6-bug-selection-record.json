@@ -1,0 +1,804 @@
+{
+ "kind": "wo6-bug-select",
+ "rule": "REG-C item 7 (docs/registration/wo6-selection-rule.md), as implemented by D169",
+ "app": {
+  "repo": "paperless-ngx/paperless-ngx",
+  "head_sha": "0cb2cdbfdd91a2078236f8851cd310261284591c",
+  "default_branch": "dev",
+  "app_path": "src"
+ },
+ "main_sha": "d8e2ecb172a13bcf69993ec20aef31840662f79d",
+ "merge_base_with_main": "d8e2ecb172a13bcf69993ec20aef31840662f79d",
+ "script_sha256": "04f63dd146072c5115e87f79cc69f17f74bf343ff73bb1c872aeb53cafc9e162",
+ "boundary": "2026-07-01T00:00:00Z",
+ "walk": "first-parent",
+ "walked_count": 64,
+ "outcome": "selected",
+ "rejected_by_check": {
+  "a": 43,
+  "b": 4,
+  "c": 5,
+  "d": 0,
+  "e": 11,
+  "selected": 1
+ },
+ "walked": [
+  {
+   "sha": "5589a584b690bfbd1f668f08d38f15f4294692b0",
+   "committer_date": "2026-07-10T18:05:40+00:00",
+   "subject": "Documentation: clarify PAPERLESS_URL requirement for pw reset",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "2ab1ac7cb82a12a8cbe81c23d4063cf4a4209fd6",
+   "committer_date": "2026-07-22T17:55:13+00:00",
+   "subject": "[Beta] Paperless-ngx v3.0.0 Beta (#12713)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "24aee98ad5496d9fb9a038e0f7206c0dad84ad2f",
+   "committer_date": "2026-07-22T18:31:15+00:00",
+   "subject": "Documentation: fix v3 migration guide header level",
+   "outcome": "rejected",
+   "failed_check": "b",
+   "reason": "no SOURCE file changed (changed classes: SOURCE=0, TEST=0, DOC=1, OTHER=0)",
+   "fix_parent": "2ab1ac7cb82a12a8cbe81c23d4063cf4a4209fd6",
+   "changed_classes": {
+    "SOURCE": 0,
+    "TEST": 0,
+    "DOC": 1,
+    "OTHER": 0
+   }
+  },
+  {
+   "sha": "6cf3c4781497b8ff0843375583996b3123d419e6",
+   "committer_date": "2026-07-22T18:37:56+00:00",
+   "subject": "Documentation: fix a couple broken links",
+   "outcome": "rejected",
+   "failed_check": "b",
+   "reason": "no SOURCE file changed (changed classes: SOURCE=0, TEST=0, DOC=2, OTHER=0)",
+   "fix_parent": "24aee98ad5496d9fb9a038e0f7206c0dad84ad2f",
+   "changed_classes": {
+    "SOURCE": 0,
+    "TEST": 0,
+    "DOC": 2,
+    "OTHER": 0
+   }
+  },
+  {
+   "sha": "1203203e083d1c752a6ec24016db4d56a90256e0",
+   "committer_date": "2026-07-22T20:05:33+00:00",
+   "subject": "Documentation: Add v3.0.0 changelog (#13199)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "b5662325420136d7c92cd6e2248e073876e65c91",
+   "committer_date": "2026-07-23T13:25:33+00:00",
+   "subject": "Documentation: correct search docs for v3",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "17796357eee9b6fa5371590927cebeb6839f68b6",
+   "committer_date": "2026-07-23T22:55:41+00:00",
+   "subject": "Merge remote-tracking branch 'origin/dev'",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "5569447ea00c50de8c0c1c75136418bb3343dad6",
+   "committer_date": "2026-07-23T22:59:53+00:00",
+   "subject": "Bumps the version to 3.0.1 everywhere",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "371c4f57d3ab208fc261e159fa86ca1dc80cb334",
+   "committer_date": "2026-07-24T00:59:03+00:00",
+   "subject": "Fix: fix broken migration in 3.0.1 (#13242)",
+   "outcome": "rejected",
+   "failed_check": "b",
+   "reason": "b: upgrade-path only (every SOURCE path is a migration path; changed classes: SOURCE=2, TEST=1, DOC=0, OTHER=0)",
+   "fix_parent": "5569447ea00c50de8c0c1c75136418bb3343dad6",
+   "changed_classes": {
+    "SOURCE": 2,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   }
+  },
+  {
+   "sha": "6d249b49327fdab58ff915d3f5435e49de742464",
+   "committer_date": "2026-07-24T01:12:59+00:00",
+   "subject": "Bump version to 3.0.2",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "b992f9fc05bedd2f26f7291028b0b38471e697db",
+   "committer_date": "2026-07-24T13:39:11+00:00",
+   "subject": "Fix: handle notes without a user when building the search index (#13260)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (769621 chars > 80000)",
+   "fix_parent": "6d249b49327fdab58ff915d3f5435e49de742464",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "aed9abe48c02b1b7df07e429db3f2ed8c3a58ce8",
+   "b_committer_date": "2026-04-02T19:38:22+00:00",
+   "tag": "v3.0.0-beta.rc1",
+   "tag_created": "2026-05-05T16:06:00+00:00",
+   "author_prompt_chars": 769621
+  },
+  {
+   "sha": "737d568f8065a9e7d7f87695aaebe3ee68222d8e",
+   "committer_date": "2026-07-24T15:07:52+00:00",
+   "subject": "Fix: Emit the torch index into the requirements.txt for people still using it (#13265)",
+   "outcome": "rejected",
+   "failed_check": "b",
+   "reason": "no SOURCE file changed (changed classes: SOURCE=0, TEST=0, DOC=0, OTHER=1)",
+   "fix_parent": "b992f9fc05bedd2f26f7291028b0b38471e697db",
+   "changed_classes": {
+    "SOURCE": 0,
+    "TEST": 0,
+    "DOC": 0,
+    "OTHER": 1
+   }
+  },
+  {
+   "sha": "3fe6562c570001cbb15ab6b8fa3ed7ca4e7b5434",
+   "committer_date": "2026-07-24T15:27:57+00:00",
+   "subject": "Fix: Handle a plain string as Celery sometimes provides for the traceback (#13267)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (477377 chars > 80000)",
+   "fix_parent": "737d568f8065a9e7d7f87695aaebe3ee68222d8e",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 0,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "8e67828bd7fcf85028b28e6ad6e47ea4888723e7",
+   "b_committer_date": "2026-04-20T16:28:41+00:00",
+   "tag": "v3.0.0-beta.rc1",
+   "tag_created": "2026-05-05T16:06:00+00:00",
+   "author_prompt_chars": 477377
+  },
+  {
+   "sha": "b66182cd7b559cefcfd36b0a599c3043e9d4f22d",
+   "committer_date": "2026-07-24T15:39:25+00:00",
+   "subject": "Fix: Makes the email date aware as soon as possible during parsing (#13266)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (475247 chars > 80000)",
+   "fix_parent": "3fe6562c570001cbb15ab6b8fa3ed7ca4e7b5434",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "c2b8b22fb46975c4535966682e2c3b39c2ab4845",
+   "b_committer_date": "2026-03-20T16:22:18+00:00",
+   "tag": "v3.0.0-beta.rc1",
+   "tag_created": "2026-05-05T16:06:00+00:00",
+   "author_prompt_chars": 475247
+  },
+  {
+   "sha": "d76dbf5366763e57724d923501fbba964b13879f",
+   "committer_date": "2026-07-24T16:18:07+00:00",
+   "subject": "Documentation: Add the NumPy CPU baseline increase to the migration guide (#13269)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "33cd48a17f048b47d36c3bab3be347bcde349cd2",
+   "committer_date": "2026-07-24T20:59:51+00:00",
+   "subject": "Fix: preserve document fields during Gotenberg conversion (#13271)",
+   "outcome": "rejected",
+   "failed_check": "c",
+   "reason": "no removed or changed lines: B does not exist",
+   "fix_parent": "d76dbf5366763e57724d923501fbba964b13879f",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   }
+  },
+  {
+   "sha": "f60a2af841c8f2bf05e53c713c6be00787a1ae64",
+   "committer_date": "2026-07-25T02:08:23+00:00",
+   "subject": "Merge branch 'main' into dev",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "dee568e2a6fb8184756aa9b7e789b1c6d6e161f9",
+   "committer_date": "2026-07-25T06:50:10+00:00",
+   "subject": "Tweak: adjust top navbar wrapping when AI chat button visible (#13280)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "4f0845b09471cb933aa5ccfd750f760834ab5e17",
+   "committer_date": "2026-07-25T07:12:12+00:00",
+   "subject": "Fixhancement: PAPERLESS_ALLAUTH_TRUSTED_PROXY_COUNT (#13281)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "bfe2d9261944b4019e558af184a62e5ddf06eaee",
+   "committer_date": "2026-07-25T07:13:46+00:00",
+   "subject": "Auto translate strings",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "48d6ff13f2594877efd905bdd68598e34c1a0c7a",
+   "committer_date": "2026-07-25T16:13:34+00:00",
+   "subject": "Tweak: use css grid for navbar",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "1646756c6c4d4860d8f7f3f4022862cd19d3c391",
+   "committer_date": "2026-07-25T21:06:31+00:00",
+   "subject": "Docs: warn bare-metal users about stale files when upgrading (#13296)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "e704bf88dc203559776f627567d45bdcbb825ceb",
+   "committer_date": "2026-07-25T23:30:17+00:00",
+   "subject": "New Crowdin translations by GitHub Action (#13239)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "aa90f79c21bd8f3964e4a11945580ba7c87f5af9",
+   "committer_date": "2026-07-25T23:31:40+00:00",
+   "subject": "New Crowdin translations by GitHub Action (#13297)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "b5a23cff2f00fa428888f86176ea18171130db3f",
+   "committer_date": "2026-07-25T23:32:39+00:00",
+   "subject": "Bump version to 3.0.3",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "65fe6aacc7b4cfb54b5a6714a90a02179ab88d1a",
+   "committer_date": "2026-07-26T01:57:03+00:00",
+   "subject": "Documentation: Add v3.0.3 changelog (#13300)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "aaee24ac0b1dc76fcd7eb9f38b8d1f820a8bd8d6",
+   "committer_date": "2026-07-28T03:14:04+00:00",
+   "subject": "Merge branch 'dev'",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "3bc03bbaec3e996ef7ddf7b6aec79f42969efc15",
+   "committer_date": "2026-07-28T03:14:39+00:00",
+   "subject": "Bump version to 3.0.4",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "217421bceb2e00d4f87856da113748e9018bc820",
+   "committer_date": "2026-07-28T04:21:10+00:00",
+   "subject": "Documentation: Add v3.0.4 changelog (#13356)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "882dfa78d2e9679ba3f7b76b87115d4d6443645a",
+   "committer_date": "2026-08-01T21:20:31+00:00",
+   "subject": "Documentation: PAPERLESS_CONSUMER_IGNORE_PATTERNS clarifications (#13489)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "b8ab8327b0c135c302cffb714bab279f65354332",
+   "committer_date": "2026-08-01T21:37:17+00:00",
+   "subject": "Merge branch 'dev'",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "8fb73b2709e4c38180a7632edf32f32fe2315961",
+   "committer_date": "2026-08-01T21:38:08+00:00",
+   "subject": "Bump version to 3.0.5",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "08ab98f3fc56863825135967f3214394c1be5ac5",
+   "committer_date": "2026-08-01T22:02:46+00:00",
+   "subject": "Changelog v3.0.5 - GHA (#13492)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "e2c284f64ea6a074ae641388062e31d55b233e97",
+   "committer_date": "2026-08-10T02:05:32+00:00",
+   "subject": "Documentation: add wiki links for AI stuff and parser plugins (#13626)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "2d084983c811d051b1ea6b19d0426dba8f83efb1",
+   "committer_date": "2026-08-13T04:46:52+00:00",
+   "subject": "Documentation: clarify OCR mode changes in v3 (#13666)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "d7b3612a412e282b82797a4a4b654d7ebd481110",
+   "committer_date": "2026-08-22T12:25:37+00:00",
+   "subject": "Chore: pin Apache Tika images to 3.3.1 (#13758)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "aad75b4981b190752e7ee4e1a6b0034112d9b7fe",
+   "committer_date": "2026-08-26T08:39:50+00:00",
+   "subject": "Docs: clarify app config trust",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "94651d817da21edd375ce5373f010838db5bb19d",
+   "committer_date": "2026-08-27T01:42:21+00:00",
+   "subject": "Merge branch 'dev'",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "9009fbb4e9024c70ff4f4abe1ff6c5acdfbc91ef",
+   "committer_date": "2026-08-27T02:13:04+00:00",
+   "subject": "Documentation: Add v3.1.0 changelog (#13809)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "14b17ddf8dc90b5abd219080ba053b32989ed896",
+   "committer_date": "2026-08-27T04:28:01+00:00",
+   "subject": "Fix: navbar brand anchor size + Safari position jitter (#13810)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (80049 chars > 80000)",
+   "fix_parent": "9009fbb4e9024c70ff4f4abe1ff6c5acdfbc91ef",
+   "changed_classes": {
+    "SOURCE": 2,
+    "TEST": 0,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "f24d58a383a74c1e309b5272848b4bf79d047a20",
+   "b_committer_date": "2026-08-27T01:02:14+00:00",
+   "tag": "v3.1.0",
+   "tag_created": "2026-08-27T01:42:44+00:00",
+   "author_prompt_chars": 80049
+  },
+  {
+   "sha": "0cfe33720a4631d98e14acd9ea87542969e3ce79",
+   "committer_date": "2026-08-27T04:29:13+00:00",
+   "subject": "Auto translate strings",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "f6f37898e802971ce7bd3f2483a8d429712def58",
+   "committer_date": "2026-08-27T07:21:02+00:00",
+   "subject": "Chore: use PinnedIMAP4",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "a2ea3b9e76d48ec476185b330a85612592240baa",
+   "committer_date": "2026-08-27T07:21:03+00:00",
+   "subject": "Update SECURITY.md",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "a298568962d1f6d6c26e70f9a3926836c2a95fed",
+   "committer_date": "2026-08-27T07:21:03+00:00",
+   "subject": "Security: harden is_public_ip",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "02b2f55248af1da43759ede68e44223516bd822e",
+   "committer_date": "2026-08-27T07:28:39+00:00",
+   "subject": "New Crowdin translations by GitHub Action (#13811)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "05917a04aaf1e968dc49ca6908511325fa2e35a2",
+   "committer_date": "2026-08-27T19:19:31+00:00",
+   "subject": "Fix: immediately re-add doc to index after trash restore (#13818)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (481385 chars > 80000)",
+   "fix_parent": "02b2f55248af1da43759ede68e44223516bd822e",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "a796e58a94abf1f619b8e04fc33e1464594c50b5",
+   "b_committer_date": "2024-06-17T15:07:08+00:00",
+   "tag": "v2.10.0",
+   "tag_created": "2024-06-18T17:20:53+00:00",
+   "author_prompt_chars": 481385
+  },
+  {
+   "sha": "e1aa9997d764f391c0405621c5339cafd25c7a10",
+   "committer_date": "2026-08-28T00:20:46+00:00",
+   "subject": "Fix: correct sharelink bundle + document link permissions display bugs (#13827)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (160266 chars > 80000)",
+   "fix_parent": "05917a04aaf1e968dc49ca6908511325fa2e35a2",
+   "changed_classes": {
+    "SOURCE": 4,
+    "TEST": 2,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "d113826cf85eae478cd1c81ed47c7ba49d29db91",
+   "b_committer_date": "2026-07-22T15:28:49+00:00",
+   "tag": "v3.0.0",
+   "tag_created": "2026-07-22T18:25:00+00:00",
+   "author_prompt_chars": 160266
+  },
+  {
+   "sha": "d30ee1d62016ee2f20736e315000e07cb9012a95",
+   "committer_date": "2026-08-28T00:22:08+00:00",
+   "subject": "Auto translate strings",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "4a69c47bddf7bd4cc519a37b830d7c9149270a90",
+   "committer_date": "2026-08-28T14:46:47+00:00",
+   "subject": "Fix: hide slim sidebar scrollbar in browsers with stupid scrollbars (#13837)",
+   "outcome": "rejected",
+   "failed_check": "c",
+   "reason": "no removed or changed lines: B does not exist",
+   "fix_parent": "d30ee1d62016ee2f20736e315000e07cb9012a95",
+   "changed_classes": {
+    "SOURCE": 2,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   }
+  },
+  {
+   "sha": "c6252a02349ea5dadb5131c0fa4b3d1c9a4d8b15",
+   "committer_date": "2026-08-28T14:48:21+00:00",
+   "subject": "Auto translate strings",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "8079690f33dfc268b7c249d949d1cf76a9fa295b",
+   "committer_date": "2026-08-28T15:51:23+00:00",
+   "subject": "Fix: ensure scrollbar probe css at host context",
+   "outcome": "rejected",
+   "failed_check": "c",
+   "reason": "every tag containing B was created at or after the fix (earliest: v3.1.1 created 2026-08-31T05:37:26+00:00)",
+   "fix_parent": "c6252a02349ea5dadb5131c0fa4b3d1c9a4d8b15",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 0,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "4a69c47bddf7bd4cc519a37b830d7c9149270a90",
+   "b_committer_date": "2026-08-28T14:46:47+00:00"
+  },
+  {
+   "sha": "00d9bf474ad0555044e4737c341d8c353531d2b2",
+   "committer_date": "2026-08-28T16:55:13+00:00",
+   "subject": "Fix: always pass a non-empty api key for OpenAI-like servers (#13838)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (767905 chars > 80000)",
+   "fix_parent": "8079690f33dfc268b7c249d949d1cf76a9fa295b",
+   "changed_classes": {
+    "SOURCE": 2,
+    "TEST": 2,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "e940764fe01038bec4d0fb14009dc375b44d9323",
+   "b_committer_date": "2026-01-13T16:24:42+00:00",
+   "tag": "v3.0.0-beta.rc1",
+   "tag_created": "2026-05-05T16:06:00+00:00",
+   "author_prompt_chars": 767905
+  },
+  {
+   "sha": "3a5312ba6f8f804be3ca5ca02cecfe420004eca7",
+   "committer_date": "2026-08-28T17:52:30+00:00",
+   "subject": "Fix: ensure ui reset of suggestionsLoading when changing docs (#13840)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (1340972 chars > 80000)",
+   "fix_parent": "00d9bf474ad0555044e4737c341d8c353531d2b2",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "106b41a15cd41bf3adcf3d8a6dd321a165903473",
+   "b_committer_date": "2026-07-10T07:42:16+00:00",
+   "tag": "v3.0.0-beta.rc2",
+   "tag_created": "2026-07-17T22:17:16+00:00",
+   "author_prompt_chars": 1340972
+  },
+  {
+   "sha": "8ded82ea23c13d2fb78a7823a11b1d1be55f72cf",
+   "committer_date": "2026-08-28T17:53:57+00:00",
+   "subject": "Auto translate strings",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "a784a642ee7807c8f5d6829de7a4e32489b91546",
+   "committer_date": "2026-08-28T23:07:41+00:00",
+   "subject": "Fixhancement: make imap port required, better error display (#13845)",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "6f3945f11f1ff13ab90da76c26de37660ff1d497",
+   "committer_date": "2026-08-28T23:09:08+00:00",
+   "subject": "Auto translate strings",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "7ddc1c98015c620a530cc286c7cbd049fbee3e04",
+   "committer_date": "2026-08-29T17:56:05+00:00",
+   "subject": "Fix: 3.1 LLM suggestions fix rank ordering (#13848)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (500092 chars > 80000)",
+   "fix_parent": "6f3945f11f1ff13ab90da76c26de37660ff1d497",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "0e5fbc973a674ee9ed660169df254826b380e888",
+   "b_committer_date": "2026-08-14T22:51:34+00:00",
+   "tag": "v3.1.0",
+   "tag_created": "2026-08-27T01:42:44+00:00",
+   "author_prompt_chars": 500092
+  },
+  {
+   "sha": "9c475e0b27a0f1f272a0ed1dfa22ff5cff12de52",
+   "committer_date": "2026-08-29T20:02:05+00:00",
+   "subject": "Fix: 3.1.0 llm suggestion raw cache user scoping (#13849)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (500092 chars > 80000)",
+   "fix_parent": "7ddc1c98015c620a530cc286c7cbd049fbee3e04",
+   "changed_classes": {
+    "SOURCE": 3,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "0e5fbc973a674ee9ed660169df254826b380e888",
+   "b_committer_date": "2026-08-14T22:51:34+00:00",
+   "tag": "v3.1.0",
+   "tag_created": "2026-08-27T01:42:44+00:00",
+   "author_prompt_chars": 500092
+  },
+  {
+   "sha": "535975e2fd866fb8601521de5781379a0a727cc8",
+   "committer_date": "2026-08-29T20:03:36+00:00",
+   "subject": "Auto translate strings",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "b89fb0f9789443d596814ee59034ce33728babaa",
+   "committer_date": "2026-08-29T21:03:30+00:00",
+   "subject": "Fix: 3.1.0 llm suggestions simplify schema, fix docstrings (#13850)",
+   "outcome": "rejected",
+   "failed_check": "e",
+   "reason": "e: author prompt too large (159314 chars > 80000)",
+   "fix_parent": "535975e2fd866fb8601521de5781379a0a727cc8",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 2,
+    "DOC": 0,
+    "OTHER": 3
+   },
+   "b_sha": "b17a512539fd6c0b30938a51f4376b30cb3944af",
+   "b_committer_date": "2026-08-18T18:32:21+00:00",
+   "tag": "v3.1.0",
+   "tag_created": "2026-08-27T01:42:44+00:00",
+   "author_prompt_chars": 159314
+  },
+  {
+   "sha": "1d23a9550c9e1fdf73c8c0bf04e70a1bf1164ee5",
+   "committer_date": "2026-08-30T05:32:57+00:00",
+   "subject": "Update app-frame.component.scss",
+   "outcome": "rejected",
+   "failed_check": "a",
+   "reason": "subject does not match (?i)\\bfix(e[sd])?\\b"
+  },
+  {
+   "sha": "8af3e69084d1a98724ef9871e3867c7f62db0e76",
+   "committer_date": "2026-08-30T06:14:24+00:00",
+   "subject": "Fix: 3.1 LLM suggestions normalize flat lists from smaller models (#13853)",
+   "outcome": "rejected",
+   "failed_check": "c",
+   "reason": "no removed or changed lines: B does not exist",
+   "fix_parent": "1d23a9550c9e1fdf73c8c0bf04e70a1bf1164ee5",
+   "changed_classes": {
+    "SOURCE": 1,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   }
+  },
+  {
+   "sha": "14b6a41b88e75fb7d35aa84b33986870bfd1aa69",
+   "committer_date": "2026-08-30T14:44:45+00:00",
+   "subject": "Fix: 3.1 llm suggestions request a flat list we change later (#13860)",
+   "outcome": "rejected",
+   "failed_check": "c",
+   "reason": "every tag containing B was created at or after the fix (earliest: v3.1.1 created 2026-08-31T05:37:26+00:00)",
+   "fix_parent": "8af3e69084d1a98724ef9871e3867c7f62db0e76",
+   "changed_classes": {
+    "SOURCE": 3,
+    "TEST": 3,
+    "DOC": 0,
+    "OTHER": 2
+   },
+   "b_sha": "8af3e69084d1a98724ef9871e3867c7f62db0e76",
+   "b_committer_date": "2026-08-30T06:14:24+00:00"
+  },
+  {
+   "sha": "d3710856992a91783783819217b43392aab73e00",
+   "committer_date": "2026-08-30T14:50:50+00:00",
+   "subject": "Tweak/fix: show existing count for ai suggestions (#13861)",
+   "outcome": "selected",
+   "failed_check": null,
+   "reason": null,
+   "fix_parent": "14b6a41b88e75fb7d35aa84b33986870bfd1aa69",
+   "changed_classes": {
+    "SOURCE": 3,
+    "TEST": 1,
+    "DOC": 0,
+    "OTHER": 0
+   },
+   "b_sha": "aa67fd3aefa6489984fc15a5c32c1ad2b16ac23a",
+   "b_committer_date": "2026-08-09T07:15:27+00:00",
+   "tag": "v3.1.0",
+   "tag_created": "2026-08-27T01:42:44+00:00",
+   "author_prompt_chars": 56176,
+   "readiness": {
+    "fix_parent": {
+     "sha": "14b6a41b88e75fb7d35aa84b33986870bfd1aa69",
+     "ready": true,
+     "status": "READY",
+     "class": "ready",
+     "reason": null,
+     "engine": "podman podman version 4.9.3",
+     "isolation_mode": "userns-remap",
+     "network_mode": "none+socket",
+     "network_none_evidence": "app container ran with --net=none (no network interfaces); the executor reached it over a Unix-socket bridge",
+     "contract_store_sha256": "eb60559b9fdd879e5cb8ca30d16c7cbfb1cea356e9385b8e367a249ab7c19e6a",
+     "attempts": [
+      {
+       "attempt": 1,
+       "status": "READY",
+       "class": "ready",
+       "reason": null,
+       "workflow_run_id": "39350296019"
+      }
+     ]
+    },
+    "fix": {
+     "sha": "d3710856992a91783783819217b43392aab73e00",
+     "ready": true,
+     "status": "READY",
+     "class": "ready",
+     "reason": null,
+     "engine": "podman podman version 4.9.3",
+     "isolation_mode": "userns-remap",
+     "network_mode": "none+socket",
+     "network_none_evidence": "app container ran with --net=none (no network interfaces); the executor reached it over a Unix-socket bridge",
+     "contract_store_sha256": "eb60559b9fdd879e5cb8ca30d16c7cbfb1cea356e9385b8e367a249ab7c19e6a",
+     "attempts": [
+      {
+       "attempt": 1,
+       "status": "READY",
+       "class": "ready",
+       "reason": null,
+       "workflow_run_id": "39350296019"
+      }
+     ]
+    }
+   },
+   "parent_ready": true,
+   "fix_ready": true
+  }
+ ],
+ "selected": {
+  "fix": "d3710856992a91783783819217b43392aab73e00",
+  "fix_parent": "14b6a41b88e75fb7d35aa84b33986870bfd1aa69",
+  "b": "aa67fd3aefa6489984fc15a5c32c1ad2b16ac23a",
+  "b_committer_date": "2026-08-09T07:15:27+00:00",
+  "tag": "v3.1.0",
+  "tag_created": "2026-08-27T01:42:44+00:00"
+ }
+}
