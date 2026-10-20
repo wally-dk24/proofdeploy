@@ -1,0 +1,57 @@
+{
+  "app_repo_head": "f730513e79da9b13a3a0b44cb6360457d29a6bd3",
+  "candidates_examined": 6,
+  "excluded": [
+    "14b6a41b88e75fb7d35aa84b33986870bfd1aa69",
+    "17dc482872cf62e12965f6207772c83d1deb651b",
+    "aa67fd3aefa6489984fc15a5c32c1ad2b16ac23a",
+    "d3710856992a91783783819217b43392aab73e00"
+  ],
+  "journal_order_is_committer_date_ascending": true,
+  "journal_ref": "records/wo6-bug-selection-2026-10-20:docs/registration/wo6-bug-selection-2026-10-20/wo6-bug-selection-record-journal/walk.jsonl",
+  "journal_rows": 64,
+  "journal_sha256": "63a1c8693981145569cb8d995405f8393a3f0bfafb3c9a1e9e43eb48d5875137",
+  "measured_result": false,
+  "n": 3,
+  "rule": "In walk order (the committed WO-6 walk journal's order: first-parent, committer date ascending, after 2026-07-01), the first N commits with failed_check == 'a' (subject not fix-titled) that change at least one SOURCE file under the WO-6 script's own classify_path (paths from git diff --name-only <first-parent>..<sha>, --no-renames) and that are not B, B's first parent, or the fix pair (fix^ and fix).",
+  "skipped_excluded": 0,
+  "skipped_no_source_file": 3,
+  "units": [
+    {
+      "changed_class_counts": {
+        "DOC": 27,
+        "OTHER": 176,
+        "SOURCE": 570,
+        "TEST": 380
+      },
+      "changed_source_paths": 570,
+      "committer_date": "2026-07-22T17:55:13+00:00",
+      "first_parent": "5589a584b690bfbd1f668f08d38f15f4294692b0",
+      "sha": "2ab1ac7cb82a12a8cbe81c23d4063cf4a4209fd6"
+    },
+    {
+      "changed_class_counts": {
+        "DOC": 0,
+        "OTHER": 100,
+        "SOURCE": 18,
+        "TEST": 5
+      },
+      "changed_source_paths": 18,
+      "committer_date": "2026-07-23T22:55:41+00:00",
+      "first_parent": "b5662325420136d7c92cd6e2248e073876e65c91",
+      "sha": "17796357eee9b6fa5371590927cebeb6839f68b6"
+    },
+    {
+      "changed_class_counts": {
+        "DOC": 0,
+        "OTHER": 3,
+        "SOURCE": 2,
+        "TEST": 0
+      },
+      "changed_source_paths": 2,
+      "committer_date": "2026-07-23T22:59:53+00:00",
+      "first_parent": "17796357eee9b6fa5371590927cebeb6839f68b6",
+      "sha": "5569447ea00c50de8c0c1c75136418bb3343dad6"
+    }
+  ]
+}
