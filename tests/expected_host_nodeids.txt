@@ -393,6 +393,9 @@ tests/test_leakcheck.py::test_short_values_ignored
 tests/test_leakcheck.py::test_tampered_fixture_description_refused
 tests/test_leakcheck.py::test_tampered_skill_arm_copy_refused
 tests/test_leakcheck.py::test_tampered_skill_copy_refused
+tests/test_lean_clean_units.py::test_cli_output_is_blind
+tests/test_lean_clean_units.py::test_selects_first_three_eligible_in_walk_order
+tests/test_lean_clean_units.py::test_too_few_units_fails
 tests/test_lean_coverage.py::test_added_lines_are_judged_on_new_side_only
 tests/test_lean_coverage.py::test_binary_files_are_listed_not_counted
 tests/test_lean_coverage.py::test_c_quoted_paths_fail_closed[diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n--- "a/caf\\303\\251.py"\n]
@@ -517,6 +520,21 @@ tests/test_lean_judge.py::test_transport_error_retries_once_then_inconclusive_en
 tests/test_lean_judge.py::test_transport_error_then_success
 tests/test_lean_judge.py::test_unexercised_lines_never_pass
 tests/test_lean_judge.py::test_usage_missing_falls_back_to_estimate
+tests/test_lean_mutants.py::test_committed_manifest_matches_generator
+tests/test_lean_mutants.py::test_delete_statement_and_pass_replacement_and_docstring_kept
+tests/test_lean_mutants.py::test_determinism_same_seed_same_ids
+tests/test_lean_mutants.py::test_exclude_functions_untouched_incl_nested
+tests/test_lean_mutants.py::test_flip_bool
+tests/test_lean_mutants.py::test_flip_comparison_each_pair
+tests/test_lean_mutants.py::test_flip_comparison_ignores_chained_and_in
+tests/test_lean_mutants.py::test_gate_mutants_compile_distinct_and_ids_stable
+tests/test_lean_mutants.py::test_golden_excluded_functions_untouched
+tests/test_lean_mutants.py::test_int_plus_minus_one_and_bool_excluded
+tests/test_lean_mutants.py::test_materialized_branches_differ_from_base_by_one_mutation
+tests/test_lean_mutants.py::test_module_level_and_main_block_never_mutated
+tests/test_lean_mutants.py::test_negate_if
+tests/test_lean_mutants.py::test_not_enough_sites_raises
+tests/test_lean_mutants.py::test_swap_dict_values_in_return_only
 tests/test_lockfile_drift.py::test_classifier_does_not_type_generic_error_lines
 tests/test_lockfile_drift.py::test_classifier_does_not_type_network_failure
 tests/test_lockfile_drift.py::test_classifier_does_not_type_peer_resolution_failure

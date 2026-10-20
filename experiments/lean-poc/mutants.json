@@ -1,0 +1,159 @@
+{
+  "base_revision": "intermediate",
+  "base_source_sha256": "6e7a025e89b9500611e158a333355775f6083079ba0b2e295ba60ab84cd7de7d",
+  "commit_message": "refactor: tidy note handling",
+  "exclude_functions": [
+    "db",
+    "_close"
+  ],
+  "excluded_regions": [
+    "__main__ block (module level is never mutated)"
+  ],
+  "golden_app": "python-flask-sqlite",
+  "judge_intent": "no behaviour change intended",
+  "mutants": [
+    {
+      "branch": "mutant/7303292711b9",
+      "description": "replace statement with pass at line 91",
+      "id": "7303292711b9",
+      "line": 91,
+      "operator": "delete_statement"
+    },
+    {
+      "branch": "mutant/a6e06b0e052e",
+      "description": "swap values of keys \"id\" and \"done\" in returned dict at line 116",
+      "id": "a6e06b0e052e",
+      "line": 116,
+      "operator": "swap_dict_values"
+    },
+    {
+      "branch": "mutant/bff3bc73ba9f",
+      "description": "delete statement at line 76",
+      "id": "bff3bc73ba9f",
+      "line": 76,
+      "operator": "delete_statement"
+    },
+    {
+      "branch": "mutant/b1c2d654301d",
+      "description": "change integer 409 to 408 at line 57",
+      "id": "b1c2d654301d",
+      "line": 57,
+      "operator": "int_sub_one"
+    },
+    {
+      "branch": "mutant/d82bb9ffbbab",
+      "description": "delete statement at line 92",
+      "id": "d82bb9ffbbab",
+      "line": 92,
+      "operator": "delete_statement"
+    },
+    {
+      "branch": "mutant/74d3159a3173",
+      "description": "change integer 7 to 8 at line 35",
+      "id": "74d3159a3173",
+      "line": 35,
+      "operator": "int_add_one"
+    },
+    {
+      "branch": "mutant/7e4ca3fe86d1",
+      "description": "swap values of keys \"id\" and \"title\" in returned dict at line 98",
+      "id": "7e4ca3fe86d1",
+      "line": 98,
+      "operator": "swap_dict_values"
+    },
+    {
+      "branch": "mutant/29320670f9a2",
+      "description": "replace statement with pass at line 41",
+      "id": "29320670f9a2",
+      "line": 41,
+      "operator": "delete_statement"
+    },
+    {
+      "branch": "mutant/8d5ad03af8e1",
+      "description": "replace statement with pass at line 49",
+      "id": "8d5ad03af8e1",
+      "line": 49,
+      "operator": "delete_statement"
+    },
+    {
+      "branch": "mutant/4351e00b3552",
+      "description": "delete statement at line 30",
+      "id": "4351e00b3552",
+      "line": 30,
+      "operator": "delete_statement"
+    },
+    {
+      "branch": "mutant/ae04924df7c1",
+      "description": "negate if condition at line 76",
+      "id": "ae04924df7c1",
+      "line": 76,
+      "operator": "negate_if"
+    },
+    {
+      "branch": "mutant/650da0680d77",
+      "description": "swap values of keys \"title\" and \"done\" in returned dict at line 98",
+      "id": "650da0680d77",
+      "line": 98,
+      "operator": "swap_dict_values"
+    },
+    {
+      "branch": "mutant/4b824aab7f73",
+      "description": "change integer 409 to 410 at line 57",
+      "id": "4b824aab7f73",
+      "line": 57,
+      "operator": "int_add_one"
+    },
+    {
+      "branch": "mutant/4bac3ccb1313",
+      "description": "change integer 7 to 6 at line 35",
+      "id": "4bac3ccb1313",
+      "line": 35,
+      "operator": "int_sub_one"
+    },
+    {
+      "branch": "mutant/c9ef2478c4db",
+      "description": "flip True to False at line 63",
+      "id": "c9ef2478c4db",
+      "line": 63,
+      "operator": "flip_bool"
+    },
+    {
+      "branch": "mutant/ba811424b5ec",
+      "description": "flip False to True at line 84",
+      "id": "ba811424b5ec",
+      "line": 84,
+      "operator": "flip_bool"
+    },
+    {
+      "branch": "mutant/33e10c06c92f",
+      "description": "flip True to False at line 41",
+      "id": "33e10c06c92f",
+      "line": 41,
+      "operator": "flip_bool"
+    },
+    {
+      "branch": "mutant/8f17d9d44400",
+      "description": "delete statement at line 58",
+      "id": "8f17d9d44400",
+      "line": 58,
+      "operator": "delete_statement"
+    },
+    {
+      "branch": "mutant/13c18f349fc1",
+      "description": "change integer 1 to 2 at line 98",
+      "id": "13c18f349fc1",
+      "line": 98,
+      "operator": "int_add_one"
+    },
+    {
+      "branch": "mutant/4cb814960e5c",
+      "description": "swap values of keys \"title\" and \"done\" in returned dict at line 117",
+      "id": "4cb814960e5c",
+      "line": 117,
+      "operator": "swap_dict_values"
+    }
+  ],
+  "n": 20,
+  "seed": 20261020,
+  "target": "app.py"
+}
