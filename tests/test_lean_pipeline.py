@@ -261,6 +261,56 @@ def test_planted_500_on_head_fails_by_hard_oracle_with_zero_model_calls(
     assert judge.calls == 0 and m["judge"]["calls"] == 0
 
 
+def _inject_500_in(labels: set[str]) -> Any:
+    """Wrap ``replay_run`` so that the named runs see a 500 on their last exchange."""
+    from proofdeploy.lean import pipeline
+
+    real = pipeline.replay_run
+
+    def wrapper(driver: Any, label: str, scenarios: Any, auth: Any) -> Any:
+        data = real(driver, label, scenarios, auth)
+        if label in labels:
+            ex = data.exchanges[data.order[-1]]
+            ex.status = 500
+            ex.body_json_or_text = "Internal Server Error"
+        return data
+
+    return mock.patch.object(pipeline, "replay_run", wrapper)
+
+
+def test_head_500_in_one_run_only_is_never_a_pass_when_the_third_run_is_clean(
+    golden: dict[str, Any], ci_env: None, tmp_path: Path
+) -> None:
+    with _inject_500_in({"head"}):
+        code, m = run_golden(
+            golden, "intermediate", "clean", tmp_path / "out", PromptStub(clean_rule)
+        )
+    assert m["verdict"]["status"] == INCONCLUSIVE and code == 2, m["verdict"]
+    assert m["verdict"]["cause"] == "flaky_hard_failure"
+    assert [h["kind"] for h in m["flaky_hard_failures"]] == ["5xx"]
+    assert m["hard_failures"] == [] and "head3" in m["runs"]  # the third run happened
+
+
+def test_head_500_in_one_run_that_reproduces_on_the_third_run_fails_by_hard_oracle(
+    golden: dict[str, Any], ci_env: None, tmp_path: Path
+) -> None:
+    judge = NoModel()
+    with _inject_500_in({"head", "head3"}):
+        code, m = run_golden(golden, "intermediate", "clean", tmp_path / "out", judge)
+    assert code == 1 and m["verdict"]["status"] == FAIL, m["verdict"]
+    assert m["verdict"]["cause"] == "hard_oracle"
+    assert [h["kind"] for h in m["hard_failures"]] == ["5xx"]
+    assert "reproduced in 2 of 3 head runs" in m["hard_failures"][0]["detail"]
+    assert m["flaky_hard_failures"] == [] and judge.calls == 0
+
+
+def test_a_clean_run_never_starts_a_third_head_run(
+    golden: dict[str, Any], ci_env: None, tmp_path: Path
+) -> None:
+    code, m = run_golden(golden, "intermediate", "clean", tmp_path / "out", PromptStub(clean_rule))
+    assert code == 0 and "head3" not in m["runs"] and m["flaky_hard_failures"] == []
+
+
 def test_comment_only_change_has_no_executable_lines_and_passes_without_running(
     golden: dict[str, Any], ci_env: None, tmp_path: Path
 ) -> None:
@@ -618,9 +668,14 @@ def test_hard_failures_need_head_only_and_must_reproduce() -> None:
     assert [h.kind for h in hard] == ["5xx"] and flaky == []
     once = _runs(sc, [ok, ok, boom, ok])
     hard, flaky = find_hard_failures(*once)
-    assert hard == [] and [n.field_path for n in flaky] == ["$5xx"]
+    assert hard == [] and [(h.kind, h.request_id) for h in flaky] == [("5xx", f"{sc.id}:1")]
+    # the 5xx in the SECOND head run is the same signal
+    assert [h.kind for h in find_hard_failures(*_runs(sc, [ok, ok, ok, boom]))[1]] == ["5xx"]
     both = _runs(sc, [boom, ok, boom, boom])  # base also 5xx once: base is not clean
-    assert find_hard_failures(*both)[0] == []
+    assert find_hard_failures(*both) == ([], [])
+    # base flaky too (500/200 on base, 500/200 on head): genuine noise, neither list
+    assert find_hard_failures(*_runs(sc, [boom, ok, boom, ok])) == ([], [])
+    assert find_hard_failures(*_runs(sc, [boom, ok, ok, boom])) == ([], [])
     # JSON that stops parsing
     text = _runs(sc, [ok, ok, [(201, {}), (200, "<html>oops")], [(201, {}), (200, "<html>oops")]])
     assert [h.kind for h in find_hard_failures(*text)[0]] == ["schema_violation"]
@@ -648,9 +703,51 @@ def test_new_tracebacks_in_head_logs_are_hard_failures() -> None:
     assert [(h.kind, h.request_id) for h in hard] == [("new_exception", "server_log")]
     # the same traceback on base is not new
     assert find_hard_failures(*_runs(sc, [ok] * 4, [old, "", old, old]))[0] == []
-    # only in one head run: flaky, recorded as noise
+    # only in one head run: a head-only one-off, kept apart from noise
     hard, flaky = find_hard_failures(*_runs(sc, [ok] * 4, ["", "", tb, ""]))
-    assert hard == [] and flaky and flaky[0].field_path == "$traceback"
+    assert hard == [] and [(h.request_id, h.kind) for h in flaky] == [
+        ("server_log", "new_exception")
+    ]
+    assert "ZeroDivisionError" in flaky[0].detail
+    # base flaky too (the traceback appears once on base): not new, so not a signal at all
+    assert find_hard_failures(*_runs(sc, [ok] * 4, [tb, "", tb, ""])) == ([], [])
+
+
+def test_transport_error_in_one_head_run_only_is_a_flaky_hard_failure() -> None:
+    sc = _scenario()
+    ok = [(201, {}), (200, {})]
+    dead = [(201, {}), (0, "transport error: ConnectionRefusedError: [Errno 111]")]
+    hard, flaky = find_hard_failures(*_runs(sc, [ok, ok, dead, ok]))
+    assert hard == [] and [h.kind for h in flaky] == ["crash"]
+    assert find_hard_failures(*_runs(sc, [dead, ok, dead, ok])) == ([], [])  # base not clean
+
+
+def _diff_free_ctx() -> Any:
+    from proofdeploy.lean.judge import JudgeContext
+
+    return JudgeContext(intent="", changed_hunks="", seed_facts=[], field_descriptions={})
+
+
+def test_a_flaky_hard_failure_is_never_a_pass_but_a_real_failure_still_fails() -> None:
+    from proofdeploy.lean.judge import HardFailure
+    from proofdeploy.lean.verdict import decide, run_lean
+
+    flaky = [HardFailure("s:1", "5xx", "head answered HTTP 500 in only one of two runs")]
+    v = decide([], [], [], True, flaky)
+    assert (v.status, v.cause) == (INCONCLUSIVE, "flaky_hard_failure")
+    assert v.details["flaky_hard_failures"][0]["request_id"] == "s:1"
+    # no flaky failure: the old PASS stays
+    assert decide([], [], [], True, []).status == PASS
+    assert decide([], [], [], True).status == PASS
+    # a stable hard failure outranks it
+    hard = [HardFailure("s:1", "5xx", "x")]
+    assert decide(hard, [], [], True, flaky).cause == "hard_oracle"
+    # through run_lean and replay: recorded, replays to the same verdict, zero model calls
+    model = NoModel()
+    rec = run_lean([], [], _diff_free_ctx(), [], True, runner=model, flaky_hard_failures=flaky)
+    assert (rec.verdict["status"], rec.verdict["cause"]) == (INCONCLUSIVE, "flaky_hard_failure")
+    assert rec.inputs["flaky_hard_failures"][0]["kind"] == "5xx"
+    assert replay(rec).cause == "flaky_hard_failure" and model.calls == 0
 
 
 # --------------------------------------------------------------------------

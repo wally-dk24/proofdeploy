@@ -10,12 +10,16 @@ Order of the rules (first match wins):
 
 1. any hard failure                      -> FAIL  hard_oracle (no AI used)
 2. any judged regression (evidence ok)   -> FAIL  judged_regression
-3. observable is False                   -> INCONCLUSIVE not_observable_over_http
-4. unexercised changed lines             -> INCONCLUSIVE change_not_exercised
-5. any unclear group                     -> INCONCLUSIVE needs_information
+3. a hard failure in only one head run  -> INCONCLUSIVE flaky_hard_failure
+   (base clean in both runs): a crash that
+   appears only after the change, even
+   intermittently, is never a PASS
+4. observable is False                   -> INCONCLUSIVE not_observable_over_http
+5. unexercised changed lines             -> INCONCLUSIVE change_not_exercised
+6. any unclear group                     -> INCONCLUSIVE needs_information
                                             (cause ``environment`` when a model
                                             call failed for a transport reason)
-6. otherwise                             -> PASS
+7. otherwise                             -> PASS
 """
 
 from __future__ import annotations
@@ -59,6 +63,7 @@ def decide(
     groups_with_judgments: list[JudgedGroup],
     unexercised_lines: list[str],
     observable: bool,
+    flaky_hard_failures: list[HardFailure] | None = None,
 ) -> Verdict:
     if hard_failures:
         return Verdict(FAIL, "hard_oracle", {"hard_failures": [h.to_dict() for h in hard_failures]})
@@ -88,6 +93,13 @@ def decide(
                     for jg in regressions
                 ]
             },
+        )
+
+    if flaky_hard_failures:
+        return Verdict(
+            INCONCLUSIVE,
+            "flaky_hard_failure",
+            {"flaky_hard_failures": [h.to_dict() for h in flaky_hard_failures]},
         )
 
     if not observable:
@@ -155,10 +167,12 @@ def _inputs(
     token_budget: int,
     prompt_cap: int,
     templates: list[str],
+    flaky_hard_failures: list[HardFailure] | None = None,
 ) -> dict[str, Any]:
     return {
         "differences": [d.to_dict() for d in differences],
         "hard_failures": [h.to_dict() for h in hard_failures],
+        "flaky_hard_failures": [h.to_dict() for h in flaky_hard_failures or []],
         "context": ctx.to_dict(),
         "unexercised_lines": list(unexercised_lines),
         "observable": observable,
@@ -194,6 +208,7 @@ def run_lean(
     token_budget: int = DEFAULT_TOKEN_BUDGET,
     prompt_cap: int = DEFAULT_PROMPT_CAP,
     templates: list[str] | None = None,
+    flaky_hard_failures: list[HardFailure] | None = None,
 ) -> LeanRecord:
     """Judge (unless a hard failure already decides) and decide."""
     tpls = list(templates or [])
@@ -206,6 +221,7 @@ def run_lean(
         token_budget,
         prompt_cap,
         tpls,
+        flaky_hard_failures,
     )
     if hard_failures:
         # The hard oracle decides; no model call is made or needed.
@@ -223,7 +239,7 @@ def run_lean(
             templates=tpls,
         )
         judged, plans, results = run.judged, run.plans, run.results
-    verdict = decide(hard_failures, judged, unexercised_lines, observable)
+    verdict = decide(hard_failures, judged, unexercised_lines, observable, flaky_hard_failures)
     return LeanRecord(
         inputs=inputs,
         prompts_sha256=[p.prompt_sha256 for p in plans],
@@ -258,7 +274,8 @@ def replay(record: LeanRecord | dict[str, Any]) -> Verdict:
     got_hashes = [p.prompt_sha256 for p in plans]
     if got_hashes != rec.prompts_sha256:
         raise ReplayMismatch("prompts differ from the recorded sha256 values")
-    verdict = decide(hard_failures, judged, inp["unexercised_lines"], inp["observable"])
+    flaky = [HardFailure.from_dict(h) for h in inp.get("flaky_hard_failures") or []]
+    verdict = decide(hard_failures, judged, inp["unexercised_lines"], inp["observable"], flaky)
     if [jg.to_dict() for jg in judged] != rec.groups:
         raise ReplayMismatch("re-derived group judgments differ from the record")
     if verdict.to_dict() != rec.verdict:

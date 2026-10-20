@@ -67,6 +67,7 @@ from proofdeploy.lean.index import (
 )
 from proofdeploy.lean.judge import (
     DEFAULT_TOKEN_BUDGET,
+    HardFailure,
     JudgeContext,
     path_template,
 )
@@ -408,6 +409,41 @@ def replay_run(
     return data
 
 
+def settle_flaky(
+    runs: dict[str, RunData], flaky: list[HardFailure], hard: list[HardFailure]
+) -> tuple[list[HardFailure], list[HardFailure]]:
+    """Use the third head run: a one-off that reproduces becomes a hard failure.
+
+    The third run is compared with each earlier head run under the same rule
+    (base clean in both runs); a flaky failure that comes back in either pair
+    is reproduced. The rest stay flaky (INCONCLUSIVE, never PASS).
+    """
+    h3 = runs["head3"]
+
+    def ident(h: HardFailure) -> tuple[str, str, str]:
+        sig = h.detail.split(": ", 1)[-1] if h.request_id == "server_log" else ""
+        return (h.request_id, h.kind, sig)
+
+    again: set[tuple[str, str, str]] = set()
+    for other in (runs["head"], runs["head2"]):
+        stable, _ = find_hard_failures(runs["base"], runs["base2"], other, h3)
+        again |= {ident(h) for h in stable}
+    still: list[HardFailure] = []
+    hard = list(hard)
+    for f in flaky:
+        if ident(f) in again:
+            hard.append(
+                HardFailure(
+                    f.request_id,
+                    f.kind,
+                    f"reproduced in 2 of 3 head runs (base clean in both runs): {f.detail}",
+                )
+            )
+        else:
+            still.append(f)
+    return still, hard
+
+
 def _run_summary(run: RunData) -> dict[str, Any]:
     statuses = [e.status for e in run.exchanges.values()]
     return {
@@ -560,8 +596,19 @@ def run_pipeline(
         comparison: Comparison = compare_runs(
             runs["base"], runs["base2"], runs["head"], runs["head2"]
         )
-        hard, flaky = find_hard_failures(runs["base"], runs["base2"], runs["head"], runs["head2"])
-    noise: list[NoiseItem] = [*comparison.noise, *flaky]
+        hard, flaky_hard = find_hard_failures(
+            runs["base"], runs["base2"], runs["head"], runs["head2"]
+        )
+    if flaky_hard:
+        # A failure that appears after the change in only one of two head runs is a
+        # regression signal, not noise. Run the head a third time to see whether it
+        # reproduces: reproduced -> hard failure; not -> INCONCLUSIVE flaky_hard_failure.
+        log(f"{len(flaky_hard)} head-only one-off failure(s): re-running head a third time")
+        with timings.stage("run_head3"):
+            runs["head3"] = replay_run(head, "head3", scenarios, auth)
+        log(f"run head3: {runs['head3'].request_count()} request(s)")
+        flaky_hard, hard = settle_flaky(runs, flaky_hard, hard)
+    noise: list[NoiseItem] = list(comparison.noise)
 
     # 6. judge and decide ---------------------------------------------------------
     templates = sorted(
@@ -586,6 +633,7 @@ def run_pipeline(
             runner=runner,
             token_budget=cfg.budget_tokens,
             templates=templates,
+            flaky_hard_failures=flaky_hard,
         )
         replayed = replay(record)  # self-check: the stored outputs re-derive the verdict
     verdict = Verdict(
@@ -635,6 +683,7 @@ def run_pipeline(
         "noise_fields": sorted({n.field_path for n in noise}),
         "noise": [n.to_dict() for n in noise],
         "hard_failures": [h.to_dict() for h in hard],
+        "flaky_hard_failures": [h.to_dict() for h in flaky_hard],
         "judge": {
             "calls": len(record.calls),
             "total_tokens": record.total_tokens,

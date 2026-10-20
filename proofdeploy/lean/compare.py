@@ -373,10 +373,17 @@ def find_hard_failures(
     base2: RunData,
     head: RunData,
     head2: RunData,
-) -> tuple[list[HardFailure], list[NoiseItem]]:
-    """Hard failures (stable on head, absent on base) and the flaky ones as noise."""
+) -> tuple[list[HardFailure], list[HardFailure]]:
+    """Hard failures that appear only after the change: ``(stable, flaky)``.
+
+    ``stable`` reproduce in both head runs; ``flaky`` appear in exactly one
+    head run. Both need a base that is clean in BOTH base runs: a failure the
+    base shows too varies independent of the change, so it is noise (and is
+    left to the comparison). A head-only one-off is not noise; it is a
+    regression signal that the verdict must not pass over.
+    """
     failures: list[HardFailure] = []
-    flaky: list[NoiseItem] = []
+    flaky: list[HardFailure] = []
     seen: dict[ExKey, None] = {}
     for run in (head, head2):
         for k in run.order:
@@ -386,22 +393,39 @@ def find_hard_failures(
         rid = f"{key[0]}:{key[1]}"
         sb, sb2, sh, sh2 = (_status(e) for e in (eb, eb2, eh, eh2))
         base_ok = sb < 500 and sb2 < 500
-        # 5xx on head where base was below 500
+        # 5xx on head where base was below 500 in both runs
         if base_ok and (sh >= 500 or sh2 >= 500):
             if sh >= 500 and sh2 >= 500:
                 failures.append(
                     HardFailure(rid, "5xx", f"head answered HTTP {sh} (base {sb}) at {_where(eh)}")
                 )
             else:
-                flaky.append(NoiseItem(rid, "$5xx", f"head {sh}/{sh2} base {sb}/{sb2}"))
+                flaky.append(
+                    HardFailure(
+                        rid,
+                        "5xx",
+                        f"head answered HTTP {sh}/{sh2} in only one of two runs "
+                        f"(base {sb}/{sb2}) at {_where(eh if sh >= 500 else eh2)}",
+                    )
+                )
             continue
-        # connection error / timeout on head only
-        if _is_transport_error(eh) and _is_transport_error(eh2) and not _is_transport_error(eb):
-            text = str(eh.body_json_or_text if eh else "")
+        # connection error / timeout on head, none on base
+        base_up = not _is_transport_error(eb) and not _is_transport_error(eb2)
+        t_h, t_h2 = _is_transport_error(eh), _is_transport_error(eh2)
+        if base_up and (t_h or t_h2):
+            bad = eh if t_h else eh2
+            text = str(bad.body_json_or_text if bad else "")
             kind = (
                 "timeout" if "timed out" in text.lower() or "timeout" in text.lower() else "crash"
             )
-            failures.append(HardFailure(rid, kind, f"{text[:200]} at {_where(eh)}"))
+            if t_h and t_h2:
+                failures.append(HardFailure(rid, kind, f"{text[:200]} at {_where(eh)}"))
+            else:
+                flaky.append(
+                    HardFailure(
+                        rid, kind, f"in only one of two head runs: {text[:200]} at {_where(bad)}"
+                    )
+                )
             continue
         # a JSON body that no longer parses
         if (
@@ -426,8 +450,8 @@ def find_hard_failures(
     )
     new_h = [s for s in traceback_signatures(head.server_log) if s not in base_sigs]
     new_h2 = [s for s in traceback_signatures(head2.server_log) if s not in base_sigs]
-    for sig in dict.fromkeys(new_h):
-        if sig in new_h2:
+    for sig in dict.fromkeys([*new_h, *new_h2]):
+        if sig in new_h and sig in new_h2:
             failures.append(
                 HardFailure(
                     "server_log", "new_exception", f"new traceback in head's server log: {sig}"
@@ -435,7 +459,11 @@ def find_hard_failures(
             )
         else:
             flaky.append(
-                NoiseItem("server_log", "$traceback", f"only in the first head run: {sig}")
+                HardFailure(
+                    "server_log",
+                    "new_exception",
+                    f"new traceback in only one of two head runs: {sig}",
+                )
             )
     return failures, flaky
 
