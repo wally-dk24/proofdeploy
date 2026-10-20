@@ -1,0 +1,152 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Mini Docs API", "version": "1.0.0"},
+  "paths": {
+    "/api/tags/": {
+      "get": {
+        "operationId": "tags_list",
+        "description": "List tags.",
+        "parameters": [
+          {"name": "name__icontains", "in": "query", "description": "Case-insensitive name filter", "schema": {"type": "string"}},
+          {"name": "page", "in": "query", "description": "A page number within the paginated result set.", "schema": {"type": "integer"}},
+          {"name": "page_size", "in": "query", "schema": {"type": "integer"}}
+        ],
+        "tags": ["tags"],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/PaginatedTagList"}}
+            },
+            "description": ""
+          }
+        }
+      },
+      "post": {
+        "operationId": "tags_create",
+        "tags": ["tags"],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {"schema": {"$ref": "#/components/schemas/TagRequest"}},
+            "application/json": {"schema": {"$ref": "#/components/schemas/TagRequest"}}
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Tag"}}},
+            "description": ""
+          }
+        }
+      }
+    },
+    "/api/tags/{id}/": {
+      "parameters": [
+        {"in": "path", "name": "id", "schema": {"type": "integer"}, "description": "A unique integer value identifying this tag.", "required": true}
+      ],
+      "get": {
+        "operationId": "tags_retrieve",
+        "responses": {
+          "200": {
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TagDetail"}}},
+            "description": ""
+          },
+          "404": {"description": "not found"}
+        }
+      }
+    },
+    "/api/documents/post_document/": {
+      "post": {
+        "operationId": "documents_post_document_create",
+        "summary": "Upload a document",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {"schema": {"$ref": "#/components/schemas/PostDocumentRequest"}}
+          },
+          "required": true
+        },
+        "responses": {"200": {"description": "No response body"}}
+      }
+    },
+    "/api/nodes/{id}/": {
+      "get": {
+        "operationId": "nodes_retrieve",
+        "parameters": [{"in": "path", "name": "id", "schema": {"type": "integer"}, "required": true}],
+        "responses": {
+          "200": {
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Node"}}},
+            "description": ""
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "PaginatedTagList": {
+        "type": "object",
+        "required": ["count", "results"],
+        "properties": {
+          "count": {"type": "integer", "example": 123},
+          "next": {"type": "string", "nullable": true, "format": "uri"},
+          "previous": {"type": "string", "nullable": true, "format": "uri"},
+          "results": {"type": "array", "items": {"$ref": "#/components/schemas/Tag"}}
+        }
+      },
+      "Tag": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer", "readOnly": true},
+          "name": {"type": "string", "description": "Display name of the tag"},
+          "color": {"type": "string"},
+          "document_count": {"type": "integer", "readOnly": true, "description": "Number of documents carrying this tag"}
+        },
+        "required": ["id", "name"]
+      },
+      "TagRequest": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string", "minLength": 1, "description": "Display name of the tag"},
+          "color": {"type": "string"}
+        },
+        "required": ["name"]
+      },
+      "User": {
+        "type": "object",
+        "properties": {"username": {"type": "string", "description": "Login name"}},
+        "required": ["username"]
+      },
+      "TagDetail": {
+        "allOf": [
+          {"$ref": "#/components/schemas/Tag"},
+          {
+            "type": "object",
+            "properties": {
+              "owner": {
+                "allOf": [{"$ref": "#/components/schemas/User"}],
+                "nullable": true,
+                "description": "The user who owns the tag"
+              }
+            },
+            "required": ["owner"]
+          }
+        ]
+      },
+      "PostDocumentRequest": {
+        "type": "object",
+        "properties": {
+          "document": {"type": "string", "format": "binary", "description": "The file to ingest"},
+          "title": {"type": "string"}
+        },
+        "required": ["document"]
+      },
+      "Node": {
+        "type": "object",
+        "description": "A tree node",
+        "properties": {
+          "name": {"type": "string", "description": "Node name"},
+          "children": {"type": "array", "items": {"$ref": "#/components/schemas/Node"}}
+        }
+      }
+    }
+  }
+}
