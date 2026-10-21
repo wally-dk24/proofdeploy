@@ -560,6 +560,21 @@ def test_a_latin1_file_never_crashes_the_diff_and_the_hash_is_over_the_raw_bytes
     assert res.manifest["inputs"]["diff_sha256"] != hashlib.sha256(text.encode()).hexdigest()
 
 
+def test_a_latin1_source_file_and_commit_message_never_crash_a_unit(tmp_path: Path) -> None:
+    src = '# caf\xe9\n__version__ = "1"\n'.encode("latin-1")
+    repo, base, head = _repo(tmp_path, {"pkg/mod.py": b"# x\n"}, {"pkg/mod.py": src})
+    msg = tmp_path / "msg.txt"
+    msg.write_bytes("fix caf\xe9\n".encode("latin-1"))
+    _git(repo, "-c", "i18n.commitEncoding=latin1", "commit", "--amend", "-q", "-F", str(msg))
+    head = _git(repo, "rev-parse", "HEAD")
+    cfg = _cfg(repo, base, head)
+    text = pipeline.source_reader(cfg, "added")("pkg/mod.py")
+    assert text is not None and "__version__" in text
+    assert function_body_lines(text) == set()
+    intent, source = pipeline.intent_of(repo, head, None)
+    assert source == "head_commit_message" and intent.startswith("fix caf")
+
+
 # --------------------------------------------------------------------------
 # Item 5: frontend-only changes typed up front
 # --------------------------------------------------------------------------
