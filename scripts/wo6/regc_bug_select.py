@@ -161,6 +161,16 @@ this PR does):
   command line (D166: paperless-ngx/paperless-ngx @
   0cb2cdbfdd91a2078236f8851cd310261284591c, app.path src).
 
+Lean mode (`--rule lean --lean-language python`, R-LEAN-SEL, signed
+2026-10-20, docs/registration/r-lean-sel.md; D267): checks (a), (b)
+with R-SEL and (c) as above; R-SIZE (e) is skipped and never called;
+new check L (from `git diff --name-only -z --no-renames` path lists
+only: L1 B^..B and L2 fix^..fix each change a backend source file);
+check (d) runs the B pair (B^, B) first, then (fix^, fix), each under
+the unchanged D48/D177 classification; 200 walked without a selection
+ends as `no_unit_selected` (no fallback). The default `--rule regc` is
+unchanged.
+
 Exit status: 0 when the run completed (a selection and an
 exhaustion are both results); 2 when the run itself failed
 (journal identity mismatch, lock held, clone/harness errors) or
@@ -201,6 +211,21 @@ FIX_SUBJECT_RE = re.compile(r"\bfix(e[sd])?\b", re.IGNORECASE)
 
 # The empty tree: the diff base for a parentless commit.
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# R-LEAN-SEL (signed 2026-10-20; D267): the registered text, pinned.
+LEAN_RULE_NAME = "R-LEAN-SEL"
+LEAN_SEL_SHA256 = "abc78a10fb5fa3af21b88ed2f43e58cbb8c374a0b1550c30ec8bc830f0aaa3ce"
+LEAN_SEL_PATH = (
+    Path(__file__).resolve().parents[2] / "docs" / "registration" / "r-lean-sel.md"
+)
+# R-LEAN-SEL 4: the app language's source extensions. Other languages
+# are not defined yet; a lean walk on such an app refuses.
+LEAN_LANGUAGE_EXTENSIONS: dict[str, frozenset[str]] = {
+    "python": frozenset({".py"}),
+}
+LEAN_REFUSAL = "not defined yet (R-LEAN-SEL 4)"
+# Lean mode has no check (e) (R-LEAN-SEL 3); L1/L2 follow (c).
+LEAN_CHECKS = ("a", "b", "c", "L1", "L2", "d")
 
 DEFAULT_SURVIVORS = (
     "docs/registration/wo6-regc-add2-closeout-2026-10-17/"
@@ -383,6 +408,43 @@ def is_migration_path(path: str) -> bool:
     return MIGRATION_NAME_SUBSTRING in segments[-1]
 
 
+def backend_source_count(paths: list[str], language: str) -> int:
+    """R-LEAN-SEL 4: the number of backend source files among the
+    changed paths: class SOURCE (D169), not a migration path (R-SEL
+    1), extension in the app language's set."""
+    exts = LEAN_LANGUAGE_EXTENSIONS[language]
+    return sum(
+        1
+        for p in paths
+        if classify_path(p) == "SOURCE"
+        and not is_migration_path(p)
+        and _extension(p.rsplit("/", 1)[-1]) in exts
+    )
+
+
+def lean_path_counts(paths: list[str], language: str) -> dict[str, int]:
+    """Counts per class plus the backend-source count. No paths."""
+    classes = [classify_path(p) for p in paths]
+    counts = {c: classes.count(c) for c in ("SOURCE", "TEST", "DOC", "OTHER")}
+    counts["backend_source"] = backend_source_count(paths, language)
+    return counts
+
+
+def lean_registered_sha256() -> str:
+    """The sha256 of the registered R-LEAN-SEL text in this checkout,
+    refused unless it is the signed one."""
+    try:
+        digest = hashlib.sha256(LEAN_SEL_PATH.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise HarnessError(f"R-LEAN-SEL text unreadable: {exc}") from exc
+    if digest != LEAN_SEL_SHA256:
+        raise HarnessError(
+            f"R-LEAN-SEL text sha256 is {digest}, not the signed "
+            f"{LEAN_SEL_SHA256}; refusing"
+        )
+    return digest
+
+
 def subject_matches(subject: str) -> bool:
     """Check (a): the REG-C item 7 pattern, verbatim."""
     return FIX_SUBJECT_RE.search(subject) is not None
@@ -473,6 +535,13 @@ class AppRepo:
             "diff", "--name-only", "--no-renames", base, fix,
         )
         return [ln for ln in out.splitlines() if ln]
+
+    def changed_paths_z(self, parent: str | None, tip: str) -> list[str]:
+        """Changed path names only, NUL-separated (R-LEAN-SEL 4):
+        `git diff --name-only -z --no-renames`. Never a diff body."""
+        base = parent if parent is not None else EMPTY_TREE
+        out = self._git("diff", "--name-only", "-z", "--no-renames", base, tip)
+        return [p for p in out.split("\0") if p]
 
     def removed_or_changed_lines(
         self, parent: str | None, fix: str
@@ -689,6 +758,7 @@ class StopForRuling(Exception):
         reason: str | None,
         exhausted: bool,
         sides: dict[str, Any],
+        pair: str | None = None,
     ) -> None:
         super().__init__(
             f"check (d) stopped at {commit_sha[:12]}: {klass} on "
@@ -700,6 +770,7 @@ class StopForRuling(Exception):
         self.reason = reason
         self.exhausted = exhausted
         self.sides = sides
+        self.pair = pair
 
 
 def _side_records(
@@ -737,6 +808,7 @@ def _run_check_d(
     *,
     journal: Journal | None,
     commit_sha: str,
+    pair: str | None = None,
 ) -> dict[str, Any]:
     """Provision fix^ and fix under the D48 classification (D177).
 
@@ -775,6 +847,10 @@ def _run_check_d(
                 "reason": outcome.get("typed_reason")
                 or outcome.get("last_error"),
             }
+            if pair is not None:
+                # Lean mode (R-LEAN-SEL 5): which pair this attempt
+                # belongs to ("b" or "fix"); absent in regc mode.
+                attempt_rec["pair"] = pair
             if outcome.get("workflow_run_id") is not None:
                 # The GitHub checker (D194): the readiness
                 # workflow run this attempt dispatched, journaled
@@ -812,6 +888,7 @@ def _run_check_d(
                     or outcome.get("last_error"),
                     exhausted=False,
                     sides=_side_records(final, attempts, shas),
+                    pair=pair,
                 )
         if any(final[r][1] == "not_supported" for r in pending):
             # A genuine (d) failure settles the candidate: no
@@ -839,6 +916,7 @@ def _run_check_d(
                     or outcome.get("last_error"),
                     exhausted=True,
                     sides=_side_records(final, attempts, shas),
+                    pair=pair,
                 )
     return _side_records(final, attempts, shas)
 
@@ -847,9 +925,15 @@ def evaluate_commit(
     repo: AppRepo,
     meta: CommitMeta,
     ready_pair: ReadyPairCheck,
-    prompt_size: PromptSizeCheck,
+    prompt_size: PromptSizeCheck | None,
     journal: Journal | None = None,
+    *,
+    rule: str = "regc",
+    language: str | None = None,
 ) -> dict[str, Any]:
+    lean = rule == "lean"
+    if lean and language not in LEAN_LANGUAGE_EXTENSIONS:
+        raise HarnessError(f"lean language {language!r} is {LEAN_REFUSAL}")
     entry: dict[str, Any] = {
         "sha": meta.sha,
         "committer_date": _iso(meta.committer_ts),
@@ -859,10 +943,19 @@ def evaluate_commit(
         "reason": None,
     }
 
+    if lean:
+        entry["rule"] = LEAN_RULE_NAME
+        entry["checks_run"] = ["a"]
+        entry["e"] = "skipped: R-SIZE does not apply (R-LEAN-SEL 3)"
+
     def reject(check: str, reason: str) -> dict[str, Any]:
         entry["failed_check"] = check
         entry["reason"] = reason
         return entry
+
+    def ran(letter: str) -> None:
+        if lean:
+            entry["checks_run"].append(letter)
 
     # (a) subject.
     if not subject_matches(meta.subject):
@@ -872,6 +965,7 @@ def evaluate_commit(
     entry["fix_parent"] = parent
 
     # (b) at least one SOURCE file changed.
+    ran("b")
     paths = repo.changed_paths(parent, meta.sha)
     classes = [classify_path(p) for p in paths]
     counts = {c: classes.count(c) for c in ("SOURCE", "TEST", "DOC", "OTHER")}
@@ -899,6 +993,7 @@ def evaluate_commit(
         )
 
     # (c) B exists and is shipped in a tag created before the fix.
+    ran("c")
     lines = repo.removed_or_changed_lines(parent, meta.sha)
     if not lines:
         return reject(
@@ -927,6 +1022,15 @@ def evaluate_commit(
     tag_name, tag_ts = min(qualifying, key=lambda t: (t[1], t[0]))
     entry["tag"] = tag_name
     entry["tag_created"] = _iso(tag_ts)
+
+    if lean:
+        return _lean_checks_l_and_d(
+            repo, meta, entry, ready_pair, journal, language or "",
+            parent, b_sha, reject, ran,
+        )
+
+    if prompt_size is None:
+        raise HarnessError("check (e) needs a prompt-size function")
 
     # (e) R-SIZE (D253), order per Amendment 1 (D255): the blind
     # author's prompt for B^..B is at most R_SIZE_MAX_PROMPT_CHARS
@@ -975,6 +1079,80 @@ def evaluate_commit(
     return entry
 
 
+def _pair_not_ready_reason(
+    label: str, first: str, second: str, sides: dict[str, Any]
+) -> str | None:
+    ok_first = sides["fix_parent"]["ready"]
+    ok_second = sides["fix"]["ready"]
+    if ok_first and ok_second:
+        return None
+    if not ok_first and not ok_second:
+        return f"{label}: {first} and {second} are not READY"
+    return f"{label}: {first if not ok_first else second} is not READY"
+
+
+def _lean_checks_l_and_d(
+    repo: AppRepo,
+    meta: CommitMeta,
+    entry: dict[str, Any],
+    ready_pair: ReadyPairCheck,
+    journal: Journal | None,
+    language: str,
+    parent: str | None,
+    b_sha: str,
+    reject: Callable[[str, str], dict[str, Any]],
+    ran: Callable[[str], None],
+) -> dict[str, Any]:
+    """R-LEAN-SEL checks L (4) and d (5), after (c). Paths only."""
+    b_parent = repo.first_parent(b_sha)
+    if b_parent is None:
+        raise HarnessError(
+            f"check L refused: B {b_sha} has no parent, so B^..B does "
+            "not exist (ruling required; the commit is not rejected)"
+        )
+    entry["b_parent"] = b_parent
+    ran("L")
+    b_paths = repo.changed_paths_z(b_parent, b_sha)
+    b_counts = lean_path_counts(b_paths, language)
+    entry["l_counts"] = {"b": b_counts}
+    if b_counts["backend_source"] == 0:
+        return reject("L1", "L1: no backend source in B")
+    fix_paths = repo.changed_paths_z(parent, meta.sha)
+    fix_counts = lean_path_counts(fix_paths, language)
+    entry["l_counts"]["fix"] = fix_counts
+    if fix_counts["backend_source"] == 0:
+        return reject("L2", "L2: no backend source in fix")
+
+    assert parent is not None  # (c) passed, so a real fix^ exists
+    ran("d")
+    # Check (d), extended (R-LEAN-SEL 5): the B pair first.
+    b_sides = _run_check_d(
+        b_parent, b_sha, ready_pair,
+        journal=journal, commit_sha=meta.sha, pair="b",
+    )
+    entry["readiness_b"] = {
+        "b_parent": b_sides["fix_parent"],
+        "b": b_sides["fix"],
+    }
+    entry["b_parent_ready"] = b_sides["fix_parent"]["ready"]
+    entry["b_ready"] = b_sides["fix"]["ready"]
+    reason = _pair_not_ready_reason("B pair", "B^", "B", b_sides)
+    if reason is not None:
+        return reject("d", reason)
+    fix_sides = _run_check_d(
+        parent, meta.sha, ready_pair,
+        journal=journal, commit_sha=meta.sha, pair="fix",
+    )
+    entry["readiness"] = fix_sides
+    entry["parent_ready"] = fix_sides["fix_parent"]["ready"]
+    entry["fix_ready"] = fix_sides["fix"]["ready"]
+    reason = _pair_not_ready_reason("fix pair", "fix^", "fix", fix_sides)
+    if reason is not None:
+        return reject("d", reason)
+    entry["outcome"] = "selected"
+    return entry
+
+
 # ---------------------------------------------------------------------
 # The journal (D74) and the single-writer lock (D140), mirroring
 # scripts/wo6/regc_add2_run.py's conventions.
@@ -1001,6 +1179,7 @@ class Journal:
         main_sha: str | None,
         app_repo: str,
         app_head_sha: str,
+        extra_identity: dict[str, Any] | None = None,
     ) -> tuple[Journal, bool, str | None]:
         """(journal, resumed, previous exit cause). A directory
         without a header starts a new run; one with a header
@@ -1013,6 +1192,7 @@ class Journal:
             "main_sha": main_sha,
             "app_repo": app_repo,
             "app_head_sha": app_head_sha,
+            **(extra_identity or {}),
         }
         if not header_path.exists():
             dir_path.mkdir(parents=True, exist_ok=True)
@@ -1163,10 +1343,13 @@ class SingleWriterLock:
 CHECKS = ("a", "b", "c", "d", "e")
 
 
-def check_tally(entries: list[dict[str, Any]]) -> dict[str, int]:
-    """How many walked commits failed each check (a)-(e), and how
-    many were selected. Counts only: no subject or content."""
-    tally = {c: 0 for c in CHECKS}
+def check_tally(
+    entries: list[dict[str, Any]], checks: tuple[str, ...] = CHECKS
+) -> dict[str, int]:
+    """How many walked commits failed each check (a)-(e) (lean:
+    a, b, c, L1, L2, d), and how many were selected. Counts only: no
+    subject or content."""
+    tally = {c: 0 for c in checks}
     tally["selected"] = 0
     for e in entries:
         if e["outcome"] == "selected":
@@ -1181,12 +1364,14 @@ def select_fix(
     repo: AppRepo,
     app: dict[str, Any],
     ready_pair: ReadyPairCheck,
-    prompt_size: PromptSizeCheck,
+    prompt_size: PromptSizeCheck | None,
     journal: Journal | None = None,
     main_sha: str | None,
     script_sha256: str,
     limit: int = MAX_WALKED,
     merge_base: str | None = None,
+    rule: str = "regc",
+    language: str | None = None,
 ) -> dict[str, Any]:
     """Walk in the registered order and build the output record.
 
@@ -1196,6 +1381,14 @@ def select_fix(
     D48 stop (StopForRuling from check (d)) ends the walk with
     outcome "stopped": the stopped commit is journaled as a stop
     event, gains no walk entry, and is re-evaluated on resume."""
+    lean = rule == "lean"
+    lean_sha = ""
+    if lean:
+        if language not in LEAN_LANGUAGE_EXTENSIONS:
+            raise HarnessError(f"lean language {language!r} is {LEAN_REFUSAL}")
+        lean_sha = lean_registered_sha256()
+    elif rule != "regc":
+        raise HarnessError(f"unknown rule {rule!r}")
     ordered = repo.walk_order(str(app["head_sha"]))
     prior: dict[str, dict[str, Any]] = {}
     if journal is not None:
@@ -1210,7 +1403,8 @@ def select_fix(
         if entry is None:
             try:
                 entry = evaluate_commit(
-                    repo, meta, ready_pair, prompt_size, journal=journal
+                    repo, meta, ready_pair, prompt_size, journal=journal,
+                    rule=rule, language=language,
                 )
             except StopForRuling as stop_exc:
                 stopped = {
@@ -1222,6 +1416,8 @@ def select_fix(
                     "retries_exhausted": stop_exc.exhausted,
                     "readiness": stop_exc.sides,
                 }
+                if stop_exc.pair is not None:
+                    stopped["pair"] = stop_exc.pair
                 if journal is not None:
                     journal.record_stop(stopped)
                 break
@@ -1254,12 +1450,20 @@ def select_fix(
             if stopped is not None
             else "selected"
             if selected is not None
+            else "no_unit_selected"
+            if lean
             else "exhausted"
         ),
-        "rejected_by_check": check_tally(entries),
+        "rejected_by_check": (
+            check_tally(entries, LEAN_CHECKS) if lean else check_tally(entries)
+        ),
         "walked": entries,
         "selected": None,
     }
+    if lean:
+        record["rule"] = LEAN_RULE_NAME
+        record["rule_sha256"] = lean_sha
+        record["language"] = language
     if selected is not None:
         record["selected"] = {
             "fix": selected["sha"],
@@ -1269,6 +1473,8 @@ def select_fix(
             "tag": selected["tag"],
             "tag_created": selected["tag_created"],
         }
+        if lean:
+            record["selected"]["b_parent"] = selected["b_parent"]
     elif stopped is not None:
         record["stopped"] = stopped
         record["next"] = (
@@ -1276,6 +1482,11 @@ def select_fix(
             "was not rejected; rule on the recorded class, fix the "
             "cause if it is ours, then resume the same journal to "
             "re-evaluate it"
+        )
+    elif lean:
+        record["next"] = (
+            "no unit selected (R-LEAN-SEL 6): the walk stops and the "
+            "reviewer reports to Master; no fallback app"
         )
     else:
         record["next"] = (
@@ -1974,7 +2185,31 @@ def main(argv: list[str] | None = None) -> int:
         "this host (default); github = readiness.yml dispatched "
         "from main to the GitHub runners (D194)",
     )
+    ap.add_argument(
+        "--rule",
+        choices=("regc", "lean"),
+        default="regc",
+        help="selection rule: regc = REG-C item 7 as implemented by "
+        "D169 (default, unchanged); lean = R-LEAN-SEL (requires "
+        "--lean-language)",
+    )
+    ap.add_argument(
+        "--lean-language",
+        default=None,
+        help="the app's language for --rule lean (only 'python' is "
+        "defined, R-LEAN-SEL 4)",
+    )
     args = ap.parse_args(argv)
+    lean = args.rule == "lean"
+    if lean:
+        if args.lean_language is None:
+            ap.error("--rule lean requires --lean-language")
+        if args.lean_language not in LEAN_LANGUAGE_EXTENSIONS:
+            ap.error(
+                f"--lean-language {args.lean_language!r}: {LEAN_REFUSAL}"
+            )
+    elif args.lean_language is not None:
+        ap.error("--lean-language is only valid with --rule lean")
 
     journal_dir = args.journal or args.out.with_suffix("").with_name(
         args.out.stem + "-journal"
@@ -1995,6 +2230,11 @@ def main(argv: list[str] | None = None) -> int:
                 main_sha=main_sha,
                 app_repo=app["repo"],
                 app_head_sha=str(app["head_sha"]),
+                extra_identity=(
+                    {"rule": LEAN_RULE_NAME, "language": args.lean_language}
+                    if lean
+                    else None
+                ),
             )
             journal.record_start(
                 resumed=resumed, previous_exit_cause=previous_cause
@@ -2012,13 +2252,19 @@ def main(argv: list[str] | None = None) -> int:
                 repo=repo,
                 app=app,
                 ready_pair=ready_pair,
-                prompt_size=make_author_prompt_size_builder(
-                    repo_name=app["repo"], repo=repo
+                prompt_size=(
+                    None
+                    if lean
+                    else make_author_prompt_size_builder(
+                        repo_name=app["repo"], repo=repo
+                    )
                 ),
                 journal=journal,
                 main_sha=main_sha,
                 script_sha256=script_sha256,
                 merge_base=_detect_merge_base(),
+                rule=args.rule,
+                language=args.lean_language,
             )
             args.out.parent.mkdir(parents=True, exist_ok=True)
             tmp = args.out.with_suffix(".tmp")
@@ -2052,7 +2298,7 @@ def main(argv: list[str] | None = None) -> int:
     tally = record["rejected_by_check"]
     print(
         "tally: "
-        + " ".join(f"{c}={tally[c]}" for c in CHECKS)
+        + " ".join(f"{c}={tally[c]}" for c in (LEAN_CHECKS if lean else CHECKS))
         + f" selected={tally['selected']}"
     )
     if record["outcome"] == "selected":
@@ -2070,6 +2316,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"record written to {args.out}")
         return 2
+    elif lean:
+        print(
+            f"NO UNIT SELECTED after {record['walked_count']} walked "
+            "(R-LEAN-SEL 6; no fallback)"
+        )
     else:
         print(f"EXHAUSTED after {record['walked_count']} walked")
     print(f"record written to {args.out}")
