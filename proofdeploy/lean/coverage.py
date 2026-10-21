@@ -33,6 +33,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ from typing import Any
 
 import coverage
 from coverage.data import CoverageData, combine_parallel_data
+
+from proofdeploy.lean import hostfs
 
 # Default location of the tool directory inside the sandbox (userns-mapped
 # home of the app user); host-side runs pass their own directory.
@@ -77,6 +80,20 @@ _QUOTED_MSG = (
     "non-ASCII characters; run git with -c core.quotepath=off or rename the "
     "file. Failing closed rather than guessing the path."
 )
+
+
+def split_diff_lines(text: str) -> list[str]:
+    """Split diff (or git output) text into lines on ``\\n`` ONLY.
+
+    ``str.splitlines()`` also breaks on ``\\x0b \\x0c \\x1c-\\x1e \\x85`` and U+2028/2029, so a
+    source line containing one of them (legal in a file) would yield extra
+    "lines" in a hunk and break the header counts (issue-register R6). A
+    trailing ``\\r`` stays part of the line: it is file content.
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def _clean_path(raw: str, line: str) -> str | None:
@@ -148,7 +165,11 @@ class ChangedLines(dict[str, dict[str, set[int]]]):
                 entry = out.setdefault(path, {"added": set(), "removed": set()})
             return entry
 
-        for line in diff_text.splitlines():
+        in_binary_patch = False
+        for line in split_diff_lines(diff_text):
+            if in_binary_patch and not line.startswith("diff --git "):
+                continue  # base85 payload of a ``GIT binary patch``: no line information
+            in_binary_patch = False
             if in_hunk:
                 if line.startswith("\\"):  # "\ No newline at end of file"
                     continue
@@ -195,6 +216,7 @@ class ChangedLines(dict[str, dict[str, set[int]]]):
             if line.startswith(("Binary files ", "GIT binary patch")):
                 have_file = True
                 binary = True
+                in_binary_patch = line.startswith("GIT binary patch")
                 continue
             if line.startswith("--- "):
                 if saw_plus:  # plain (non-git) diff: a new file section begins
@@ -381,17 +403,18 @@ def install_pdcov(
     src = coverage_package or Path(coverage.__file__).resolve().parent
     dest = pd.lib_dir / "coverage"
     if dest.exists():
-        shutil.rmtree(dest)
+        hostfs.remove_tree(dest)
     shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__"))
     reset_runtime_state(pd)
     return pd
 
 
 def reset_runtime_state(pd: PdCov) -> None:
+    # The data files and the acks are written by the app (the userns-mapped uid in the sandbox).
     for f in pd.data_dir.glob(".coverage*"):
-        f.unlink()
+        hostfs.remove_tree(f)
     for f in (pd.context_file, pd.ack_file, pd.flush_file, pd.flush_ack_file):
-        f.unlink(missing_ok=True)
+        hostfs.remove_tree(f)
 
 
 def install_pth(site_packages: str | Path, pd: PdCov) -> Path:
@@ -408,8 +431,19 @@ def install_pth(site_packages: str | Path, pd: PdCov) -> Path:
 
 def _write_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".host.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(text, encoding="utf-8")
+    except PermissionError:  # the tool directory is not writable by the host user
+        with tempfile.TemporaryDirectory() as scratch:
+            staged = Path(scratch) / "staged"
+            staged.write_text(text, encoding="utf-8")
+            hostfs.copy_into(staged, tmp)
+    hostfs.replace(tmp, path)
+
+
+def _read_ack(path: Path) -> str:
+    """Text of a control or ack file the app wrote (OSError when absent)."""
+    return hostfs.read_bytes(path).decode("utf-8")
 
 
 class CoverageSession:
@@ -436,7 +470,7 @@ class CoverageSession:
         deadline = time.monotonic() + self.ack_timeout
         while True:
             try:
-                if self.pd.ack_file.read_text(encoding="utf-8") == request_id:
+                if _read_ack(self.pd.ack_file) == request_id:
                     return
             except OSError:
                 pass
@@ -460,7 +494,7 @@ class CoverageSession:
         deadline = time.monotonic() + self.ack_timeout
         while True:
             try:
-                if self.pd.flush_ack_file.read_text(encoding="utf-8") == token:
+                if _read_ack(self.pd.flush_ack_file) == token:
                     return
             except OSError:
                 pass
@@ -528,9 +562,29 @@ def collect_coverage(data_dir: str | Path, *, root_prefix: str = "") -> Coverage
             f"(pdcov.pth missing, COVERAGE_PROCESS_START unset, COVERAGE_FILE inherited\n"
             f"and overriding data_file, or app killed without SIGTERM)"
         )
-    data = CoverageData(basename=str(data_dir / ".coverage"))
-    combine_parallel_data(data, data_paths=[str(data_dir)], strict=True, keep=True)
-    data.read()
+    # Data files written by the app can be unreadable for the host user (mapped uid): then
+    # they are copied through hostfs into a scratch directory and combined there.
+    with tempfile.TemporaryDirectory() as scratch:
+        src_dir = data_dir
+        if not all(_host_can_open(p) for p in parts):
+            src_dir = Path(scratch)
+            for p in parts:
+                (src_dir / p.name).write_bytes(hostfs.read_bytes(p))
+        data = CoverageData(basename=str(src_dir / ".coverage"))
+        combine_parallel_data(data, data_paths=[str(src_dir)], strict=True, keep=True)
+        data.read()
+        return _contexts_to_coverage(data, root_prefix)
+
+
+def _host_can_open(path: Path) -> bool:
+    try:
+        with path.open("rb"):
+            return True
+    except PermissionError:
+        return False
+
+
+def _contexts_to_coverage(data: CoverageData, root_prefix: str) -> Coverage:
     prefix = root_prefix.rstrip("/") + "/" if root_prefix else ""
     result: Coverage = {}
     for filename in data.measured_files():
