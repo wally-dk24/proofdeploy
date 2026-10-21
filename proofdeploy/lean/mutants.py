@@ -447,7 +447,7 @@ def build_manifest(
 
 
 GATE_APP = "python-flask-sqlite"
-GATE_REVISION = "intermediate"
+GATE_REVISION = "fix"
 GATE_TARGET = "app.py"
 GATE_SEED = 20261020
 GATE_N = 20

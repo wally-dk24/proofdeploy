@@ -41,6 +41,33 @@ CLEAN = json.loads(
     (ROOT / "experiments/lean-poc/paperless-clean-units.json").read_text(encoding="utf-8")
 )
 
+BUG_UNIT = {
+    "unit_repo": "paperless-ngx/paperless-ngx",
+    "b_parent": "1" * 40,
+    "b": "2" * 40,
+    "fix_parent": "3" * 40,
+    "fix": "4" * 40,
+    "selection_record": "evidence/synthetic/selection.json",
+    "selection_record_sha256": "5" * 64,
+}
+
+
+def write_bug_unit(path: Path, **override: Any) -> Path:
+    data = {**BUG_UNIT, **override}
+    path.write_text(json.dumps({k: v for k, v in data.items() if v is not None}), encoding="utf-8")
+    return path
+
+
+@pytest.fixture(autouse=True)
+def bug_unit_file(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """A synthetic paperless-bug-unit.json (the real one is written by the blind re-walk)."""
+    path = write_bug_unit(tmp_path_factory.mktemp("bugunit") / "paperless-bug-unit.json")
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", path)
+    return path
+
+
 # --------------------------------------------------------------------------
 # The unit list
 # --------------------------------------------------------------------------
@@ -63,20 +90,17 @@ def test_unit_list_is_26_units_in_the_registered_order() -> None:
 def test_unit_definitions_follow_the_work_order() -> None:
     by = {u.id: u for u in gate.load_units()}
     assert (by["golden-bug"].base, by["golden-bug"].head) == ("base", "bug")
-    assert (by["golden-clean"].base, by["golden-clean"].head) == ("intermediate", "clean")
+    assert (by["golden-clean"].base, by["golden-clean"].head) == ("fix", "clean")
     for u in by.values():
         if u.group == "golden":
             assert (u.mode, u.intent) == ("sandbox", None)  # intent = the head commit's message
     mutants = [u for u in by.values() if u.kind == "mutant"]
     assert len(mutants) == 20
     for m, reg in zip(mutants, MUTANTS["mutants"], strict=True):
-        assert (m.mode, m.base, m.head) == ("host", "intermediate", reg["branch"])
+        assert (m.mode, m.base, m.head) == ("host", "fix", reg["branch"])
         assert m.intent == "no behaviour change intended" == MUTANTS["judge_intent"]
     bug = by["paperless-bug"]
-    assert (bug.base, bug.head) == (
-        "17dc482872cf62e12965f6207772c83d1deb651b",
-        "aa67fd3aefa6489984fc15a5c32c1ad2b16ac23a",
-    )
+    assert (bug.base, bug.head) == (BUG_UNIT["b_parent"], BUG_UNIT["b"])
     assert (bug.mode, bug.intent, bug.paperless) == ("sandbox", None, True)
     cleans = [u for u in by.values() if u.id.startswith("paperless-clean-")]
     for c, reg in zip(cleans, CLEAN["units"], strict=True):
@@ -86,8 +110,6 @@ def test_unit_definitions_follow_the_work_order() -> None:
             "clean",
             "sandbox",
         )
-    assert gate.PAPERLESS_FIX_PARENT == "14b6a41b88e75fb7d35aa84b33986870bfd1aa69"
-    assert gate.PAPERLESS_FIX == "d3710856992a91783783819217b43392aab73e00"
     assert gate.PAPERLESS_UNIT_REPO == "paperless-ngx/paperless-ngx"
     assert gate.PAPERLESS_OPENAPI == "/api/schema/"
     assert gate.PAPERLESS_OVERLAY == ["CELERY_TASK_ALWAYS_EAGER=True"]
@@ -103,14 +125,14 @@ def test_selection_by_group() -> None:
 
 def test_regenerated_mutants_equal_the_registered_file(tmp_path: Path) -> None:
     repo, shas = gate.materialize_golden_repo(tmp_path / "g")
-    assert set(shas) >= {"base", "bug", "intermediate", "clean"}
+    assert set(shas) >= {"base", "bug", "fix", "clean"}
     branches = gate._git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
     assert sorted(b for b in branches if b.startswith("mutant/")) == sorted(
         m["branch"] for m in MUTANTS["mutants"]
     )
-    # each mutant branch is one commit on intermediate
+    # each mutant branch is one commit on fix
     for m in MUTANTS["mutants"]:
-        assert gate._git(repo, "rev-parse", f"{m['branch']}~1") == shas["intermediate"]
+        assert gate._git(repo, "rev-parse", f"{m['branch']}~1") == shas["fix"]
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +278,97 @@ def test_criterion_3_is_reported_not_required() -> None:
     err = crit([row("paperless-bug", None, cause=None, error="LeanEnvironmentError")], "3")
     assert err["status"] == "FAIL" and err["error"] is True
     assert crit([], "3")["status"] == "NOT_RUN"
+
+
+def test_criterion_3_reads_a_provider_limit_as_not_a_real_verdict() -> None:
+    limit = crit([row("paperless-bug", INCONCLUSIVE, cause="provider_limit")], "3")
+    assert limit["status"] == "FAIL" and limit["real_verdict"] is False
+    assert limit["cause"] == "provider_limit"
+
+
+def test_golden_clean_runs_fix_to_clean_and_mutants_sit_on_fix() -> None:
+    by = {u.id: u for u in gate.select_units(gate.load_units("golden"), "golden")}
+    assert list(by) == ["golden-bug", "golden-clean"]
+    assert (by["golden-clean"].base, by["golden-clean"].head) == ("fix", "clean")
+    assert (by["golden-bug"].base, by["golden-bug"].head) == ("base", "bug")
+    assert MUTANTS["base_revision"] == "fix"
+    assert all(u.base == "fix" for u in gate.select_units(gate.load_units("mutants"), "mutants"))
+
+
+def test_golden_and_mutant_groups_need_no_bug_unit_file(
+    bug_unit_file: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", tmp_path / "absent.json")
+    assert len(gate.select_units(gate.load_units("golden"), "golden")) == 2
+    assert len(gate.select_units(gate.load_units("mutants"), "mutants")) == 20
+    for which in ("paperless", "all"):
+        with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+            gate.load_units(which)
+
+
+def test_absent_bug_unit_file_stops_run_gate_and_list_before_anything_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", tmp_path / "absent.json")
+    with mock.patch.object(lean_run, "lean_verify") as verify:
+        with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+            gate.run_gate(gate.GateConfig(out=tmp_path / "o", workdir=tmp_path / "w"))
+        verify.assert_not_called()
+    assert not (tmp_path / "o").exists()
+    assert gate.main(["--units", "all", "--list"]) == lean_run.EXIT_USAGE
+    assert "paperless bug unit not selected yet" in capsys.readouterr().err
+    assert gate.main(["--units", "golden", "--list"]) == 0
+    assert capsys.readouterr().out.split() == ["golden-bug", "golden-clean"]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"b_parent": "1" * 39},
+        {"b": "A" * 40},
+        {"fix_parent": "g" * 40},
+        {"fix": None},
+        {"selection_record_sha256": "5" * 40},
+        {"selection_record": ""},
+        {"unit_repo": "someone/else"},
+        {"extra": "x"},
+    ],
+)
+def test_invalid_bug_unit_file_is_a_gate_error(
+    override: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = write_bug_unit(tmp_path / "bad.json", **override)
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", path)
+    with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+        gate.load_units("paperless")
+    path.write_text("not json", encoding="utf-8")
+    with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+        gate.load_units("all")
+    assert len(gate.select_units(gate.load_units("golden"), "golden")) == 2
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"b": "a" * 41},
+        {"fix": "a" * 40 + "\n"},
+        {"b_parent": "a" * 40 + "\n"},
+        {"selection_record_sha256": "5" * 65},
+        {"selection_record_sha256": "5" * 64 + "\n"},
+    ],
+)
+def test_bug_unit_shas_must_match_exactly(
+    override: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = write_bug_unit(tmp_path / "long.json", **override)
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", path)
+    with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+        gate.load_paperless_bug_unit()
+
+
+def test_valid_bug_unit_file_is_loaded_not_constants() -> None:
+    assert gate.load_paperless_bug_unit() == BUG_UNIT
+    assert not hasattr(gate, "PAPERLESS_FIX") and not hasattr(gate, "PAPERLESS_BASE")
 
 
 def paperless_cleans(*verdicts: str | None) -> list[dict[str, Any]]:
@@ -469,7 +582,8 @@ def test_run_confirm_replays_each_fix_side_twice_and_closes_both(tmp_path: Path)
     calls: list[tuple[str, str]] = []
 
     def provision(rc: Any, contract_file: Any, work: Path, timings: Any) -> Any:
-        assert (rc.base_sha, rc.head_sha) == (gate.PAPERLESS_FIX_PARENT, gate.PAPERLESS_FIX)
+        assert (rc.base_sha, rc.head_sha) == (BUG_UNIT["fix_parent"], BUG_UNIT["fix"])
+        assert (rc.base, rc.head) == (BUG_UNIT["fix_parent"], BUG_UNIT["fix"])
         assert rc.unit_repo == gate.PAPERLESS_UNIT_REPO and contract_file is not None
         sides.extend([FakeSide("fixp"), FakeSide("fix")])
         return sides[0], sides[1], object()
@@ -493,6 +607,7 @@ def test_run_confirm_replays_each_fix_side_twice_and_closes_both(tmp_path: Path)
             cfg, rc, [_scenario()], None, [gate.Flagged(f"{SID}:1", "title", "B-value")]
         )
     assert out["confirmed"] is True and out["runs_each"] == 2
+    assert (out["fix_parent"], out["fix"]) == (BUG_UNIT["fix_parent"], BUG_UNIT["fix"])
     assert calls == [("fixp", "fixp"), ("fixp", "fixp2"), ("fix", "fix"), ("fix", "fix2")]
     assert all(s.closed for s in sides)
 

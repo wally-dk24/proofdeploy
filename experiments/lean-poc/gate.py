@@ -10,8 +10,8 @@ Runs the fixed gate units sequentially through the lean pipeline
 Units, in this order (26):
 
   a. golden python-flask-sqlite, SANDBOX: ``golden-bug`` (base -> bug) and
-     ``golden-clean`` (intermediate -> clean); intent = the head commit's message.
-  b. the 20 mutants of ``mutants.json`` on ``intermediate``, HOST mode (our own golden
+     ``golden-clean`` (fix -> clean); intent = the head commit's message.
+  b. the 20 mutants of ``mutants.json`` on ``fix``, HOST mode (our own golden
      code; each row says ``mode: host``); intent "no behaviour change intended".
   c. ``paperless-bug`` (B^..B), SANDBOX, contract store paperless-ngx/paperless-ngx, OpenAPI
      path /api/schema/, ``CELERY_TASK_ALWAYS_EAGER=True``; intent = B's commit message. When
@@ -38,6 +38,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -61,13 +62,11 @@ from proofdeploy.model_client import ModelRunner
 HERE = Path(__file__).resolve().parent
 MUTANTS_JSON = HERE / "mutants.json"
 CLEAN_UNITS_JSON = HERE / "paperless-clean-units.json"
+# Written by the blind re-walk (D267), not by this module: see load_paperless_bug_unit().
+PAPERLESS_BUG_UNIT_JSON = HERE / "paperless-bug-unit.json"
 
 # -- the paperless bug unit (WO-6 selection), fixed -----------------------------------------
 PAPERLESS_UNIT_REPO = "paperless-ngx/paperless-ngx"
-PAPERLESS_BASE = "17dc482872cf62e12965f6207772c83d1deb651b"  # B^
-PAPERLESS_BUG = "aa67fd3aefa6489984fc15a5c32c1ad2b16ac23a"  # B
-PAPERLESS_FIX_PARENT = "14b6a41b88e75fb7d35aa84b33986870bfd1aa69"  # fix^
-PAPERLESS_FIX = "d3710856992a91783783819217b43392aab73e00"  # fix
 PAPERLESS_OPENAPI = "/api/schema/"
 PAPERLESS_OVERLAY = ["CELERY_TASK_ALWAYS_EAGER=True"]
 
@@ -123,11 +122,17 @@ class Unit:
     paperless: bool = False
 
 
-def build_units(mutants: dict[str, Any], clean: dict[str, Any]) -> list[Unit]:
-    """The fixed unit list: 2 golden, one per mutant, the paperless bug, the paperless cleans."""
+def build_units(
+    mutants: dict[str, Any], clean: dict[str, Any], bug: dict[str, Any] | None = None
+) -> list[Unit]:
+    """The fixed unit list: 2 golden, one per mutant, the paperless bug, the paperless cleans.
+
+    ``bug`` is the validated paperless bug unit (``load_paperless_bug_unit``); without it the
+    ``paperless-bug`` unit is left out (the golden and mutant groups do not need it).
+    """
     units = [
         Unit("golden-bug", "bug", "golden", "sandbox", "base", "bug", None),
-        Unit("golden-clean", "clean", "golden", "sandbox", GATE_REVISION, "clean", None),
+        Unit("golden-clean", "clean", "golden", "sandbox", "fix", "clean", None),
     ]
     for m in mutants["mutants"]:
         units.append(
@@ -141,18 +146,19 @@ def build_units(mutants: dict[str, Any], clean: dict[str, Any]) -> list[Unit]:
                 str(mutants.get("judge_intent") or MUTANT_INTENT),
             )
         )
-    units.append(
-        Unit(
-            "paperless-bug",
-            "bug",
-            "paperless",
-            "sandbox",
-            PAPERLESS_BASE,
-            PAPERLESS_BUG,
-            None,
-            True,
+    if bug is not None:
+        units.append(
+            Unit(
+                "paperless-bug",
+                "bug",
+                "paperless",
+                "sandbox",
+                str(bug["b_parent"]),
+                str(bug["b"]),
+                None,
+                True,
+            )
         )
-    )
     for u in clean["units"]:
         units.append(
             Unit(
@@ -169,10 +175,68 @@ def build_units(mutants: dict[str, Any], clean: dict[str, Any]) -> list[Unit]:
     return units
 
 
-def load_units() -> list[Unit]:
+_BUG_UNIT_KEYS = frozenset(
+    {
+        "unit_repo",
+        "b_parent",
+        "b",
+        "fix_parent",
+        "fix",
+        "selection_record",
+        "selection_record_sha256",
+    }
+)
+_SHA1_RE = re.compile(r"[0-9a-f]{40}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def load_paperless_bug_unit(path: Path | None = None) -> dict[str, Any]:
+    """The paperless bug unit from its file (written by the blind re-walk), validated.
+
+    Raises ``GateError("paperless bug unit not selected yet: ...")`` when the file is absent or
+    invalid, so the gate stops before running anything.
+    """
+    path = PAPERLESS_BUG_UNIT_JSON if path is None else path
+
+    def bad(why: str) -> GateError:
+        return GateError(f"paperless bug unit not selected yet: {why}")
+
+    if not path.is_file():
+        raise bad(f"{path.name} is missing")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise bad(f"{path.name} is unreadable ({type(exc).__name__})") from exc
+    if not isinstance(data, dict):
+        raise bad(f"{path.name} is not a JSON object")
+    keys = set(data)
+    if keys != _BUG_UNIT_KEYS:
+        raise bad(
+            f"{path.name} keys differ (missing {sorted(_BUG_UNIT_KEYS - keys)}, "
+            f"extra {sorted(keys - _BUG_UNIT_KEYS)})"
+        )
+    for key in ("b_parent", "b", "fix_parent", "fix"):
+        v = data[key]
+        if not isinstance(v, str) or not _SHA1_RE.fullmatch(v):
+            raise bad(f"{key} is not a 40-character lowercase hex sha")
+    v = data["selection_record_sha256"]
+    if not isinstance(v, str) or not _SHA256_RE.fullmatch(v):
+        raise bad("selection_record_sha256 is not a 64-character lowercase hex sha256")
+    for key in ("unit_repo", "selection_record"):
+        if not isinstance(data[key], str) or not data[key].strip():
+            raise bad(f"{key} is not a non-empty string")
+    if data["unit_repo"] != PAPERLESS_UNIT_REPO:
+        raise bad(f"unit_repo is not {PAPERLESS_UNIT_REPO}")
+    return data
+
+
+def load_units(which: str = "all") -> list[Unit]:
+    """All units of the selected group (default: all). The paperless bug unit file is required
+    only when the paperless group is part of the selection."""
+    bug = load_paperless_bug_unit() if which in ("all", "paperless") else None
     mutants = json.loads(MUTANTS_JSON.read_text(encoding="utf-8"))
     clean = json.loads(CLEAN_UNITS_JSON.read_text(encoding="utf-8"))
-    return build_units(mutants, clean)
+    return build_units(mutants, clean, bug)
 
 
 def select_units(units: list[Unit], which: str) -> list[Unit]:
@@ -481,7 +545,7 @@ def compute_summary(
         real = (
             not b["error"]
             and b["verdict"] in (PASS, FAIL, INCONCLUSIVE)
-            and b["cause"] != "environment"
+            and b["cause"] not in ("environment", "provider_limit")
         )
         crit["3"] = _crit(
             "PASS" if real else "FAIL",
@@ -648,16 +712,17 @@ def run_confirm(
     """Re-run the flagged scenarios on fix^ and fix (two fresh runs each); NO judge, no model."""
     provision = cfg.provision or lean_run.provision_sandbox_sides
     replay = cfg.replay or pipeline.replay_run
+    bug = load_paperless_bug_unit()
     crc = lean_run.LeanRunConfig(
         repo=rc.repo,
-        base=PAPERLESS_FIX_PARENT,
-        head=PAPERLESS_FIX,
+        base=bug["fix_parent"],
+        head=bug["fix"],
         output_dir=rc.output_dir / "confirm",
         unit_repo=rc.unit_repo,
         django_overlay=rc.django_overlay,
         openapi_path=rc.openapi_path,
-        base_sha=pipeline.resolve_sha(rc.repo, PAPERLESS_FIX_PARENT),
-        head_sha=pipeline.resolve_sha(rc.repo, PAPERLESS_FIX),
+        base_sha=pipeline.resolve_sha(rc.repo, bug["fix_parent"]),
+        head_sha=pipeline.resolve_sha(rc.repo, bug["fix"]),
     )
     crc.output_dir.mkdir(parents=True, exist_ok=True)
     contract_file = lean_run._contract_file(crc)
@@ -674,7 +739,7 @@ def run_confirm(
                 with contextlib.suppress(Exception):
                     side.close()
     out = confirm_flagged(flagged, fp, fx)
-    out.update(fix_parent=PAPERLESS_FIX_PARENT, fix=PAPERLESS_FIX, runs_each=2)
+    out.update(fix_parent=bug["fix_parent"], fix=bug["fix"], runs_each=2)
     return out
 
 
@@ -786,7 +851,7 @@ def _write_summary(
 
 
 def run_gate(cfg: GateConfig) -> dict[str, Any]:
-    units = select_units(load_units(), cfg.which)
+    units = select_units(load_units(cfg.which), cfg.which)
     if cfg.only is not None:
         units = [u for u in units if u.id in cfg.only]
     cfg.out.mkdir(parents=True, exist_ok=True)
@@ -839,7 +904,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--list", action="store_true", help="print the selected unit ids and exit")
     args = ap.parse_args(argv)
     try:
-        units = select_units(load_units(), args.units)
+        units = select_units(load_units(args.units), args.units)
         if args.list:
             for u in units:
                 print(u.id)
