@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from proofdeploy.lean import coverage as lc
-from proofdeploy.lean.coverage import ChangedLines, Coverage
+from proofdeploy.lean.coverage import ChangedLines, Coverage, split_diff_lines
 from proofdeploy.lean.http import (
     TOKEN_VAR,
     AuthSpec,
@@ -99,7 +99,7 @@ def parse_diff_text(diff_text: str) -> DiffText:
     old_path: str | None = None
     new_path: str | None = None
     old_ln = new_ln = old_rem = new_rem = 0
-    for line in diff_text.splitlines():
+    for line in split_diff_lines(diff_text):
         if old_rem > 0 or new_rem > 0:
             tag = line[:1]
             path = new_path if new_path is not None else old_path

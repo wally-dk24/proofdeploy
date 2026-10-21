@@ -1,0 +1,87 @@
+# Lean round 3 (R5): the no-model rehearsal of the Stage 2 Phase 0 gate environment.
+#
+# For each selected unit, both sides: provision through the real sandbox drivers,
+# run the sign-in proof, start the app three times (each start restores the seed
+# database), send one authenticated request to the unit's proof path, stop. No
+# coverage loop, no judge, no model call.
+#
+# NOT a model-calling workflow: no `environment:` (so no approval gate), no
+# secrets, and it is deliberately outside the proofdeploy-model-calls group. The
+# model key is never available to it and the code path never reads it.
+#
+# Blindness: the driver logs ids and statuses only; paperless diffs, contents and
+# commit messages stay out of the log (error messages go to the artifact).
+name: lean-rehearse
+
+on:
+  workflow_dispatch:
+    inputs:
+      units:
+        description: "Which units to rehearse (all = golden and paperless)"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - golden
+          - paperless
+
+permissions:
+  contents: read
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Check out paperless-ngx (full history)
+        if: ${{ inputs.units == 'all' || inputs.units == 'paperless' }}
+        run: |
+          git clone --quiet https://github.com/paperless-ngx/paperless-ngx /tmp/paperless
+
+      - name: Capability probe (fail-closed gate)
+        run: |
+          python -c "
+          from proofdeploy.sandbox import assert_measurement_gate
+          assert_measurement_gate()
+          print('GATE PASSED')
+          "
+
+      - name: Run the rehearsal
+        env:
+          UNITS: ${{ inputs.units }}
+        run: |
+          mkdir -p /tmp/lean-rehearse-out /tmp/lean-rehearse-work
+          python experiments/lean-poc/gate.py \
+            --rehearse \
+            --units "$UNITS" \
+            --out /tmp/lean-rehearse-out \
+            --workdir /tmp/lean-rehearse-work \
+            --paperless-repo /tmp/paperless
+
+      - name: Upload rehearsal results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lean-rehearse-${{ github.run_id }}
+          path: /tmp/lean-rehearse-out/
+          retention-days: 30
