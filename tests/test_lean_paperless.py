@@ -32,6 +32,7 @@ from proofdeploy.lean.coverage import ChangedLines
 from proofdeploy.lean.generate import CoverResult, ScenarioRunner
 from proofdeploy.lean.http import (
     AuthSpec,
+    Exchange,
     HttpClient,
     Scenario,
     auth_from_contract,
@@ -366,6 +367,80 @@ def test_a_5xx_on_the_proof_path_after_a_good_sign_in_is_not_an_unauthenticated_
     finally:
         s.close()
     assert proof["ok"] and proof["outcome"] == "5xx_past_auth" and proof["proof_status"] == 500
+
+
+class _FakeRunner:
+    """Stands in for ScenarioRunner: returns a login exchange and a proof exchange as given."""
+
+    def __init__(self, login: int, proof: int, proof_auth_sent: bool) -> None:
+        self.rows = (login, proof, proof_auth_sent)
+
+    def __call__(self, scenario: Scenario) -> Any:
+        from proofdeploy.lean.generate import RunResult
+
+        login, proof, sent = self.rows
+        req = {"method": "GET", "url_path": "/api/profile/", "body": None}
+        exs = [
+            Exchange(
+                scenario.id,
+                0,
+                {"method": "POST", "url_path": "/api/token/", "body": None},
+                login,
+                {},
+                {},
+                0.0,
+            ),
+            Exchange(scenario.id, 1, req, proof, {}, {}, 0.0, auth_sent=sent),
+        ]
+        return RunResult(exchanges=exs, scenario=scenario)
+
+
+def _prove_with(server: FakeServer, login: int, proof: int, sent: bool) -> dict[str, Any]:
+    driver = FakeDriver("head", server.url, SIDE_ENV)
+    with mock.patch.object(
+        pipeline, "ScenarioRunner", lambda *a, **k: _FakeRunner(login, proof, sent)
+    ):
+        return prove_auth(driver, _login_auth(), "/api/profile/", side="head")
+
+
+def test_a_public_proof_path_answering_2xx_without_any_authorization_is_unproven(
+    server: FakeServer,
+) -> None:
+    """Login 2xx, no token captured, so the proof GET carries no header; a 200 proves nothing."""
+    proof = _prove_with(server, login=200, proof=200, sent=False)
+    assert proof["outcome"] == "unproven" and proof["ok"] is False
+    assert proof["proof_auth_sent"] is False and proof["proof_status"] == 200
+
+
+def test_a_5xx_on_the_proof_path_with_no_authorization_sent_is_unproven(
+    server: FakeServer,
+) -> None:
+    proof = _prove_with(server, login=200, proof=500, sent=False)
+    assert proof["outcome"] == "unproven" and proof["ok"] is False
+    assert proof["proof_auth_sent"] is False
+
+
+def test_a_login_that_yields_no_token_ends_the_unit_auth_unproven(
+    tmp_path: Path, server: FakeServer
+) -> None:
+    """End to end through run_pipeline: the proof endpoint answers 200 with no header sent."""
+    repo, base, head = _pipeline_repo(tmp_path)
+    cfg = _cfg(repo, base, head, unit_repo="paperless-ngx/paperless-ngx")
+    judge = NoModel()
+    with mock.patch.object(
+        pipeline, "ScenarioRunner", lambda *a, **k: _FakeRunner(200, 200, False)
+    ):
+        res = run_pipeline(
+            cfg,
+            _contract(PAPERLESS_AUTH),
+            FakeDriver("base", server.url, SIDE_ENV),
+            FakeDriver("head", server.url, SIDE_ENV),
+            runner=judge,
+        )
+    assert res.verdict.status == INCONCLUSIVE and res.verdict.cause == "auth_unproven"
+    assert res.verdict.details == {"side": "head", "login_status": 200, "proof_status": 200}
+    assert res.manifest["auth_proof"]["head"]["proof_auth_sent"] is False
+    assert judge.calls == 0
 
 
 def _pipeline_repo(tmp: Path) -> tuple[Path, str, str]:
