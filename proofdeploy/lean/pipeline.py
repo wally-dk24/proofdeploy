@@ -714,6 +714,11 @@ def unit_identity(cfg: LeanConfig, contract: Any) -> str | None:
 
 
 def auth_proof_path(cfg: LeanConfig, contract: Any) -> str:
+    """The authenticated GET the sign-in proof sends: the contract's own ``auth.proof_path``
+    first, else the in-code map for the unit (a unit with neither is a typed refusal)."""
+    declared = (getattr(contract, "auth", None) or {}).get("proof_path")
+    if declared:
+        return str(declared)
     ident = unit_identity(cfg, contract)
     path = AUTH_PROOF_PATHS.get(ident or "")
     if path is None:

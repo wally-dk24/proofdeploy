@@ -568,6 +568,12 @@ GOLDEN_STORE_STEMS: dict[str, str] = {
 
 GOLDEN_DIR = Path(__file__).resolve().parents[1] / "conformance" / "golden"
 
+# Round 5 (D267): contracts that exist for the lean path only. Their repo has no
+# registered unit in the readiness manifest (units are selected later, by the blind
+# walk), so the manifest<->store equality below cannot hold for them. Named, not a
+# wildcard: any other unmanifested store file still fails the coverage guard.
+LEAN_ONLY_STORE_STEMS = frozenset({"sissbruecker__linkding"})
+
 
 def test_manifest_and_contracts_cover_the_same_repos() -> None:
     manifest = rp.load_manifest(rp.DEFAULT_MANIFEST)
@@ -575,7 +581,8 @@ def test_manifest_and_contracts_cover_the_same_repos() -> None:
     files = {p.stem for p in rp.CONTRACTS_DIR.glob("*.yml")}
     golden_files = {s for s in files if s.startswith("golden__")}
     assert golden_files == set(GOLDEN_STORE_STEMS)
-    assert {rp.repo_slug(r) for r in repos} == files - golden_files
+    assert LEAN_ONLY_STORE_STEMS <= files
+    assert {rp.repo_slug(r) for r in repos} == files - golden_files - LEAN_ONLY_STORE_STEMS
 
 
 def test_every_contract_validates() -> None:
@@ -614,6 +621,10 @@ def test_contracts_carry_no_unapproved_credentials() -> None:
             assert data.get("auth", {}).get("mode") == "login"
         elif path.name == "paperless-ngx__paperless-ngx.yml":
             assert data.get("auth", {}).get("mode") == "login"
+        elif path.name == "sissbruecker__linkding.yml":
+            # Round 5 (D267): static_token, the sixth approved group. Only env NAMES
+            # (LD_SUPERUSER_NAME / LD_API_TOKEN); the token value is generated per run.
+            assert data.get("auth", {}).get("mode") == "static_token"
         elif path.name in golden_names:
             assert data.get("auth", {}).get("mode") == "login"
         else:
