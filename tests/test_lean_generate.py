@@ -1048,3 +1048,130 @@ def test_loop_stops_after_the_impacting_scenario_using_real_snapshots(
     ran = {e.scenario_id for e in res.exchanges}
     assert ran == {impacting.id} and not ran & {s.id for s in later}
     assert [s.id for s in res.impact_set] == [impacting.id]
+
+
+# --------------------------------------------------------------------------
+# WO-R4-G on the golden app: sign in once, aim, seed (registers R7, R2)
+# --------------------------------------------------------------------------
+
+
+def _line_diff(tree: Path, wanted: list[str]) -> str:
+    """A diff that changes exactly the lines of ``app.py`` containing each wanted text."""
+    lines = (tree / "app.py").read_text(encoding="utf-8").splitlines()
+    out = ["diff --git a/app.py b/app.py", "--- a/app.py", "+++ b/app.py"]
+    for text in wanted:
+        (n,) = [i + 1 for i, ln in enumerate(lines) if text in ln]
+        out += [f"@@ -{n},1 +{n},1 @@", f"-{lines[n - 1]}", f"+{lines[n - 1]}  # changed"]
+    return "\n".join(out) + "\n"
+
+
+def _golden_run(
+    golden: dict[str, Any],
+    tmp: Path,
+    diff_for: Any,
+    budget: int,
+    *,
+    schema: bool = False,
+) -> tuple[Any, Any, Any]:
+    tree, index, auth, _, _ = _bug_app_parts(golden, tmp)
+    if schema:
+        for op in index.operations:
+            if (op.method, op.path) == ("POST", "/notes"):
+                op.request_schema = {
+                    "type": "object",
+                    "required": ["title"],
+                    "properties": {
+                        "title": {"type": "string", "maxLength": 80},
+                        "color": {"type": "string", "maxLength": 12},
+                    },
+                }
+                op.request_content_type = "application/json"
+    diff = diff_for(tree)
+    changed = ChangedLines.from_diff(diff)
+    with hostrun.running_app(golden["py"], tree, tmp / "pdcov") as app:
+        runner = ScenarioRunner(
+            HttpClient(app.base_url), auth=auth, session=app.session, index=index
+        )
+        res = cover_change(
+            index, changed, runner, app.session, budget, diff_text=diff, auth=auth, side="new"
+        )
+        app.stop_and_collect()
+    return res, runner, index
+
+
+def test_golden_signs_in_once_for_the_whole_loop(
+    golden: dict[str, Any],
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp = _env(monkeypatch, tmp_path_factory)
+
+    def diff_for(tree: Path) -> str:
+        return _line_diff(tree, ['"done": row[', "if __name__"])
+
+    res, runner, _ = _golden_run(golden, tmp, diff_for, 40)
+    assert res.scenarios_run >= 10 and not res.covered  # the last line never runs in a request
+    sent = [
+        e
+        for e in res.exchanges
+        if e.request["url_path"] == "/login" and e.request["body"]["password"] == "seedpass"
+    ]
+    # one sign-in for the loop, one more for the scenario aimed at the login operation itself
+    assert res.logins == runner.logins == len(sent) and 1 <= res.logins <= 2
+    assert res.scenarios_run > 5 * res.logins and res.stats()["logins"] == res.logins
+    assert res.requests_used == len(res.exchanges)  # logins are in the count the budget sees
+    print(f"golden: {res.scenarios_run} scenarios, {res.logins} login(s)")
+
+
+def test_golden_aim_spends_the_remaining_budget_on_the_operation_reaching_the_change(
+    golden: dict[str, Any],
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp = _env(monkeypatch, tmp_path_factory)
+
+    def diff_for(tree: Path) -> str:
+        # the done line (every read), the 404 line (a read of a missing note), and a line
+        # no request reaches: the loop runs to the end of its budget
+        return _line_diff(tree, ['"done": row[', '"not found"', "if __name__"])
+
+    res, _, _ = _golden_run(golden, tmp, diff_for, 20)
+    top = res.aim[0]
+    assert top["operation"] == "GET /notes/{note_id}" and top["reached_a_changed_line"]
+    by_op = res.requests_by_operation
+    spent = by_op["GET /notes/{note_id}"]
+    first_pass = 3  # login + the seeded read of note 1, and the seeded read of note 2
+    assert spent - first_pass > top["budget_left"] / 2, (by_op, top)
+    assert all(v <= spent for v in by_op.values())
+    assert res.unexercised["app.py"]["added"] != []  # only the unreachable line is left
+    assert len(res.unexercised["app.py"]["added"]) == 1
+    print(f"golden aim: {by_op}, left at aim {top['budget_left']}")
+
+
+def test_golden_seeding_makes_records_with_and_without_optional_fields(
+    golden: dict[str, Any],
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp = _env(monkeypatch, tmp_path_factory)
+
+    def diff_for(tree: Path) -> str:
+        return _line_diff(tree, ['"done": row[', "if __name__"])
+
+    res, _, _ = _golden_run(golden, tmp, diff_for, 60, schema=True)
+    posts = [
+        e
+        for e in res.exchanges
+        if e.request["url_path"] == "/notes" and e.request["method"] == "POST"
+    ]
+    bodies = [e.request["body"] for e in posts]
+    assert {"title": bodies[0]["title"]} == bodies[0]  # first record: optional fields omitted
+    assert any(set(b) == {"title", "color"} for b in bodies)  # one with every field set
+    assert len(next(b for b in bodies if "color" in b)["title"]) == 80  # at maxLength
+    assert all(e.status == 200 for e in posts[:3])
+    # each record was read back, in the same scenario, before any probing
+    reads = [e for e in res.exchanges if e.request["url_path"].startswith("/notes/")]
+    assert [e.status for e in reads[:3]] == [200, 200, 200]
+    assert res.seed_scenarios_run >= 3 and res.seed_requests <= 60 // 3
+    first_ids = [e.scenario_id for e in res.exchanges[: res.seed_requests]]
+    assert {s.id for s in res.impact_set[: res.seed_scenarios_run]} >= set(first_ids)

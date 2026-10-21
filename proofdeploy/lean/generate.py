@@ -18,7 +18,11 @@ diff text) this module
 2. executes them (:class:`ScenarioRunner`), repairing a 400/422 once from the
    error body (DRF, ``detail``/``error`` strings, ``loc`` lists);
 3. loops until the changed lines are covered or the request budget ends
-   (:func:`cover_change`), reading coverage after every scenario.
+   (:func:`cover_change`), reading coverage after every scenario: a seeding
+   stage first (records in varied states built through the API), one request
+   per operation, then the remaining budget aimed at the operations whose
+   requests executed the most changed lines. The runner signs in once and
+   reuses the token until a 401/403.
 
 The only model hook is ``value_hint``: an optional callable that is given an
 operation and the uncovered diff text and may return extra body fields. It is
@@ -31,7 +35,7 @@ import json
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
 
 from proofdeploy.lean import coverage as lc
 from proofdeploy.lean.coverage import ChangedLines, Coverage, split_diff_lines
@@ -648,6 +652,143 @@ def _default_param(name: str, schema: dict[str, Any], int_value: int | None) -> 
     return f"pd-{name}"
 
 
+# --------------------------------------------------------------------------
+# Seed values and edge values (WO-R4-G items 2 and 3)
+# --------------------------------------------------------------------------
+
+SEED_DEFAULT_STRING = 255
+SEED_MAX_STRING = 10000
+LONG_STRING = 5000
+INT_MAX = 2**31 - 1
+UNICODE_TEXT = "ünï字é"
+AIM_INPUT_CAP = 48
+AIM_PATH_CAP = 12
+_REF_NAME_RE = re.compile(r"^(?P<stem>.+?)(?:_ids?|_pks?|Ids?|Pks?)$")
+
+
+def _tag_number(tag: str) -> int:
+    digits = re.sub(r"\D", "", tag)
+    return int(digits) if digits else 0
+
+
+def _numeric(v: Any) -> TypeGuard[int | float]:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _seed_value(schema: Any, name: str, tag: str, mode: str, _depth: int = 0) -> Any:
+    """A value for one field of a seed record.
+
+    ``mode``: ``min`` (plain), ``full`` (strings at maxLength or 255 with unicode,
+    numbers at their maximum) or ``alt`` (booleans false, numbers at the low end,
+    last enum member). ``tag`` keeps unique-looking fields apart between records.
+    """
+    if not isinstance(schema, dict) or _depth > 3:
+        return f"pd-{name}-{tag}"
+    if "x-cycle" in schema:
+        return None
+    if "const" in schema:
+        return schema["const"]
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[-1] if mode == "alt" else enum[0]
+    for key in ("oneOf", "anyOf"):
+        non_null = [
+            m for m in schema.get(key) or [] if isinstance(m, dict) and m.get("type") != "null"
+        ]
+        if non_null:
+            return _seed_value(non_null[0], name, tag, mode, _depth + 1)
+    t = _schema_type(schema)
+    if t == "string":
+        fmt = str(schema.get("format") or "")
+        if fmt in ("email", "idn-email"):
+            return f"pd-{tag}@example.com"
+        if fmt in ("uri", "url", "uri-reference"):
+            return f"https://example.com/pd-{tag}"
+        if fmt == "uuid":
+            return f"00000000-0000-4000-8000-{_tag_number(tag):012d}"
+        if fmt in _FORMAT_VALUES:
+            return _FORMAT_VALUES[fmt]
+        lo, hi = schema.get("minLength"), schema.get("maxLength")
+        if mode == "full":
+            n = hi if isinstance(hi, int) and 0 < hi <= SEED_MAX_STRING else SEED_DEFAULT_STRING
+            if isinstance(lo, int) and n < lo:
+                n = lo
+            text = UNICODE_TEXT + f"-{name}-{tag}-" + UNICODE_TEXT * (n // len(UNICODE_TEXT) + 1)
+            return text[:n]
+        s = f"pd-{name}-{tag}"
+        if isinstance(lo, int) and len(s) < lo:
+            s += "x" * (lo - len(s))
+        if isinstance(hi, int) and hi > 0 and len(s) > hi:
+            s = s[:hi]
+        return s
+    if t in ("integer", "number"):
+        v = value_for(schema, name)
+        top = schema.get("maximum")
+        if mode == "full" and _numeric(top) and abs(top) <= INT_MAX:
+            return int(top)
+        if (
+            mode == "alt"
+            and schema.get("minimum") is None
+            and schema.get("exclusiveMinimum") is None
+        ):
+            return 0
+        return v
+    if t == "boolean":
+        return mode != "alt"
+    if t == "array":
+        return [_seed_value(schema.get("items"), name, tag, mode, _depth + 1)]
+    if t == "object":
+        return value_for(schema, name)
+    if t == "null":
+        return None
+    return f"pd-{name}-{tag}"
+
+
+def _changed_value(schema: dict[str, Any], name: str, current: Any) -> Any:
+    """A different, valid-looking value for one field (the update step)."""
+    t = _schema_type(schema)
+    if t == "boolean":
+        return not current if isinstance(current, bool) else False
+    if t in ("integer", "number"):
+        top = schema.get("maximum")
+        if isinstance(current, int) and not isinstance(current, bool):
+            return current - 1 if _numeric(top) and current >= top else current + 1
+        return 2
+    s = f"pd-{name}-upd"
+    hi = schema.get("maxLength")
+    if isinstance(hi, int) and hi > 0:
+        s = s[:hi]
+    if s == current:
+        s = s[:-1] + ("z" if not s.endswith("z") else "y")
+    return s
+
+
+def _edge_values(schema: dict[str, Any], optional: bool) -> list[tuple[str, Any]]:
+    """Boundary inputs for one field: numbers 0/-1/max, empty/long/unicode strings, null."""
+    out: list[tuple[str, Any]] = []
+    t = _schema_type(schema)
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        out.extend((f"enum={v}", v) for v in enum[1:])
+    elif t in ("integer", "number"):
+        top = schema.get("maximum")
+        out.extend([("0", 0), ("-1", -1), ("max", int(top) if _numeric(top) else INT_MAX)])
+    elif t == "string":
+        out.extend([("empty", ""), ("long", "a" * LONG_STRING), ("unicode", UNICODE_TEXT)])
+    elif t == "array":
+        out.append(("empty-list", []))
+    if optional:
+        out.append(("null", None))
+    seen: set[str] = set()
+    uniq: list[tuple[str, Any]] = []
+    for label, v in out:
+        key = json.dumps(v, sort_keys=True, default=str)
+        if key not in seen:
+            seen.add(key)
+            uniq.append((label, v))
+    return uniq
+
+
 class ScenarioGenerator:
     """Builds scenarios for operations of one index. See the module docstring."""
 
@@ -664,6 +805,8 @@ class ScenarioGenerator:
         self.max_variants = max_variants_per_op
         self.mined = mine_constants(diff_text) if diff_text else []
         self.seed_ids = seed_ids(index.seed_facts)
+        self._coll_cache: dict[str, Operation] | None = None
+        self._chain_n = 0
         self._by_path: dict[str, list[Operation]] = {}
         for op in index.operations:
             self._by_path.setdefault(_norm(op.path), []).append(op)
@@ -918,6 +1061,450 @@ class ScenarioGenerator:
                 out.append(sc)
         return out
 
+    # -- seeding stage (varied states through the API) ---------------------------
+
+    def _wrap(self, target: Operation, steps: Sequence[Step]) -> Scenario:
+        head = [self.auth.login] if self.auth is not None else []
+        return Scenario(steps=[*head, *steps], target_operation=op_key(target))
+
+    def _is_create_op(self, op: Operation) -> bool:
+        schema = op.request_schema
+        return (
+            op.method == "POST"
+            and not self._is_login_op(op)
+            and isinstance(schema, dict)
+            and _schema_type(schema) == "object"
+            and bool(schema.get("properties"))
+            and "json" in (op.request_content_type or "application/json")
+        )
+
+    def _collections(self) -> dict[str, Operation]:
+        """Singular and plural names of top-level collections -> their create operation."""
+        if self._coll_cache is None:
+            out: dict[str, Operation] = {}
+            for op in sorted(self.index.operations, key=lambda o: (o.path, o.method)):
+                if not self._is_create_op(op) or _param_schemas(op):
+                    continue
+                segs = [s for s in op.path.strip("/").split("/") if s]
+                if segs:
+                    for name in _singulars(segs[-1]):
+                        out.setdefault(name, op)
+            self._coll_cache = out
+        return self._coll_cache
+
+    def _ref_fields(self, op: Operation) -> dict[str, tuple[Operation, bool]]:
+        """Writable fields that name another record (``<thing>_id``, ``<thing>Ids``), with
+        the create operation of that collection and whether the field is a list."""
+        out: dict[str, tuple[Operation, bool]] = {}
+        colls = self._collections()
+        for k, sch in _writable_props(op.request_schema or {}).items():
+            m = _REF_NAME_RE.match(k)
+            t = _schema_type(sch)
+            if not m or t not in ("integer", "number", "string", "array"):
+                continue
+            target = colls.get(_flat(m.group("stem")))
+            if target is not None:
+                out[k] = (target, t == "array")
+        return out
+
+    def _item_ops(self, create_op: Operation) -> dict[str, tuple[Operation, str]]:
+        """Operations on ``<collection>/{param}`` by method, with the name of that param."""
+        coll = _norm(create_op.path)
+        out: dict[str, tuple[Operation, str]] = {}
+        for o in self.index.operations:
+            segs = o.path.strip("/").split("/")
+            if len(segs) < 2 or not (segs[-1].startswith("{") and segs[-1].endswith("}")):
+                continue
+            if _norm("/".join(segs[:-1])) == coll:
+                out.setdefault(o.method, (o, segs[-1][1:-1]))
+        return out
+
+    def _seed_body(
+        self, op: Operation, mode: str, tag: str, refs: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """``min``: required fields only; ``full``: every writable field; ``alt``: required
+        plus every second optional field, with the low-end values."""
+        schema = op.request_schema or {}
+        props = _writable_props(schema)
+        required = set(_required_names(schema))
+        names = sorted(props)
+        optional = [k for k in names if k not in required]
+        if mode == "min":
+            use = [k for k in names if k in required]
+        elif mode == "full":
+            use = names
+        else:
+            use = [k for k in names if k in required or optional.index(k) % 2 == 0]
+        body: dict[str, Any] = {}
+        for k in use:
+            body[k] = refs[k] if refs and k in refs else _seed_value(props[k], k, tag, mode)
+        for k in sorted(required):
+            if k not in (schema.get("properties") or {}):
+                body[k] = f"pd-{k}-{tag}"
+        return body
+
+    def _referent_steps(
+        self, target: Operation, var: str, kind: str, tag: str
+    ) -> tuple[list[Step], Any]:
+        """Steps that make a record of ``target`` (and delete it for ``kind="deleted"``);
+        the value to put in the referring field."""
+        authed = self.auth is not None
+        create = Step(
+            "POST",
+            target.path,
+            query=request_variants(target)[0][2],
+            body=self._seed_body(target, "min", tag),
+            content_type=target.request_content_type or "application/json",
+            auth=authed,
+            capture={var: self._capture_path(target, "id")},
+        )
+        if kind != "deleted":
+            return [create], "${" + var + "}"
+        info = self._item_ops(target).get("DELETE")
+        if info is None:
+            return [], MISSING_ID  # nothing can delete it: an id that never existed
+        op_d, pname = info
+        gone = Step("DELETE", op_d.path, path_params={pname: "${" + var + "}"}, auth=authed)
+        return [create, gone], "${" + var + "}"
+
+    def _parent_context(self, op: Operation) -> tuple[list[Step], dict[str, Any]]:
+        """Producer steps for the path params of ``op`` and their values."""
+        chain = self._chain(op)
+        if chain:
+            return chain
+        fb = self.seed_ids[0] if self.seed_ids else None
+        return [], {n: _default_param(n, s, fb) for n, s in _param_schemas(op).items()}
+
+    def _create_context(
+        self, op: Operation, mode: str, tag: str
+    ) -> tuple[list[Step], dict[str, Any], Step]:
+        """Steps up to and including the create of one record (capturing ``rec``), the path
+        params of the collection, and the create step."""
+        authed = self.auth is not None
+        pre, ids = self._parent_context(op)
+        steps = list(pre)
+        refs: dict[str, Any] = {}
+        required = set(_required_names(op.request_schema or {}))
+        kind = "deleted" if mode == "alt" else "existing"
+        for k, (target, is_list) in self._ref_fields(op).items():
+            if mode == "min" and k not in required:
+                continue
+            var = "ref_" + re.sub(r"\W", "_", k)
+            more, value = self._referent_steps(target, var, kind, f"{tag}{mode[0]}")
+            steps.extend(more)
+            refs[k] = [value] if is_list else value
+        create = Step(
+            "POST",
+            op.path,
+            path_params=dict(ids),
+            query=request_variants(op)[0][2],
+            body=self._seed_body(op, mode, tag, refs),
+            content_type=op.request_content_type or "application/json",
+            auth=authed,
+            capture={"rec": self._capture_path(op, "id")},
+        )
+        steps.append(create)
+        return steps, ids, create
+
+    def _item_step(
+        self, create_op: Operation, method: str, ids: Mapping[str, Any], body: Any = None
+    ) -> Step | None:
+        info = self._item_ops(create_op).get(method)
+        if info is None:
+            return None
+        o, pname = info
+        others = set(_param_schemas(o)) - {pname}
+        if not others <= set(ids):
+            return None
+        _, own_body, query = request_variants(o)[0]
+        sent = body if body is not None else own_body
+        return Step(
+            method,
+            o.path,
+            path_params={**{n: ids[n] for n in others}, pname: "${rec}"},
+            query=query,
+            body=sent,
+            content_type=(o.request_content_type or "application/json")
+            if sent is not None
+            else None,
+            auth=self.auth is not None,
+        )
+
+    def _list_step(self, create_op: Operation, ids: Mapping[str, Any]) -> Step | None:
+        for o in self._by_path.get(_norm(create_op.path), []):
+            if o.method == "GET" and set(_param_schemas(o)) <= set(ids):
+                return Step(
+                    "GET",
+                    o.path,
+                    path_params={n: ids[n] for n in _param_schemas(o)},
+                    query=request_variants(o)[0][2],
+                    auth=self.auth is not None,
+                )
+        return None
+
+    def _update_step(
+        self, create_op: Operation, ids: Mapping[str, Any], created: Any
+    ) -> Step | None:
+        info = self._item_ops(create_op).get("PATCH") or self._item_ops(create_op).get("PUT")
+        if info is None:
+            return None
+        o, _ = info
+        schema = (
+            o.request_schema if isinstance(o.request_schema, dict) else create_op.request_schema
+        )
+        props = _writable_props(schema or {})
+        skip = set(self._ref_fields(create_op))
+        field_name = next(
+            (
+                k
+                for k in sorted(props)
+                if k not in skip
+                and not props[k].get("enum")
+                and _schema_type(props[k]) in ("string", "integer", "boolean")
+            ),
+            None,
+        )
+        if field_name is None:
+            return None
+        base = dict(created) if isinstance(created, dict) else {}
+        new = _changed_value(props[field_name], field_name, base.get(field_name))
+        body = {field_name: new} if o.method == "PATCH" else {**base, field_name: new}
+        return self._item_step(create_op, o.method, ids, body)
+
+    def seed_scenarios(self, ops: Sequence[Operation] | None = None) -> list[Scenario]:
+        """The seeding stage: records in varied states, built through the API.
+
+        For every create operation (POST with a JSON object body schema) three
+        records, each followed by a read of it: ``min`` (optional fields
+        omitted), ``full`` (every optional field set, strings at maxLength or
+        255 with unicode, references to an existing record) and ``alt`` (every
+        second optional field, low-end values, references to a DELETED record).
+        Then, per collection, a list, an update of one field and a delete (with
+        a read after it). Each scenario is self-contained (it creates what it
+        refers to), so it replays identically on every side and run. A shape
+        the app rejects ends that scenario as data. Stage order: all creates,
+        all lists, all updates, all deletes.
+        """
+        creates = [
+            o for o in (ops if ops is not None else self.index.operations) if self._is_create_op(o)
+        ]
+        n = 0
+        stage_create: list[Scenario] = []
+        stage_list: list[Scenario] = []
+        stage_update: list[Scenario] = []
+        stage_delete: list[Scenario] = []
+        for op in creates:
+            for mode in ("min", "full", "alt"):
+                n += 1
+                steps, ids, _ = self._create_context(op, mode, f"s{n}")
+                read = self._item_step(op, "GET", ids)
+                stage_create.append(self._wrap(op, [*steps, *([read] if read else [])]))
+        for op in creates:
+            pre, pids = self._parent_context(op)
+            lst = self._list_step(op, pids)
+            if lst is not None:
+                stage_list.append(self._wrap(op, [*pre, lst]))
+            n += 1
+            steps, ids, created = self._create_context(op, "full", f"s{n}")
+            upd = self._update_step(op, ids, created.body)
+            if upd is not None:
+                read = self._item_step(op, "GET", ids)
+                stage_update.append(self._wrap(op, [*steps, upd, *([read] if read else [])]))
+            n += 1
+            steps, ids, _ = self._create_context(op, "min", f"s{n}")
+            gone = self._item_step(op, "DELETE", ids)
+            if gone is not None:
+                after = self._item_step(op, "GET", ids)
+                stage_delete.append(self._wrap(op, [*steps, gone, *([after] if after else [])]))
+        seen: set[str] = set()
+        out: list[Scenario] = []
+        for sc in [*stage_create, *stage_list, *stage_update, *stage_delete]:
+            if sc.id not in seen:
+                seen.add(sc.id)
+                out.append(sc)
+        return out
+
+    # -- aimed variants (item 2) -------------------------------------------------
+
+    def input_variants(self, op: Operation) -> list[tuple[str, Any, dict[str, Any]]]:
+        """Boundary inputs for the fields of one operation as ``(label, body, query)``.
+
+        Numbers 0/-1/max, empty, very long and unicode strings, null for optional
+        fields, other enum members. Fields named like a mined constant come first.
+        After the single-field variants: every field at the same edge at once, then
+        pairs of fields.
+        """
+        _, base_body, base_query = request_variants(op)[0]
+        schema = op.request_schema if isinstance(op.request_schema, dict) else {}
+        required = set(_required_names(schema))
+        q_all = _query_params(op)
+        q_required = {
+            str(p["name"]) for p in op.params if p.get("in") == "query" and p.get("required")
+        }
+        fields: list[tuple[str, str, dict[str, Any], bool]] = []
+        if isinstance(base_body, dict):
+            fields += [
+                ("body", k, sch, k not in required) for k, sch in _writable_props(schema).items()
+            ]
+        fields += [("query", k, sch, k not in q_required) for k, sch in q_all.items()]
+
+        def matched(item: tuple[str, str, dict[str, Any], bool]) -> bool:
+            return any(_field_matches(item[1], c) for c in self.mined)
+
+        fields = [f for f in fields if matched(f)] + [f for f in fields if not matched(f)]
+        singles: list[tuple[str, str, str, Any]] = []  # (where, field, label, value)
+        for where, k, sch, optional in fields:
+            singles.extend((where, k, label, v) for label, v in _edge_values(sch, optional))
+
+        def variant(
+            picked: Sequence[tuple[str, str, str, Any]],
+        ) -> tuple[str, Any, dict[str, Any]]:
+            body = dict(base_body) if isinstance(base_body, dict) else base_body
+            query = dict(base_query)
+            for where, k, _, v in picked:
+                if where == "body" and isinstance(body, dict):
+                    body[k] = v
+                elif where == "query":
+                    query[k] = v
+            label = "+".join(f"{k}={lbl}" for _, k, lbl, _ in picked)
+            return f"edge:{label}", body, query
+
+        out = [variant([one]) for one in singles[:AIM_INPUT_CAP]]
+        # every field at the same edge at once, then pairs of different fields
+        for label in dict.fromkeys(lbl for _, _, lbl, _ in singles):
+            same = [one for one in singles if one[2] == label]
+            if len({k for _, k, _, _ in same}) > 1:
+                out.append(variant(same))
+        pairs = 0
+        for a in range(len(singles)):
+            for b in range(a + 1, len(singles)):
+                if singles[a][1] != singles[b][1] and pairs < AIM_INPUT_CAP:
+                    out.append(variant([singles[a], singles[b]]))
+                    pairs += 1
+        return out
+
+    def _is_producer_op(self, op: Operation) -> bool:
+        """A POST that makes a record: with or without a body schema (no schema sends ``{}``)."""
+        return op.method == "POST" and not self._is_login_op(op)
+
+    def _collection_create_of(self, op: Operation) -> Operation | None:
+        if self._is_producer_op(op) and not _param_schemas(op) or self._is_create_op(op):
+            return op
+        segs = op.path.strip("/").split("/")
+        if len(segs) > 1 and segs[-1].startswith("{") and segs[-1].endswith("}"):
+            where = _norm("/".join(segs[:-1]))
+        elif op.method == "GET":
+            where = _norm(op.path)
+        else:
+            return None
+        return next((c for c in self._by_path.get(where, []) if self._is_producer_op(c)), None)
+
+    def path_variants(self, op: Operation) -> list[tuple[str, dict[str, Any]]]:
+        """Boundary values for the path params of ``op`` (0, -1, max, empty, long, unicode)."""
+        params = _param_schemas(op)
+        fb = self.seed_ids[0] if self.seed_ids else None
+        base = {n: _default_param(n, s, fb) for n, s in params.items()}
+        out: list[tuple[str, dict[str, Any]]] = []
+        for name, sch in params.items():
+            for label, v in _edge_values(sch or {"type": "integer"}, False):
+                out.append((f"path:{name}={label}", {**base, name: v}))
+        return out[:AIM_PATH_CAP]
+
+    def chain_scenarios(self, op: Operation) -> list[Scenario]:
+        """Create -> read/list/update/delete sequences on one record, ending on ``op``'s kind."""
+        coll = self._collection_create_of(op)
+        if coll is None:
+            return []
+        self._chain_n += 1
+        out: list[Scenario] = []
+        info = self._item_ops(coll)
+        is_item = any(o is op for o, _ in info.values())
+
+        def build(
+            mode: str, wanted: Callable[[Mapping[str, Any], Step], list[Step | None]]
+        ) -> None:
+            self._chain_n += 1
+            steps, ids, created = self._create_context(coll, mode, f"c{self._chain_n}")
+            tail = [s for s in wanted(ids, created) if s is not None]
+            if tail:
+                out.append(
+                    Scenario(
+                        steps=[*self._wrap(op, steps).steps, *tail], target_operation=op_key(op)
+                    )
+                )
+
+        if op is coll:
+            build(
+                "full",
+                lambda ids, c: [
+                    self._item_step(coll, "GET", ids),
+                    self._list_step(coll, ids),
+                    self._update_step(coll, ids, c.body),
+                    self._item_step(coll, "DELETE", ids),
+                    self._item_step(coll, "GET", ids),
+                ],
+            )
+            build(
+                "min",
+                lambda ids, c: [
+                    self._update_step(coll, ids, c.body),
+                    self._item_step(coll, "GET", ids),
+                ],
+            )
+        elif is_item:
+            own = lambda ids: self._item_step(coll, op.method, ids)  # noqa: E731
+            if op.method == "GET":
+                build("full", lambda ids, c: [self._update_step(coll, ids, c.body), own(ids)])
+                build("min", lambda ids, c: [self._item_step(coll, "DELETE", ids), own(ids)])
+            else:
+                build("full", lambda ids, c: [own(ids), self._item_step(coll, "GET", ids)])
+                build("min", lambda ids, c: [own(ids), own(ids)])
+        else:
+            build(
+                "min",
+                lambda ids, c: [
+                    Step(**{**c.to_dict(), "capture": {}}),
+                    self._list_step(coll, ids),
+                ],
+            )
+        return out
+
+    def aimed_scenarios(self, op: Operation) -> list[Scenario]:
+        """Everything worth sending at ``op`` after its first request, most varied first:
+        the generated variants, boundary inputs and record chains, interleaved."""
+        chain = self._chain(op)
+        pre, ids = chain if chain else ([], None)
+        params = _param_schemas(op)
+        if ids is None:
+            fb = self.seed_ids[0] if self.seed_ids else None
+            ids = {n: _default_param(n, s, fb) for n, s in params.items()}
+        authed = self.auth is not None
+        groups = [
+            self.for_operation(op)[1:],
+            [
+                self._make(op, pre, self._target(op, b, q, ids, authed=authed), login=True)
+                for _, b, q in self.input_variants(op)
+            ],
+            [
+                self._make(
+                    op,
+                    [],
+                    self._target(op, *request_variants(op)[0][1:], pids, authed=authed),
+                    login=True,
+                )
+                for _, pids in self.path_variants(op)
+            ],
+            self.chain_scenarios(op),
+        ]
+        seen: set[str] = set()
+        out: list[Scenario] = []
+        for i in range(max(len(g) for g in groups)):
+            for g in groups:
+                if i < len(g) and g[i].id not in seen:
+                    seen.add(g[i].id)
+                    out.append(g[i])
+        return out
+
 
 def generate_scenarios(
     index: AppIndex,
@@ -938,6 +1525,7 @@ def generate_scenarios(
 # --------------------------------------------------------------------------
 
 _REPAIR_STATUSES = (400, 422)
+_AUTH_REJECTED = (401, 403)
 _MSG_KEYS = ("detail", "error", "message", "msg")
 _NOT_FIELDS = {"detail", "error", "errors", "message", "msg", "non_field_errors", "status", "code"}
 _MSG_STOP = {
@@ -1116,6 +1704,13 @@ class ScenarioRunner:
     (``repair=True``) and retried in the same coverage context; both exchanges
     are kept, the second with ``attempt=1``. A step that must capture a value
     and cannot ends the scenario (``aborted``).
+
+    Sign in once: the contract's login step runs the first time a scenario
+    needs it; its token is cached and every later scenario skips its own copy
+    of the login step (the step stays in the scenario, no request is sent) until
+    an authenticated request is answered 401/403, which drops the token so the
+    next scenario signs in again. ``logins`` counts the login requests sent.
+    A scenario whose target IS the login operation always sends its login.
     """
 
     def __init__(
@@ -1135,9 +1730,23 @@ class ScenarioRunner:
         self.env: dict[str, str] = dict(env or {})
         self._secrets = sorted({v for v in self.env.values() if v}, key=len, reverse=True)
         self.scheme = auth.scheme if auth else "Bearer"
+        self._auth = auth
+        self._token: Any = None
+        self.logins = 0
         self.session = session
         self.repair = repair
         self._ops = {op_key(o): o for o in (index.operations if index else [])}
+
+    def _reuses_login(self, step: Step, scenario: Scenario) -> bool:
+        """True when ``step`` is the contract login and a cached token makes it unnecessary."""
+        a = self._auth
+        if a is None or self._token is None or step != a.login:
+            return False
+        return scenario.target_operation != f"{a.login.method} {a.login.path}"
+
+    def planned_requests(self, scenario: Scenario) -> int:
+        """Requests the scenario needs right now (its steps minus a login that is cached)."""
+        return sum(1 for st in scenario.steps if not self._reuses_login(st, scenario))
 
     def _schema_for(self, step: Step) -> dict[str, Any] | None:
         op = self._ops.get(f"{step.method} {step.path}")
@@ -1204,15 +1813,23 @@ class ScenarioRunner:
 
     def __call__(self, scenario: Scenario) -> RunResult:
         variables: dict[str, Any] = {}
+        if self._token is not None:
+            variables[TOKEN_VAR] = self._token
         exchanges: list[Exchange] = []
         effective: list[Step] = []
         aborted = False
         for idx, step in enumerate(scenario.steps):
+            if self._reuses_login(step, scenario):
+                effective.append(step)
+                continue
+            is_login = self._auth is not None and step == self._auth.login
             if self.session is not None:
                 self.session.set_context(scenario.request_id(idx))
             current = step
             ex, live, kept = self._send(scenario.id, idx, current, variables, 0)
             exchanges.append(ex)
+            if is_login:
+                self.logins += 1
             if self.repair and ex.status in _REPAIR_STATUSES:
                 fixed = repair_step(current, live, self._schema_for(current))
                 if fixed is not None:
@@ -1221,6 +1838,8 @@ class ScenarioRunner:
                     if ex2.status not in _REPAIR_STATUSES:
                         current, ex, live, kept = fixed, ex2, live2, kept2
             effective.append(current)
+            if ex.auth_sent and ex.status in _AUTH_REJECTED:
+                self._token = None  # the next scenario signs in again
             if current.capture:
                 got: dict[str, Any] = {}
                 if 200 <= ex.status < 300:
@@ -1232,6 +1851,8 @@ class ScenarioRunner:
                     aborted = True
                     break
                 variables.update(got)
+                if is_login:
+                    self._token = variables.get(TOKEN_VAR)
             elif ex.status == 0:
                 aborted = True
                 break
@@ -1277,6 +1898,14 @@ class CoverResult:
     budget_requests: int
     exchanges: list[Exchange] = field(default_factory=list)
     aborted_scenarios: list[str] = field(default_factory=list)
+    logins: int = 0  # login requests sent in this loop (they count in requests_used)
+    seed_scenarios_run: int = 0
+    seed_requests: int = 0
+    # Requests spent per target operation (all scenarios, seeding included).
+    requests_by_operation: dict[str, int] = field(default_factory=dict)
+    # The aiming pass: operations ranked by changed lines their requests executed,
+    # each with its request quota and the scenarios queued for it.
+    aim: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def budget_exhausted(self) -> bool:
@@ -1292,6 +1921,11 @@ class CoverResult:
             "unexercised": self.unexercised,
             "budget_requests": self.budget_requests,
             "budget_exhausted": self.budget_exhausted,
+            "logins": self.logins,
+            "seed_scenarios_run": self.seed_scenarios_run,
+            "seed_requests": self.seed_requests,
+            "requests_by_operation": dict(sorted(self.requests_by_operation.items())),
+            "aim": self.aim,
         }
 
 
@@ -1319,17 +1953,31 @@ def cover_change(
     side: str = "new",
     root_prefix: str = "",
     max_variants_per_op: int = 24,
+    seed: bool = True,
 ) -> CoverResult:
     """Run scenarios until the changed lines are covered or the budget ends.
 
     ``side="new"`` (default) is for a run on the NEW tree and tries to cover
     the ADDED lines; ``"old"`` is for the OLD tree and the REMOVED lines.
-    Scenarios come from :func:`generate_scenarios` unless given; they run in
-    that order (operations that mention identifiers of the change first).
-    After each scenario coverage is read with ``coverage_session.snapshot()``.
-    When every generated scenario has run and lines are still uncovered,
-    ``value_hint(operation, uncovered_snippet)`` (if given) may return extra
-    body fields for the top-ranked operations; those scenarios run next.
+    Unless ``scenarios`` is given, the stages are:
+
+    1. SEEDING (``seed=True``): :meth:`ScenarioGenerator.seed_scenarios`, at most
+       a third of the budget. The seeding scenarios that ran always join the
+       impact set (first), because the 2x2 replays must rebuild their state.
+    2. FIRST PASS: the seeded reads and one scenario per operation, in ranked order.
+    3. AIM: operations are ranked by the number of changed executable lines their
+       requests executed (per-request coverage contexts). The remaining budget
+       goes to the top ones, half to the first, half of the rest to the second,
+       and so on: boundary inputs, mined constants and create/read/list/update/
+       delete chains on one record (:meth:`ScenarioGenerator.aimed_scenarios`).
+       With no operation reaching a changed line, the three best by identifier
+       match get the same shares.
+    4. REST: every other variant, in ranked order, then ``value_hint`` (if given)
+       for the top-ranked operations.
+
+    After each scenario coverage is read with ``coverage_session.snapshot()``
+    and the loop stops as soon as every changed line is covered. Nothing is
+    random: the same inputs give the same scenarios in the same order.
 
     Requests are counted per exchange (login, producers, retries). A scenario
     is skipped when it cannot start inside the remaining budget; a repair
@@ -1341,7 +1989,27 @@ def cover_change(
         index, diff_text=diff_text, auth=auth, max_variants_per_op=max_variants_per_op
     )
     ranked = rank_operations(index.operations, diff_text)
-    queue: list[Scenario] = list(scenarios) if scenarios is not None else gen.generate(ranked)
+    auto = scenarios is None
+    planned = getattr(run_scenario, "planned_requests", None)
+
+    def need_of(sc: Scenario) -> int:
+        return int(planned(sc)) if callable(planned) else len(sc.steps)
+
+    seeds = gen.seed_scenarios(ranked) if auto and seed else []
+    seed_set = {s.id for s in seeds}
+    seed_cap = budget_requests // 3
+    per_op: dict[str, list[Scenario]] = {}
+    phase = 3
+    if scenarios is not None:
+        queue: list[Scenario] = list(scenarios)
+    else:
+        per_op = {op_key(o): gen.for_operation(o) for o in ranked}
+        firsts = [per_op[op_key(o)][0] for o in ranked if per_op[op_key(o)]]
+        queue = []
+        for sc in [*seeds, *gen.seeded_reads(ranked), *firsts]:
+            if sc.id not in {q.id for q in queue}:
+                queue.append(sc)
+        phase = 1
 
     def read() -> tuple[Coverage, dict[str, dict[str, list[int]]]]:
         cov = coverage_session.snapshot(root_prefix=root_prefix)
@@ -1353,13 +2021,74 @@ def cover_change(
     effective: dict[str, Scenario] = {}
     exchanges: list[Exchange] = []
     aborted: list[str] = []
+    by_op: dict[str, int] = {}
+    step_ops: dict[str, str] = {}  # request id -> "METHOD path template" of the step
+    aim_info: list[dict[str, Any]] = []
+    seeds_ran: list[Scenario] = []
+    seed_used = 0
+    logins_before = int(getattr(run_scenario, "logins", 0))
     cov: Coverage = {}
     unex: dict[str, dict[str, list[int]]] = lc.unexercised(view, {}, {})
     to_cover: int | None = 0 if not unex else None
     hint_done = False
+
+    def aim_batch() -> list[Scenario]:
+        old, new = ({}, cov) if side == "new" else (cov, {})
+        reached: dict[str, set[str]] = {}
+        for rid, h in lc.impact(view, old, new).items():
+            key = step_ops.get(rid)
+            if key:
+                reached.setdefault(key, set()).update(h["hits_added"], h["hits_removed"])
+        pos = {op_key(o): n for n, o in enumerate(ranked)}
+        cands = [o for o in ranked if reached.get(op_key(o))]
+        cands.sort(key=lambda o: (-len(reached[op_key(o)]), pos[op_key(o)]))
+        reaching = bool(cands)
+        if not cands:
+            cands = ranked[:3]
+        left = max(budget_requests - used, 0)
+        queued = {q.id for q in queue}
+        batch: list[Scenario] = []
+        for k, op in enumerate(cands):
+            quota = left >> (k + 1) if k < len(cands) - 1 else left >> (len(cands) - 1)
+            spent = count = 0
+            for sc in gen.aimed_scenarios(op):
+                if sc.id in queued:
+                    continue
+                need = need_of(sc)
+                if spent + need > quota:
+                    continue
+                batch.append(sc)
+                queued.add(sc.id)
+                spent += need
+                count += 1
+            aim_info.append(
+                {
+                    "operation": op_key(op),
+                    "changed_lines_reached": len(reached.get(op_key(op), ())),
+                    "reached_a_changed_line": reaching,
+                    "request_quota": quota,
+                    "scenarios_queued": count,
+                    "budget_left": left,
+                }
+            )
+        return batch
+
     i = 0
     while unex:
         if i >= len(queue):
+            if phase == 1:
+                phase = 2
+                queue.extend(aim_batch())
+                continue
+            if phase == 2:
+                phase = 3
+                queued_now = {q.id for q in queue}
+                for o in ranked:
+                    for sc in per_op.get(op_key(o), [])[1:]:
+                        if sc.id not in queued_now:
+                            queued_now.add(sc.id)
+                            queue.append(sc)
+                continue
             if value_hint is None or hint_done:
                 break
             hint_done = True
@@ -1371,10 +2100,20 @@ def cover_change(
             continue
         sc = queue[i]
         i += 1
-        if used + len(sc.steps) > budget_requests:
+        need = need_of(sc)
+        if used + need > budget_requests:
+            continue
+        if sc.id in seed_set and seed_used + need > seed_cap:
             continue
         result = run_scenario(sc)
-        used += len(result.exchanges)
+        n_ex = len(result.exchanges)
+        used += n_ex
+        by_op[sc.target_operation] = by_op.get(sc.target_operation, 0) + n_ex
+        for idx, st in enumerate(sc.steps):
+            step_ops[sc.request_id(idx)] = f"{st.method} {st.path}"
+        if sc.id in seed_set:
+            seed_used += n_ex
+            seeds_ran.append(result.scenario)
         exchanges.extend(result.exchanges)
         ran.append(sc)
         effective[sc.id] = result.scenario
@@ -1386,7 +2125,7 @@ def cover_change(
         if used >= budget_requests:
             break
     hits: dict[str, dict[str, list[str]]] = {}
-    impact_set: list[Scenario] = []
+    impact_set: list[Scenario] = list(seeds_ran)
     if ran:
         old, new = ({}, cov) if side == "new" else (cov, {})
         per_request = lc.impact(view, old, new)
@@ -1398,7 +2137,8 @@ def cover_change(
                         agg[k] = sorted(set(agg[k]) | set(h[k]))
             if agg["hits_added"] or agg["hits_removed"]:
                 hits[sc.id] = agg
-                impact_set.append(effective[sc.id])
+                if sc.id not in seed_set:
+                    impact_set.append(effective[sc.id])
     return CoverResult(
         impact_set=impact_set,
         hits=hits,
@@ -1410,4 +2150,9 @@ def cover_change(
         budget_requests=budget_requests,
         exchanges=exchanges,
         aborted_scenarios=aborted,
+        logins=int(getattr(run_scenario, "logins", 0)) - logins_before,
+        seed_scenarios_run=len(seeds_ran),
+        seed_requests=seed_used,
+        requests_by_operation=by_op,
+        aim=aim_info,
     )
