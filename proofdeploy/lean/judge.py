@@ -832,8 +832,8 @@ def _contradicted_by_data(g: Group, answer: dict[str, Any], ctx: JudgeContext) -
 
     * a fact counts (for a difference on a record, only the clauses of the fact
       about that record, see ``_fact_parts``) when it names the field
-      (``_name_regex``) and contains the value the field had before (or the answer's ``expected_value``) that
-      ``_has_value`` finds, while it does not contain ``after``;
+      (``_name_regex``) and contains the value the field had before (or the
+      answer's ``expected_value``) that ``_has_value`` finds, while it does not contain ``after``;
     * a shown exchange counts when its value for the field differs from ``after``.
 
     A ``removed_field`` is exempt: the data necessarily shows the field that the
