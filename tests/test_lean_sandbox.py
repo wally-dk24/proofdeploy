@@ -127,3 +127,47 @@ def test_golden_bug_lean_verify_fails_in_the_sandbox_with_a_judged_regression(
     for f in out.glob("*.json"):
         assert "pdcanary-" not in f.read_text(encoding="utf-8"), f.name
     print("timings (s):", json.dumps(m["timings_seconds"], sort_keys=True))
+
+
+def test_restore_sqlite_into_a_container_owned_directory_and_restart(tmp_path: Path) -> None:
+    """R4: a database directory owned by the userns-mapped uid (as after provisioning).
+
+    ``podman unshare chown -R 1:1`` is the sandbox's own ownership transfer. The host user then
+    cannot create the restore temp file there; ``restore_sqlite`` must still put the snapshot in
+    place, twice (the second is a restart after the app changed the database and left a WAL).
+    Synthetic bytes only.
+    """
+    import os
+    import subprocess
+    from unittest import mock
+
+    from proofdeploy.lean import hostfs
+    from proofdeploy.lean.run import restore_sqlite
+    from proofdeploy.sandbox import PODMAN
+
+    snap = tmp_path / "seed.sqlite"
+    snap.write_bytes(b"SEEDED-DB-BYTES")
+    data = tmp_path / "data"
+    data.mkdir()
+    db = data / "db.sqlite3"
+    db.write_bytes(b"first")
+    data.chmod(0o755)
+    subprocess.run([*PODMAN, "unshare", "chown", "-R", "1:1", str(data)], check=True, timeout=120)
+    try:
+        real_run = hostfs._run
+        with mock.patch.object(hostfs, "_run", wraps=real_run) as spy:
+            restore_sqlite(snap, db)
+            assert db.read_bytes() == b"SEEDED-DB-BYTES"
+            # the app changes the database and leaves sidecar files (as the mapped uid)
+            script = f"echo changed > {db}; echo wal > {db}-wal; echo shm > {db}-shm"
+            subprocess.run([*PODMAN, "unshare", "sh", "-c", script], check=True, timeout=120)
+            restore_sqlite(snap, db)
+            assert db.read_bytes() == b"SEEDED-DB-BYTES"
+            assert not (data / "db.sqlite3-wal").exists() and not (data / "db.sqlite3-shm").exists()
+            assert not (data / "db.sqlite3.pd-restore").exists()
+        if os.geteuid() != 0:  # root bypasses directory permissions: no fallback to prove
+            assert spy.call_count >= 1, "the plain host operations must have been denied"
+            assert all(c.args[0][len(PODMAN)] == "unshare" for c in spy.call_args_list)
+    finally:
+        hostfs.remove_tree(data)
+    assert not data.exists()

@@ -54,7 +54,7 @@ from typing import Any
 from unittest import mock
 
 from proofdeploy.lean import coverage as lc
-from proofdeploy.lean import hostrun
+from proofdeploy.lean import hostfs, hostrun
 from proofdeploy.lean.coverage import CoverageSession, PdCov
 from proofdeploy.lean.index import FLASK_DUMP_SNIPPET
 from proofdeploy.lean.pipeline import (
@@ -161,23 +161,23 @@ def snapshot_sqlite(src: Path, dest: Path) -> None:
             with contextlib.closing(sqlite3.connect(str(dest))) as d:
                 s.backup(d)
     except sqlite3.Error:
-        shutil.copyfile(src, dest)
+        # ``src`` can sit in a container-owned directory: read it through hostfs
+        dest.write_bytes(hostfs.read_bytes(src))
 
 
 def restore_sqlite(snapshot: Path, target: Path) -> None:
     """Put ``snapshot`` at ``target`` atomically, dropping stale sidecar files.
 
-    A rename inside the directory works whoever owns ``target`` (in the
-    sandbox the previous database file belongs to the userns-mapped uid),
-    so the new file is made world-writable for the app user.
+    ``target`` and its directory belong to the userns-mapped uid in the sandbox, so
+    every step goes through :mod:`hostfs` (plain first, ``podman unshare`` on
+    ``PermissionError``); the new file is made world-writable for the app user.
     """
     tmp = target.with_name(target.name + ".pd-restore")
-    shutil.copyfile(snapshot, tmp)
-    os.chmod(tmp, 0o666)
-    os.replace(tmp, target)
+    hostfs.copy_into(snapshot, tmp)
+    hostfs.chmod(tmp, 0o666)
+    hostfs.replace(tmp, target)
     for suffix in ("-wal", "-shm", "-journal"):
-        with contextlib.suppress(OSError):
-            target.with_name(target.name + suffix).unlink()
+        hostfs.remove_tree(target.with_name(target.name + suffix))
 
 
 def db_file_of(app_dir: Path, contract: RepoContract) -> Path:
@@ -463,7 +463,7 @@ class SandboxHook:
         shutil.copyfile(Path(lc.__file__).with_name("pdcov_startup.py"), tool / "pdcov_startup.py")
         dest = tool / "lib" / "coverage"
         if dest.exists():
-            shutil.rmtree(dest)
+            hostfs.remove_tree(dest)
         import coverage
 
         shutil.copytree(

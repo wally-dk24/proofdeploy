@@ -31,13 +31,18 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 
 MODEL_CONCURRENCY_GROUP = "proofdeploy-model-calls"
 
+# ``gate.py --rehearse`` (lean-rehearse.yml, round 3 R5) never calls the model: the rehearsal
+# code path has no judge and never reads the key (tests/test_lean_env.py asserts both). A
+# workflow that names the key still counts, whatever it runs.
 _MODEL_CLI = re.compile(
-    r"proofdeploy(?:\.cli)?\s+(?:measure|verify|lean-verify)\b|experiments/lean-poc/gate\.py"
+    r"proofdeploy(?:\.cli)?\s+(?:measure|verify|lean-verify)\b"
+    r"|experiments/lean-poc/gate\.py(?![^\n]*--rehearse\b)"
 )
 
 
 def _can_call_model(text: str) -> bool:
-    return "GROQ_API_KEY" in text or bool(_MODEL_CLI.search(text))
+    joined = re.sub(r"\\\n\s*", " ", text)  # a backslash-continued command is one command
+    return "GROQ_API_KEY" in text or bool(_MODEL_CLI.search(joined))
 
 
 def _violations(workflows_dir: Path) -> list[str]:
@@ -87,6 +92,37 @@ def test_the_known_model_workflows_are_detected():
         if _can_call_model(path.read_text(encoding="utf-8"))
     }
     assert {"verify.yml", "measure.yml", "lean-poc.yml"} <= detected
+
+
+_REHEARSE_STEP = """name: fake
+on: workflow_dispatch
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          python experiments/lean-poc/gate.py \\
+            --rehearse \\
+            --out /tmp/o
+"""
+
+
+def test_a_no_key_rehearsal_invocation_is_not_a_model_workflow(tmp_path):
+    _write_workflow(tmp_path, "rehearse.yml", _REHEARSE_STEP)
+    assert _violations(tmp_path) == []
+
+
+def test_a_rehearsal_workflow_that_names_the_key_is_still_a_model_workflow(tmp_path):
+    body = _REHEARSE_STEP.replace(
+        "--out /tmp/o", "--out /tmp/o\n        env:\n          GROQ_API_KEY: x"
+    )
+    _write_workflow(tmp_path, "rehearse.yml", body)
+    assert len(_violations(tmp_path)) == 1
+
+
+def test_the_gate_without_rehearse_is_still_a_model_workflow(tmp_path):
+    _write_workflow(tmp_path, "gate.yml", _REHEARSE_STEP.replace("--rehearse", "--units all"))
+    assert len(_violations(tmp_path)) == 1
 
 
 def _write_workflow(dir_: Path, name: str, body: str) -> None:

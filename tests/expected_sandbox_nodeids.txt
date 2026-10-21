@@ -55,6 +55,7 @@ tests/test_container_spike.py::test_build_caps_allow_chown_but_not_net_admin
 tests/test_container_spike.py::test_build_network_blocks_host_loopback
 tests/test_forced_compile.py::test_forced_compile_variant_ready_on_node24
 tests/test_lean_sandbox.py::test_golden_bug_lean_verify_fails_in_the_sandbox_with_a_judged_regression
+tests/test_lean_sandbox.py::test_restore_sqlite_into_a_container_owned_directory_and_restart
 tests/test_node26_corepack.py::test_pnpm_golden_variant_provisions_on_node26
 tests/test_node_headers.py::test_pinned_node_image_ships_its_headers[24.21.0-24]
 tests/test_node_headers.py::test_pinned_node_image_ships_its_headers[26.11.1-26]
