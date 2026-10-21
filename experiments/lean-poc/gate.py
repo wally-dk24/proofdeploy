@@ -39,7 +39,6 @@ import contextlib
 import hashlib
 import json
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -49,7 +48,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from proofdeploy.lean import pipeline
+from proofdeploy.lean import hostfs, pipeline
 from proofdeploy.lean import run as lean_run
 from proofdeploy.lean.compare import MISSING, RunData, flatten
 from proofdeploy.lean.http import AuthSpec
@@ -667,7 +666,7 @@ def materialize_golden_repo(dest: Path) -> tuple[Path, dict[str, str]]:
         for b in _git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
         if not b.startswith("mutant/")
     )
-    for line in _git(repo, "log", "--format=%H%x09%s", branch).splitlines():
+    for line in _git(repo, "log", "--format=%H%x09%s", branch).split("\n"):
         sha, _, subject = line.partition("\t")
         if subject in by_msg:
             shas[by_msg[subject]] = sha
@@ -677,13 +676,17 @@ def materialize_golden_repo(dest: Path) -> tuple[Path, dict[str, str]]:
 
 
 def _rmtree(path: Path) -> None:
-    """Remove a tree this driver created; rootless-podman-owned files need ``podman unshare``."""
+    """Remove a tree this driver created (best effort).
+
+    Rootless-podman-owned files need ``podman unshare``: ``hostfs.remove_tree`` does that.
+    A failure is logged by path only and never turns a unit's row into an error.
+    """
     if not path.exists():
         return
-    shutil.rmtree(path, ignore_errors=True)
-    if path.exists():
-        subprocess.run(["podman", "unshare", "rm", "-rf", str(path)], check=False, timeout=600)
-        shutil.rmtree(path, ignore_errors=True)
+    try:
+        hostfs.remove_tree(path)
+    except OSError as exc:
+        print(f"gate: cleanup of {path} failed ({type(exc).__name__})", file=sys.stderr, flush=True)
 
 
 @contextlib.contextmanager
@@ -895,6 +898,221 @@ def run_gate(cfg: GateConfig) -> dict[str, Any]:
     return summary
 
 
+# --------------------------------------------------------------------------
+# No-model rehearsal (issue-register R5)
+# --------------------------------------------------------------------------
+
+REHEARSE_GROUPS = ("all", "golden", "paperless")
+REHEARSE_STARTS = 3  # the first start plus two restarts, each on a restored seed database
+REHEARSAL_FILE = "rehearsal.jsonl"
+
+
+def rehearsal_units(which: str) -> list[Unit]:
+    """The sandbox units of the selection (golden, paperless); never the host-mode mutants."""
+    if which not in REHEARSE_GROUPS:
+        raise GateError(f"units must be one of {REHEARSE_GROUPS} for a rehearsal, got {which!r}")
+    return [u for u in select_units(load_units(which), which) if u.group != "mutants"]
+
+
+def _side_row(unit: Unit, label: str, sha: str) -> dict[str, Any]:
+    return {
+        "unit": unit.id,
+        "side": label,
+        "sha": sha,
+        "measured_result": False,
+        "provision": None,
+        "auth_proof": None,
+        "starts": [],
+        "request": None,
+        "provision_seconds": None,
+        "duration_seconds": None,
+        "ok": False,
+        "error": None,
+    }
+
+
+def _status_of(exc: BaseException) -> str:
+    """A class name and, for the lean error types, the typed cause (never the message)."""
+    cause = getattr(exc, "cause", None) or getattr(exc, "code", None)
+    return f"{type(exc).__name__}: {cause}" if cause else type(exc).__name__
+
+
+def rehearse_side(
+    driver: Any, contract: Any, rc: lean_run.LeanRunConfig, unit: Unit, row: dict[str, Any]
+) -> None:
+    """Three starts of one provisioned side, the sign-in proof and one authenticated request.
+
+    Start 1 is the sign-in proof's own fresh instance; start 2 only has to come up; start 3 gets
+    the authenticated request. Every ``driver.start`` restores the seed database, so starts 2 and
+    3 are the two restarts. No coverage, no scenarios, no judge, no model: the key is never read.
+    """
+    t0 = time.perf_counter()
+    label = str(row["side"])
+    lean_cfg = pipeline.LeanConfig(
+        repo=rc.repo, base=rc.base_sha, head=rc.head_sha, unit_repo=rc.unit_repo
+    )
+    auth = pipeline.auth_from_contract(contract)
+    if auth is not None:
+        path = pipeline.auth_proof_path(lean_cfg, contract)
+    else:
+        path = str(getattr(contract, "readiness", None) or "/health")
+
+    def record_start(n: int, status: str) -> None:
+        row["starts"].append({"n": n, "status": status})
+
+    # start 1: the sign-in proof (it starts, signs in, sends one authenticated GET, stops)
+    try:
+        if auth is not None:
+            proof = pipeline.prove_auth(driver, auth, path, side=label)
+            row["auth_proof"] = {
+                "outcome": proof["outcome"],
+                "login_status": proof["login_status"],
+                "proof_status": proof["proof_status"],
+            }
+            record_start(1, "ok")
+        else:
+            row["auth_proof"] = {"outcome": "no_auth_declared"}
+            app = driver.start(measured=False)
+            app.stop()
+            record_start(1, "ok")
+    except Exception as exc:
+        record_start(1, f"error: {_status_of(exc)}")
+    # start 2: must come up on a restored database
+    try:
+        app = driver.start(measured=False)
+        app.stop()
+        record_start(2, "ok")
+    except Exception as exc:
+        record_start(2, f"error: {_status_of(exc)}")
+    # start 3: one authenticated request to the proof path, then stop
+    try:
+        app = driver.start(measured=False)
+        try:
+            runner = pipeline.ScenarioRunner(
+                pipeline.HttpClient(app.base_url),
+                auth=auth,
+                session=None,
+                repair=False,
+                env=pipeline.side_bootstrap_env(driver),
+            )
+            steps = [auth.login] if auth is not None else []
+            steps.append(pipeline.Step("GET", path, auth=auth is not None))
+            res = runner(pipeline.Scenario(steps, f"GET {path}"))
+        finally:
+            app.stop()
+        last = res.exchanges[-1] if res.exchanges else None
+        row["request"] = {"path": path, "status": last.status if last else None}
+        record_start(3, "ok")
+    except Exception as exc:
+        record_start(3, f"error: {_status_of(exc)}")
+    row["duration_seconds"] = round(time.perf_counter() - t0, 1)
+    proof_ok = auth is None or (row["auth_proof"] or {}).get("outcome") == "2xx"
+    status = (row["request"] or {}).get("status")
+    request_ok = isinstance(status, int) and 200 <= status < (300 if auth is not None else 400)
+    row["ok"] = (
+        row["provision"] == "ok"
+        and proof_ok
+        and request_ok
+        and [s["status"] for s in row["starts"]] == ["ok"] * REHEARSE_STARTS
+    )
+    if not row["ok"] and row["error"] is None:
+        row["error"] = "side check failed"
+
+
+def rehearse_unit(cfg: GateConfig, unit: Unit, repos: _Repos) -> list[dict[str, Any]]:
+    """Both sides of one unit: provision (real sandbox drivers), then :func:`rehearse_side`."""
+    out_dir = cfg.out / "units" / unit.id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rc = _unit_rc(cfg, unit, repos, out_dir, "sandbox")
+    rows = {label: _side_row(unit, label, "") for label in ("base", "head")}
+    provision = cfg.provision or lean_run.provision_sandbox_sides
+    sides: tuple[Any, Any] | None = None
+    t0 = time.perf_counter()
+    try:
+        rc.base_sha = pipeline.resolve_sha(rc.repo, rc.base)
+        rc.head_sha = pipeline.resolve_sha(rc.repo, rc.head)
+        rows["base"]["sha"], rows["head"]["sha"] = rc.base_sha, rc.head_sha
+        contract_file = lean_run._contract_file(rc)
+        base, head, contract = provision(rc, contract_file, out_dir / "work", Timings())
+        sides = (base, head)
+    except Exception as exc:
+        # the message (it can carry log tails) goes to the artifact only
+        (out_dir / "rehearse-console.log").write_text(
+            f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+        )
+        for row in rows.values():
+            row["provision"] = "failed"
+            row["error"] = _status_of(exc)
+    provision_seconds = round(time.perf_counter() - t0, 1)
+    try:
+        if sides is not None:
+            for label, driver in zip(("base", "head"), sides, strict=True):
+                row = rows[label]
+                row["provision"] = "ok"
+                rehearse_side(driver, contract, rc, unit, row)
+    finally:
+        for driver in sides or ():
+            with contextlib.suppress(Exception):
+                driver.close()
+        if not cfg.keep_work:
+            _rmtree(out_dir / "work")
+    for row in rows.values():
+        row["provision_seconds"] = provision_seconds
+    return [rows["base"], rows["head"]]
+
+
+def rehearsal_log_line(row: dict[str, Any]) -> str:
+    """Ids and statuses only (paperless blindness)."""
+    starts = ",".join(str(s["status"]).split(":")[0] for s in row["starts"])
+    proof = (row["auth_proof"] or {}).get("outcome")
+    req = (row["request"] or {}).get("status")
+    return (
+        f"[rehearse {row['unit']} {row['side']}] ok={row['ok']} provision={row['provision']} "
+        f"auth={proof} starts=[{starts}] request={req} t={row['duration_seconds']}s"
+    )
+
+
+def run_rehearsal(cfg: GateConfig) -> list[dict[str, Any]]:
+    """The no-model rehearsal of the selected units; rows go to ``<out>/rehearsal.jsonl``."""
+    units = rehearsal_units(cfg.which)
+    if cfg.only is not None:
+        units = [u for u in units if u.id in cfg.only]
+    cfg.out.mkdir(parents=True, exist_ok=True)
+    cfg.workdir.mkdir(parents=True, exist_ok=True)
+    results = cfg.out / REHEARSAL_FILE
+    results.write_text("", encoding="utf-8")
+    repos = _Repos()
+    prep_error: str | None = None
+    if any(u.group == "golden" for u in units):
+        try:
+            repos.golden, repos.golden_shas = materialize_golden_repo(cfg.workdir / "golden-repo")
+        except Exception as exc:
+            prep_error = f"golden preparation failed: {type(exc).__name__}"
+    rows: list[dict[str, Any]] = []
+    for unit in units:
+        if unit.paperless and cfg.paperless_repo is None:
+            unit_rows = [_side_row(unit, label, "") for label in ("base", "head")]
+            for r in unit_rows:
+                r["error"] = "paperless repo not given (--paperless-repo)"
+        elif not unit.paperless and prep_error:
+            unit_rows = [_side_row(unit, label, "") for label in ("base", "head")]
+            for r in unit_rows:
+                r["error"] = prep_error
+        else:
+            try:
+                unit_rows = rehearse_unit(cfg, unit, repos)
+            except Exception as exc:
+                unit_rows = [_side_row(unit, label, "") for label in ("base", "head")]
+                for r in unit_rows:
+                    r["error"] = _status_of(exc)
+        for r in unit_rows:
+            rows.append(r)
+            with results.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(r, sort_keys=True, default=str) + "\n")
+            print(rehearsal_log_line(r), flush=True)
+    return rows
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Lean P6b gate driver (Stage 2 Phase 0).")
     ap.add_argument("--units", choices=GROUPS, default="all")
@@ -902,9 +1120,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workdir", type=Path, help="scratch dir (golden repo, host venv)")
     ap.add_argument("--paperless-repo", type=Path, help="a full clone of paperless-ngx")
     ap.add_argument("--list", action="store_true", help="print the selected unit ids and exit")
+    ap.add_argument(
+        "--rehearse",
+        action="store_true",
+        help="no-model rehearsal: provision, sign in, three starts and one request per side",
+    )
     args = ap.parse_args(argv)
     try:
-        units = select_units(load_units(args.units), args.units)
+        if args.rehearse:
+            units = rehearsal_units(args.units)
+        else:
+            units = select_units(load_units(args.units), args.units)
         if args.list:
             for u in units:
                 print(u.id)
@@ -912,6 +1138,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.out is None or args.workdir is None:
             print("gate: --out and --workdir are required", file=sys.stderr)
             return lean_run.EXIT_USAGE
+        if args.rehearse:
+            rows = run_rehearsal(
+                GateConfig(
+                    out=args.out,
+                    workdir=args.workdir,
+                    which=args.units,
+                    paperless_repo=args.paperless_repo,
+                )
+            )
+            return 0 if rows and all(r["ok"] for r in rows) else 1
         run_gate(
             GateConfig(
                 out=args.out,
