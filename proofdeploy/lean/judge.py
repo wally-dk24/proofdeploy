@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -48,6 +50,12 @@ For "correct" and "regression", quote verbatim the sentence you rely on, copied 
 Answer with only a JSON array, one object per difference:
 [{"group": n, "verdict": "correct|regression|unclear", "expected_value": <json or null>, "evidence": {"source": "intent|facts|schema", "quote": "..."}, "question": "<only when unclear>"}]
 """  # noqa: E501
+
+DEFAULT_MIN_CALL_INTERVAL = 13.0
+DEFAULT_429_RETRIES = 3
+BACKOFF_429_SECONDS = (20.0, 40.0, 60.0)
+ENV_MIN_CALL_INTERVAL = "PROOFDEPLOY_MIN_CALL_INTERVAL"
+ENV_429_RETRIES = "PROOFDEPLOY_429_RETRIES"
 
 _MAX_SHOWN_IDS = 5
 _MAX_SHOWN_VALUE = 400
@@ -350,6 +358,8 @@ def plan_calls(
     """
     plans: list[CallPlan] = []
     too_big: dict[int, str] = {}
+    if declares_no_behaviour_change(ctx.intent) is not None:
+        return plans, too_big  # code decides these groups; no call is planned
     batch: list[Group] = []
 
     def fits(gs: list[Group], hunks: str, trimmed: bool) -> bool:
@@ -408,6 +418,7 @@ class CallResult:
     tokens_estimated: bool = False
     error_cause: str | None = None
     attempts: list[str] = field(default_factory=list)
+    waited_seconds: float = 0.0  # total time slept for pacing and 429 backoff
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -425,6 +436,75 @@ def _call_pinned(prompt: str, runner: ModelRunner | None) -> ModelResponse:
         raise ModelCallError(str(exc), cause="model_transport") from exc
 
 
+# --- pacing and 429 backoff -------------------------------------------------
+# The clock and the sleep are module-level so tests can patch them.
+
+_last_call_started: float | None = None
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def reset_pacer() -> None:
+    """Forget the previous call's start (tests)."""
+    global _last_call_started
+    _last_call_started = None
+
+
+def min_call_interval() -> float:
+    raw = os.environ.get(ENV_MIN_CALL_INTERVAL)
+    if raw is None or not raw.strip():
+        return DEFAULT_MIN_CALL_INTERVAL
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not value >= 0 or value == float("inf"):
+        raise ValueError(f"{ENV_MIN_CALL_INTERVAL} must be a float >= 0, got {raw!r}")
+    return value
+
+
+def max_429_retries() -> int:
+    raw = os.environ.get(ENV_429_RETRIES)
+    if raw is None or not raw.strip():
+        return DEFAULT_429_RETRIES
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(f"{ENV_429_RETRIES} must be an integer >= 0, got {raw!r}") from None
+    if value < 0:
+        raise ValueError(f"{ENV_429_RETRIES} must be an integer >= 0, got {raw!r}")
+    return value
+
+
+def _pace() -> float:
+    """Wait until ``min_call_interval`` seconds have passed since the previous
+    call started in this process, then mark this call as started. Returns the
+    time slept."""
+    global _last_call_started
+    interval = min_call_interval()
+    slept = 0.0
+    now = _clock()
+    if _last_call_started is not None:
+        wait = _last_call_started + interval - now
+        if wait > 0:
+            _sleep(wait)
+            slept = wait
+            now = _clock()
+    _last_call_started = now
+    return slept
+
+
+def http_status_of(message: str) -> int | None:
+    m = re.search(r"HTTP (\d{3})", message)
+    return int(m.group(1)) if m else None
+
+
 def usage_tokens(usage: dict[str, Any] | None, prompt: str, content: str) -> tuple[int, bool]:
     """Tokens a call used: the response's usage if present, else the estimate."""
     if usage:
@@ -438,16 +518,48 @@ def usage_tokens(usage: dict[str, Any] | None, prompt: str, content: str) -> tup
 
 
 def execute_call(prompt: str, index: int, runner: ModelRunner | None) -> CallResult:
-    """One model call; exactly one retry on ``model_transport``."""
+    """One model call, paced. A ``model_transport`` error is retried once; an
+    HTTP 429 is retried up to ``max_429_retries`` times after 20, 40, 60 s,
+    then ends as ``provider_limit``."""
     attempts: list[str] = []
-    for attempt in (1, 2):
+    waited = 0.0
+    retries_429 = max_429_retries()
+    used_429 = 0
+    transport_retried = False
+    attempt = 0
+    while True:
+        attempt += 1
+        waited += _pace()
         try:
             resp = _call_pinned(prompt, runner)
         except ModelCallError as exc:
             attempts.append(f"attempt_{attempt}: {exc.cause}: {str(exc)[:300]}")
-            if exc.cause == "model_transport" and attempt == 1:
-                continue
-            return CallResult(index=index, status="error", error_cause=exc.cause, attempts=attempts)
+            if exc.cause == "model_transport":
+                if http_status_of(str(exc)) == 429:
+                    if used_429 >= retries_429:
+                        return CallResult(
+                            index=index,
+                            status="error",
+                            error_cause="provider_limit",
+                            attempts=attempts,
+                            waited_seconds=waited,
+                        )
+                    delay = BACKOFF_429_SECONDS[min(used_429, len(BACKOFF_429_SECONDS) - 1)]
+                    used_429 += 1
+                    attempts.append(f"attempt_{attempt + 1}: waited {delay:.1f}s after 429")
+                    _sleep(delay)
+                    waited += delay
+                    continue
+                if not transport_retried:
+                    transport_retried = True
+                    continue
+            return CallResult(
+                index=index,
+                status="error",
+                error_cause=exc.cause,
+                attempts=attempts,
+                waited_seconds=waited,
+            )
         attempts.append(f"attempt_{attempt}: success")
         tokens, est = usage_tokens(resp.usage, prompt, resp.content)
         return CallResult(
@@ -458,8 +570,8 @@ def execute_call(prompt: str, index: int, runner: ModelRunner | None) -> CallRes
             tokens=tokens,
             tokens_estimated=est,
             attempts=attempts,
+            waited_seconds=waited,
         )
-    raise AssertionError("unreachable")  # pragma: no cover
 
 
 # --------------------------------------------------------------------------
@@ -511,6 +623,18 @@ def _norm(s: str) -> str:
     return " ".join(s.split())
 
 
+_LIST_MARKER = re.compile(r"^(?:[-*\u2022]|\d{1,3}[.)])\s+")
+
+
+def _norm_quote(quote: str) -> str:
+    """Per line: strip whitespace and ONE leading list marker (the prompt shows
+    facts as ``- <fact>``), then collapse whitespace as ``_norm`` does."""
+    lines = []
+    for line in quote.splitlines() or [quote]:
+        lines.append(_LIST_MARKER.sub("", line.lstrip(), count=1).strip())
+    return _norm(" ".join(lines))
+
+
 def _source_items(source: str, ctx: JudgeContext) -> list[str]:
     if source == "intent":
         return [_norm(ctx.intent)]
@@ -546,9 +670,11 @@ def check_evidence(
     source, quote = ev.get("source"), ev.get("quote")
     if source not in SOURCES:
         return False, "bad_source", passed
-    if not isinstance(quote, str) or not _norm(quote):
+    if not isinstance(quote, str):
         return False, "empty_quote", passed
-    q = _norm(quote)
+    q = _norm_quote(quote)
+    if not q:
+        return False, "empty_quote", passed
     if not any(q in item for item in _source_items(source, ctx)):
         return False, "quote_not_in_source", passed
     passed.append("verbatim_in_source")
@@ -597,6 +723,53 @@ def check_evidence(
             return False, "intent_lacks_field_name", passed
         passed.append("intent_names_field")
     return True, None, passed
+
+
+_NO_CHANGE_PHRASES = (
+    "no behaviour change",
+    "no behavior change",
+    "no functional change",
+    "no behaviour changes",
+    "no behavior changes",
+    "no functional changes",
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+DECLARED_RULE = "declared_no_behaviour_change"
+
+
+def declares_no_behaviour_change(intent: str) -> str | None:
+    """The first sentence of the intent that declares no behaviour change, or
+    None. Only the exact phrases count; the word "refactor" alone does not."""
+    for line in intent.splitlines():
+        for sentence in _SENTENCE_SPLIT.split(line):
+            text = sentence.strip()
+            if text and any(p in _norm(text).lower() for p in _NO_CHANGE_PHRASES):
+                return text
+    return None
+
+
+def _declared_judgment(g: Group, sentence: str) -> Judgment:
+    """A stable base!=head difference under a declared refactor: the correct
+    value is the base value. Decided by code; no model is asked."""
+    check: dict[str, Any] = {
+        "ok": True,
+        "reason": None,
+        "passed": [DECLARED_RULE],
+        "rule": DECLARED_RULE,
+    }
+    expected = g.before
+    if g.kind == "added_field":
+        expected = None
+        check["expected_absent"] = True
+    return Judgment(
+        group=g.index,
+        verdict="regression",
+        model_verdict=None,
+        expected_value=expected,
+        evidence_source="intent",
+        quote=sentence,
+        check=check,
+    )
 
 
 def _auto_question(g: Group, cause: str) -> str:
@@ -658,6 +831,9 @@ def judge_from_calls(
 
     Used for the live run and for replay, so both derive identical output.
     """
+    declared = declares_no_behaviour_change(ctx.intent)
+    if declared is not None:
+        return [JudgedGroup(g, _declared_judgment(g, declared)) for g in groups]
     by_index = {g.index: g for g in groups}
     judgments: dict[int, Judgment] = {}
     for gi, cause in too_big.items():

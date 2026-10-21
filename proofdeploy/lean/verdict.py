@@ -18,7 +18,9 @@ Order of the rules (first match wins):
 5. unexercised changed lines             -> INCONCLUSIVE change_not_exercised
 6. any unclear group                     -> INCONCLUSIVE needs_information
                                             (cause ``environment`` when a model
-                                            call failed for a transport reason)
+                                            call failed for a transport reason;
+                                            ``provider_limit`` when the provider
+                                            kept answering HTTP 429)
 7. otherwise                             -> PASS
 """
 
@@ -88,6 +90,7 @@ def decide(
                         "expected_value": jg.judgment.expected_value,
                         "source": jg.judgment.evidence_source,
                         "quote": jg.judgment.quote,
+                        "rule": jg.judgment.check.get("rule"),
                         "request_ids": jg.group.request_ids,
                     }
                     for jg in regressions
@@ -112,10 +115,12 @@ def decide(
 
     unclear = [jg for jg in groups_with_judgments if jg.judgment.verdict != "correct"]
     if unclear:
-        env = any((jg.judgment.cause or "").startswith("environment") for jg in unclear)
+        causes = [jg.judgment.cause or "" for jg in unclear]
+        limit = any(c == "environment:provider_limit" for c in causes)
+        env = any(c.startswith("environment") for c in causes)
         return Verdict(
             INCONCLUSIVE,
-            "environment" if env else "needs_information",
+            "provider_limit" if limit else "environment" if env else "needs_information",
             {
                 "questions": [
                     {
