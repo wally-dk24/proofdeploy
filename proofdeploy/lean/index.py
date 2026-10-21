@@ -465,7 +465,8 @@ def index_from_flask_url_map(
 # with the app's directory as cwd and the app's own environment (so
 # ``DJANGO_SETTINGS_MODULE`` normally comes from there). It walks
 # ``django.urls.get_resolver()`` recursively and prints, as JSON on stdout
-# (anything the import prints goes to stderr), one record per URL pattern:
+# (anything the import prints goes to stderr), after a marker line (see
+# :func:`parse_django_dump`), one record per URL pattern:
 #   {"path": "/api/items/{pk}/", "view": "pkg.mod.Name", "kind": "drf" | "django",
 #    "params": [{"name": "pk", "type": "int"}],
 #    "methods": {"GET": {"action": "retrieve", "request": null, "content_type": null,
@@ -806,8 +807,31 @@ def walk(patterns, prefix, pparams):
 
 walk(get_resolver().url_patterns, "", [])
 routes.sort(key=lambda r: (r["path"], r["view"]))
-real_out.write(json.dumps(routes, default=str))
+real_out.write("\n@@PD_DJANGO_ROUTES@@\n" + json.dumps(routes, default=str) + "\n")
 """
+
+# The line before the JSON. Anything else on stdout (a banner written straight to
+# file descriptor 1 by a settings module or an extension) is ignored.
+DJANGO_DUMP_MARKER = "@@PD_DJANGO_ROUTES@@"
+
+
+def parse_django_dump(stdout: str) -> list[dict[str, Any]]:
+    """The route records after the last marker line of :data:`DJANGO_DUMP_SNIPPET` output.
+
+    Raises ``ValueError`` (with the reason) when there is no marker, nothing follows it,
+    or the line after it is not a JSON list.
+    """
+    lines = stdout.splitlines()
+    at = [i for i, line in enumerate(lines) if line.strip() == DJANGO_DUMP_MARKER]
+    if not at:
+        raise ValueError("no route marker in the dump output")
+    if at[-1] + 1 >= len(lines):
+        raise ValueError("nothing after the route marker")
+    data = json.loads(lines[at[-1] + 1])
+    if not isinstance(data, list):
+        raise ValueError("route records are not a JSON list")
+    return [r for r in data if isinstance(r, dict)]
+
 
 _DJANGO_PARAM_SCHEMAS: dict[str, dict[str, Any]] = {
     "int": {"type": "integer"},

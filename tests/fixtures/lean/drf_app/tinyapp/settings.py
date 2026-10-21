@@ -2,6 +2,10 @@
 
 import os
 
+if os.environ.get("PD_TEST_BANNER"):
+    # a banner written straight to file descriptor 1, past sys.stdout
+    os.write(1, b"settings banner on stdout\n")
+
 SECRET_KEY = "pd-test-only"
 DEBUG = False
 LOGGING = {

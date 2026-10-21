@@ -46,7 +46,7 @@ import subprocess
 import sys
 import time
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,7 +56,11 @@ from unittest import mock
 from proofdeploy.lean import coverage as lc
 from proofdeploy.lean import hostfs, hostrun
 from proofdeploy.lean.coverage import CoverageSession, PdCov
-from proofdeploy.lean.index import DJANGO_DUMP_SNIPPET, FLASK_DUMP_SNIPPET
+from proofdeploy.lean.index import (
+    DJANGO_DUMP_SNIPPET,
+    FLASK_DUMP_SNIPPET,
+    parse_django_dump,
+)
 from proofdeploy.lean.pipeline import (
     LeanConfig,
     LeanEnvironmentError,
@@ -214,6 +218,36 @@ _DETERMINISTIC_ENV = {"PYTHONHASHSEED": "0", "TZ": "UTC"}
 # --------------------------------------------------------------------------
 
 
+def _redact(text: str, secrets: Iterable[str]) -> str:
+    """``text`` with every secret value (4+ characters) replaced, longest first."""
+    for v in sorted({x for x in secrets if x and len(x) >= 4}, key=len, reverse=True):
+        text = text.replace(v, "<redacted>")
+    return text
+
+
+def django_dump_outcome(
+    run: Callable[[], subprocess.CompletedProcess[str]], secrets: Iterable[str]
+) -> tuple[list[dict[str, Any]] | None, str]:
+    """(routes, diagnostic) of one Django dump. The diagnostic is empty on success, else
+    the exit code with the last 20 stderr lines, the timeout, or the parse error; every
+    secret value (contract env, overlay, bootstrap) is redacted by value."""
+    secrets = list(secrets)
+    try:
+        proc = run()
+    except subprocess.TimeoutExpired as exc:
+        return None, f"timeout after {exc.timeout}s"
+    except OSError as exc:
+        return None, _redact(f"{type(exc).__name__}: {exc}", secrets)
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stderr or "").splitlines()[-20:])
+        return None, _redact(f"exit {proc.returncode}: {tail}", secrets)
+    try:
+        routes = parse_django_dump(proc.stdout)
+    except ValueError as exc:
+        return None, _redact(f"unparseable output: {exc}", secrets)
+    return routes, ""
+
+
 @dataclass
 class HostLive:
     base_url: str
@@ -238,6 +272,8 @@ class HostLive:
 
 class HostSide:
     """One side on this machine: dev and golden use only (never a measured result)."""
+
+    django_diagnostic: str = ""  # why the last django_routes() returned None
 
     def __init__(
         self,
@@ -356,9 +392,10 @@ class HostSide:
 
     def django_routes(self, app: Any) -> list[dict[str, Any]] | None:
         """The Django URL resolver (and DRF serializers) dumped in the app's own interpreter,
-        with its own environment (``DJANGO_SETTINGS_MODULE``)."""
-        try:
-            proc = subprocess.run(
+        with its own environment (``DJANGO_SETTINGS_MODULE``). On failure None, and
+        ``django_diagnostic`` says why."""
+        routes, self.django_diagnostic = django_dump_outcome(
+            lambda: subprocess.run(
                 [str(self.py), "-c", DJANGO_DUMP_SNIPPET],
                 cwd=self.app_dir,
                 env=self._base_env(measured=False),
@@ -366,13 +403,10 @@ class HostSide:
                 text=True,
                 timeout=90,
                 check=False,
-            )
-            if proc.returncode != 0:
-                return None
-            routes = json.loads(proc.stdout)
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return None
-        return routes if isinstance(routes, list) else None
+            ),
+            [*self._env.values(), *self._overlay.values()],
+        )
+        return routes
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -642,6 +676,8 @@ class SandboxLive:
 class SandboxSide:
     """A READY sandboxed side that can start fresh instances on the seed snapshot."""
 
+    django_diagnostic: str = ""  # why the last django_routes() returned None
+
     def __init__(
         self,
         *,
@@ -757,7 +793,8 @@ class SandboxSide:
     def django_routes(self, app: Any) -> list[dict[str, Any]] | None:
         """The Django URL resolver (and DRF serializers) dumped inside the app container with
         the environment the app itself starts with, handed over as an env file (the values
-        may be secrets: they never appear in a process argument list)."""
+        may be secrets: they never appear in a process argument list). On failure None, and
+        ``django_diagnostic`` says why (secret values redacted)."""
         import tempfile
 
         from proofdeploy.sandbox import _podman_base
@@ -781,15 +818,15 @@ class SandboxSide:
                 "-c",
                 DJANGO_DUMP_SNIPPET,
             ]
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=90, check=False)
-            if proc.returncode != 0:
-                return None
-            routes = json.loads(proc.stdout)
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return None
+            routes, self.django_diagnostic = django_dump_outcome(
+                lambda: subprocess.run(
+                    argv, capture_output=True, text=True, timeout=90, check=False
+                ),
+                [*env.values(), *self.bootstrap_env().values()],
+            )
+            return routes
         finally:
             Path(name).unlink(missing_ok=True)
-        return routes if isinstance(routes, list) else None
 
     def bootstrap_env(self) -> dict[str, str]:
         """The generated bootstrap values this side was provisioned with (secrets)."""
@@ -1011,6 +1048,8 @@ def lean_verify(
             result = environment_result(cfg, "coverage_harness", str(exc)[:500], timings)
         except LeanRefusal as exc:
             result = environment_result(cfg, exc.code, exc.message, timings)
+            if exc.attempts:
+                result.manifest["mapping_attempts"] = exc.attempts
             result.verdict = Verdict("NOT_SUPPORTED", exc.code, {"message": exc.message})
             result.manifest["verdict"] = result.verdict.to_dict()
             write_outputs(rc.output_dir, result)

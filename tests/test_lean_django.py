@@ -28,8 +28,10 @@ from proofdeploy.lean.index import (
     AppIndex,
     Operation,
     index_from_django_dump,
+    parse_django_dump,
 )
 from proofdeploy.lean.pipeline import LeanConfig, LeanRefusal, acceptance_rate, build_index
+from proofdeploy.lean.run import django_dump_outcome
 
 APP_DIR = Path(__file__).resolve().parent / "fixtures" / "lean" / "drf_app"
 SETTINGS = "tinyapp.settings"
@@ -69,19 +71,24 @@ def _clean_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def _dump(
-    settings: str | None = SETTINGS, *, env_settings: str | None = None
-) -> list[dict[str, Any]]:
+def _run_dump(
+    settings: str | None = SETTINGS, *, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     argv = [sys.executable, "-c", DJANGO_DUMP_SNIPPET]
     if settings:
         argv.append(settings)
-    extra = {"DJANGO_SETTINGS_MODULE": env_settings} if env_settings else None
-    proc = subprocess.run(
-        argv, cwd=APP_DIR, env=_clean_env(extra), capture_output=True, text=True, timeout=120
+    return subprocess.run(
+        argv, cwd=APP_DIR, env=_clean_env(extra_env), capture_output=True, text=True, timeout=120
     )
+
+
+def _dump(
+    settings: str | None = SETTINGS, *, env_settings: str | None = None
+) -> list[dict[str, Any]]:
+    extra = {"DJANGO_SETTINGS_MODULE": env_settings} if env_settings else None
+    proc = _run_dump(settings, extra_env=extra)
     assert proc.returncode == 0, proc.stderr[-1500:]
-    routes: list[dict[str, Any]] = json.loads(proc.stdout)
-    return routes
+    return parse_django_dump(proc.stdout)
 
 
 @pytest.fixture(scope="module")
@@ -146,6 +153,22 @@ def test_the_dump_is_deterministic(routes: list[dict[str, Any]]) -> None:
     a = index_from_django_dump(routes, app="tiny", commit_sha="c1")
     b = index_from_django_dump(again, app="tiny", commit_sha="c1")
     assert a.sha256() == b.sha256()
+
+
+def test_stdout_noise_before_the_marker_does_not_break_the_parse(
+    routes: list[dict[str, Any]],
+) -> None:
+    proc = _run_dump(extra_env={"PD_TEST_BANNER": "1"})
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert "settings banner on stdout" in proc.stdout  # the noise really is on stdout
+    assert parse_django_dump(proc.stdout) == routes
+
+
+def test_parse_django_dump_rejects_output_without_the_marker_or_the_json() -> None:
+    for bad in ("", "[]", "@@PD_DJANGO_ROUTES@@\n", "@@PD_DJANGO_ROUTES@@\n{}\n"):
+        with pytest.raises(ValueError):
+            parse_django_dump(bad)
+    assert parse_django_dump("noise\n@@PD_DJANGO_ROUTES@@\n[]\n") == []
 
 
 # --------------------------------------------------------------------------
@@ -334,6 +357,80 @@ def test_a_driver_without_a_django_dump_still_maps_or_refuses(dead_url: str) -> 
 
     with pytest.raises(LeanRefusal):
         _build(Old(), dead_url)  # type: ignore[arg-type]
+
+
+class _FailingDriver(_Driver):
+    """A driver whose Django dump failed with a diagnostic."""
+
+    def __init__(self, diagnostic: str):
+        super().__init__(None, None)
+        self.django_diagnostic = diagnostic
+
+
+def test_cannot_map_names_the_django_step_and_its_exit_code(dead_url: str) -> None:
+    attempts: list[dict[str, Any]] = []
+    cfg = LeanConfig(repo=Path("."), base="b", head="h")
+    with pytest.raises(LeanRefusal) as exc:
+        build_index(
+            _FailingDriver("exit 3: ImportError: no module named x"),  # type: ignore[arg-type]
+            _Live(dead_url),  # type: ignore[arg-type]
+            cfg,
+            app_name="x",
+            seed_facts=[],
+            attempts=attempts,
+        )
+    assert "django: exit 3: ImportError" in exc.value.message
+    assert [a["step"] for a in exc.value.attempts] == ["openapi", "flask", "django"]
+    assert attempts == exc.value.attempts
+    assert exc.value.attempts[2]["outcome"].startswith("exit 3")
+    assert exc.value.attempts[0]["paths_tried"]  # the OpenAPI paths that were tried
+
+
+def test_a_successful_mapping_records_its_attempts(
+    dead_url: str, routes: list[dict[str, Any]]
+) -> None:
+    attempts: list[dict[str, Any]] = []
+    cfg = LeanConfig(repo=Path("."), base="b", head="h")
+    build_index(
+        _Driver(None, routes),  # type: ignore[arg-type]
+        _Live(dead_url),  # type: ignore[arg-type]
+        cfg,
+        app_name="x",
+        seed_facts=[],
+        attempts=attempts,
+    )
+    assert [(a["step"], a["outcome"]) for a in attempts][1:] == [
+        ("flask", "no url_map could be read"),
+        ("django", "mapped"),
+    ]
+
+
+def test_a_real_failing_dump_reports_its_exit_code_and_stderr() -> None:
+    routes, why = django_dump_outcome(lambda: _run_dump("no_such_settings_module"), secrets=[])
+    assert routes is None
+    assert why.startswith("exit 1: ") and "no_such_settings_module" in why
+
+
+def test_secret_values_are_redacted_from_the_diagnostic() -> None:
+    def fake() -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            [], 2, stdout="", stderr="boot\n" * 30 + "key=hunter2-secret-value failed\n"
+        )
+
+    routes, why = django_dump_outcome(fake, secrets=["hunter2-secret-value", "ab"])
+    assert routes is None and why.startswith("exit 2: ")
+    assert "hunter2-secret-value" not in why and "key=<redacted> failed" in why
+    assert len(why.splitlines()) == 20  # the last 20 stderr lines (the first line carries the code)
+
+
+def test_timeout_and_garbage_output_have_a_reason() -> None:
+    def slow() -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired("x", 90)
+
+    assert django_dump_outcome(slow, [])[1] == "timeout after 90s"
+    junk = lambda: subprocess.CompletedProcess([], 0, stdout="not json", stderr="")  # noqa: E731
+    routes, why = django_dump_outcome(junk, [])
+    assert routes is None and why.startswith("unparseable output:")
 
 
 def _ex(status: int) -> Exchange:
