@@ -44,6 +44,7 @@ from proofdeploy.lean.http import (
     AuthSpec,
     Exchange,
     HttpClient,
+    MissingStaticToken,
     Scenario,
     Step,
     UnresolvedReference,
@@ -907,7 +908,7 @@ class ScenarioGenerator:
     def _make(self, op: Operation, pre: list[Step], target: Step, *, login: bool) -> Scenario:
         steps: list[Step] = []
         if login and self.auth is not None:
-            steps.append(self.auth.login)
+            steps.extend(self.auth.login_steps())
         steps.extend(pre)
         steps.append(target)
         return Scenario(steps=steps, target_operation=op_key(op))
@@ -915,7 +916,10 @@ class ScenarioGenerator:
     def _is_login_op(self, op: Operation) -> bool:
         a = self.auth
         return (
-            a is not None and op.method == a.login.method and _norm(op.path) == _norm(a.login.path)
+            a is not None
+            and not a.is_static
+            and op.method == a.login.method
+            and _norm(op.path) == _norm(a.login.path)
         )
 
     def for_operation(
@@ -1064,7 +1068,7 @@ class ScenarioGenerator:
     # -- seeding stage (varied states through the API) ---------------------------
 
     def _wrap(self, target: Operation, steps: Sequence[Step]) -> Scenario:
-        head = [self.auth.login] if self.auth is not None else []
+        head = self.auth.login_steps() if self.auth is not None else []
         return Scenario(steps=[*head, *steps], target_operation=op_key(target))
 
     def _is_create_op(self, op: Operation) -> bool:
@@ -1732,6 +1736,13 @@ class ScenarioRunner:
         self.scheme = auth.scheme if auth else "Bearer"
         self._auth = auth
         self._token: Any = None
+        self._static = bool(auth is not None and auth.is_static)
+        if auth is not None and auth.static_token_env is not None:
+            # the token IS the side's generated value; no sign-in request exists for it
+            value = self.env.get(auth.static_token_env)
+            if not value:
+                raise MissingStaticToken(f"no generated value for {auth.static_token_env}")
+            self._token = value
         self.logins = 0
         self.session = session
         self.repair = repair
@@ -1742,6 +1753,8 @@ class ScenarioRunner:
         a = self._auth
         if a is None or self._token is None or step != a.login:
             return False
+        if self._static:
+            return True  # a static spec has no login to send, whatever the scenario targets
         return scenario.target_operation != f"{a.login.method} {a.login.path}"
 
     def planned_requests(self, scenario: Scenario) -> int:
@@ -1838,8 +1851,8 @@ class ScenarioRunner:
                     if ex2.status not in _REPAIR_STATUSES:
                         current, ex, live, kept = fixed, ex2, live2, kept2
             effective.append(current)
-            if ex.auth_sent and ex.status in _AUTH_REJECTED:
-                self._token = None  # the next scenario signs in again
+            if ex.auth_sent and ex.status in _AUTH_REJECTED and not self._static:
+                self._token = None  # the next scenario signs in again (a static token stays)
             if current.capture:
                 got: dict[str, Any] = {}
                 if 200 <= ex.status < 300:

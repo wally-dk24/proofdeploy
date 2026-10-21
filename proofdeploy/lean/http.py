@@ -14,7 +14,9 @@ pointed at the app under test.
   captured value is read at send time from the SIDE's own generated bootstrap
   environment (never from this process's environment), is never written into
   an exchange, and a placeholder that cannot be resolved is never sent.
-* ``AuthSpec`` is derived from the contract's ``auth:`` block (``mode: login``).
+* ``AuthSpec`` is derived from the contract's ``auth:`` block (``mode: login``, or
+  ``mode: static_token``: the token is the side's own generated bootstrap value named by
+  ``token_env``, presented on every authenticated step; no login request is ever built or sent).
 """
 
 from __future__ import annotations
@@ -48,6 +50,13 @@ class UnresolvedReference(KeyError):
 
 class UnsupportedAuth(ValueError):
     """The contract's auth mode has no login driver in the lean path."""
+
+
+class MissingStaticToken(ValueError):
+    """A ``static_token`` contract but the side has no generated value for ``token_env``.
+
+    Nothing may be sent: an authenticated step without its token would run unauthenticated.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -396,10 +405,25 @@ def presentation_scheme(fixture: dict[str, str] | None) -> str:
     return w.group(1) if w else "Bearer"
 
 
+# The ``login`` of a static spec: a placeholder that is never put in a scenario and never sent
+# (``AuthSpec.login_steps`` is empty and the runner treats it as already done).
+STATIC_LOGIN = Step(method="GET", path="/__static_token__", auth=False)
+
+
 @dataclass
 class AuthSpec:
     login: Step
     scheme: str = "Bearer"
+    # static_token: the env NAME of the side's generated token value (None: sign in by ``login``)
+    static_token_env: str | None = None
+
+    @property
+    def is_static(self) -> bool:
+        return self.static_token_env is not None
+
+    def login_steps(self) -> list[Step]:
+        """The steps that sign in: none for a static token."""
+        return [] if self.is_static else [self.login]
 
     def header(self, token: Any) -> str:
         return f"{self.scheme} {token}"
@@ -408,8 +432,8 @@ class AuthSpec:
 def auth_from_contract(contract: Any) -> AuthSpec | None:
     """AuthSpec for a loaded ``RepoContract`` (or a path to one); None without ``auth``.
 
-    Only ``mode: login`` is driven here; other modes raise ``UnsupportedAuth``
-    so the caller can decide, rather than silently running unauthenticated.
+    ``mode: login`` and ``mode: static_token`` are driven here; other modes raise
+    ``UnsupportedAuth`` so the caller can decide, rather than silently running unauthenticated.
     """
     if isinstance(contract, (str, Path)):
         from proofdeploy.yml import load_contract
@@ -419,6 +443,12 @@ def auth_from_contract(contract: Any) -> AuthSpec | None:
     if not auth:
         return None
     mode = auth.get("mode")
+    if mode == "static_token":
+        return AuthSpec(
+            login=STATIC_LOGIN,
+            scheme=presentation_scheme(getattr(contract, "fixture", None)),
+            static_token_env=str(auth["token_env"]),
+        )
     if mode != "login":
         raise UnsupportedAuth(f"auth mode {mode!r} is not supported by the lean generator")
     if auth.get("token_json_path"):

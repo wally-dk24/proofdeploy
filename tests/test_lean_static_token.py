@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -25,7 +25,17 @@ from test_lean_env import CONTRACT, FakeSide, proof_server  # noqa: F401
 from proofdeploy.executor import Executor
 from proofdeploy.lean import pipeline
 from proofdeploy.lean import run as lean_run
-from proofdeploy.lean.http import UnsupportedAuth, auth_from_contract, presentation_scheme
+from proofdeploy.lean.generate import ScenarioRunner, generate_scenarios
+from proofdeploy.lean.http import (
+    HttpClient,
+    MissingStaticToken,
+    Scenario,
+    Step,
+    UnsupportedAuth,
+    auth_from_contract,
+    presentation_scheme,
+)
+from proofdeploy.lean.index import index_from_flask_url_map
 from proofdeploy.orchestrator import Orchestrator
 from proofdeploy.yml import RepoContract, load_contract
 
@@ -177,12 +187,6 @@ def test_the_seed_bash_heredoc_runs_the_script_text_intact() -> None:
     shell = c.seed.replace("python manage.py shell", "cat", 1)
     out = subprocess.run(["bash", "-c", shell], capture_output=True, text=True, check=True)
     assert out.stdout == SEED_FILE.read_text(encoding="utf-8")
-
-
-def test_the_lean_path_still_refuses_static_token_until_the_runner_drives_it() -> None:
-    """Fail closed: no static_token driver in the lean generator yet; never unauthenticated."""
-    with pytest.raises(UnsupportedAuth, match="static_token"):
-        auth_from_contract(CONTRACT_FILE)
 
 
 # --------------------------------------------------------------------------
@@ -554,3 +558,379 @@ def test_the_gate_run_of_a_group_unit_reads_its_clone_and_keeps_the_console_out_
         False,
     )
     assert lean_run._contract_file(rc) == CONTRACT_FILE
+
+
+# --------------------------------------------------------------------------
+# A. The lean runner drives static_token: no login request, the header on every authenticated step
+# --------------------------------------------------------------------------
+
+TOKEN = "t0k3n" + "ab12" * 7  # a 33-character generated-looking value
+SUPERUSER = "su" + "cd34" * 7
+ENV = {"LD_API_TOKEN": TOKEN, "LD_SUPERUSER_NAME": SUPERUSER}
+
+
+class _App(BaseHTTPRequestHandler):
+    """Requires 'Token <TOKEN>' on /api/*; echoes what it was sent (to test redaction)."""
+
+    hits: list[tuple[str, str, str | None]] = []
+
+    def log_message(self, *_a: Any) -> None:
+        return None
+
+    def _reply(self) -> None:
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n).decode() if n else ""
+        auth = self.headers.get("Authorization")
+        type(self).hits.append((self.command, self.path, auth))
+        body: dict[str, Any]
+        if self.path.startswith("/deny"):
+            status, body = 401, {"detail": "no"}
+        elif self.path.startswith("/api/") and auth != f"Token {TOKEN}":
+            status, body = 401, {"detail": "Invalid token."}
+        else:
+            status = 200
+            body = {"path": self.path, "auth": auth, "body": raw, "echo": TOKEN, "user": SUPERUSER}
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_GET = do_POST = _reply
+
+
+@pytest.fixture
+def app_url() -> Iterator[str]:
+    _App.hits = []
+    srv = HTTPServer(("127.0.0.1", 0), _App)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_port}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _static_auth() -> Any:
+    auth = auth_from_contract(CONTRACT_FILE)
+    assert auth is not None
+    return auth
+
+
+def test_auth_from_contract_returns_a_static_spec_with_no_login_step() -> None:
+    auth = _static_auth()
+    assert auth.is_static and auth.static_token_env == "LD_API_TOKEN"
+    assert auth.scheme == "Token" and auth.header("x") == "Token x"
+    assert auth.login_steps() == []
+    # the other modes keep their login step
+    login = auth_from_contract(ROOT / "readiness/contracts/golden__python-flask-sqlite.yml")
+    assert login is not None and not login.is_static and len(login.login_steps()) == 1
+    with pytest.raises(UnsupportedAuth):
+        auth_from_contract(SimpleNamespace(auth={"mode": "refresh"}, fixture={}))
+
+
+def test_generated_scenarios_carry_no_login_step_for_a_static_token() -> None:
+    index = index_from_flask_url_map(
+        [{"rule": "/notes/<int:note_id>", "methods": ["GET"], "endpoint": "get_note"}],
+        app="a",
+        commit_sha="c",
+    )
+    auth = _static_auth()
+    scs = generate_scenarios(index, auth=auth)
+    assert scs and all(st.path != auth.login.path for sc in scs for st in sc.steps)
+    assert any(sc.steps[-1].auth is True for sc in scs)
+    assert all(sc.steps[0].auth is True or not sc.steps[-1].auth for sc in scs)
+
+
+def test_no_login_request_is_ever_sent_and_the_header_is_on_every_authenticated_step(
+    app_url: str,
+) -> None:
+    auth = _static_auth()
+    runner = ScenarioRunner(HttpClient(app_url), auth=auth, env=ENV, repair=False)
+    profile = Step("GET", "/api/user/profile/", auth=True)
+    create = Step("POST", "/api/bookmarks/", body={"url": "https://e.example/"}, auth=True)
+    plain = Step("GET", "/health", auth=False)
+    # even a scenario that (wrongly) still lists the placeholder login never sends it
+    scenarios = [
+        Scenario([profile], "GET /api/user/profile/"),
+        Scenario([auth.login, create, profile], "POST /api/bookmarks/"),
+        Scenario([plain], "GET /health"),
+    ]
+    results = [runner(sc) for sc in scenarios]
+    assert runner.logins == 0
+    assert [(m, p) for m, p, _ in _App.hits] == [
+        ("GET", "/api/user/profile/"),
+        ("POST", "/api/bookmarks/"),
+        ("GET", "/api/user/profile/"),
+        ("GET", "/health"),
+    ]
+    assert all(a == f"Token {TOKEN}" for _m, p, a in _App.hits if p.startswith("/api/"))
+    assert _App.hits[-1][2] is None  # a step that is not authenticated carries no header
+    assert all(e.status == 200 for r in results for e in r.exchanges)
+    assert [e.auth_sent for r in results for e in r.exchanges] == [True, True, True, False]
+    assert runner.planned_requests(scenarios[1]) == 2
+
+
+def test_a_scenario_that_targets_the_placeholder_login_still_sends_no_login(app_url: str) -> None:
+    auth = _static_auth()
+    runner = ScenarioRunner(HttpClient(app_url), auth=auth, env=ENV, repair=False)
+    target = f"{auth.login.method} {auth.login.path}"
+    res = runner(Scenario([auth.login], target))
+    assert res.exchanges == [] and runner.logins == 0 and _App.hits == []
+
+
+def test_the_generated_value_is_redacted_from_every_recorded_exchange(app_url: str) -> None:
+    runner = ScenarioRunner(HttpClient(app_url), auth=_static_auth(), env=ENV, repair=False)
+    leaky = Step("GET", "/echo", query={"k": TOKEN, "who": SUPERUSER}, auth=True)
+    res = runner(Scenario([leaky, Step("GET", "/api/user/profile/", auth=True)], "GET /echo"))
+    recorded = json.dumps([e.to_dict() for e in res.exchanges])
+    assert TOKEN not in recorded and SUPERUSER not in recorded
+    assert "<redacted:bootstrap>" in recorded
+    # the Authorization header value is never part of an exchange either
+    assert "Authorization" not in recorded and f"Token {TOKEN}" not in recorded
+    assert res.scenario.id  # the scenario content id is derived from steps, not from the value
+
+
+def test_a_401_is_data_and_never_clears_a_static_token(app_url: str) -> None:
+    runner = ScenarioRunner(HttpClient(app_url), auth=_static_auth(), env=ENV, repair=False)
+    denied = runner(Scenario([Step("GET", "/deny", auth=True)], "GET /deny"))
+    assert denied.exchanges[0].status == 401 and denied.exchanges[0].auth_sent
+    after = runner(
+        Scenario([Step("GET", "/api/user/profile/", auth=True)], "GET /api/user/profile/")
+    )
+    assert after.exchanges[0].status == 200 and after.exchanges[0].auth_sent
+    assert runner.logins == 0 and [p for _m, p, _a in _App.hits] == ["/deny", "/api/user/profile/"]
+
+
+@pytest.mark.parametrize("env", [{}, {"LD_API_TOKEN": ""}, {"LD_SUPERUSER_NAME": SUPERUSER}])
+def test_a_missing_generated_value_sends_nothing(app_url: str, env: dict[str, str]) -> None:
+    with pytest.raises(MissingStaticToken):
+        ScenarioRunner(HttpClient(app_url), auth=_static_auth(), env=env)
+    assert _App.hits == []
+
+
+class _Driver:
+    """A SideDriver double: one app on the test server; counts starts."""
+
+    root_prefix = ""
+    label = "head"
+    sha = "0" * 40
+
+    def __init__(self, url: str, env: dict[str, str]) -> None:
+        self.url, self.env, self.starts = url, env, 0
+
+    def bootstrap_env(self) -> dict[str, str]:
+        return dict(self.env)
+
+    def start(self, *, measured: bool) -> Any:
+        self.starts += 1
+        return SimpleNamespace(base_url=self.url, session=None, stop=lambda: None)
+
+
+def test_prove_auth_with_a_static_token_sends_one_authenticated_request(app_url: str) -> None:
+    drv = _Driver(app_url, ENV)
+    proof = pipeline.prove_auth(cast(Any, drv), _static_auth(), "/api/user/profile/", side="head")
+    assert proof == {
+        "side": "head",
+        "ok": True,
+        "outcome": "2xx",
+        "proof_path": "/api/user/profile/",
+        "login_status": None,
+        "proof_status": 200,
+        "proof_auth_sent": True,
+    }
+    assert _App.hits == [("GET", "/api/user/profile/", f"Token {TOKEN}")]
+
+
+def test_prove_auth_without_the_generated_value_is_unproven_and_starts_nothing(
+    app_url: str,
+) -> None:
+    drv = _Driver(app_url, {"LD_SUPERUSER_NAME": SUPERUSER})
+    proof = pipeline.prove_auth(cast(Any, drv), _static_auth(), "/api/user/profile/", side="base")
+    assert proof["ok"] is False and proof["outcome"] == "unproven"
+    assert proof["reason"] == "static_token_missing" and proof["proof_auth_sent"] is False
+    assert drv.starts == 0 and _App.hits == []
+
+
+def test_prove_auth_with_a_rejected_token_is_unproven(app_url: str) -> None:
+    drv = _Driver(app_url, {"LD_API_TOKEN": "wrong-value", "LD_SUPERUSER_NAME": SUPERUSER})
+    proof = pipeline.prove_auth(cast(Any, drv), _static_auth(), "/api/user/profile/", side="head")
+    assert proof["ok"] is False and proof["proof_status"] == 401 and proof["proof_auth_sent"]
+
+
+def test_the_group_rehearses_the_real_contract_with_a_static_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, app_url: str
+) -> None:
+    repo, sha = _app_repo(tmp_path)
+    monkeypatch.setitem(
+        gate.APP_UNITS_FILES, "linkding", _write_group(tmp_path, _group_json(check_sha=sha))
+    )
+    contract = load_contract(CONTRACT_FILE)
+    sides = [_Driver(app_url, ENV), _Driver(app_url, ENV)]
+    cfg = gate.GateConfig(
+        out=tmp_path / "out",
+        workdir=tmp_path / "work",
+        which="linkding",
+        app_repos={"linkding": repo},
+        provision=lambda *_a: (sides[0], sides[1], contract),
+    )
+    rows = gate.run_rehearsal(cfg)
+    assert [r["ok"] for r in rows] == [True, True], rows
+    assert all(
+        r["auth_proof"] == {"outcome": "2xx", "login_status": None, "proof_status": 200}
+        for r in rows
+    )
+    assert all(r["request"] == {"path": "/api/user/profile/", "status": 200} for r in rows)
+    assert all(m == "GET" and p == "/api/user/profile/" for m, p, _a in _App.hits)
+    assert all(a == f"Token {TOKEN}" for _m, _p, a in _App.hits) and len(_App.hits) == 4
+    assert [d.starts for d in sides] == [3, 3]
+    assert TOKEN not in (tmp_path / "out" / "rehearsal.jsonl").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# B. The workflows offer the linkding group
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "options"),
+    [
+        ("lean-poc.yml", ["all", "golden", "mutants", "paperless", "linkding"]),
+        ("lean-rehearse.yml", ["all", "golden", "paperless", "linkding"]),
+    ],
+)
+def test_workflows_offer_linkding_and_clone_it_only_for_that_choice(
+    name: str, options: list[str]
+) -> None:
+    text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+    data = yaml.safe_load(text)
+    on = data.get("on", data.get(True))
+    assert on["workflow_dispatch"]["inputs"]["units"]["options"] == options
+    job = next(iter(data["jobs"].values()))
+    clones = [st for st in job["steps"] if "linkding" in str(st.get("run", ""))]
+    clone = next(st for st in job["steps"] if st.get("name") == "Check out linkding (full history)")
+    assert clone["if"] == "${{ inputs.units == 'linkding' }}"
+    assert (
+        "git clone --quiet https://github.com/sissbruecker/linkding /tmp/linkding" in clone["run"]
+    )
+    assert clone in clones
+    gate_step = next(st for st in job["steps"] if "gate.py" in str(st.get("run", "")))
+    assert "--linkding-repo /tmp/linkding" in gate_step["run"]
+    assert "--paperless-repo /tmp/paperless" in gate_step["run"]
+    # the paperless clone keeps its own condition
+    pl = next(
+        st for st in job["steps"] if st.get("name") == "Check out paperless-ngx (full history)"
+    )
+    assert pl["if"] == "${{ inputs.units == 'all' || inputs.units == 'paperless' }}"
+    # the inputs still reach the shell through env, never inline
+    assert "${{ inputs" not in gate_step["run"]
+
+
+# --------------------------------------------------------------------------
+# C. The app block of a linkding run
+# --------------------------------------------------------------------------
+
+
+def _row(unit: str, kind: str, group: str, verdict: str, **kw: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "unit": unit,
+        "kind": kind,
+        "group": group,
+        "verdict": verdict,
+        "cause": kw.pop("cause", None),
+        "confirmed": None,
+        "executable_changed_lines": 12,
+        "lines_reached": 9,
+        "requests_hitting_changed_code": 14,
+        "differences": 3,
+        "differences_judged": 2,
+        "rate_2xx": 0.75,
+        "impacted_2xx": {"GET /api/bookmarks/": {"requests": 14, "2xx": 10}},
+        "tokens": 0,
+        "model_errors": [],
+        "error": None,
+        "observable": True,
+        "unexercised": 0,
+        "wall_seconds": 1.0,
+    }
+    base.update(kw)
+    return base
+
+
+def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return gate.compute_summary(rows, expected=[r["unit"] for r in rows])  # type: ignore[no-any-return]
+
+
+def test_the_app_block_reports_bug_units_clean_units_false_alarms_and_cost() -> None:
+    rows = [
+        _row(
+            "linkding-bug-aaaaaaaa",
+            "bug",
+            "linkding",
+            gate.FAIL,
+            cause="judged_regression",
+            confirmed=True,
+            tokens=4100,
+            mapped_by="route_table",
+        ),
+        _row("linkding-bug-bbbbbbbb", "bug", "linkding", gate.PASS, tokens=900),
+        _row("linkding-clean-111111111111", "clean", "linkding", gate.PASS, tokens=300),
+        _row(
+            "linkding-clean-222222222222",
+            "clean",
+            "linkding",
+            gate.FAIL,
+            cause="hard_oracle",
+            tokens=7200,
+        ),
+        _row(
+            "linkding-clean-333333333333",
+            "clean",
+            "linkding",
+            gate.INCONCLUSIVE,
+            cause="environment",
+            model_errors=["rate_limit"],
+            tokens=10,
+        ),
+    ]
+    block = _summary(rows)["app_block"]["linkding"]
+    bug = block["bug_units"]["linkding-bug-aaaaaaaa"]
+    assert bug == {
+        "verdict": gate.FAIL,
+        "cause": "judged_regression",
+        "confirmed": True,
+        "executable_changed_lines": 12,
+        "lines_reached": 9,
+        "requests_hitting_changed_code": 14,
+        "differences_found": 3,
+        "differences_judged": 2,
+        "mapped_by": "route_table",
+        "request_acceptance": 0.75,
+        "impacted_2xx": {"GET /api/bookmarks/": {"requests": 14, "2xx": 10}},
+    }
+    assert block["bug_units"]["linkding-bug-bbbbbbbb"]["mapped_by"] is None  # row carries none
+    assert block["clean_units"] == {
+        "linkding-clean-111111111111": {"verdict": gate.PASS, "cause": None},
+        "linkding-clean-222222222222": {"verdict": gate.FAIL, "cause": "hard_oracle"},
+        "linkding-clean-333333333333": {"verdict": gate.INCONCLUSIVE, "cause": "environment"},
+    }
+    assert block["false_alarms"] == ["linkding-clean-222222222222"]
+    assert block["false_alarm_count"] == 1 and block["clean_units_run"] == 3
+    assert block["max_tokens"] == 7200
+    assert block["provider_failures"] == {"linkding-clean-333333333333": ["rate_limit"]}
+
+
+def test_no_app_block_for_the_registered_groups_and_their_criteria_text_is_untouched() -> None:
+    rows = [
+        _row("golden-bug", "bug", "golden", gate.FAIL),
+        _row("golden-clean", "clean", "golden", gate.PASS),
+    ]
+    summary = _summary(rows)
+    assert "app_block" not in summary
+    assert summary["criteria_text"] == gate.CRITERIA
+    assert summary["criteria"]["1"]["status"] == "PASS"
+    mixed = _summary([*rows, _row("linkding-clean-1", "clean", "linkding", gate.PASS)])
+    assert list(mixed["app_block"]) == ["linkding"]
+    assert mixed["criteria"]["1"] == summary["criteria"]["1"]
+    assert mixed["criteria_text"] == gate.CRITERIA

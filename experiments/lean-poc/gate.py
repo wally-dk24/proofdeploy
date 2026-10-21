@@ -711,6 +711,56 @@ def round4_block(rows: list[dict[str, Any]], bug_ids: list[str]) -> dict[str, An
     }
 
 
+APP_BUG_FIELDS = (
+    ("verdict", "verdict"),
+    ("cause", "cause"),
+    ("confirmed", "confirmed"),
+    ("executable_changed_lines", "executable_changed_lines"),
+    ("lines_reached", "lines_reached"),
+    ("requests_hitting_changed_code", "requests_hitting_changed_code"),
+    ("differences_found", "differences"),
+    ("differences_judged", "differences_judged"),
+    ("mapped_by", "mapped_by"),  # None while a row does not carry it
+    ("request_acceptance", "rate_2xx"),  # share of impacted requests answered 2xx
+    ("impacted_2xx", "impacted_2xx"),
+)
+_REGISTERED_GROUPS = ("golden", "mutants", "paperless")
+
+
+def app_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per app group (any group other than golden, mutants, paperless): what the run showed.
+
+    Per bug unit: verdict, cause, confirmed, executable changed lines, lines reached, requests
+    hitting changed code, differences found and judged, mapped_by and request acceptance. Per
+    clean unit: verdict and cause. Then the false alarms (FAIL on a clean unit), the largest
+    token use and the provider failures. Ids, verdicts and counts only; no criterion here is
+    pre-registered, so nothing in this block is a PASS or a FAIL of the gate.
+    """
+    out: dict[str, Any] = {}
+    named = {str(r["group"]) for r in rows if r.get("group")}
+    for group in sorted(named - set(_REGISTERED_GROUPS)):
+        grows = [r for r in rows if r.get("group") == group]
+        bugs = [r for r in grows if r["kind"] == "bug"]
+        cleans = [r for r in grows if r["kind"] == "clean"]
+        out[group] = {
+            "bug_units": {
+                str(r["unit"]): {name: r.get(src) for name, src in APP_BUG_FIELDS} for r in bugs
+            },
+            "clean_units": {
+                str(r["unit"]): {"verdict": r["verdict"], "cause": r["cause"]} for r in cleans
+            },
+            "false_alarms": sorted(str(r["unit"]) for r in cleans if r["verdict"] == FAIL),
+            "false_alarm_count": sum(1 for r in cleans if r["verdict"] == FAIL),
+            "clean_units_run": len(cleans),
+            "max_tokens": max((int(r["tokens"]) for r in grows), default=0),
+            "provider_failures": {
+                str(r["unit"]): r["model_errors"] for r in grows if r["model_errors"]
+            },
+            "errors": sorted(str(r["unit"]) for r in grows if r["error"]),
+        }
+    return out
+
+
 def compute_summary(
     rows: list[dict[str, Any]], *, expected: list[str] | None = None
 ) -> dict[str, Any]:
@@ -846,7 +896,7 @@ def compute_summary(
     for r in rows:
         key = r["verdict"] or "ERROR"
         verdicts[key] = verdicts.get(key, 0) + 1
-    return {
+    summary: dict[str, Any] = {
         "measured_result": False,
         "units_expected": len(expect),
         "units_run": len(rows),
@@ -858,6 +908,10 @@ def compute_summary(
         "criteria": crit,
         "round4": round4_block(rows, [i for i in expect if i.startswith(BUG_UNIT_PREFIX)]),
     }
+    groups = app_block(rows)
+    if groups:
+        summary["app_block"] = groups
+    return summary
 
 
 # --------------------------------------------------------------------------
@@ -1277,7 +1331,7 @@ def rehearse_side(
                 repair=False,
                 env=pipeline.side_bootstrap_env(driver),
             )
-            steps = [auth.login] if auth is not None else []
+            steps = auth.login_steps() if auth is not None else []
             steps.append(pipeline.Step("GET", path, auth=auth is not None))
             res = runner(pipeline.Scenario(steps, f"GET {path}"))
         finally:
