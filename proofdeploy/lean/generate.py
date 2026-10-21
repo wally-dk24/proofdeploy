@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -50,6 +50,7 @@ from proofdeploy.lean.http import (
     parse_body,
     resolve_refs,
     scrub_value,
+    unresolved_placeholders,
 )
 from proofdeploy.lean.index import AppIndex, Operation
 
@@ -1030,8 +1031,14 @@ class ScenarioRunner:
         session: ContextSetter | None = None,
         index: AppIndex | None = None,
         repair: bool = True,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         self.client = client
+        # The side's own generated bootstrap values: the ONLY source of ``${NAME}``
+        # placeholders in a body (never the host environment). Secrets: redacted
+        # by value from everything recorded.
+        self.env: dict[str, str] = dict(env or {})
+        self._secrets = sorted({v for v in self.env.values() if v}, key=len, reverse=True)
         self.scheme = auth.scheme if auth else "Bearer"
         self.session = session
         self.repair = repair
@@ -1059,7 +1066,14 @@ class ScenarioRunner:
         headers: dict[str, str] = {"Accept": "application/json"}
         if step.auth and TOKEN_VAR in variables:
             headers["Authorization"] = f"{self.scheme} {variables[TOKEN_VAR]}"
-        data, ctype = encode_body(expand_env(recorded_body), step.content_type)
+        sent_body = expand_env(recorded_body, self.env)
+        left = unresolved_placeholders(sent_body)
+        if left:
+            # Never send an unexpanded placeholder: nothing goes on the wire.
+            req = {"method": step.method, "url_path": url_path, "body": recorded_body}
+            msg = "unresolved placeholder " + ", ".join("${" + n + "}" for n in left)
+            return Exchange(scenario_id, idx, req, 0, {}, msg, 0.0, attempt), None, {}
+        data, ctype = encode_body(sent_body, step.content_type)
         if ctype:
             headers["Content-Type"] = ctype
         status, kept, text, elapsed = self.client.request(
@@ -1074,7 +1088,24 @@ class ScenarioRunner:
         if isinstance(tok, str) and tok:
             shown = scrub_value(live, tok)
         req = {"method": step.method, "url_path": url_path, "body": recorded_body}
-        return Exchange(scenario_id, idx, req, status, kept, shown, elapsed, attempt), live, kept
+        for secret in self._secrets:
+            shown = scrub_value(shown, secret, "<redacted:bootstrap>")
+            req = scrub_value(req, secret, "<redacted:bootstrap>")
+        return (
+            Exchange(
+                scenario_id,
+                idx,
+                req,
+                status,
+                kept,
+                shown,
+                elapsed,
+                attempt,
+                auth_sent="Authorization" in headers,
+            ),
+            live,
+            kept,
+        )
 
     def __call__(self, scenario: Scenario) -> RunResult:
         variables: dict[str, Any] = {}
