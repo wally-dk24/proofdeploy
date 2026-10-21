@@ -494,6 +494,65 @@ def seed_ids(seed_facts: Iterable[str]) -> list[int]:
     return out
 
 
+_ID_LIST = r"\d+(?:\s*(?:,|and|&)\s*\d+)*"
+_RECORD_RE = re.compile(
+    r"(?:\b(?P<w>[A-Za-z][A-Za-z_-]*)\s+)?(?:\bids?\s*[:=#]?\s*|#\s*)(?P<n>" + _ID_LIST + r")"
+    r"|\b(?P<w2>[A-Za-z][A-Za-z_-]*)\s+(?P<n2>" + _ID_LIST + r")(?![\w.])",
+    re.IGNORECASE,
+)
+# Words that may stand before ``id <n>`` without naming a collection ("seed id 1").
+_ID_FILLER = {
+    "a", "an", "and", "as", "at", "both", "by", "for", "has", "have", "id", "ids", "is", "are",
+    "of", "or", "record", "records", "row", "rows", "seed", "seeded", "the", "to", "with",
+}  # fmt: skip
+
+
+def _flat(word: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", word.lower())
+
+
+def _singulars(coll: str) -> set[str]:
+    c = _flat(coll)
+    out = {c}
+    if c.endswith("ies") and len(c) > 3:
+        out.add(c[:-3] + "y")
+    if c.endswith("es") and len(c) > 2:
+        out.add(c[:-2])
+    if c.endswith("s") and len(c) > 1:
+        out.add(c[:-1])
+    return out
+
+
+def seeded_records(
+    seed_facts: Iterable[str], collections: Iterable[str] = ()
+) -> list[tuple[str | None, int]]:
+    """Record ids named in seed sentences as ``(collection | None, id)``, in order.
+
+    ``id <n>``, ``id=<n>``, ``#<n>`` name an id for any collection (None).
+    ``<word> <n>`` (also ``<word> id <n>``, ``<word> #<n>``) names an id for the
+    collection of ``collections`` whose singular or plural form is ``<word>``; a
+    word that matches none of them is ignored. Only integers; no ids, empty list.
+    """
+    colls = list(dict.fromkeys(collections))
+    out: list[tuple[str | None, int]] = []
+    for fact in seed_facts:
+        for m in _RECORD_RE.finditer(fact):
+            word = m.group("w") or m.group("w2")
+            nums = [int(n) for n in re.findall(r"\d+", m.group("n") or m.group("n2"))]
+            target: str | None = None
+            if word and word.lower() not in _ID_FILLER:
+                hits = [c for c in colls if _flat(word) in _singulars(c) or _flat(word) == _flat(c)]
+                if not hits:
+                    continue
+                target = hits[0]
+            elif m.group("w2"):
+                continue  # "<filler> <n>" is not an id mention
+            for n in nums:
+                if (target, n) not in out:
+                    out.append((target, n))
+    return out
+
+
 # --------------------------------------------------------------------------
 # Ranking
 # --------------------------------------------------------------------------
@@ -808,16 +867,52 @@ class ScenarioGenerator:
                 uniq.append(sc)
         return uniq[: self.max_variants]
 
+    def seeded_reads(self, ops: Sequence[Operation]) -> list[Scenario]:
+        """One read of every seeded record id on every GET op with exactly one path param."""
+        colls = [c for c in (self._collection_of(op) for op in self.index.operations) if c]
+        records = seeded_records(self.index.seed_facts, colls)
+        if not records:
+            return []
+        authed = self.auth is not None
+        out: list[Scenario] = []
+        for op in ops:
+            params = _param_schemas(op)
+            if op.method != "GET" or len(params) != 1 or self._is_login_op(op):
+                continue
+            (name, schema), coll = next(iter(params.items())), self._collection_of(op)
+            if _schema_type(schema) not in ("integer", "number", None):
+                continue
+            _, body, query = request_variants(op, self.mined)[0]
+            for target, n in records:
+                if target is not None and target != coll:
+                    continue
+                out.append(
+                    self._make(
+                        op, [], self._target(op, body, query, {name: n}, authed=authed), login=True
+                    )
+                )
+        return out
+
+    @staticmethod
+    def _collection_of(op: Operation) -> str | None:
+        """The path segment just before the op's single ``{param}`` (None if none/several)."""
+        segs = op.path.strip("/").split("/")
+        marks = [i for i, sg in enumerate(segs) if sg.startswith("{") and sg.endswith("}")]
+        if len(marks) != 1 or marks[0] == 0:
+            return None
+        return segs[marks[0] - 1]
+
     def generate(self, ops: Sequence[Operation] | None = None) -> list[Scenario]:
-        """All scenarios, ordered: the first scenario of each ranked op, then the rest."""
-        per_op = [
-            self.for_operation(op) for op in (ops if ops is not None else self.index.operations)
-        ]
+        """All scenarios, ordered: seeded record reads, the first scenario of each ranked op,
+        then the rest."""
+        use = list(ops if ops is not None else self.index.operations)
+        per_op = [self.for_operation(op) for op in use]
+        seeded = self.seeded_reads(use)
         first = [lst[0] for lst in per_op if lst]
         rest = [s for lst in per_op for s in lst[1:]]
         seen: set[str] = set()
         out: list[Scenario] = []
-        for sc in [*first, *rest]:
+        for sc in [*seeded, *first, *rest]:
             if sc.id not in seen:
                 seen.add(sc.id)
                 out.append(sc)
