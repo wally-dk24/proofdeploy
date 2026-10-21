@@ -11,7 +11,7 @@ Units, in this order (26):
 
   a. golden python-flask-sqlite, SANDBOX: ``golden-bug`` (base -> bug) and
      ``golden-clean`` (fix -> clean); intent = the head commit's message.
-  b. the 20 mutants of ``mutants.json`` on ``intermediate``, HOST mode (our own golden
+  b. the 20 mutants of ``mutants.json`` on ``fix``, HOST mode (our own golden
      code; each row says ``mode: host``); intent "no behaviour change intended".
   c. ``paperless-bug`` (B^..B), SANDBOX, contract store paperless-ngx/paperless-ngx, OpenAPI
      path /api/schema/, ``CELERY_TASK_ALWAYS_EAGER=True``; intent = B's commit message. When

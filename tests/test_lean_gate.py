@@ -347,6 +347,25 @@ def test_invalid_bug_unit_file_is_a_gate_error(
     assert len(gate.select_units(gate.load_units("golden"), "golden")) == 2
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"b": "a" * 41},
+        {"fix": "a" * 40 + "\n"},
+        {"b_parent": "a" * 40 + "\n"},
+        {"selection_record_sha256": "5" * 65},
+        {"selection_record_sha256": "5" * 64 + "\n"},
+    ],
+)
+def test_bug_unit_shas_must_match_exactly(
+    override: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = write_bug_unit(tmp_path / "long.json", **override)
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", path)
+    with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+        gate.load_paperless_bug_unit()
+
+
 def test_valid_bug_unit_file_is_loaded_not_constants() -> None:
     assert gate.load_paperless_bug_unit() == BUG_UNIT
     assert not hasattr(gate, "PAPERLESS_FIX") and not hasattr(gate, "PAPERLESS_BASE")
@@ -564,6 +583,7 @@ def test_run_confirm_replays_each_fix_side_twice_and_closes_both(tmp_path: Path)
 
     def provision(rc: Any, contract_file: Any, work: Path, timings: Any) -> Any:
         assert (rc.base_sha, rc.head_sha) == (BUG_UNIT["fix_parent"], BUG_UNIT["fix"])
+        assert (rc.base, rc.head) == (BUG_UNIT["fix_parent"], BUG_UNIT["fix"])
         assert rc.unit_repo == gate.PAPERLESS_UNIT_REPO and contract_file is not None
         sides.extend([FakeSide("fixp"), FakeSide("fix")])
         return sides[0], sides[1], object()
@@ -587,6 +607,7 @@ def test_run_confirm_replays_each_fix_side_twice_and_closes_both(tmp_path: Path)
             cfg, rc, [_scenario()], None, [gate.Flagged(f"{SID}:1", "title", "B-value")]
         )
     assert out["confirmed"] is True and out["runs_each"] == 2
+    assert (out["fix_parent"], out["fix"]) == (BUG_UNIT["fix_parent"], BUG_UNIT["fix"])
     assert calls == [("fixp", "fixp"), ("fixp", "fixp2"), ("fix", "fix"), ("fix", "fix2")]
     assert all(s.closed for s in sides)
 
