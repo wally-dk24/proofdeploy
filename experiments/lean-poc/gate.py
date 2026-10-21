@@ -7,16 +7,17 @@ Runs the fixed gate units sequentially through the lean pipeline
     <out>/gate-summary.json       the pre-registered criteria, computed (see below)
     <out>/units/<unit-id>/        that unit's lean-verify output (manifest, record, exchanges, logs)
 
-Units, in this order (26):
+Units, in this order (28):
 
   a. golden python-flask-sqlite, SANDBOX: ``golden-bug`` (base -> bug) and
      ``golden-clean`` (fix -> clean); intent = the head commit's message.
   b. the 20 mutants of ``mutants.json`` on ``fix``, HOST mode (our own golden
      code; each row says ``mode: host``); intent "no behaviour change intended".
-  c. ``paperless-bug`` (B^..B), SANDBOX, contract store paperless-ngx/paperless-ngx, OpenAPI
-     path /api/schema/, ``CELERY_TASK_ALWAYS_EAGER=True``; intent = B's commit message. When
-     the verdict is FAIL the flagged requests are re-run on fix^ and fix (two runs each, no
-     judge) and ``confirmed`` records whether fix^ shows the flagged value and fix does not.
+  c. the 3 paperless bug units of ``paperless-bug-units.json`` (``paperless-bug-<fix[:8]>``,
+     B^..B), SANDBOX, contract store paperless-ngx/paperless-ngx, OpenAPI path /api/schema/,
+     ``CELERY_TASK_ALWAYS_EAGER=True``; intent = B's commit message. When a unit's verdict is
+     FAIL the flagged requests are re-run on THAT unit's fix^ and fix (two runs each, no judge)
+     and ``confirmed`` records whether fix^ shows the flagged value and fix does not.
   d. the 3 paperless clean units of ``paperless-clean-units.json`` (first_parent -> sha),
      same options; intent = the unit's own commit message.
 
@@ -61,10 +62,10 @@ from proofdeploy.model_client import ModelRunner
 HERE = Path(__file__).resolve().parent
 MUTANTS_JSON = HERE / "mutants.json"
 CLEAN_UNITS_JSON = HERE / "paperless-clean-units.json"
-# Written by the blind re-walk (D267), not by this module: see load_paperless_bug_unit().
-PAPERLESS_BUG_UNIT_JSON = HERE / "paperless-bug-unit.json"
+# The bugs already found (round 4, WO-R4-B): see load_paperless_bug_units().
+PAPERLESS_BUG_UNITS_JSON = HERE / "paperless-bug-units.json"
 
-# -- the paperless bug unit (WO-6 selection), fixed -----------------------------------------
+# -- the paperless bug units (WO-6 selections), fixed -----------------------------------------
 PAPERLESS_UNIT_REPO = "paperless-ngx/paperless-ngx"
 PAPERLESS_OPENAPI = "/api/schema/"
 PAPERLESS_OVERLAY = ["CELERY_TASK_ALWAYS_EAGER=True"]
@@ -75,6 +76,7 @@ OBSERVABLE_MIN_PERCENT = 70
 PAPERLESS_CLEAN_MAX_FALSE_ALARMS = 1
 
 GROUPS = ("all", "golden", "mutants", "paperless")
+BUG_UNIT_PREFIX = "paperless-bug-"
 
 # The pre-registered criteria (claude/stage-2-phase-0-poc-plan-2026-10-20.md), verbatim.
 CRITERIA: dict[str, str] = {
@@ -119,15 +121,17 @@ class Unit:
     head: str
     intent: str | None  # None = the head commit's message (the pipeline default)
     paperless: bool = False
+    fix_parent: str | None = None  # bug units: the fix's first parent (the confirm base)
+    fix: str | None = None  # bug units: the fix commit (the confirm head)
 
 
 def build_units(
-    mutants: dict[str, Any], clean: dict[str, Any], bug: dict[str, Any] | None = None
+    mutants: dict[str, Any], clean: dict[str, Any], bugs: list[dict[str, Any]] | None = None
 ) -> list[Unit]:
-    """The fixed unit list: 2 golden, one per mutant, the paperless bug, the paperless cleans.
+    """The fixed unit list: 2 golden, one per mutant, the paperless bugs, the paperless cleans.
 
-    ``bug`` is the validated paperless bug unit (``load_paperless_bug_unit``); without it the
-    ``paperless-bug`` unit is left out (the golden and mutant groups do not need it).
+    ``bugs`` are the validated paperless bug units (``load_paperless_bug_units``); without them
+    the bug units are left out (the golden and mutant groups do not need them).
     """
     units = [
         Unit("golden-bug", "bug", "golden", "sandbox", "base", "bug", None),
@@ -145,10 +149,10 @@ def build_units(
                 str(mutants.get("judge_intent") or MUTANT_INTENT),
             )
         )
-    if bug is not None:
+    for bug in bugs or []:
         units.append(
             Unit(
-                "paperless-bug",
+                str(bug["id"]),
                 "bug",
                 "paperless",
                 "sandbox",
@@ -156,6 +160,8 @@ def build_units(
                 str(bug["b"]),
                 None,
                 True,
+                str(bug["fix_parent"]),
+                str(bug["fix"]),
             )
         )
     for u in clean["units"]:
@@ -176,6 +182,8 @@ def build_units(
 
 _BUG_UNIT_KEYS = frozenset(
     {
+        "id",
+        "note",
         "unit_repo",
         "b_parent",
         "b",
@@ -189,16 +197,17 @@ _SHA1_RE = re.compile(r"[0-9a-f]{40}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
-def load_paperless_bug_unit(path: Path | None = None) -> dict[str, Any]:
-    """The paperless bug unit from its file (written by the blind re-walk), validated.
+def load_paperless_bug_units(path: Path | None = None) -> list[dict[str, Any]]:
+    """The paperless bug units from their file, each validated.
 
-    Raises ``GateError("paperless bug unit not selected yet: ...")`` when the file is absent or
-    invalid, so the gate stops before running anything.
+    Raises ``GateError("paperless bug units not selected yet: ...")`` when the file is absent
+    or invalid (or lists no unit, or repeats an id), so the gate stops before running anything.
+    A unit's id must be ``paperless-bug-<first 8 characters of its fix>``.
     """
-    path = PAPERLESS_BUG_UNIT_JSON if path is None else path
+    path = PAPERLESS_BUG_UNITS_JSON if path is None else path
 
     def bad(why: str) -> GateError:
-        return GateError(f"paperless bug unit not selected yet: {why}")
+        return GateError(f"paperless bug units not selected yet: {why}")
 
     if not path.is_file():
         raise bad(f"{path.name} is missing")
@@ -206,36 +215,48 @@ def load_paperless_bug_unit(path: Path | None = None) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise bad(f"{path.name} is unreadable ({type(exc).__name__})") from exc
-    if not isinstance(data, dict):
-        raise bad(f"{path.name} is not a JSON object")
-    keys = set(data)
-    if keys != _BUG_UNIT_KEYS:
-        raise bad(
-            f"{path.name} keys differ (missing {sorted(_BUG_UNIT_KEYS - keys)}, "
-            f"extra {sorted(keys - _BUG_UNIT_KEYS)})"
-        )
-    for key in ("b_parent", "b", "fix_parent", "fix"):
-        v = data[key]
-        if not isinstance(v, str) or not _SHA1_RE.fullmatch(v):
-            raise bad(f"{key} is not a 40-character lowercase hex sha")
-    v = data["selection_record_sha256"]
-    if not isinstance(v, str) or not _SHA256_RE.fullmatch(v):
-        raise bad("selection_record_sha256 is not a 64-character lowercase hex sha256")
-    for key in ("unit_repo", "selection_record"):
-        if not isinstance(data[key], str) or not data[key].strip():
-            raise bad(f"{key} is not a non-empty string")
-    if data["unit_repo"] != PAPERLESS_UNIT_REPO:
-        raise bad(f"unit_repo is not {PAPERLESS_UNIT_REPO}")
-    return data
+    if not isinstance(data, dict) or set(data) != {"units"}:
+        raise bad(f"{path.name} is not an object with exactly the key 'units'")
+    units = data["units"]
+    if not isinstance(units, list) or not units:
+        raise bad(f"{path.name} lists no unit")
+    seen: set[str] = set()
+    for n, unit in enumerate(units):
+        if not isinstance(unit, dict):
+            raise bad(f"unit {n} is not a JSON object")
+        keys = set(unit)
+        if keys != _BUG_UNIT_KEYS:
+            raise bad(
+                f"unit {n} keys differ (missing {sorted(_BUG_UNIT_KEYS - keys)}, "
+                f"extra {sorted(keys - _BUG_UNIT_KEYS)})"
+            )
+        for key in ("b_parent", "b", "fix_parent", "fix"):
+            v = unit[key]
+            if not isinstance(v, str) or not _SHA1_RE.fullmatch(v):
+                raise bad(f"unit {n}: {key} is not a 40-character lowercase hex sha")
+        v = unit["selection_record_sha256"]
+        if not isinstance(v, str) or not _SHA256_RE.fullmatch(v):
+            raise bad(f"unit {n}: selection_record_sha256 is not a 64-character lowercase hex")
+        for key in ("id", "note", "unit_repo", "selection_record"):
+            if not isinstance(unit[key], str) or not unit[key].strip():
+                raise bad(f"unit {n}: {key} is not a non-empty string")
+        if unit["unit_repo"] != PAPERLESS_UNIT_REPO:
+            raise bad(f"unit {n}: unit_repo is not {PAPERLESS_UNIT_REPO}")
+        if unit["id"] != f"paperless-bug-{unit['fix'][:8]}":
+            raise bad(f"unit {n}: id is not paperless-bug-<fix[:8]>")
+        if unit["id"] in seen:
+            raise bad(f"unit {n}: id {unit['id']} is repeated")
+        seen.add(unit["id"])
+    return [dict(u) for u in units]
 
 
 def load_units(which: str = "all") -> list[Unit]:
     """All units of the selected group (default: all). The paperless bug unit file is required
     only when the paperless group is part of the selection."""
-    bug = load_paperless_bug_unit() if which in ("all", "paperless") else None
+    bugs = load_paperless_bug_units() if which in ("all", "paperless") else None
     mutants = json.loads(MUTANTS_JSON.read_text(encoding="utf-8"))
     clean = json.loads(CLEAN_UNITS_JSON.read_text(encoding="utf-8"))
-    return build_units(mutants, clean, bug)
+    return build_units(mutants, clean, bugs)
 
 
 def select_units(units: list[Unit], which: str) -> list[Unit]:
@@ -396,6 +417,21 @@ def row_from_result(
     impacted = m.get("impacted_operations_head") or {}
     reqs = sum(int(r.get("requests", 0)) for r in impacted.values())
     ok2xx = sum(int(r.get("2xx", 0)) for r in impacted.values())
+    executable = m.get("executable_changed_lines")
+    load_only = sum(
+        len((m.get("coverage") or {}).get(side, {}).get("load_only_declarations") or [])
+        for side in ("head", "base")
+    )
+    reached = (
+        None
+        if not isinstance(executable, int)
+        else max(0, executable - len(m.get("unexercised_lines") or []) - load_only)
+    )
+    groups = getattr(result.record, "groups", None) if result.record is not None else None
+    judged = 0
+    for g in groups if isinstance(groups, list) else []:
+        if (g.get("judgment") or {}).get("verdict") != "unjudged":
+            judged += len((g.get("group") or {}).get("request_ids") or [])
     return {
         "unit": unit.id,
         "kind": unit.kind,
@@ -411,7 +447,10 @@ def row_from_result(
         "differences": differences,
         "noise": len(m.get("noise") or []),
         "unexercised": len(m.get("unexercised_lines") or []),
-        "executable_changed_lines": m.get("executable_changed_lines"),
+        "executable_changed_lines": executable,
+        "lines_reached": reached,
+        "requests_hitting_changed_code": reqs,
+        "differences_judged": judged,
         "hard_failures": hard,
         "flaky_hard_failures": flaky,
         "tokens": int(result.record.total_tokens) if result.record is not None else 0,
@@ -447,6 +486,9 @@ def error_row(
         "noise": 0,
         "unexercised": 0,
         "executable_changed_lines": None,
+        "lines_reached": None,
+        "requests_hitting_changed_code": 0,
+        "differences_judged": 0,
         "hard_failures": 0,
         "flaky_hard_failures": 0,
         "tokens": 0,
@@ -474,6 +516,30 @@ def _by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 def _crit(status: str, **details: Any) -> dict[str, Any]:
     return {"status": status, **details}
+
+
+ROUND4_FIELDS = (
+    ("verdict", "verdict"),
+    ("cause", "cause"),
+    ("confirmed", "confirmed"),
+    ("executable_changed_lines", "executable_changed_lines"),
+    ("lines_reached", "lines_reached"),
+    ("requests_hitting_changed_code", "requests_hitting_changed_code"),
+    ("differences_found", "differences"),
+    ("differences_judged", "differences_judged"),
+)
+
+
+def round4_block(rows: list[dict[str, Any]], bug_ids: list[str]) -> dict[str, Any]:
+    """Per bug unit: verdict, cause, confirmed, executable changed lines, lines reached,
+    requests hitting changed code, differences found, differences judged (ids and counts only)."""
+    by = _by_id(rows)
+    return {
+        "bug_units": {
+            i: {out: by[i].get(src) for out, src in ROUND4_FIELDS} for i in bug_ids if i in by
+        },
+        "bug_units_missing": [i for i in bug_ids if i not in by],
+    }
 
 
 def compute_summary(
@@ -536,25 +602,34 @@ def compute_summary(
             errors=sorted(r["unit"] for r in m_rows if r["error"]),
         )
 
-    # 3. paperless bug (reported, not required)
-    if "paperless-bug" not in have:
-        crit["3"] = _crit("NOT_RUN", required=False, missing=["paperless-bug"])
-    else:
-        b = by["paperless-bug"]
-        real = (
-            not b["error"]
-            and b["verdict"] in (PASS, FAIL, INCONCLUSIVE)
-            and b["cause"] not in ("environment", "provider_limit")
-        )
+    # 3. paperless bugs (reported, not required): computed per bug unit, reported per unit
+    bug_expected = [i for i in expect if i.startswith(BUG_UNIT_PREFIX)]
+    bug_rows = [r for r in rows if str(r["unit"]).startswith(BUG_UNIT_PREFIX)]
+    if not bug_expected or missing(bug_expected):
         crit["3"] = _crit(
-            "PASS" if real else "FAIL",
+            "NOT_RUN", required=False, missing=missing(bug_expected) or [BUG_UNIT_PREFIX + "*"]
+        )
+    else:
+        per_unit: dict[str, Any] = {}
+        for b in sorted(bug_rows, key=lambda r: bug_expected.index(r["unit"])):
+            real = (
+                not b["error"]
+                and b["verdict"] in (PASS, FAIL, INCONCLUSIVE)
+                and b["cause"] not in ("environment", "provider_limit")
+            )
+            per_unit[b["unit"]] = _crit(
+                "PASS" if real else "FAIL",
+                real_verdict=real,
+                verdict=b["verdict"],
+                cause=b["cause"],
+                confirmed=b["confirmed"],
+                caught=b["verdict"] == FAIL and b["confirmed"] is True,
+                error=bool(b["error"]),
+            )
+        crit["3"] = _crit(
+            "PASS" if all(u["status"] == "PASS" for u in per_unit.values()) else "FAIL",
             required=False,
-            real_verdict=real,
-            verdict=b["verdict"],
-            cause=b["cause"],
-            confirmed=b["confirmed"],
-            caught=b["verdict"] == FAIL and b["confirmed"] is True,
-            error=bool(b["error"]),
+            units=per_unit,
         )
 
     # 4. false alarms
@@ -612,6 +687,7 @@ def compute_summary(
         "wall_seconds": round(sum(r["wall_seconds"] for r in rows), 1),
         "criteria_text": CRITERIA,
         "criteria": crit,
+        "round4": round4_block(rows, [i for i in expect if i.startswith(BUG_UNIT_PREFIX)]),
     }
 
 
@@ -711,11 +787,16 @@ def run_confirm(
     scenarios: list[HttpScenario],
     auth: AuthSpec | None,
     flagged: list[Flagged],
+    unit: Unit,
 ) -> dict[str, Any]:
-    """Re-run the flagged scenarios on fix^ and fix (two fresh runs each); NO judge, no model."""
+    """Re-run the flagged scenarios on the unit's own fix^ and fix (two fresh runs each).
+
+    NO judge, no model."""
     provision = cfg.provision or lean_run.provision_sandbox_sides
     replay = cfg.replay or pipeline.replay_run
-    bug = load_paperless_bug_unit()
+    if unit.fix_parent is None or unit.fix is None:
+        raise GateError(f"{unit.id} has no fix and fix^ to confirm against")
+    bug = {"fix_parent": unit.fix_parent, "fix": unit.fix}
     crc = lean_run.LeanRunConfig(
         repo=rc.repo,
         base=bug["fix_parent"],
@@ -800,7 +881,7 @@ def run_unit(cfg: GateConfig, unit: Unit, repos: _Repos) -> dict[str, Any]:
             rc = _unit_rc(cfg, unit, repos, out_dir, mode)
             result, code = lean_run.lean_verify(rc, model_runner=cfg.runner, log=log)
             row = row_from_result(unit, result, code, wall_seconds=0.0, mode=mode)
-            if unit.id == "paperless-bug" and result.verdict.status == FAIL:
+            if unit.id.startswith(BUG_UNIT_PREFIX) and result.verdict.status == FAIL:
                 row["confirmed"] = False
                 try:
                     flagged = flagged_from_verdict(
@@ -808,7 +889,7 @@ def run_unit(cfg: GateConfig, unit: Unit, repos: _Repos) -> dict[str, Any]:
                     )
                     if not flagged or not cap["scenarios"]:
                         raise RuntimeError("no flagged items or no replayed scenarios to confirm")
-                    conf = run_confirm(cfg, rc, cap["scenarios"], cap["auth"], flagged)
+                    conf = run_confirm(cfg, rc, cap["scenarios"], cap["auth"], flagged, unit)
                     row["confirmed"] = bool(conf["confirmed"])
                     (out_dir / "confirm.json").write_text(
                         json.dumps(conf, indent=2, sort_keys=True, default=str) + "\n",

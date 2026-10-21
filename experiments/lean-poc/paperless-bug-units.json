@@ -1,0 +1,37 @@
+{
+  "units": [
+    {
+      "id": "paperless-bug-371c4f57",
+      "note": "upgrade-path only (D229); expected not observable over HTTP",
+      "unit_repo": "paperless-ngx/paperless-ngx",
+      "b_parent": "3a34bdc7b078486bc85a97ce309a1c8180cdfc88",
+      "b": "7dca0bfa6af103b76185aada3ce736b0ac1abc01",
+      "fix_parent": "5569447ea00c50de8c0c1c75136418bb3343dad6",
+      "fix": "371c4f57d3ab208fc261e159fa86ca1dc80cb334",
+      "selection_record": "selection/wo6-bug-selection-record.json",
+      "selection_record_sha256": "6dd2956a100e79d39a2957fa55993f511fe8c9157836b183b32d1681eb2d318d"
+    },
+    {
+      "id": "paperless-bug-d3710856",
+      "note": "frontend-only B (round 1); expected not observable over HTTP",
+      "unit_repo": "paperless-ngx/paperless-ngx",
+      "b_parent": "17dc482872cf62e12965f6207772c83d1deb651b",
+      "b": "aa67fd3aefa6489984fc15a5c32c1ad2b16ac23a",
+      "fix_parent": "14b6a41b88e75fb7d35aa84b33986870bfd1aa69",
+      "fix": "d3710856992a91783783819217b43392aab73e00",
+      "selection_record": "selection/wo6-c4-2026-10-20/wo6-bug-selection-record.json",
+      "selection_record_sha256": "cd5b78361b8829d4095dca3ca323d630c62483bee988c391698eba3b23a12784"
+    },
+    {
+      "id": "paperless-bug-b992f9fc",
+      "note": "round 2 blind re-walk selection (D267)",
+      "unit_repo": "paperless-ngx/paperless-ngx",
+      "b_parent": "e01a762e81dd65dff927988aa51594906d8a417f",
+      "b": "aed9abe48c02b1b7df07e429db3f2ed8c3a58ce8",
+      "fix_parent": "6d249b49327fdab58ff915d3f5435e49de742464",
+      "fix": "b992f9fc05bedd2f26f7291028b0b38471e697db",
+      "selection_record": "selection/lean-r2-2026-10-21/out",
+      "selection_record_sha256": "44a411590b3f58cbbda295f293b89817d693c34d221f33061ebc528d92b5907a"
+    }
+  ]
+}
