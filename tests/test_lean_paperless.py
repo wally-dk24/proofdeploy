@@ -766,6 +766,12 @@ def test_the_coverage_loop_requests_are_recorded_with_counts_and_the_auth_flag(
     rates = m["impacted_operations_loop_head"]["GET /notes/{note_id}"]
     assert 0 < rates["2xx_rate"] <= 1 and rates["requests"] >= 1
     assert "impacted_operations_loop_base" in m
+    base_ran = "skipped" not in m["coverage"]["base"]
+    assert base_ran == (out / "exchanges.cover_base.jsonl").exists()
+    if base_ran:  # the base side's loop is recorded the same way
+        n_base = len((out / "exchanges.cover_base.jsonl").read_text(encoding="utf-8").splitlines())
+        assert m["cover_loop"]["base"]["requests"] == n_base > 0
+        assert m["auth_proof"]["base"]["outcome"] == "2xx"
     # the sign-in proof ran inside the side and was recorded
     assert m["auth_proof"]["head"]["outcome"] == "2xx" and m["auth_proof"]["head"]["ok"]
     blob = "".join(p.read_text(encoding="utf-8") for p in out.glob("exchanges.cover_*.jsonl"))
