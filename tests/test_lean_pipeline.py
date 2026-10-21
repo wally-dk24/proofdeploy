@@ -909,3 +909,24 @@ def test_the_record_never_carries_the_model_key(
     run_golden(golden, "intermediate", "clean", tmp_path / "out", stub)
     for f in (tmp_path / "out").glob("*.json"):
         assert secret not in f.read_text(encoding="utf-8")
+
+
+def test_manifest_carries_hard_check_notes_run_windows_and_side_windows(
+    golden: dict[str, Any], ci_env: None, tmp_path: Path
+) -> None:
+    code, m = run_golden(golden, "intermediate", "clean", tmp_path / "out", PromptStub(clean_rule))
+    assert code == 0, m["verdict"]
+    assert set(m["hard_check_notes"]) == {
+        "timeout_seconds",
+        "preexisting_failure",
+        "excluded_tracebacks",
+    }
+    assert m["hard_check_notes"]["timeout_seconds"] == 10.0
+    assert set(m["run_windows"]) == {"base", "base2", "head", "head2"}
+    assert set(m["side_windows"]) == {"base", "head"}
+    for side in ("base", "head"):
+        lo, hi = m["side_windows"][side]
+        assert lo < hi
+        # the side's lifetime starts at its provisioning, before its first replay run begins
+        assert m["sides"][side]["provisioned_at"] is not None
+        assert lo < min(m["run_windows"][r][0] for r in (side, side + "2"))

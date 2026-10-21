@@ -40,6 +40,7 @@ from proofdeploy.lean import coverage as lc
 from proofdeploy.lean.compare import (
     RUN_LABELS,
     Comparison,
+    HardCheckNotes,
     NoiseItem,
     RunData,
     compare_runs,
@@ -551,6 +552,7 @@ def replay_run(
 ) -> RunData:
     """Replay the scenarios on a fresh app: same requests, same order, no repair."""
     data = RunData(label)
+    data.side_started_at = getattr(driver, "provisioned_at", None)
     app = driver.start(measured=False)
     try:
         runner = ScenarioRunner(
@@ -572,7 +574,10 @@ def replay_run(
 
 
 def settle_flaky(
-    runs: dict[str, RunData], flaky: list[HardFailure], hard: list[HardFailure]
+    runs: dict[str, RunData],
+    flaky: list[HardFailure],
+    hard: list[HardFailure],
+    notes: HardCheckNotes | None = None,
 ) -> tuple[list[HardFailure], list[HardFailure]]:
     """Use the third head run: a one-off that reproduces becomes a hard failure.
 
@@ -588,7 +593,7 @@ def settle_flaky(
 
     again: set[tuple[str, str, str]] = set()
     for other in (runs["head"], runs["head2"]):
-        stable, _ = find_hard_failures(runs["base"], runs["base2"], other, h3)
+        stable, _ = find_hard_failures(runs["base"], runs["base2"], other, h3, notes=notes)
         again |= {ident(h) for h in stable}
     still: list[HardFailure] = []
     hard = list(hard)
@@ -969,8 +974,9 @@ def run_pipeline(
         comparison: Comparison = compare_runs(
             runs["base"], runs["base2"], runs["head"], runs["head2"]
         )
+        hard_notes = HardCheckNotes()
         hard, flaky_hard = find_hard_failures(
-            runs["base"], runs["base2"], runs["head"], runs["head2"]
+            runs["base"], runs["base2"], runs["head"], runs["head2"], notes=hard_notes
         )
     if flaky_hard:
         # A failure that appears after the change in only one of two head runs is a
@@ -980,7 +986,7 @@ def run_pipeline(
         with timings.stage("run_head3"):
             runs["head3"] = replay_run(head, "head3", scenarios, auth)
         log(f"run head3: {runs['head3'].request_count()} request(s)")
-        flaky_hard, hard = settle_flaky(runs, flaky_hard, hard)
+        flaky_hard, hard = settle_flaky(runs, flaky_hard, hard, hard_notes)
     noise: list[NoiseItem] = list(comparison.noise)
 
     # 6. judge and decide ---------------------------------------------------------
@@ -1090,6 +1096,9 @@ def run_pipeline(
         },
         "noise_fields": sorted({n.field_path for n in noise}),
         "noise": [n.to_dict() for n in noise],
+        "hard_check_notes": hard_notes.to_dict(),
+        "run_windows": comparison.run_windows,
+        "side_windows": comparison.side_windows,
         "hard_failures": [h.to_dict() for h in hard],
         "flaky_hard_failures": [h.to_dict() for h in flaky_hard],
         "judge": {

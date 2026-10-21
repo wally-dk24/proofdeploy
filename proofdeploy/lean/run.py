@@ -258,6 +258,7 @@ class HostSide:
         overlay: dict[str, Any] | None = None,
     ) -> None:
         self.label = label
+        self.provisioned_at: float | None = None  # wall clock when provisioning began
         self.sha = sha
         self.tree = tree
         self.py = py
@@ -369,6 +370,7 @@ class HostSide:
             "db_snapshot_sha256": _sha256_file(self.seed_db) if self.seed_db.is_file() else None,
             "starts": self._starts,
             "frozen_clock": self._clock,
+            "provisioned_at": self.provisioned_at,
             "env": {"PYTHONHASHSEED": "0", "TZ": "UTC"},
         }
 
@@ -401,6 +403,7 @@ def provision_host_sides(
     contracts: dict[str, RepoContract] = {}
     for label, sha in (("base", rc.base_sha), ("head", rc.head_sha)):
         with timings.stage(f"provision_{label}"):
+            provisioned_at = time.time()
             side_work = work / label
             side_work.mkdir(parents=True, exist_ok=True)
             tree = create_snapshot(
@@ -421,6 +424,7 @@ def provision_host_sides(
                 overlay=rc.django_overlay,
             )
             side.prepare()
+            side.provisioned_at = provisioned_at
             sides[label] = side
             contracts[label] = contract
     return sides["base"], sides["head"], contracts["head"]
@@ -638,6 +642,7 @@ class SandboxSide:
         work: Path,
     ) -> None:
         self.label = label
+        self.provisioned_at: float | None = None  # wall clock when provisioning began
         self.sha: str = side.sha
         self.side = side
         self.hook = hook
@@ -769,6 +774,7 @@ class SandboxSide:
             "db_snapshot_sha256": _sha256_file(self.seed_db) if self.seed_db.is_file() else None,
             "starts": self._starts,
             "frozen_clock": self._clock,
+            "provisioned_at": self.provisioned_at,
             "pdcov_setup_exit": self.hook.pdcov_rc,
             "app_cwd": self.hook.app_cwd,
             "env": {"PYTHONHASHSEED": "0", "TZ": "UTC"},
@@ -822,6 +828,7 @@ def provision_sandbox_sides(
     try:
         for label, sha in (("base", rc.base_sha), ("head", rc.head_sha)):
             hook = SandboxHook(overlay=rc.django_overlay, contract_env=contract_env)
+            provisioned_at = time.time()
             with timings.stage(f"provision_{label}"):
                 try:
                     with lean_sandbox_patched(make_lean_sandbox(hook)):
@@ -849,6 +856,7 @@ def provision_sandbox_sides(
             try:
                 ss = SandboxSide(label=label, side=side, hook=hook, work=work / "lean" / label)
                 ss.prepare()
+                ss.provisioned_at = provisioned_at
             except BaseException:
                 if side.provision.proc is not None:
                     with contextlib.suppress(Exception):

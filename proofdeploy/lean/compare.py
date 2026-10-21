@@ -66,6 +66,8 @@ class RunData:
     # extended each time a scenario's exchanges are added.
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
+    # When this run's side began provisioning (seed and cover phases stamp values then).
+    side_started_at: float | None = None
 
     def add(self, scenario: Scenario, exchanges: list[Exchange]) -> None:
         self.finished_at = max(self.finished_at, time.time())
@@ -257,6 +259,16 @@ def run_window(run: RunData) -> tuple[float, float]:
     return run.started_at - RUN_WINDOW_SLACK_S, end + RUN_WINDOW_SLACK_S
 
 
+def side_windows(runs: dict[str, list[RunData]]) -> dict[str, tuple[float, float]]:
+    """Lifetime window per side: from the start of its provisioning to the end of its last run."""
+    out: dict[str, tuple[float, float]] = {}
+    for side, rs in runs.items():
+        lo = min((r.side_started_at if r.side_started_at is not None else r.started_at) for r in rs)
+        hi = max(max(r.finished_at, r.started_at) for r in rs)
+        out[side] = (lo - RUN_WINDOW_SLACK_S, hi + RUN_WINDOW_SLACK_S)
+    return out
+
+
 def is_run_time_value(values: list[Any], windows: list[tuple[float, float]]) -> bool:
     """True when every run's value is a timestamp inside that run's own window."""
     for v, (lo, hi) in zip(values, windows, strict=True):
@@ -289,6 +301,8 @@ class Comparison:
     compared_fields: int = 0
     # label -> [start, end] epoch seconds (with slack) used for ``run_time_value``
     run_windows: dict[str, list[float]] = field(default_factory=dict)
+    # side -> [provisioning start, last run end] (with slack), the lifetime window
+    side_windows: dict[str, list[float]] = field(default_factory=dict)
 
     def noise_fields(self) -> list[str]:
         return sorted({n.field_path for n in self.noise})
@@ -327,6 +341,9 @@ def compare_runs(
         r.label: [round(w[0], 3), round(w[1], 3)]
         for r, w in zip((base, base2, head, head2), windows, strict=True)
     }
+    side_win = side_windows({"base": [base, base2], "head": [head, head2]})
+    result.side_windows = {k: [round(v[0], 3), round(v[1], 3)] for k, v in side_win.items()}
+    lifetime = [side_win["base"], side_win["base"], side_win["head"], side_win["head"]]
     if keys is None:
         seen: dict[ExKey, None] = {}
         for run in (base, head, base2, head2):
@@ -393,10 +410,13 @@ def compare_runs(
         for path, vals, raws in entries:
             result.compared_fields += 1
             shown = path if path.startswith("$") else display_path(path)
+            # Stable within each side: stamped once per side (seed, cover), so judge it against
+            # the side's lifetime. Moving between runs of a side: against each run's own window.
+            stable = raws[0] == raws[1] and raws[2] == raws[3]
             if (
                 not path.startswith("$")
                 and len({_canon(r) for r in raws}) > 1
-                and is_run_time_value(raws, windows)
+                and is_run_time_value(raws, lifetime if stable else windows)
             ):
                 result.noise.append(NoiseItem(request_id, shown, RUN_TIME_REASON))
                 continue
@@ -475,10 +495,13 @@ class HardCheckNotes:
     excluded_tracebacks: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        def uniq(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return list({_canon(r): r for r in rows}.values())
+
         return {
             "timeout_seconds": self.timeout_seconds,
-            "preexisting_failure": self.preexisting_failures,
-            "excluded_tracebacks": self.excluded_tracebacks,
+            "preexisting_failure": uniq(self.preexisting_failures),
+            "excluded_tracebacks": uniq(self.excluded_tracebacks),
         }
 
 
@@ -693,6 +716,7 @@ __all__ = [
     "flatten",
     "parse_timestamp",
     "request_windows",
+    "side_windows",
     "traceback_signatures",
     "unstable_list_paths",
 ]

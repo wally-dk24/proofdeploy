@@ -206,7 +206,10 @@ def _starts() -> list[float]:
     return [_start(i) for i in range(4)]
 
 
-def _timed(vals: list[Any]) -> list[RunData]:
+SEED_LEAD = 400.0  # a side provisions (seed, cover) this long before its first replay run
+
+
+def _timed(vals: list[Any], *, side_lead: float | None = None) -> list[RunData]:
     sc = _scenario()
     runs = []
     for i, (label, v) in enumerate(zip(("base", "base2", "head", "head2"), vals, strict=True)):
@@ -236,6 +239,8 @@ def _timed(vals: list[Any]) -> list[RunData]:
             ],
         )
         run.started_at = _start(i)
+        if side_lead is not None:
+            run.side_started_at = _start(i - i % 2) - side_lead
         run.finished_at = run.started_at + 30
         runs.append(run)
     return runs
@@ -363,3 +368,53 @@ def test_prepare_with_no_running_container_does_not_claim_the_image_lacks_it(
     side = _side(tmp_path, None)
     side.prepare()
     assert "image" not in side._clock["reason"]
+
+
+def test_round4_shape_value_stamped_at_seed_time_on_each_side_is_run_time_noise() -> None:
+    """date_joined / index_last_modified: stable within a side, set minutes before its runs."""
+    starts = _starts()
+    base_seed = _iso(starts[0] - 300)  # during base's provisioning
+    head_seed = _iso(starts[2] - 150)  # during head's provisioning
+    cmp = compare_runs(*_timed([base_seed, base_seed, head_seed, head_seed], side_lead=SEED_LEAD))
+    assert cmp.differences == []
+    assert [n.detail for n in cmp.noise if n.field_path == "date_joined"] == ["run_time_value"]
+    assert set(cmp.side_windows) == {"base", "head"}
+    assert cmp.side_windows["base"][0] < cmp.run_windows["base"][0]  # lifetime contains the run
+
+
+def test_seed_time_value_without_the_side_window_is_a_difference() -> None:
+    starts = _starts()
+    base_seed, head_seed = _iso(starts[0] - 300), _iso(starts[2] - 150)
+    cmp = compare_runs(*_timed([base_seed, base_seed, head_seed, head_seed]))  # no side start
+    assert [d.field_path for d in cmp.differences] == ["date_joined"]
+
+
+def test_fixed_date_changed_by_the_code_is_a_difference_even_with_side_windows() -> None:
+    cmp = compare_runs(
+        *_timed(["2020-01-01T00:00:00Z"] * 2 + ["2021-06-30T12:00:00Z"] * 2, side_lead=SEED_LEAD)
+    )
+    assert [(d.field_path, d.before, d.after) for d in cmp.differences] == [
+        ("date_joined", "2020-01-01T00:00:00Z", "2021-06-30T12:00:00Z")
+    ]
+
+
+def test_value_before_a_sides_provisioning_is_not_run_time() -> None:
+    starts = _starts()
+    early = _iso(starts[0] - SEED_LEAD - 60)  # an hour-old row, before base even provisioned
+    head_seed = _iso(starts[2] - 150)
+    cmp = compare_runs(*_timed([early, early, head_seed, head_seed], side_lead=SEED_LEAD))
+    assert [d.field_path for d in cmp.differences] == ["date_joined"]
+
+
+def test_settle_flaky_passes_the_notes_to_the_third_run_comparison() -> None:
+    from proofdeploy.lean.judge import HardFailure
+    from proofdeploy.lean.pipeline import settle_flaky
+
+    base, base2, head, head3 = _runs(_four(SERVER_ERROR, TIMEOUT))
+    head3.label = "head3"
+    runs = {"base": base, "base2": base2, "head": head, "head2": head, "head3": head3}
+    notes = HardCheckNotes()
+    flaky = [HardFailure(f"{_scenario().id}:1", "timeout", "x")]
+    still, hard = settle_flaky(runs, flaky, [], notes)
+    assert hard == [] and len(still) == 1
+    assert [n["kind"] for n in notes.to_dict()["preexisting_failure"]] == ["preexisting_failure"]
