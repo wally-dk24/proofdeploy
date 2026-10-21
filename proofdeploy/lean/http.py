@@ -11,8 +11,9 @@ pointed at the app under test.
 * ``${name}`` values inside path params, query and body refer to a value
   captured by an earlier step (``capture: {name: json_path}``) and are
   resolved when the step is sent. In a login body, ``${NAME}`` that is not a
-  captured value is read from the process environment at send time and never
-  written into an exchange.
+  captured value is read at send time from the SIDE's own generated bootstrap
+  environment (never from this process's environment), is never written into
+  an exchange, and a placeholder that cannot be resolved is never sent.
 * ``AuthSpec`` is derived from the contract's ``auth:`` block (``mode: login``).
 """
 
@@ -20,13 +21,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,7 @@ class Exchange:
     body_json_or_text: Any
     elapsed_ms: float
     attempt: int = 0  # 0 = as generated, 1 = after 400 repair
+    auth_sent: bool = False  # whether an Authorization header went out (never its value)
 
     @property
     def request_id(self) -> str:
@@ -209,17 +211,40 @@ def resolve_refs(obj: Any, variables: dict[str, Any], *, strict: bool = True) ->
     return obj
 
 
-def expand_env(obj: Any) -> Any:
-    """Expand remaining ``${NAME}`` placeholders from the environment (send time only)."""
+def expand_env(obj: Any, env: Mapping[str, str]) -> Any:
+    """Expand remaining ``${NAME}`` placeholders from ``env`` (send time only).
+
+    ``env`` is the side's own generated bootstrap environment. The process
+    environment is never consulted: a name that ``env`` does not hold stays a
+    literal ``${NAME}`` (see :func:`unresolved_placeholders`).
+    """
     if isinstance(obj, str):
         if "${" not in obj:
             return obj
-        return _PLACEHOLDER_RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), obj)
+        return _PLACEHOLDER_RE.sub(lambda m: env.get(m.group(1), m.group(0)), obj)
     if isinstance(obj, dict):
-        return {k: expand_env(v) for k, v in obj.items()}
+        return {k: expand_env(v, env) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [expand_env(v) for v in obj]
+        return [expand_env(v, env) for v in obj]
     return obj
+
+
+def unresolved_placeholders(obj: Any) -> list[str]:
+    """Names of the ``${NAME}`` placeholders still present in ``obj`` (sorted, unique)."""
+    found: set[str] = set()
+
+    def walk(o: Any) -> None:
+        if isinstance(o, str):
+            found.update(_PLACEHOLDER_RE.findall(o))
+        elif isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(obj)
+    return sorted(found)
 
 
 def fill_path(template: str, params: dict[str, Any]) -> str:

@@ -459,3 +459,266 @@ def test_removed_field_regression_may_quote_field_name_only():
     ans = answer("regression", source="schema", quote="done: whether the note is done")
     rec = lean([d], Stub([ans]), c)
     assert rec.verdict["status"] == FAIL and rec.verdict["cause"] == "judged_regression"
+
+
+# --- WO-R2-J (a): evidence quotes survive list markers (D261, D266 C1a) ------
+
+FACT = "seed user seeduser/seedpass owns note id 1 (done=false) after seed"
+
+
+@pytest.fixture
+def _fresh_pacer():
+    from proofdeploy.lean import judge as J
+
+    J.reset_pacer()
+    yield J
+    J.reset_pacer()
+
+
+@pytest.mark.parametrize("prefix", ["- ", "1. ", "12) ", "* ", "• ", "  - ", "-   "])
+def test_list_marker_prefix_passes_verbatim_step(prefix):
+    # the exact round-1 golden-bug shape: the prompt shows "- <fact>", the model copies it
+    c = ctx(facts=[FACT])
+    rec = lean([diff()], Stub([answer("regression", quote=prefix + FACT)]), c)
+    j = rec.groups[0]["judgment"]
+    assert "verbatim_in_source" in j["check"]["passed"], j
+    assert rec.verdict["status"] == FAIL and rec.verdict["cause"] == "judged_regression"
+
+
+def test_multiline_quote_markers_stripped_per_line():
+    c = JudgeContext(INTENT, HUNKS, ["alpha beta one. gamma delta two"], {})
+    quote = "- alpha beta one.\n- gamma delta two"
+    ans = answer("correct", quote=quote, expected=None)
+    d = diff(before="x", after="one")
+    rec = lean([d], Stub([ans]), c)
+    assert "verbatim_in_source" in rec.groups[0]["judgment"]["check"]["passed"]
+
+
+def test_marker_only_quote_is_empty_quote():
+    rec = lean([diff()], Stub([answer("regression", quote="- ")]))
+    assert rec.groups[0]["judgment"]["cause"] == "evidence_rejected:empty_quote"
+
+
+def test_changed_word_after_marker_still_not_in_source():
+    q = "- " + FACT.replace("owns", "holds")
+    rec = lean([diff()], Stub([answer("regression", quote=q)]), ctx(facts=[FACT]))
+    assert rec.groups[0]["judgment"]["cause"] == "evidence_rejected:quote_not_in_source"
+
+
+def test_only_one_marker_is_stripped():
+    rec = lean([diff()], Stub([answer("regression", quote="- - " + FACT)]), ctx(facts=[FACT]))
+    assert rec.groups[0]["judgment"]["cause"] == "evidence_rejected:quote_not_in_source"
+
+
+# --- WO-R2-J (b): declared refactor decided by code (D266 C1b) --------------
+
+
+def test_declares_no_behaviour_change_phrases():
+    from proofdeploy.lean.judge import declares_no_behaviour_change as dnb
+
+    for phrase in (
+        "no behaviour change",
+        "No behavior change",
+        "no functional change",
+        "no behaviour changes",
+        "no behavior changes",
+        "No  functional   changes",
+    ):
+        assert dnb(f"tidy. {phrase} intended") is not None, phrase
+    assert dnb("refactor: tidy note handling") is None
+    assert dnb("Refactor the code. Behaviour is unchanged.") is None
+    assert dnb("") is None
+
+
+def test_declared_no_change_fails_with_base_value_and_no_calls():
+    stub = Stub()
+    rec = lean([diff(before=False, after=True)], stub, ctx("no behaviour change intended"))
+    assert stub.prompts == [] and rec.calls == [] and rec.prompts_sha256 == []
+    assert rec.total_tokens == 0
+    assert rec.verdict["status"] == FAIL and rec.verdict["cause"] == "judged_regression"
+    reg = rec.verdict["details"]["regressions"][0]
+    assert reg["expected_value"] is False and reg["source"] == "intent"
+    assert reg["quote"] == "no behaviour change intended"
+    assert reg["rule"] == "declared_no_behaviour_change"
+    j = rec.groups[0]["judgment"]
+    assert j["model_verdict"] is None and j["check"]["passed"] == ["declared_no_behaviour_change"]
+    assert replay(rec).to_dict() == rec.verdict
+
+
+def test_declared_no_change_covers_every_group_and_added_field():
+    stub = Stub()
+    diffs = [diff(), diff("r2", "/notes/2", "extra", None, 5, "added_field")]
+    rec = lean(diffs, stub, ctx("Tidy. No functional changes."))
+    assert stub.prompts == []
+    assert [g["judgment"]["verdict"] for g in rec.groups] == ["regression", "regression"]
+    added = rec.groups[1]["judgment"]
+    assert added["expected_value"] is None and added["check"]["expected_absent"] is True
+    assert rec.groups[0]["judgment"]["check"].get("expected_absent") is None
+    assert replay(json.loads(json.dumps(rec.to_dict()))).to_dict() == rec.verdict
+
+
+def test_declared_sentence_is_the_matching_one_in_multi_sentence_intent():
+    intent = "Move helpers into utils.\nNo functional changes. Also renames a variable."
+    rec = lean([diff()], Stub(), ctx(intent))
+    assert rec.groups[0]["judgment"]["quote"] == "No functional changes."
+    assert replay(rec).cause == "judged_regression"
+
+
+def test_refactor_word_alone_uses_the_model_path():
+    stub = Stub([answer("regression")])
+    rec = lean([diff()], stub, ctx("refactor: tidy note handling"))
+    assert len(stub.prompts) == 1
+    assert rec.groups[0]["judgment"]["model_verdict"] == "regression"
+    assert replay(rec).to_dict() == rec.verdict
+
+
+def test_declared_replay_detects_tampering():
+    rec = lean([diff()], Stub(), ctx("no behaviour change intended"))
+    bad = copy.deepcopy(rec.to_dict())
+    bad["inputs"]["context"]["intent"] = "refactor: tidy note handling"
+    with pytest.raises(ReplayMismatch):
+        replay(bad)
+
+
+def test_model_judged_regression_detail_has_rule_none():
+    rec = lean([diff()], Stub([answer("regression")]))
+    assert rec.verdict["details"]["regressions"][0]["rule"] is None
+
+
+# --- WO-R2-J (c): pacing and HTTP 429 backoff (D266 C2) ---------------------
+
+
+class FakeTime:
+    def __init__(self, J, monkeypatch):
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+        monkeypatch.setattr(J, "_clock", lambda: self.now)
+        monkeypatch.setattr(J, "_sleep", self.sleep)
+
+    def sleep(self, s: float) -> None:
+        self.sleeps.append(s)
+        self.now += s
+
+
+E429 = "model API call failed: HTTP 429: too many requests"
+
+
+def test_pacer_second_call_waits_for_the_interval(monkeypatch, _fresh_pacer):
+    J = _fresh_pacer
+    monkeypatch.setenv("PROOFDEPLOY_MIN_CALL_INTERVAL", "13")
+    ft = FakeTime(J, monkeypatch)
+    stub = Stub([answer("regression")], [answer("regression")])
+    first = J.execute_call("p", 0, stub)
+    assert ft.sleeps == [] and first.waited_seconds == 0.0
+    ft.now += 1.0
+    second = J.execute_call("p", 1, stub)
+    assert ft.sleeps == [12.0] and second.waited_seconds == 12.0 and second.status == "ok"
+
+
+def test_pacer_no_wait_when_interval_already_elapsed(monkeypatch, _fresh_pacer):
+    J = _fresh_pacer
+    monkeypatch.setenv("PROOFDEPLOY_MIN_CALL_INTERVAL", "13")
+    ft = FakeTime(J, monkeypatch)
+    stub = Stub([answer("regression")], [answer("regression")])
+    J.execute_call("p", 0, stub)
+    ft.now += 20.0
+    J.execute_call("p", 1, stub)
+    assert ft.sleeps == []
+
+
+def test_429_then_success_backs_off_20s_once(monkeypatch, _fresh_pacer):
+    J = _fresh_pacer
+    monkeypatch.setenv("PROOFDEPLOY_MIN_CALL_INTERVAL", "13")
+    ft = FakeTime(J, monkeypatch)
+    stub = Stub(RuntimeError(E429), [answer("regression")])
+    r = J.execute_call("p", 0, stub)
+    assert r.status == "ok" and ft.sleeps == [20.0] and r.waited_seconds == 20.0
+    assert r.attempts[0].startswith("attempt_1: model_transport")
+    assert r.attempts[1] == "attempt_2: waited 20.0s after 429"
+    assert r.attempts[2] == "attempt_2: success"
+
+
+def test_pacing_applies_on_top_of_429_backoff(monkeypatch, _fresh_pacer):
+    J = _fresh_pacer
+    monkeypatch.setenv("PROOFDEPLOY_MIN_CALL_INTERVAL", "30")
+    ft = FakeTime(J, monkeypatch)
+    stub = Stub(RuntimeError(E429), [answer("regression")])
+    J.execute_call("p", 0, stub)
+    # backoff of 20 s, then 10 s more pacing to reach 30 s since the failed call started
+    assert ft.sleeps == [20.0, 10.0]
+
+
+def test_four_429s_end_as_provider_limit_inconclusive(monkeypatch, _fresh_pacer):
+    J = _fresh_pacer
+    ft = FakeTime(J, monkeypatch)
+    stub = Stub(*[RuntimeError(E429) for _ in range(4)])
+    rec = lean([diff()], stub)
+    assert len(stub.prompts) == 4
+    assert ft.sleeps == [20.0, 40.0, 60.0]
+    call = rec.calls[0]
+    assert call["status"] == "error" and call["error_cause"] == "provider_limit"
+    assert call["waited_seconds"] == 120.0
+    assert rec.groups[0]["judgment"]["cause"] == "environment:provider_limit"
+    assert rec.verdict["status"] == INCONCLUSIVE and rec.verdict["cause"] == "provider_limit"
+    assert replay(json.loads(json.dumps(rec.to_dict()))).to_dict() == rec.verdict
+
+
+def test_429_retries_env_override(monkeypatch, _fresh_pacer):
+    J = _fresh_pacer
+    ft = FakeTime(J, monkeypatch)
+    monkeypatch.setenv("PROOFDEPLOY_429_RETRIES", "1")
+    stub = Stub(RuntimeError(E429), RuntimeError(E429))
+    r = J.execute_call("p", 0, stub)
+    assert r.error_cause == "provider_limit" and ft.sleeps == [20.0] and len(stub.prompts) == 2
+
+
+def test_non_429_transport_error_keeps_single_retry(monkeypatch, _fresh_pacer):
+    J = _fresh_pacer
+    ft = FakeTime(J, monkeypatch)
+    stub = Stub(RuntimeError("model API call failed: HTTP 500: boom"), RuntimeError("x"))
+    r = J.execute_call("p", 0, stub)
+    assert len(stub.prompts) == 2 and r.error_cause == "model_transport"
+    assert ft.sleeps == [] and r.waited_seconds == 0.0
+    assert not any("waited" in a for a in r.attempts)
+
+
+def test_provider_limit_beats_other_environment_causes():
+    from proofdeploy.lean.verdict import decide as decide_
+
+    def jg(i: int, cause: str):
+        from proofdeploy.lean.judge import JudgedGroup, Judgment
+
+        g = group_differences([diff(rid=f"r{i}", path=f"/n{i}")])[0]
+        return JudgedGroup(g, Judgment(group=1, verdict="unclear", cause=cause))
+
+    v = decide_(
+        [], [jg(1, "environment:model_transport"), jg(2, "environment:provider_limit")], [], True
+    )
+    assert v.status == INCONCLUSIVE and v.cause == "provider_limit"
+    v2 = decide_([], [jg(1, "environment:model_transport")], [], True)
+    assert v2.cause == "environment"
+
+
+def test_env_override_parsed_and_invalid_names_variable(monkeypatch):
+    from proofdeploy.lean import judge as J
+
+    assert J.min_call_interval() == 0.0  # conftest sets 0 for the suite
+    monkeypatch.setenv("PROOFDEPLOY_MIN_CALL_INTERVAL", "2.5")
+    assert J.min_call_interval() == 2.5
+    monkeypatch.delenv("PROOFDEPLOY_MIN_CALL_INTERVAL")
+    assert J.min_call_interval() == 13.0
+    for bad in ("abc", "-1", "nan"):
+        monkeypatch.setenv("PROOFDEPLOY_MIN_CALL_INTERVAL", bad)
+        with pytest.raises(ValueError, match="PROOFDEPLOY_MIN_CALL_INTERVAL"):
+            J.min_call_interval()
+    monkeypatch.setenv("PROOFDEPLOY_429_RETRIES", "x")
+    with pytest.raises(ValueError, match="PROOFDEPLOY_429_RETRIES"):
+        J.max_429_retries()
+
+
+def test_old_call_records_without_waited_seconds_still_load():
+    rec = lean([diff()], Stub([answer("regression")]))
+    old = copy.deepcopy(rec.to_dict())
+    for c in old["calls"]:
+        del c["waited_seconds"]
+    assert replay(old).to_dict() == rec.verdict

@@ -206,6 +206,20 @@ def test_committed_manifest_matches_generator() -> None:
     )
 
 
+def test_gate_mutants_are_on_the_fix_revision() -> None:
+    import hashlib
+    import json
+
+    committed = json.loads(
+        (Path(__file__).parent.parent / "experiments/lean-poc/mutants.json").read_text()
+    )
+    assert M.GATE_REVISION == "fix" == committed["base_revision"]
+    fix_app = M._kit().GOLDEN_DIR / M.GATE_APP / "revisions" / "fix" / "app.py"
+    sha = hashlib.sha256(fix_app.read_bytes()).hexdigest()
+    assert sha.startswith("2385b1f9cc8e")
+    assert committed["base_source_sha256"] == sha
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True
