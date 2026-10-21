@@ -223,6 +223,7 @@ def test_self_justifying_quote_is_rejected():
         Stub(
             [answer("correct", source="intent", quote="return the note's done flag", expected=None)]
         ),
+        ctx(facts=[]),  # the golden fact would (rightly) contradict the intent for note 1
     )
     assert ok.verdict["status"] == PASS
 
@@ -870,7 +871,7 @@ def test_exchange_source_verifies_the_quote_against_the_rendered_lines():
 
 def test_ordering_a_intent_contradicted_by_fact_is_refused_then_regression_fails():
     # R1: intent says return the flag, the fact says done=false, the change made it true
-    c = ctx(facts=["id 1 (done=false)"])
+    c = ctx(facts=FACTS)  # the real golden seed fact: both notes in one sentence
     first = answer("correct", source="intent", quote="return the note's done flag", expected=None)
     second = answer("regression", source="facts", quote="id 1 (done=false)", expected=False)
     stub = Stub([first], [second])
@@ -934,7 +935,8 @@ def test_rule3_does_not_refuse_when_the_data_agrees_or_is_silent():
     d.exchanges = [{"method": "GET", "path": "/notes/3", "field": "done", "value": True}]
     assert _correct_on_intent(ctx(facts=[]), d)["verdict"] == "correct"
     # a fact that mentions both values does not decide against after
-    assert _correct_on_intent(ctx(facts=FACTS), diff())["verdict"] == "correct"
+    both = ["a note is done=true or done=false"]
+    assert _correct_on_intent(ctx(facts=both), diff())["verdict"] == "correct"
 
 
 def test_rule3_applies_only_to_intent_and_not_to_removed_fields():
@@ -1088,3 +1090,46 @@ def test_largest_prompt_with_exchanges_and_correction_stays_under_3000_tokens():
     follow_up = build_correction_prompt(plans[0].prompt, first_answer, [(1, "quote_not_in_source")])
     assert follow_up.endswith(CORRECTION_SENTENCE)
     assert estimate_tokens(follow_up) <= 3000, estimate_tokens(follow_up)
+
+
+# --- rule 3 is record-aware (reviewer defect, R1) -------------------------------
+
+GOLDEN_FACT = (
+    "seed user seeduser/seedpass owns two notes after seed: id 1 (done=false) and id 2 (done=true)"
+)
+
+
+def test_golden_fact_literal_is_the_one_used_here():
+    assert FACTS == [GOLDEN_FACT]
+
+
+def test_rule3_real_golden_fact_note1_false_to_true_is_refused():
+    d = diff("r1", "/notes/1", before=False, after=True)
+    j = _correct_on_intent(ctx(facts=[GOLDEN_FACT]), d)
+    assert j["cause"] == "evidence_rejected:intent_contradicted_by_data"
+
+
+def test_rule3_real_golden_fact_note2_true_to_false_is_refused():
+    d = diff("r2", "/notes/2", before=True, after=False)
+    j = _correct_on_intent(ctx(facts=[GOLDEN_FACT]), d)
+    assert j["cause"] == "evidence_rejected:intent_contradicted_by_data"
+
+
+def test_rule3_real_golden_fact_note2_after_true_is_not_refused():
+    # note 2 is done=true in the fact; the change keeps true for it (the other clause says false)
+    d = diff("r2", "/notes/2", before=False, after=True)
+    assert _correct_on_intent(ctx(facts=[GOLDEN_FACT]), d)["verdict"] == "correct"
+
+
+def test_rule3_fact_clauses_for_another_record_do_not_count():
+    d = diff("r3", "/notes/3", before=False, after=True)
+    assert _correct_on_intent(ctx(facts=[GOLDEN_FACT]), d)["verdict"] == "correct"
+
+
+def test_rule3_fact_without_ids_is_used_whole():
+    assert _correct_on_intent(ctx(facts=["notes start with done=false"]), diff())["cause"] == (
+        "evidence_rejected:intent_contradicted_by_data"
+    )
+    # a difference without a record id also uses the whole fact
+    d = diff("r4", "/notes", before=False, after=True)
+    assert _correct_on_intent(ctx(facts=[GOLDEN_FACT]), d)["verdict"] == "correct"

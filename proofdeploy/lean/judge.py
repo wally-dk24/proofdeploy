@@ -802,14 +802,37 @@ def _has_value(quote: str, value: Any) -> bool:
     return bool(rendered) and rendered in quote
 
 
+_RECORD_MENTION = re.compile(r"(?i)(?:\bid\s*[=:#]?\s*|#)(\d+)")
+
+
+def _fact_parts(fact: str, rid: str | None) -> list[str]:
+    """The text of a fact that speaks about this record.
+
+    A fact that names records (``id 1 (...) and id 2 (...)``) is split into
+    clauses, each running from one record mention to the next; only the
+    clauses for ``rid`` count (none: the fact does not count). A fact without
+    record mentions, or a difference without a record id, is used whole.
+    """
+    mentions = list(_RECORD_MENTION.finditer(fact))
+    if not mentions or rid is None:
+        return [fact]
+    out = []
+    for i, m in enumerate(mentions):
+        end = mentions[i + 1].start() if i + 1 < len(mentions) else len(fact)
+        if m.group(1) == rid:
+            out.append(fact[m.start() : end])
+    return out
+
+
 def _contradicted_by_data(g: Group, answer: dict[str, Any], ctx: JudgeContext) -> bool:
     """Data before intent (judge skill v1, Part B 3).
 
     True when a ``correct`` answer rests on the intent but the app's data says
     another value for this field. Mechanical, in two parts:
 
-    * a fact counts when it names the field (``_name_regex``) and contains the
-      value the field had before (or the answer's ``expected_value``) that
+    * a fact counts (for a difference on a record, only the clauses of the fact
+      about that record, see ``_fact_parts``) when it names the field
+      (``_name_regex``) and contains the value the field had before (or the answer's ``expected_value``) that
       ``_has_value`` finds, while it does not contain ``after``;
     * a shown exchange counts when its value for the field differs from ``after``.
 
@@ -820,13 +843,14 @@ def _contradicted_by_data(g: Group, answer: dict[str, Any], ctx: JudgeContext) -
         return False
     name_re = _name_regex(field_name(g.field_path))
     other = [v for v in (g.before, answer.get("expected_value")) if v is not None]
+    rid = record_id_of(g.sample_path)
     if name_re is not None:
         for fact in ctx.seed_facts:
-            f = _norm(fact)
-            if not name_re.search(f) or _has_value(f, g.after):
-                continue
-            if any(_has_value(f, v) for v in other if _canon(v) != _canon(g.after)):
-                return True
+            for f in _fact_parts(_norm(fact), rid):
+                if not name_re.search(f) or _has_value(f, g.after):
+                    continue
+                if any(_has_value(f, v) for v in other if _canon(v) != _canon(g.after)):
+                    return True
     return any(_canon(e["value"]) != _canon(g.after) for e in g.exchanges[:MAX_EXCHANGES])
 
 
