@@ -1,6 +1,6 @@
 """Lean P6b (D258): the gate driver and the lean-poc workflow. No real model call is made.
 
-Covers the unit list (26, in order, equal to the registered files), the pre-registered criteria
+Covers the unit list (28, in order, equal to the registered files), the pre-registered criteria
 on synthetic result rows (every boundary), the confirm direction rule, blindness of the log, the
 workflow guards (environment, serialization group, pinned actions, the key in the gate step
 only), and a host-mode smoke of the driver on golden-bug plus two mutants with a stub judge.
@@ -41,20 +41,34 @@ CLEAN = json.loads(
     (ROOT / "experiments/lean-poc/paperless-clean-units.json").read_text(encoding="utf-8")
 )
 
-BUG_UNIT = {
-    "unit_repo": "paperless-ngx/paperless-ngx",
-    "b_parent": "1" * 40,
-    "b": "2" * 40,
-    "fix_parent": "3" * 40,
-    "fix": "4" * 40,
-    "selection_record": "evidence/synthetic/selection.json",
-    "selection_record_sha256": "5" * 64,
-}
+
+def _synthetic_bug(n: int) -> dict[str, Any]:
+    c = str(n)
+    fix = c * 4 + "abcd" + "0" * 32
+    return {
+        "id": f"paperless-bug-{fix[:8]}",
+        "note": f"synthetic unit {n}",
+        "unit_repo": "paperless-ngx/paperless-ngx",
+        "b_parent": c * 40,
+        "b": "a" + c * 39,
+        "fix_parent": "b" + c * 39,
+        "fix": fix,
+        "selection_record": f"evidence/synthetic/selection-{n}.json",
+        "selection_record_sha256": c * 64,
+    }
 
 
-def write_bug_unit(path: Path, **override: Any) -> Path:
-    data = {**BUG_UNIT, **override}
-    path.write_text(json.dumps({k: v for k, v in data.items() if v is not None}), encoding="utf-8")
+BUG_UNITS = [_synthetic_bug(n) for n in (1, 2, 3)]
+BUG_UNIT = BUG_UNITS[0]
+BUG_IDS = [u["id"] for u in BUG_UNITS]
+BUG_A = BUG_IDS[0]
+
+
+def write_bug_units(path: Path, **override: Any) -> Path:
+    """The synthetic units file; ``override`` edits the SECOND unit (None drops a key)."""
+    second = {**BUG_UNITS[1], **override}
+    second = {k: v for k, v in second.items() if v is not None}
+    path.write_text(json.dumps({"units": [BUG_UNITS[0], second, BUG_UNITS[2]]}), encoding="utf-8")
     return path
 
 
@@ -62,9 +76,9 @@ def write_bug_unit(path: Path, **override: Any) -> Path:
 def bug_unit_file(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> Path:
-    """A synthetic paperless-bug-unit.json (the real one is written by the blind re-walk)."""
-    path = write_bug_unit(tmp_path_factory.mktemp("bugunit") / "paperless-bug-unit.json")
-    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", path)
+    """A synthetic paperless-bug-units.json (three units); the real file has its own test."""
+    path = write_bug_units(tmp_path_factory.mktemp("bugunit") / "paperless-bug-units.json")
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNITS_JSON", path)
     return path
 
 
@@ -73,14 +87,14 @@ def bug_unit_file(
 # --------------------------------------------------------------------------
 
 
-def test_unit_list_is_26_units_in_the_registered_order() -> None:
+def test_unit_list_is_28_units_in_the_registered_order() -> None:
     units = gate.load_units()
     ids = [u.id for u in units]
-    assert len(ids) == len(set(ids)) == 26 == 20 + 3 + 3
+    assert len(ids) == len(set(ids)) == 28 == 2 + 20 + 3 + 3
     expected = (
         ["golden-bug", "golden-clean"]
         + [f"mutant-{m['id']}" for m in MUTANTS["mutants"]]
-        + ["paperless-bug"]
+        + BUG_IDS
         + [f"paperless-clean-{u['sha'][:12]}" for u in CLEAN["units"]]
     )
     assert ids == expected
@@ -99,9 +113,10 @@ def test_unit_definitions_follow_the_work_order() -> None:
     for m, reg in zip(mutants, MUTANTS["mutants"], strict=True):
         assert (m.mode, m.base, m.head) == ("host", "fix", reg["branch"])
         assert m.intent == "no behaviour change intended" == MUTANTS["judge_intent"]
-    bug = by["paperless-bug"]
-    assert (bug.base, bug.head) == (BUG_UNIT["b_parent"], BUG_UNIT["b"])
-    assert (bug.mode, bug.intent, bug.paperless) == ("sandbox", None, True)
+    for bug, reg in zip((by[i] for i in BUG_IDS), BUG_UNITS, strict=True):
+        assert (bug.base, bug.head) == (reg["b_parent"], reg["b"])
+        assert (bug.fix_parent, bug.fix) == (reg["fix_parent"], reg["fix"])
+        assert (bug.kind, bug.mode, bug.intent, bug.paperless) == ("bug", "sandbox", None, True)
     cleans = [u for u in by.values() if u.id.startswith("paperless-clean-")]
     for c, reg in zip(cleans, CLEAN["units"], strict=True):
         assert (c.base, c.head, c.kind, c.mode) == (
@@ -118,7 +133,7 @@ def test_unit_definitions_follow_the_work_order() -> None:
 def test_selection_by_group() -> None:
     units = gate.load_units()
     counts = {g: len(gate.select_units(units, g)) for g in gate.GROUPS}
-    assert counts == {"all": 26, "golden": 2, "mutants": 20, "paperless": 4}
+    assert counts == {"all": 28, "golden": 2, "mutants": 20, "paperless": 6}
     with pytest.raises(gate.GateError):
         gate.select_units(units, "everything")
 
@@ -266,24 +281,100 @@ def test_criterion_2_not_run_without_all_the_expected_mutants() -> None:
     assert summary["complete"] is False
 
 
-def test_criterion_3_is_reported_not_required() -> None:
-    real = crit([row("paperless-bug", FAIL, confirmed=True, cause="judged_regression")], "3")
-    assert real["status"] == "PASS" and real["required"] is False and real["caught"] is True
-    unconfirmed = crit([row("paperless-bug", FAIL, confirmed=False)], "3")
-    assert unconfirmed["status"] == "PASS" and unconfirmed["caught"] is False
-    inconclusive = crit([row("paperless-bug", INCONCLUSIVE, cause="needs_information")], "3")
-    assert inconclusive["status"] == "PASS" and inconclusive["caught"] is False
-    env = crit([row("paperless-bug", INCONCLUSIVE, cause="environment")], "3")
-    assert env["status"] == "FAIL" and env["real_verdict"] is False
-    err = crit([row("paperless-bug", None, cause=None, error="LeanEnvironmentError")], "3")
-    assert err["status"] == "FAIL" and err["error"] is True
+def bug_rows(*verdicts: str | None, **kw: Any) -> list[dict[str, Any]]:
+    return [row(i, v, **kw) for i, v in zip(BUG_IDS, verdicts, strict=True)]
+
+
+def test_criterion_3_is_reported_not_required_and_per_unit() -> None:
+    caught = row(BUG_IDS[0], FAIL, confirmed=True, cause="judged_regression")
+    c = crit([caught, row(BUG_IDS[1], PASS), row(BUG_IDS[2], None, cause=None, error="X")], "3")
+    assert c["status"] == "FAIL" and c["required"] is False  # a unit with an error is not real
+    full = crit(
+        [
+            caught,
+            row(BUG_IDS[1], FAIL, confirmed=False),
+            row(BUG_IDS[2], INCONCLUSIVE, cause="needs_information"),
+        ],
+        "3",
+    )
+    assert full["status"] == "PASS" and list(full["units"]) == BUG_IDS
+    assert full["units"][BUG_IDS[0]]["caught"] is True
+    assert full["units"][BUG_IDS[1]]["caught"] is False  # FAIL but not confirmed
+    assert (
+        full["units"][BUG_IDS[2]]["caught"] is False and full["units"][BUG_IDS[2]]["real_verdict"]
+    )
+    env = crit(
+        [
+            caught,
+            row(BUG_IDS[1], INCONCLUSIVE, cause="environment"),
+            row(BUG_IDS[2], PASS),
+        ],
+        "3",
+    )
+    assert env["status"] == "FAIL"
+    assert (
+        env["units"][BUG_IDS[1]]["status"] == "FAIL"
+        and not env["units"][BUG_IDS[1]]["real_verdict"]
+    )
+    assert env["units"][BUG_IDS[0]]["status"] == "PASS"  # judged per unit, not pooled
+    err = crit(
+        [
+            row(BUG_IDS[0], None, cause=None, error="LeanEnvironmentError"),
+            row(BUG_IDS[1], PASS),
+            row(BUG_IDS[2], PASS),
+        ],
+        "3",
+    )
+    assert err["units"][BUG_IDS[0]]["error"] is True and err["status"] == "FAIL"
     assert crit([], "3")["status"] == "NOT_RUN"
 
 
+def test_criterion_3_not_run_until_every_expected_bug_unit_ran() -> None:
+    rows = bug_rows(FAIL, PASS, PASS)[:2]
+    summary = gate.compute_summary(rows, expected=BUG_IDS)
+    assert summary["criteria"]["3"]["status"] == "NOT_RUN"
+    assert summary["criteria"]["3"]["missing"] == [BUG_IDS[2]]
+    assert summary["round4"]["bug_units_missing"] == [BUG_IDS[2]]
+
+
 def test_criterion_3_reads_a_provider_limit_as_not_a_real_verdict() -> None:
-    limit = crit([row("paperless-bug", INCONCLUSIVE, cause="provider_limit")], "3")
-    assert limit["status"] == "FAIL" and limit["real_verdict"] is False
-    assert limit["cause"] == "provider_limit"
+    limit = crit(bug_rows(INCONCLUSIVE, PASS, PASS, cause="provider_limit"), "3")
+    assert limit["status"] == "FAIL"
+    one = limit["units"][BUG_IDS[0]]
+    assert one["real_verdict"] is False and one["cause"] == "provider_limit"
+
+
+def test_round4_block_reports_each_bug_unit() -> None:
+    def rich(unit: str, verdict: str, **kw: Any) -> dict[str, Any]:
+        r = row(unit, verdict, cause="judged_regression")
+        r.update(
+            confirmed=True,
+            executable_changed_lines=12,
+            lines_reached=9,
+            requests_hitting_changed_code=7,
+            differences=3,
+            differences_judged=2,
+            **kw,
+        )
+        return r
+
+    rows = [rich(BUG_IDS[0], FAIL), rich(BUG_IDS[1], INCONCLUSIVE), rich(BUG_IDS[2], PASS)]
+    summary = gate.compute_summary(rows, expected=BUG_IDS)
+    r4 = summary["round4"]
+    assert list(r4["bug_units"]) == BUG_IDS and r4["bug_units_missing"] == []
+    assert r4["bug_units"][BUG_IDS[1]] == {
+        "verdict": INCONCLUSIVE,
+        "cause": "judged_regression",
+        "confirmed": True,
+        "executable_changed_lines": 12,
+        "lines_reached": 9,
+        "requests_hitting_changed_code": 7,
+        "differences_found": 3,
+        "differences_judged": 2,
+    }
+    # the pre-registered criteria text is unchanged
+    assert summary["criteria_text"] == gate.CRITERIA
+    assert "reported, not required" in summary["criteria_text"]["3"]
 
 
 def test_golden_clean_runs_fix_to_clean_and_mutants_sit_on_fix() -> None:
@@ -298,27 +389,36 @@ def test_golden_clean_runs_fix_to_clean_and_mutants_sit_on_fix() -> None:
 def test_golden_and_mutant_groups_need_no_bug_unit_file(
     bug_unit_file: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", tmp_path / "absent.json")
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNITS_JSON", tmp_path / "absent.json")
     assert len(gate.select_units(gate.load_units("golden"), "golden")) == 2
     assert len(gate.select_units(gate.load_units("mutants"), "mutants")) == 20
     for which in ("paperless", "all"):
-        with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+        with pytest.raises(gate.GateError, match="paperless bug units not selected yet"):
             gate.load_units(which)
 
 
 def test_absent_bug_unit_file_stops_run_gate_and_list_before_anything_runs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", tmp_path / "absent.json")
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNITS_JSON", tmp_path / "absent.json")
     with mock.patch.object(lean_run, "lean_verify") as verify:
-        with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+        with pytest.raises(gate.GateError, match="paperless bug units not selected yet"):
             gate.run_gate(gate.GateConfig(out=tmp_path / "o", workdir=tmp_path / "w"))
         verify.assert_not_called()
     assert not (tmp_path / "o").exists()
     assert gate.main(["--units", "all", "--list"]) == lean_run.EXIT_USAGE
-    assert "paperless bug unit not selected yet" in capsys.readouterr().err
+    assert "paperless bug units not selected yet" in capsys.readouterr().err
     assert gate.main(["--units", "golden", "--list"]) == 0
     assert capsys.readouterr().out.split() == ["golden-bug", "golden-clean"]
+
+
+def test_list_covers_all_three_bug_units(capsys: pytest.CaptureFixture[str]) -> None:
+    assert gate.main(["--units", "paperless", "--list"]) == 0
+    listed = capsys.readouterr().out.split()
+    assert listed[:3] == BUG_IDS and len(listed) == 6
+    assert gate.main(["--units", "all", "--list"]) == 0
+    assert set(BUG_IDS) <= set(capsys.readouterr().out.split())
+    assert [u.id for u in gate.rehearsal_units("paperless")][:3] == BUG_IDS
 
 
 @pytest.mark.parametrize(
@@ -328,6 +428,10 @@ def test_absent_bug_unit_file_stops_run_gate_and_list_before_anything_runs(
         {"b": "A" * 40},
         {"fix_parent": "g" * 40},
         {"fix": None},
+        {"id": None},
+        {"note": None},
+        {"id": "paperless-bug"},
+        {"id": BUG_A},  # repeated
         {"selection_record_sha256": "5" * 40},
         {"selection_record": ""},
         {"unit_repo": "someone/else"},
@@ -337,14 +441,25 @@ def test_absent_bug_unit_file_stops_run_gate_and_list_before_anything_runs(
 def test_invalid_bug_unit_file_is_a_gate_error(
     override: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    path = write_bug_unit(tmp_path / "bad.json", **override)
-    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", path)
-    with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+    path = write_bug_units(tmp_path / "bad.json", **override)
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNITS_JSON", path)
+    with pytest.raises(gate.GateError, match="paperless bug units not selected yet"):
         gate.load_units("paperless")
     path.write_text("not json", encoding="utf-8")
-    with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
+    with pytest.raises(gate.GateError, match="paperless bug units not selected yet"):
         gate.load_units("all")
     assert len(gate.select_units(gate.load_units("golden"), "golden")) == 2
+
+
+@pytest.mark.parametrize("content", ['{"units": []}', "[]", '{"units": {}}', '{"unit": []}'])
+def test_bug_unit_file_shape_is_validated(
+    content: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "shape.json"
+    path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNITS_JSON", path)
+    with pytest.raises(gate.GateError, match="paperless bug units not selected yet"):
+        gate.load_paperless_bug_units()
 
 
 @pytest.mark.parametrize(
@@ -360,15 +475,70 @@ def test_invalid_bug_unit_file_is_a_gate_error(
 def test_bug_unit_shas_must_match_exactly(
     override: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    path = write_bug_unit(tmp_path / "long.json", **override)
-    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNIT_JSON", path)
-    with pytest.raises(gate.GateError, match="paperless bug unit not selected yet"):
-        gate.load_paperless_bug_unit()
+    path = write_bug_units(tmp_path / "long.json", **override)
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNITS_JSON", path)
+    with pytest.raises(gate.GateError, match="paperless bug units not selected yet"):
+        gate.load_paperless_bug_units()
 
 
 def test_valid_bug_unit_file_is_loaded_not_constants() -> None:
-    assert gate.load_paperless_bug_unit() == BUG_UNIT
+    assert gate.load_paperless_bug_units() == BUG_UNITS
     assert not hasattr(gate, "PAPERLESS_FIX") and not hasattr(gate, "PAPERLESS_BASE")
+
+
+# The committed file: the three bugs already found (WO-R4-B), with the sha256 of each relay record.
+REAL_BUG_UNITS = {
+    "paperless-bug-371c4f57": (
+        "3a34bdc7b078486bc85a97ce309a1c8180cdfc88",
+        "7dca0bfa6af103b76185aada3ce736b0ac1abc01",
+        "5569447ea00c50de8c0c1c75136418bb3343dad6",
+        "371c4f57d3ab208fc261e159fa86ca1dc80cb334",
+        "selection/wo6-bug-selection-record.json",
+        "6dd2956a100e79d39a2957fa55993f511fe8c9157836b183b32d1681eb2d318d",
+    ),
+    "paperless-bug-d3710856": (
+        "17dc482872cf62e12965f6207772c83d1deb651b",
+        "aa67fd3aefa6489984fc15a5c32c1ad2b16ac23a",
+        "14b6a41b88e75fb7d35aa84b33986870bfd1aa69",
+        "d3710856992a91783783819217b43392aab73e00",
+        "selection/wo6-c4-2026-10-20/wo6-bug-selection-record.json",
+        "cd5b78361b8829d4095dca3ca323d630c62483bee988c391698eba3b23a12784",
+    ),
+    "paperless-bug-b992f9fc": (
+        "e01a762e81dd65dff927988aa51594906d8a417f",
+        "aed9abe48c02b1b7df07e429db3f2ed8c3a58ce8",
+        "6d249b49327fdab58ff915d3f5435e49de742464",
+        "b992f9fc05bedd2f26f7291028b0b38471e697db",
+        "selection/lean-r2-2026-10-21/out",
+        "44a411590b3f58cbbda295f293b89817d693c34d221f33061ebc528d92b5907a",
+    ),
+}
+
+
+def test_the_committed_file_holds_the_three_registered_bug_units() -> None:
+    real = gate.load_paperless_bug_units(ROOT / "experiments/lean-poc/paperless-bug-units.json")
+    assert [u["id"] for u in real] == list(REAL_BUG_UNITS)
+    for u in real:
+        got = (
+            u["b_parent"],
+            u["b"],
+            u["fix_parent"],
+            u["fix"],
+            u["selection_record"],
+            u["selection_record_sha256"],
+        )
+        assert got == REAL_BUG_UNITS[u["id"]]
+    notes = {u["id"]: u["note"] for u in real}
+    assert (
+        notes["paperless-bug-371c4f57"]
+        == "upgrade-path only (D229); expected not observable over HTTP"
+    )
+    assert (
+        notes["paperless-bug-d3710856"]
+        == "frontend-only B (round 1); expected not observable over HTTP"
+    )
+    assert gate.PAPERLESS_BUG_UNITS_JSON.name == "paperless-bug-units.json"
+    assert not (ROOT / "experiments/lean-poc/paperless-bug-unit.json").exists()
 
 
 def paperless_cleans(*verdicts: str | None) -> list[dict[str, Any]]:
@@ -577,16 +747,18 @@ class FakeSide:
         self.closed = True
 
 
-def test_run_confirm_replays_each_fix_side_twice_and_closes_both(tmp_path: Path) -> None:
+def _confirm_unit(unit_id: str, tmp_path: Path) -> tuple[Any, list[FakeSide], list[Any]]:
+    """Run run_confirm for one unit; returns (output, sides, provisioned (base, head) pairs)."""
     sides: list[FakeSide] = []
+    provisioned: list[tuple[str, str]] = []
     calls: list[tuple[str, str]] = []
 
     def provision(rc: Any, contract_file: Any, work: Path, timings: Any) -> Any:
-        assert (rc.base_sha, rc.head_sha) == (BUG_UNIT["fix_parent"], BUG_UNIT["fix"])
-        assert (rc.base, rc.head) == (BUG_UNIT["fix_parent"], BUG_UNIT["fix"])
+        assert (rc.base_sha, rc.head_sha) == (rc.base, rc.head)
         assert rc.unit_repo == gate.PAPERLESS_UNIT_REPO and contract_file is not None
+        provisioned.append((rc.base, rc.head))
         sides.extend([FakeSide("fixp"), FakeSide("fix")])
-        return sides[0], sides[1], object()
+        return sides[-2], sides[-1], object()
 
     def replay(driver: FakeSide, label: str, scenarios: list[Any], auth: Any) -> RunData:
         calls.append((driver.label, label))
@@ -602,14 +774,59 @@ def test_run_confirm_replays_each_fix_side_twice_and_closes_both(tmp_path: Path)
         django_overlay={"CELERY_TASK_ALWAYS_EAGER": True},
         openapi_path="/api/schema/",
     )
+    unit = next(u for u in gate.load_units("paperless") if u.id == unit_id)
     with mock.patch.object(gate.pipeline, "resolve_sha", lambda _r, rev: rev):
         out = gate.run_confirm(
-            cfg, rc, [_scenario()], None, [gate.Flagged(f"{SID}:1", "title", "B-value")]
+            cfg, rc, [_scenario()], None, [gate.Flagged(f"{SID}:1", "title", "B-value")], unit
         )
-    assert out["confirmed"] is True and out["runs_each"] == 2
-    assert (out["fix_parent"], out["fix"]) == (BUG_UNIT["fix_parent"], BUG_UNIT["fix"])
     assert calls == [("fixp", "fixp"), ("fixp", "fixp2"), ("fix", "fix"), ("fix", "fix2")]
+    return out, sides, provisioned
+
+
+@pytest.mark.parametrize("n", [0, 1, 2])
+def test_run_confirm_uses_each_units_own_fix_parent_and_fix(n: int, tmp_path: Path) -> None:
+    mine = BUG_UNITS[n]
+    out, sides, provisioned = _confirm_unit(mine["id"], tmp_path)
+    assert out["confirmed"] is True and out["runs_each"] == 2
+    assert (out["fix_parent"], out["fix"]) == (mine["fix_parent"], mine["fix"])
+    assert provisioned == [(mine["fix_parent"], mine["fix"])]
+    for other in BUG_UNITS:
+        if other is not mine:
+            assert other["fix"] not in (out["fix"], provisioned[0][1])
     assert all(s.closed for s in sides)
+
+
+def test_run_unit_confirms_a_failing_bug_unit_against_its_own_fix(tmp_path: Path) -> None:
+    unit = next(u for u in gate.load_units("paperless") if u.id == BUG_IDS[2])
+    seen: list[Any] = []
+
+    def fake_confirm(cfg: Any, rc: Any, scenarios: Any, auth: Any, flagged: Any, u: Any) -> Any:
+        seen.append(u)
+        return {"confirmed": True, "items": [], "fix": u.fix, "fix_parent": u.fix_parent}
+
+    verdict = Verdict(
+        FAIL,
+        "judged_regression",
+        {"regressions": [{"field_path": "title", "after": "B", "request_ids": [f"{SID}:1"]}]},
+    )
+    manifest = {"mode": "sandbox", "compared": {"differences": 1}}
+    result = LeanResult(verdict, mock.Mock(total_tokens=1, calls=[], groups=[]), manifest)
+
+    def verify(rc: Any, *, model_runner: Any = None, log: Any = lambda _m: None) -> Any:
+        replay: Any = pipeline.replay_run
+        replay("drv", "head", [_scenario()], None)  # the spy records the impact set
+        return result, 1
+
+    cfg = gate.GateConfig(out=tmp_path / "o", workdir=tmp_path / "w", paperless_repo=tmp_path)
+    with (
+        mock.patch.object(lean_run, "lean_verify", verify),
+        mock.patch.object(pipeline, "replay_run", mock.Mock()),
+        mock.patch.object(gate, "run_confirm", fake_confirm),
+    ):
+        r = gate.run_unit(cfg, unit, gate._Repos())
+    assert r["confirmed"] is True and r["unit"] == BUG_IDS[2], r
+    assert [(u.id, u.fix) for u in seen] == [(BUG_IDS[2], BUG_UNITS[2]["fix"])]
+    assert (tmp_path / "o/units" / BUG_IDS[2] / "confirm.json").is_file()
 
 
 # --------------------------------------------------------------------------
@@ -622,7 +839,7 @@ SECRET = "SECRET-COMMIT-MESSAGE-AND-FILE-CONTENT"
 def test_paperless_output_never_reaches_the_log(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    unit = next(u for u in gate.load_units() if u.id == "paperless-bug")
+    unit = next(u for u in gate.load_units() if u.id == BUG_A)
 
     def leaky(rc: Any, *, model_runner: Any = None, log: Any = lambda _m: None) -> Any:
         log(f"index: {SECRET}")
@@ -637,8 +854,8 @@ def test_paperless_output_never_reaches_the_log(
     shown = capsys.readouterr()
     assert SECRET not in shown.out + shown.err + line
     assert r["error"].startswith("RuntimeError") and SECRET in r["error"]  # the artifact has it
-    assert SECRET in (tmp_path / "out/units/paperless-bug/console.log").read_text("utf-8")
-    assert line.startswith("[paperless-bug] ERROR RuntimeError")
+    assert SECRET in (tmp_path / "out/units" / BUG_A / "console.log").read_text("utf-8")
+    assert line.startswith(f"[{BUG_A}] ERROR RuntimeError")
 
 
 def test_row_counts_and_flags_from_a_lean_result() -> None:
@@ -668,6 +885,22 @@ def test_row_counts_and_flags_from_a_lean_result() -> None:
     )
     assert (r["tokens"], r["model_calls"], r["rate_2xx"], r["confirmed"]) == (321, 1, 0.75, None)
     assert r["measured_result"] is False and len(r["judge_raw_sha256"]) == 64
+    # the round-4 counts: reached = executable - unexercised - load-only; judged = differences
+    # in groups the model actually judged (an unjudged group does not count)
+    manifest.update(
+        executable_changed_lines=12,
+        unexercised_lines=["a:1", "a:2"],
+        coverage={"head": {"load_only_declarations": ["d1"]}, "base": {}},
+    )
+    record.groups = [
+        {"group": {"request_ids": ["s:1", "s:2"]}, "judgment": {"verdict": "correct"}},
+        {"group": {"request_ids": ["s:3"]}, "judgment": {"verdict": "unjudged"}},
+        {"group": {"request_ids": ["s:4"]}, "judgment": {"verdict": "regression"}},
+    ]
+    r4 = gate.row_from_result(unit, result, 1, wall_seconds=0.0)
+    assert (r4["executable_changed_lines"], r4["lines_reached"]) == (12, 9)
+    assert (r4["requests_hitting_changed_code"], r4["differences_judged"]) == (4, 3)
+    manifest.update(unexercised_lines=[], coverage={})
     # flaky only is observable; nothing at all is not
     manifest.update(compared={"differences": 0}, flaky_hard_failures=[{"x": 1}])
     assert gate.row_from_result(unit, result, 1, wall_seconds=0.0)["observable"] is True
