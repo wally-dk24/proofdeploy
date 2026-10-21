@@ -1,7 +1,8 @@
 """App index: the HTTP operations of an app plus known seed facts.
 
 Step 1 of the lean path. An index is built from the app's own machinery
-(a drf-spectacular / OpenAPI document, or a Flask URL map) and is a pure
+(a drf-spectacular / OpenAPI document, a Flask URL map, or the URL
+resolver and serializers of a Django / Django REST Framework app) and is a pure
 function of its input: the same input always gives the same JSON and the
 same sha256. No model is called here.
 
@@ -453,6 +454,435 @@ def index_from_flask_url_map(
         operations=sorted(ops.values(), key=lambda o: (o.path, o.method)),
         seed_facts=list(seed_facts),
         source_kind="flask",
+    )
+
+
+# --------------------------------------------------------------------------
+# Django / Django REST Framework adapter
+# --------------------------------------------------------------------------
+
+# A python -c program. Usage: python -c "$DJANGO_DUMP_SNIPPET" [<settings module>]
+# with the app's directory as cwd and the app's own environment (so
+# ``DJANGO_SETTINGS_MODULE`` normally comes from there). It walks
+# ``django.urls.get_resolver()`` recursively and prints, as JSON on stdout
+# (anything the import prints goes to stderr), one record per URL pattern:
+#   {"path": "/api/items/{pk}/", "view": "pkg.mod.Name", "kind": "drf" | "django",
+#    "params": [{"name": "pk", "type": "int"}],
+#    "methods": {"GET": {"action": "retrieve", "request": null, "content_type": null,
+#                        "response": {...}}, "PUT": {...}}}
+# For Django REST Framework views the serializer of each method is turned into
+# a JSON schema.
+# Plain Django views carry the route only. The admin site, static-serving views and
+# format-suffix routes are left out (the admin site is a resolver with app_name
+# ``admin``).
+DJANGO_DUMP_SNIPPET = r"""
+import json, os, re, sys
+real_out = sys.stdout
+sys.stdout = sys.stderr
+sys.path.insert(0, os.getcwd())
+if len(sys.argv) > 1 and sys.argv[1]:
+    os.environ["DJANGO_SETTINGS_MODULE"] = sys.argv[1]
+import django
+django.setup()
+from django.urls import URLResolver, get_resolver
+try:
+    from rest_framework import fields as F, relations as R, serializers as S
+    from rest_framework.request import Request
+    from rest_framework.test import APIRequestFactory
+    from rest_framework.views import APIView
+except Exception:
+    APIView = None
+
+OK_METHODS = ("get", "post", "put", "patch", "delete")
+CONV = {"IntConverter": "int", "StringConverter": "str", "SlugConverter": "slug",
+        "UUIDConverter": "uuid", "PathConverter": "path"}
+SKIP_MODULES = ("django.contrib.admin", "django.views.static")
+
+
+def rx_type(rx):
+    if rx in ("[0-9]+", r"\d+"):
+        return "int"
+    if rx.startswith("[-a-zA-Z0-9_]"):
+        return "slug"
+    if "a-f" in rx and "{8}" in rx:
+        return "uuid"
+    if rx == ".+":
+        return "path"
+    return "str"
+
+
+def route_to_tpl(route, converters):
+    params = []
+
+    out, last = [], 0
+    for m in re.finditer(r"<(?:(\w+):)?(\w+)>", route):
+        out.append(route[last:m.start()])
+        name = m.group(2)
+        if name == "format":
+            return None
+        conv = converters.get(name)
+        kind = CONV.get(type(conv).__name__) if conv is not None else "str"
+        if kind is None:
+            kind = rx_type(getattr(conv, "regex", ""))
+        params.append((name, kind))
+        out.append("{" + name + "}")
+        last = m.end()
+    out.append(route[last:])
+    return "".join(out), params
+
+
+def regex_to_tpl(rx):
+    out, params, i, n = [], [], 0, len(rx)
+    while i < n:
+        c = rx[i]
+        if rx.startswith("(?P<", i):
+            j = rx.index(">", i)
+            name, depth, k = rx[i + 4:j], 1, j + 1
+            while k < n and depth:
+                ch = rx[k]
+                if ch == "\\":
+                    k += 2
+                    continue
+                if ch == "[":
+                    k += 1
+                    while k < n and rx[k] != "]":
+                        k += 2 if rx[k] == "\\" else 1
+                    k += 1
+                    continue
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                k += 1
+            if name == "format":
+                return None
+            params.append((name, rx_type(rx[j + 1:k - 1])))
+            out.append("{" + name + "}")
+            i = k
+            continue
+        if c in "^$":
+            i += 1
+        elif rx.startswith(("\\Z", "\\A"), i):
+            i += 2
+        elif rx.startswith("/?", i):
+            i += 2
+        elif c == "\\" and i + 1 < n and not rx[i + 1].isalnum():
+            out.append(rx[i + 1])
+            i += 2
+        elif c in "\\[](){}*+?|.":
+            return None
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out), params
+
+
+def piece(p):
+    pat = p.pattern
+    if type(pat).__name__ == "RoutePattern":
+        return route_to_tpl(str(pat), pat.converters)
+    return regex_to_tpl(pat.regex.pattern)
+
+
+def num(v):
+    return float(v) if not isinstance(v, (int, float)) else v
+
+
+def rel_schema(f):
+    if isinstance(f, R.PrimaryKeyRelatedField):
+        kind = "integer"
+        model = getattr(getattr(f, "queryset", None), "model", None)
+        if model is not None:
+            pk = model._meta.pk
+            if type(pk).__name__ == "UUIDField":
+                return {"type": "string", "format": "uuid", "x-reference": True}
+            if not pk.get_internal_type().endswith(("AutoField", "IntegerField")):
+                kind = "string"
+        return {"type": kind, "x-reference": True}
+    if isinstance(f, R.HyperlinkedRelatedField):
+        return {"type": "string", "format": "uri", "x-reference": True}
+    return {"type": "string", "x-reference": True}
+
+
+def fschema(f, mode, partial, depth):
+    if isinstance(f, S.ListSerializer):
+        return {"type": "array", "items": sschema(f.child, mode, partial, depth + 1)}
+    if isinstance(f, S.BaseSerializer):
+        return sschema(f, mode, partial, depth + 1)
+    if isinstance(f, R.ManyRelatedField):
+        return {"type": "array", "items": rel_schema(f.child_relation), "x-reference": True}
+    if isinstance(f, R.RelatedField):
+        return rel_schema(f)
+    s = {}
+    if isinstance(f, F.ListField):
+        s = {"type": "array", "items": fschema(f.child, mode, partial, depth + 1)}
+        if getattr(f, "min_length", None) is not None:
+            s["minItems"] = f.min_length
+        if getattr(f, "max_length", None) is not None:
+            s["maxItems"] = f.max_length
+        return s
+    if isinstance(f, F.MultipleChoiceField):
+        return {"type": "array", "items": {"enum": [k for k in f.choices]}}
+    if isinstance(f, F.ChoiceField):
+        keys = list(f.choices)
+        kind = "integer" if keys and all(isinstance(k, int) for k in keys) else "string"
+        return {"type": kind, "enum": keys if kind == "integer" else [str(k) for k in keys]}
+    if isinstance(f, F.BooleanField):
+        return {"type": "boolean"}
+    if isinstance(f, F.IntegerField):
+        s = {"type": "integer"}
+    elif isinstance(f, (F.FloatField, F.DecimalField)):
+        s = {"type": "number"}
+    elif isinstance(f, F.EmailField):
+        s = {"type": "string", "format": "email"}
+    elif isinstance(f, F.URLField):
+        s = {"type": "string", "format": "uri"}
+    elif isinstance(f, F.UUIDField):
+        s = {"type": "string", "format": "uuid"}
+    elif isinstance(f, F.DateTimeField):
+        s = {"type": "string", "format": "date-time"}
+    elif isinstance(f, F.DateField):
+        s = {"type": "string", "format": "date"}
+    elif isinstance(f, F.TimeField):
+        s = {"type": "string", "format": "time"}
+    elif isinstance(f, F.FileField):
+        s = {"type": "string", "format": "binary"}
+    elif isinstance(f, F.DictField):
+        child = fschema(f.child, mode, partial, depth + 1)
+        return {"type": "object", "additionalProperties": child}
+    elif isinstance(f, F.JSONField):
+        return {}
+    else:
+        s = {"type": "string"}
+    for attr, key in (("max_length", "maxLength"), ("min_length", "minLength")):
+        if s["type"] == "string" and getattr(f, attr, None) is not None:
+            s[key] = getattr(f, attr)
+    for attr, key in (("max_value", "maximum"), ("min_value", "minimum")):
+        if s["type"] in ("integer", "number") and getattr(f, attr, None) is not None:
+            s[key] = num(getattr(f, attr))
+    return s
+
+
+def sschema(ser, mode, partial, depth):
+    if depth > 4:
+        return {"type": "object"}
+    props, required = {}, []
+    for name, f in ser.fields.items():
+        if mode == "request" and (f.read_only or isinstance(f, F.HiddenField)):
+            continue
+        if mode == "response" and f.write_only:
+            continue
+        sch = fschema(f, mode, partial, depth)
+        if f.allow_null:
+            sch["nullable"] = True
+        if mode == "response" and f.read_only:
+            sch["readOnly"] = True
+        if getattr(f, "help_text", None):
+            sch["description"] = str(f.help_text)
+        props[name] = sch
+        if mode == "request" and f.required and not partial:
+            required.append(name)
+    out = {"type": "object", "properties": props}
+    if required:
+        out["required"] = sorted(required)
+    return out
+
+
+def serializer_for(cls, initkwargs, actions, action, method):
+    if not hasattr(cls, "get_serializer_class"):
+        return None, None
+    view = None
+    try:
+        view = cls(**initkwargs)
+        view.action = action
+        view.action_map = actions or {}
+        view.args, view.kwargs, view.format_kwarg = (), {}, None
+        view.request = Request(APIRequestFactory().generic(method, "/"))
+        return view.get_serializer_class(), view
+    except Exception:
+        return initkwargs.get("serializer_class") or getattr(cls, "serializer_class", None), view
+
+
+def wrap_list(schema, view):
+    if view is not None and getattr(view, "pagination_class", None) is not None:
+        return {"type": "object", "properties": {
+            "count": {"type": "integer"},
+            "next": {"type": "string", "nullable": True},
+            "previous": {"type": "string", "nullable": True},
+            "results": {"type": "array", "items": schema}}}
+    return {"type": "array", "items": schema}
+
+
+def method_schemas(cls, initkwargs, actions, action, method):
+    sc, view = serializer_for(cls, initkwargs, actions, action, method)
+    if sc is None:
+        return None, None, None
+    partial = method == "PATCH" or action == "partial_update"
+    try:
+        req = sschema(sc(), "request", partial, 0) if method in ("POST", "PUT", "PATCH") else None
+        resp = None
+        if method != "DELETE":
+            resp = sschema(sc(), "response", False, 0)
+            if action == "list":
+                resp = wrap_list(resp, view)
+    except Exception:
+        return None, None, None
+    ctype = None
+    if req is not None:
+        ctype = "multipart/form-data" if '"binary"' in json.dumps(req) else "application/json"
+    return req, ctype, resp
+
+
+def refine_params(cls, initkwargs, params):
+    model = getattr(getattr(cls, "queryset", None), "model", None)
+    if model is None:
+        return params
+    name = initkwargs.get("lookup_url_kwarg") or getattr(cls, "lookup_url_kwarg", None) \
+        or initkwargs.get("lookup_field") or getattr(cls, "lookup_field", None) or "pk"
+    out = []
+    for pname, kind in params:
+        if pname == name and kind == "str":
+            try:
+                lf = getattr(cls, "lookup_field", "pk")
+                fld = model._meta.pk if lf == "pk" else model._meta.get_field(lf)
+                it = fld.get_internal_type()
+                kind = "int" if it.endswith(("AutoField", "IntegerField")) else (
+                    "uuid" if it == "UUIDField" else "str")
+            except Exception:
+                pass
+        out.append((pname, kind))
+    return out
+
+
+routes = []
+
+
+def emit(cb, tpl, params):
+    cls = getattr(cb, "cls", None) or getattr(cb, "view_class", None)
+    mod = getattr(cls, "__module__", None) or getattr(cb, "__module__", "") or ""
+    if mod.startswith(SKIP_MODULES) or getattr(cb, "__module__", "").startswith(SKIP_MODULES):
+        return
+    actions = getattr(cb, "actions", None)
+    initkwargs = dict(getattr(cb, "initkwargs", None) or getattr(cb, "view_initkwargs", None) or {})
+    is_drf = APIView is not None and cls is not None and issubclass(cls, APIView)
+    if actions:
+        methods = {m.upper(): a for m, a in actions.items() if m.lower() in OK_METHODS}
+    elif cls is not None:
+        methods = {m.upper(): None for m in cls.http_method_names
+                   if m in OK_METHODS and hasattr(cls, m)}
+    else:
+        methods = {"GET": None}
+    if not methods:
+        return
+    name = (cls.__module__ + "." + cls.__qualname__) if cls is not None else (
+        getattr(cb, "__module__", "") + "." + getattr(cb, "__qualname__", repr(cb)))
+    if is_drf:
+        params = refine_params(cls, initkwargs, params)
+    rec = {"path": tpl, "view": name, "kind": "drf" if is_drf else "django",
+           "params": [{"name": n, "type": t} for n, t in params], "methods": {}}
+    for method in sorted(methods):
+        entry = {"action": methods[method], "request": None, "content_type": None,
+                 "response": None}
+        if is_drf:
+            req, ctype, resp = method_schemas(cls, initkwargs, actions, methods[method], method)
+            entry.update(request=req, content_type=ctype, response=resp)
+        rec["methods"][method] = entry
+    routes.append(rec)
+
+
+def walk(patterns, prefix, pparams):
+    for p in patterns:
+        if isinstance(p, URLResolver) and getattr(p, "app_name", None) == "admin":
+            continue
+        got = piece(p)
+        if got is None:
+            continue
+        tpl, params = prefix + got[0], pparams + got[1]
+        if isinstance(p, URLResolver):
+            walk(p.url_patterns, tpl, params)
+        else:
+            emit(p.callback, "/" + tpl.lstrip("/"), params)
+
+
+walk(get_resolver().url_patterns, "", [])
+routes.sort(key=lambda r: (r["path"], r["view"]))
+real_out.write(json.dumps(routes, default=str))
+"""
+
+_DJANGO_PARAM_SCHEMAS: dict[str, dict[str, Any]] = {
+    "int": {"type": "integer"},
+    "uuid": {"type": "string", "format": "uuid"},
+    "slug": {"type": "string", "pattern": "^[-a-zA-Z0-9_]+$"},
+    "path": {"type": "string"},
+    "str": {"type": "string"},
+}
+
+
+def index_from_django_dump(
+    routes: list[dict[str, Any]],
+    *,
+    app: str,
+    commit_sha: str,
+    seed_facts: Iterable[str] = (),
+) -> AppIndex:
+    """Build an :class:`AppIndex` from :data:`DJANGO_DUMP_SNIPPET` records.
+
+    ``source_kind`` is ``django_drf`` when any route is a Django REST Framework
+    view, else ``django``. Operations are keyed by (path, method); the first
+    record wins. A plain Django view has a route and no body schema.
+    """
+    ops: dict[tuple[str, str], Operation] = {}
+    drf = False
+    for r in routes:
+        path = str(r["path"])
+        view = str(r.get("view", ""))
+        is_drf = r.get("kind") == "drf"
+        drf = drf or is_drf
+        params = sorted(
+            (
+                {
+                    "name": p["name"],
+                    "in": "path",
+                    "required": True,
+                    "schema": dict(
+                        _DJANGO_PARAM_SCHEMAS.get(str(p.get("type")), {"type": "string"})
+                    ),
+                }
+                for p in r.get("params") or []
+            ),
+            key=lambda p: str(p["name"]),
+        )
+        for method, info in sorted((r.get("methods") or {}).items()):
+            m = str(method).upper()
+            if (path, m) in ops:
+                continue
+            info = info or {}
+            req = info.get("request")
+            resp = info.get("response")
+            descs: dict[str, str] = {}
+            if isinstance(req, dict):
+                req_descs: dict[str, str] = {}
+                _collect_descriptions(req, "", req_descs)
+                descs.update({f"request:{k}": v for k, v in req_descs.items()})
+            _collect_descriptions(resp, "", descs)
+            action = info.get("action")
+            ops[(path, m)] = Operation(
+                method=m,
+                path=path,
+                params=copy.deepcopy(params),
+                request_schema=req if isinstance(req, dict) else None,
+                response_schema=resp if isinstance(resp, dict) else None,
+                summary=f"{view}.{action}" if action else view,
+                field_descriptions=dict(sorted(descs.items())),
+                source=f"{'django_drf' if is_drf else 'django'}:{view}",
+                request_content_type=(info.get("content_type") if isinstance(req, dict) else None),
+            )
+    return AppIndex(
+        app=app,
+        commit_sha=commit_sha,
+        operations=sorted(ops.values(), key=lambda o: (o.path, o.method)),
+        seed_facts=list(seed_facts),
+        source_kind="django_drf" if drf else "django",
     )
 
 

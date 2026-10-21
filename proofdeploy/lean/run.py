@@ -56,7 +56,7 @@ from unittest import mock
 from proofdeploy.lean import coverage as lc
 from proofdeploy.lean import hostfs, hostrun
 from proofdeploy.lean.coverage import CoverageSession, PdCov
-from proofdeploy.lean.index import FLASK_DUMP_SNIPPET
+from proofdeploy.lean.index import DJANGO_DUMP_SNIPPET, FLASK_DUMP_SNIPPET
 from proofdeploy.lean.pipeline import (
     LeanConfig,
     LeanEnvironmentError,
@@ -353,6 +353,26 @@ class HostSide:
             return hostrun.flask_url_map(self.py, self.app_dir, target)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
             return None
+
+    def django_routes(self, app: Any) -> list[dict[str, Any]] | None:
+        """The Django URL resolver (and DRF serializers) dumped in the app's own interpreter,
+        with its own environment (``DJANGO_SETTINGS_MODULE``)."""
+        try:
+            proc = subprocess.run(
+                [str(self.py), "-c", DJANGO_DUMP_SNIPPET],
+                cwd=self.app_dir,
+                env=self._base_env(measured=False),
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return None
+            routes = json.loads(proc.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+        return routes if isinstance(routes, list) else None
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -733,6 +753,43 @@ class SandboxSide:
         except (OSError, subprocess.TimeoutExpired, ValueError):
             return None
         return rules if isinstance(rules, list) else None
+
+    def django_routes(self, app: Any) -> list[dict[str, Any]] | None:
+        """The Django URL resolver (and DRF serializers) dumped inside the app container with
+        the environment the app itself starts with, handed over as an env file (the values
+        may be secrets: they never appear in a process argument list)."""
+        import tempfile
+
+        from proofdeploy.sandbox import _podman_base
+
+        a = self.hook.start_args
+        env = self.hook.start_env(a["env"], False) if a else {**self.contract.env}
+        env = {k: v for k, v in env.items() if "\n" not in v and "\0" not in v}
+        cwd = "/checkout" + (f"/{self.hook.app_cwd}" if self.hook.app_cwd else "")
+        fd, name = tempfile.mkstemp(prefix="pd-django-env-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write("".join(f"{k}={v}\n" for k, v in sorted(env.items())))
+            argv = _podman_base() + [
+                "exec",
+                "--env-file",
+                name,
+                "-w",
+                cwd,
+                str(app.container),
+                APP_VENV_PYTHON,
+                "-c",
+                DJANGO_DUMP_SNIPPET,
+            ]
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=90, check=False)
+            if proc.returncode != 0:
+                return None
+            routes = json.loads(proc.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+        finally:
+            Path(name).unlink(missing_ok=True)
+        return routes if isinstance(routes, list) else None
 
     def bootstrap_env(self) -> dict[str, str]:
         """The generated bootstrap values this side was provisioned with (secrets)."""

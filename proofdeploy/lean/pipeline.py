@@ -9,7 +9,8 @@ Stages (each timed):
 
 1. ``diff``      base..head -> ChangedLines; intent; seed facts
 2. ``index``     head (and base) app index: OpenAPI from the running side if
-                 it serves one, else the Flask url_map, else ``cannot_map``
+                 it serves one, else the Flask url_map, else the Django / DRF
+                 resolver and serializers, else ``cannot_map``
 3. ``impact``    P3 ``cover_change`` on head (added lines) and on base
                  (removed lines); the impact scenario set is the union
 4. ``runs``      the impact scenarios replayed on base, base', head, head',
@@ -65,6 +66,7 @@ from proofdeploy.lean.http import (
 from proofdeploy.lean.index import (
     AppIndex,
     fetch_openapi,
+    index_from_django_dump,
     index_from_flask_url_map,
     index_from_openapi,
 )
@@ -175,6 +177,11 @@ class SideDriver(Protocol):
     def flask_rules(self, app: LiveApp, target: str) -> list[dict[str, Any]] | None:
         """Flask ``url_map`` rules of the app, or None when this driver cannot dump them."""
         ...
+
+    # Optional: ``django_routes(app) -> list[dict] | None``, the records of
+    # ``index.DJANGO_DUMP_SNIPPET`` run in the app's own interpreter and
+    # environment (``DJANGO_SETTINGS_MODULE``); a driver without the method
+    # cannot map a Django app.
 
     def describe(self) -> dict[str, Any]:
         """Facts for the run manifest (isolation, db snapshot, clock)."""
@@ -307,7 +314,9 @@ def build_index(
     app_name: str,
     seed_facts: list[str],
 ) -> AppIndex:
-    """OpenAPI from the running side, else its Flask url_map, else ``cannot_map``."""
+    """OpenAPI from the running side, else its Flask url_map, else its Django / DRF
+    resolver (in that order), else ``cannot_map``. ``index.source_kind`` is the
+    ``mapped_by`` of the manifest: ``openapi`` | ``flask`` | ``django_drf`` | ``django``."""
     paths = (cfg.openapi_path,) if cfg.openapi_path else DEFAULT_OPENAPI_PATHS
     tried: list[str] = []
     for path in paths:
@@ -323,10 +332,17 @@ def build_index(
         return index_from_flask_url_map(
             rules, app=app_name, commit_sha=driver.sha, seed_facts=seed_facts
         )
+    dump = getattr(driver, "django_routes", None)
+    routes = dump(app) if callable(dump) else None
+    if routes:
+        return index_from_django_dump(
+            routes, app=app_name, commit_sha=driver.sha, seed_facts=seed_facts
+        )
     raise LeanRefusal(
         "cannot_map",
-        f"the {driver.label} side serves no OpenAPI document (tried {', '.join(tried)}) and "
-        f"no Flask url_map could be read (target {cfg.flask_target!r})",
+        f"the {driver.label} side serves no OpenAPI document (tried {', '.join(tried)}), "
+        f"no Flask url_map could be read (target {cfg.flask_target!r}) and no Django URL "
+        "resolver could be read",
     )
 
 
@@ -648,6 +664,13 @@ def loop_summary(exchanges: list[Exchange]) -> dict[str, Any]:
         "no_response": sum(1 for e in exchanges if e.status == 0),
         "with_auth": sum(1 for e in exchanges if e.auth_sent),
     }
+
+
+def acceptance_rate(exchanges: list[Exchange]) -> dict[str, Any]:
+    """The non-4xx share of the loop's requests (a mapping that fits the app is accepted)."""
+    n = len(exchanges)
+    ok = sum(1 for e in exchanges if not 400 <= e.status < 500)
+    return {"requests": n, "non_4xx": ok, "rate": round(ok / n, 3) if n else None}
 
 
 def loop_operation_rates(
@@ -1065,6 +1088,14 @@ def run_pipeline(
             "base": {"sha256": index_base.sha256(), "kind": index_base.source_kind}
             if index_base
             else None,
+        },
+        "mapped_by": {
+            "head": index_head.source_kind if index_head else None,
+            "base": index_base.source_kind if index_base else None,
+        },
+        "request_acceptance": {
+            "head": acceptance_rate(cover_head_ex),
+            "base": acceptance_rate(cover_base_ex),
         },
         "coverage": {"head": impact_head.stats(), "base": impact_base.stats()},
         "auth_proof": auth_proof,

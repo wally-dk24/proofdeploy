@@ -179,6 +179,12 @@ def test_golden_bug_is_a_judged_regression_and_fails(
     assert m["observable"] is True and m["unexercised_lines"] == []
     assert m["impacted_operations_head"]["GET /notes/{note_id}"]["2xx_rate"] == 1.0
     assert m["coverage"]["head"]["covered"] is True
+    assert m["mapped_by"] == {"head": "flask", "base": "flask"}
+    for side in ("head", "base"):
+        acc = m["request_acceptance"][side]
+        assert acc["requests"] == m["cover_loop"][side]["requests"] > 0
+        assert acc["non_4xx"] == acc["requests"] - m["cover_loop"][side]["4xx"]
+        assert acc["rate"] == round(acc["non_4xx"] / acc["requests"], 3)
     for stage in ("diff", "index_head", "cover_head", "run_base", "run_base2", "run_head2"):
         assert stage in m["timings_seconds"], m["timings_seconds"]
     assert "verdict: FAIL (judged_regression)" in out

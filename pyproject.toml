@@ -12,7 +12,10 @@ license = { text = "MIT" }
 dependencies = ["pyyaml>=6.0", "coverage==7.16.2"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.8", "mypy>=1.10", "types-PyYAML>=6.0"]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.8", "mypy>=1.10", "types-PyYAML>=6.0",
+    # Test-only: the synthetic Django + DRF project in tests/fixtures/lean/drf_app
+    # (the lean Django adapter). Never runtime dependencies.
+    "Django==5.2.18", "djangorestframework==3.18.3"]
 
 [tool.setuptools.packages.find]
 # Explicit: the repo also hosts the Claude Code plugin marketplace under
