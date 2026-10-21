@@ -630,6 +630,8 @@ def row_from_result(
         "timings_seconds": m.get("timings_seconds") or {},
         "wall_seconds": round(wall_seconds, 1),
         "rate_2xx": round(ok2xx / reqs, 3) if reqs else None,
+        "mapped_by": m.get("mapped_by"),
+        "request_acceptance": m.get("request_acceptance"),
         "impacted_2xx": impacted,
         "confirmed": None,
         "error": None,
@@ -668,6 +670,8 @@ def error_row(
         "timings_seconds": {},
         "wall_seconds": round(wall_seconds, 1),
         "rate_2xx": None,
+        "mapped_by": None,
+        "request_acceptance": None,
         "impacted_2xx": {},
         "confirmed": None,
         "error": error,
@@ -720,8 +724,9 @@ APP_BUG_FIELDS = (
     ("requests_hitting_changed_code", "requests_hitting_changed_code"),
     ("differences_found", "differences"),
     ("differences_judged", "differences_judged"),
-    ("mapped_by", "mapped_by"),  # None while a row does not carry it
-    ("request_acceptance", "rate_2xx"),  # share of impacted requests answered 2xx
+    ("mapped_by", "mapped_by"),  # {"head", "base"}; None when the run did not map
+    ("request_acceptance", "request_acceptance"),  # {"head", "base"}; None when not reported
+    ("impacted_2xx_rate", "rate_2xx"),  # the impacted operations' 2xx share (head run)
     ("impacted_2xx", "impacted_2xx"),
 )
 _REGISTERED_GROUPS = ("golden", "mutants", "paperless")

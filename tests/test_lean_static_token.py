@@ -872,7 +872,8 @@ def test_the_app_block_reports_bug_units_clean_units_false_alarms_and_cost() -> 
             cause="judged_regression",
             confirmed=True,
             tokens=4100,
-            mapped_by="route_table",
+            mapped_by={"head": "route_table", "base": None},
+            request_acceptance={"head": 0.9, "base": 0.8},
         ),
         _row("linkding-bug-bbbbbbbb", "bug", "linkding", gate.PASS, tokens=900),
         _row("linkding-clean-111111111111", "clean", "linkding", gate.PASS, tokens=300),
@@ -905,11 +906,13 @@ def test_the_app_block_reports_bug_units_clean_units_false_alarms_and_cost() -> 
         "requests_hitting_changed_code": 14,
         "differences_found": 3,
         "differences_judged": 2,
-        "mapped_by": "route_table",
-        "request_acceptance": 0.75,
+        "mapped_by": {"head": "route_table", "base": None},
+        "request_acceptance": {"head": 0.9, "base": 0.8},
+        "impacted_2xx_rate": 0.75,
         "impacted_2xx": {"GET /api/bookmarks/": {"requests": 14, "2xx": 10}},
     }
-    assert block["bug_units"]["linkding-bug-bbbbbbbb"]["mapped_by"] is None  # row carries none
+    absent = block["bug_units"]["linkding-bug-bbbbbbbb"]  # a row that carries neither key
+    assert absent["mapped_by"] is None and absent["request_acceptance"] is None
     assert block["clean_units"] == {
         "linkding-clean-111111111111": {"verdict": gate.PASS, "cause": None},
         "linkding-clean-222222222222": {"verdict": gate.FAIL, "cause": "hard_oracle"},
@@ -934,3 +937,38 @@ def test_no_app_block_for_the_registered_groups_and_their_criteria_text_is_untou
     assert list(mixed["app_block"]) == ["linkding"]
     assert mixed["criteria"]["1"] == summary["criteria"]["1"]
     assert mixed["criteria_text"] == gate.CRITERIA
+
+
+def test_the_row_copies_mapped_by_and_request_acceptance_from_the_manifest() -> None:
+    from unittest import mock
+
+    unit = gate.Unit("linkding-bug-aaaaaaaa", "bug", "linkding", "sandbox", "b", "h", None)
+    manifest: dict[str, Any] = {
+        "mode": "sandbox",
+        "compared": {"differences": 1},
+        "impacted_operations_head": {"GET /a": {"requests": 4, "2xx": 3}},
+        "mapped_by": {"head": "route_table", "base": None},
+        "request_acceptance": {"head": 0.9, "base": None},
+        "mapping_attempts": 2,
+    }
+    record = mock.Mock(total_tokens=5, calls=[])
+    from proofdeploy.lean.pipeline import LeanResult
+    from proofdeploy.lean.verdict import Verdict
+
+    result = LeanResult(Verdict(gate.FAIL, "judged_regression", {}), record, manifest)
+    row = gate.row_from_result(unit, result, 1, wall_seconds=1.0)
+    assert row["mapped_by"] == {"head": "route_table", "base": None}
+    assert row["request_acceptance"] == {"head": 0.9, "base": None}
+    assert row["rate_2xx"] == 0.75
+    # absent keys and error rows give None
+    del manifest["mapped_by"], manifest["request_acceptance"]
+    bare = gate.row_from_result(unit, result, 1, wall_seconds=1.0)
+    assert bare["mapped_by"] is None and bare["request_acceptance"] is None
+    err = gate.error_row(unit, "boom", wall_seconds=0.0)
+    assert err["mapped_by"] is None and err["request_acceptance"] is None
+    # and the app block reports them from the row, rate_2xx separately
+    row["group"], row["kind"] = "linkding", "bug"
+    bug = _summary([row])["app_block"]["linkding"]["bug_units"][unit.id]
+    assert bug["mapped_by"] == {"head": "route_table", "base": None}
+    assert bug["request_acceptance"] == {"head": 0.9, "base": None}
+    assert bug["impacted_2xx_rate"] == 0.75
