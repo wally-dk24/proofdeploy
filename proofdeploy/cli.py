@@ -355,8 +355,11 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument(
         "--budget-requests",
         type=int,
-        default=200,
-        help="Request budget for the impact search per side (default: 200).",
+        default=None,
+        help=(
+            "requests for the coverage loop (default: scaled with the change: 200 up to "
+            "100 executable changed lines, else min(1000, 200 + 2 x lines))"
+        ),
     )
     lv.add_argument(
         "--openapi-path",

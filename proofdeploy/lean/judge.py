@@ -165,17 +165,24 @@ class JudgeContext:
     changed_hunks: str
     seed_facts: list[str] = field(default_factory=list)
     field_descriptions: dict[str, str] = field(default_factory=dict)
+    # Request id -> {"hits_added": ["path:line", ...], "hits_removed": [...]}: the changed
+    # lines that request executed (head side for added lines, base side for removed ones).
+    # When set, a group's CHANGED CODE shows only the hunks holding such lines for the
+    # group's first request; ``None`` (records before round 4) shows the whole diff.
+    executed: dict[str, dict[str, list[str]]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> JudgeContext:
+        executed = d.get("executed")
         return cls(
             intent=d["intent"],
             changed_hunks=d["changed_hunks"],
             seed_facts=list(d.get("seed_facts") or []),
             field_descriptions=dict(d.get("field_descriptions") or {}),
+            executed=None if executed is None else {k: dict(v) for k, v in executed.items()},
         )
 
 
@@ -397,6 +404,206 @@ def added_lines_text(changed_hunks: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Executed hunks (round 4): the judge sees only the code that ran
+# --------------------------------------------------------------------------
+
+HUNK_CONTEXT_LINES = 3
+NO_CHANGED_LINE_RAN = "(no changed line ran in this request)"
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$", re.DOTALL)
+
+
+@dataclass
+class DiffHunk:
+    """One hunk of the diff: its file header, label, and body entries.
+
+    ``entries`` are ``(tag, raw, old_line, new_line)`` with the tag ``" "``, ``"+"`` or
+    ``"-"``; a following ``\\ No newline`` line is part of the entry's ``raw``.
+    """
+
+    path: str
+    file_header: str
+    old_start: int
+    old_len: int
+    new_start: int
+    new_len: int
+    tail: str  # the text after the closing "@@" of the header line, newline included
+    entries: list[tuple[str, str, int, int]]
+
+    @property
+    def label(self) -> str:
+        return (
+            f"{self.path} @@ -{self.old_start},{self.old_len} +{self.new_start},{self.new_len} @@"
+        )
+
+    def changed_keys(self) -> tuple[set[str], set[str]]:
+        """``("path:line" of added lines, "path:line" of removed lines)``."""
+        added = {f"{self.path}:{nl}" for tag, _, _, nl in self.entries if tag == "+"}
+        removed = {f"{self.path}:{ol}" for tag, _, ol, _ in self.entries if tag == "-"}
+        return added, removed
+
+    def render(self, context: int = HUNK_CONTEXT_LINES) -> str:
+        """The hunk text with at most ``context`` context lines before the first
+        and after the last changed line; the header counts follow the trim."""
+        idx = [i for i, e in enumerate(self.entries) if e[0] != " "]
+        if not idx:
+            return ""
+        lo = max(0, idx[0] - context)
+        hi = min(len(self.entries), idx[-1] + 1 + context)
+        kept = self.entries[lo:hi]
+        if lo == 0 and hi == len(self.entries):
+            header = f"@@ -{self.old_start},{self.old_len} +{self.new_start},{self.new_len} @@"
+        else:
+            before = self.entries[:lo]
+            old_start = self.old_start + sum(1 for e in before if e[0] != "+")
+            new_start = self.new_start + sum(1 for e in before if e[0] != "-")
+            old_len = sum(1 for e in kept if e[0] != "+")
+            new_len = sum(1 for e in kept if e[0] != "-")
+            header = f"@@ -{old_start},{old_len} +{new_start},{new_len} @@"
+        return header + self.tail + "".join(e[1] for e in kept)
+
+
+def _diff_path(raw: str) -> str | None:
+    raw = raw.split("\t", 1)[0].rstrip("\r\n")
+    if raw == "/dev/null":
+        return None
+    return raw[2:] if raw.startswith(("a/", "b/")) else raw
+
+
+def parse_hunks(changed_hunks: str) -> list[DiffHunk]:
+    """Every hunk of a unified diff, in order, with the header lines of its file.
+
+    Hunk bodies are read by the header's line counts (as ``ChangedLines`` does), so
+    a removed line that starts with ``-- `` is never mistaken for a file header."""
+    lines = split_diff_lines_keepends(changed_hunks)
+    out: list[DiffHunk] = []
+    header: list[str] = []
+    old_path: str | None = None
+    new_path: str | None = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("diff --git "):
+            header, old_path, new_path = [line], None, None
+        elif line.startswith("--- "):
+            header.append(line)
+            old_path = _diff_path(line[4:])
+        elif line.startswith("+++ "):
+            header.append(line)
+            new_path = _diff_path(line[4:])
+        else:
+            m = _HUNK_HEADER.match(line)
+            if m is None:
+                if header:
+                    header.append(line)
+                i += 1
+                continue
+            old_start, old_len = int(m.group(1)), int(m.group(2) if m.group(2) else 1)
+            new_start, new_len = int(m.group(3)), int(m.group(4) if m.group(4) else 1)
+            path = new_path if new_path is not None else old_path
+            old_ln, new_ln = old_start, new_start
+            old_rem, new_rem = old_len, new_len
+            entries: list[tuple[str, str, int, int]] = []
+            i += 1
+            while i < len(lines) and (old_rem > 0 or new_rem > 0 or lines[i].startswith("\\")):
+                body = lines[i]
+                tag = body[:1]
+                if body.startswith("\\"):
+                    if entries:
+                        t, raw, o, n = entries[-1]
+                        entries[-1] = (t, raw + body, o, n)
+                elif tag == "-" and old_rem > 0:
+                    entries.append(("-", body, old_ln, new_ln))
+                    old_ln += 1
+                    old_rem -= 1
+                elif tag == "+" and new_rem > 0:
+                    entries.append(("+", body, old_ln, new_ln))
+                    new_ln += 1
+                    new_rem -= 1
+                elif old_rem > 0 and new_rem > 0:
+                    entries.append((" ", body, old_ln, new_ln))
+                    old_ln += 1
+                    new_ln += 1
+                    old_rem -= 1
+                    new_rem -= 1
+                else:
+                    break
+                i += 1
+            if path is not None:
+                tail = m.group(5)
+                tail = tail if tail.endswith("\n") else tail + "\n"
+                out.append(
+                    DiffHunk(
+                        path,
+                        "".join(header),
+                        old_start,
+                        old_len,
+                        new_start,
+                        new_len,
+                        tail,
+                        entries,
+                    )
+                )
+            continue
+        i += 1
+    return out
+
+
+def executed_hunks(ctx: JudgeContext, request_id: str | None) -> list[DiffHunk]:
+    """The hunks holding a changed line that ``request_id`` executed (diff order)."""
+    hits = (ctx.executed or {}).get(request_id or "", {})
+    ran_added = set(hits.get("hits_added") or [])
+    ran_removed = set(hits.get("hits_removed") or [])
+    if not ran_added and not ran_removed:
+        return []
+    shown = []
+    for h in parse_hunks(ctx.changed_hunks):
+        added, removed = h.changed_keys()
+        if added & ran_added or removed & ran_removed:
+            shown.append(h)
+    return shown
+
+
+def render_hunks(hunks: list[DiffHunk]) -> str:
+    """The hunks as diff text, each file's header once, hunks trimmed to +-3 context lines."""
+    out: list[str] = []
+    last_header = None
+    for h in hunks:
+        if h.file_header != last_header:
+            out.append(h.file_header)
+            last_header = h.file_header
+        out.append(h.render())
+    return "".join(out)
+
+
+def group_hunk_labels(ctx: JudgeContext, group: Group) -> list[str]:
+    """Which hunks the prompt shows for ``group`` (empty: none of its request's lines ran)."""
+    if ctx.executed is None:
+        return []
+    return [
+        h.label for h in executed_hunks(ctx, group.request_ids[0] if group.request_ids else None)
+    ]
+
+
+def changed_code_text(ctx: JudgeContext, groups: list[Group]) -> str:
+    """The CHANGED CODE body of a call: per group, only the hunks its first request ran.
+
+    Groups with the same selection share one block; the blocks are labelled with the
+    group numbers when the call holds more than one block."""
+    assert ctx.executed is not None
+    blocks: dict[str, list[int]] = {}
+    for g in groups:
+        text = render_hunks(executed_hunks(ctx, g.request_ids[0] if g.request_ids else None)).strip(
+            "\n"
+        )
+        blocks.setdefault(text or NO_CHANGED_LINE_RAN, []).append(g.index)
+    if len(blocks) == 1:
+        return next(iter(blocks))
+    return "\n\n".join(
+        "for " + ", ".join(f"[{n}]" for n in ids) + ":\n" + text for text, ids in blocks.items()
+    )
+
+
+# --------------------------------------------------------------------------
 # Prompt and batching
 # --------------------------------------------------------------------------
 
@@ -453,6 +660,8 @@ def render_prompt(ctx: JudgeContext, groups: list[Group], hunks: str, hunks_trim
     if descs:
         parts.append("FIELD DESCRIPTIONS:\n" + "\n".join(f"{k}: {v}" for k, v in descs.items()))
     note = " (only hunks touching these fields or paths are shown)" if hunks_trimmed else ""
+    if ctx.executed is not None:
+        note = " (only the changed lines that ran in the request are shown)" + note
     parts.append(f"CHANGED CODE (not evidence){note}:\n{hunks.strip()}")
     lines = []
     for g in groups:
@@ -502,6 +711,10 @@ def plan_calls(
         return plans, too_big  # code decides these groups; no call is planned
     batch: list[Group] = []
 
+    def hunks_of(gs: list[Group]) -> str:
+        # Round 4: each group shows only the hunks its first request ran.
+        return changed_code_text(ctx, gs) if ctx.executed is not None else ctx.changed_hunks
+
     def fits(gs: list[Group], hunks: str, trimmed: bool) -> bool:
         # Room is kept for the correction message, so the follow-up call also
         # stays under the cap (judge skill v1, Part B 7).
@@ -515,22 +728,22 @@ def plan_calls(
                 CallPlan(
                     index=len(plans),
                     group_ids=[g.index for g in batch],
-                    prompt=render_prompt(ctx, batch, ctx.changed_hunks, False),
+                    prompt=render_prompt(ctx, batch, hunks_of(batch), False),
                     hunks_trimmed=False,
                 )
             )
             batch = []
 
     for g in groups:
-        if fits(batch + [g], ctx.changed_hunks, False):
+        if fits(batch + [g], hunks_of(batch + [g]), False):
             batch.append(g)
             continue
         if batch:
             flush()
-            if fits([g], ctx.changed_hunks, False):
+            if fits([g], hunks_of([g]), False):
                 batch = [g]
                 continue
-        trimmed = trim_hunks(ctx.changed_hunks, [g])
+        trimmed = trim_hunks(hunks_of([g]), [g])
         if fits([g], trimmed, True):
             plans.append(
                 CallPlan(

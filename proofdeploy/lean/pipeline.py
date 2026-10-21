@@ -32,7 +32,7 @@ import time
 import urllib.error
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -73,6 +73,8 @@ from proofdeploy.lean.judge import (
     HardFailure,
     JudgeContext,
     attach_exchanges,
+    group_differences,
+    group_hunk_labels,
     path_template,
 )
 from proofdeploy.lean.pathclass import BACKEND_EXTENSIONS, is_backend_source, paths_by_class
@@ -87,6 +89,35 @@ from proofdeploy.model_client import ModelRunner
 
 DEFAULT_OPENAPI_PATHS = ("/api/schema/", "/openapi.json")
 DEFAULT_REQUEST_BUDGET = 200
+REQUEST_BUDGET_FREE_LINES = 100
+REQUEST_BUDGET_CAP = 1000
+REQUEST_BUDGET_RULE = (
+    "200 if executable changed lines <= 100, else min(1000, 200 + 2 * lines); "
+    "an explicit value wins"
+)
+
+
+def request_budget_for(explicit: int | None, lines: int) -> dict[str, Any]:
+    """The per-side request budget of the impact search, and how it was chosen.
+
+    An explicit value (CLI/config) wins. Otherwise the budget scales with the
+    change: 200 for up to 100 executable changed lines, else ``min(1000, 200 + 2 * lines)``.
+    """
+    if explicit is not None:
+        value, source = explicit, "explicit"
+    else:
+        if lines > REQUEST_BUDGET_FREE_LINES:
+            value, source = min(REQUEST_BUDGET_CAP, DEFAULT_REQUEST_BUDGET + 2 * lines), "scaled"
+        else:
+            value, source = DEFAULT_REQUEST_BUDGET, "default"
+    return {
+        "value": value,
+        "source": source,
+        "executable_changed_lines": lines,
+        "rule": REQUEST_BUDGET_RULE,
+    }
+
+
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -163,7 +194,7 @@ class LeanConfig:
     head: str
     intent: str | None = None
     budget_tokens: int = DEFAULT_TOKEN_BUDGET
-    budget_requests: int = DEFAULT_REQUEST_BUDGET
+    budget_requests: int | None = None  # None: scaled with the change (request_budget_for)
     openapi_path: str | None = None
     flask_target: str = "app"
     mode: str = "sandbox"  # "sandbox" | "host"
@@ -327,6 +358,9 @@ class SideImpact:
     skipped_reason: str | None = None
     unexercised: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     load_only: list[str] = field(default_factory=list)
+    # Request id -> the changed lines that request executed ("path:line"), read from the
+    # coverage session while the app was still up. Not part of the manifest.
+    request_hits: dict[str, dict[str, list[str]]] = field(default_factory=dict)
 
     def stats(self) -> dict[str, Any]:
         if self.result is None:
@@ -420,7 +454,7 @@ def cover_side(
             changed,
             runner,
             app.session,
-            cfg.budget_requests,
+            cfg.budget_requests if cfg.budget_requests is not None else DEFAULT_REQUEST_BUDGET,
             diff_text=diff_text,
             auth=auth,
             side=side,
@@ -435,11 +469,25 @@ def cover_side(
             driver.root_prefix,
             source_of=source_reader(cfg, key),
         )
+        impact.request_hits = _request_hits(app.session, view, side, driver.root_prefix)
     except lc.CoverageHarnessError as exc:
         raise LeanEnvironmentError("coverage_harness", str(exc)[:500]) from exc
     finally:
         app.stop()
     return impact
+
+
+def _request_hits(
+    session: CoverageSession, view: ChangedLines, side: str, root_prefix: str
+) -> dict[str, dict[str, list[str]]]:
+    """Per request id, the changed lines of this side's view it executed (none: left out)."""
+    cov = session.snapshot(root_prefix=root_prefix)
+    old, new = ({}, cov) if side == "new" else (cov, {})
+    return {
+        rid: h
+        for rid, h in lc.impact(view, old, new).items()
+        if h["hits_added"] or h["hits_removed"]
+    }
 
 
 def _settle_load_only(
@@ -797,6 +845,11 @@ def run_pipeline(
     dt = parse_diff_text(diff_text)
     view_new = executable_view(changed, dt, "new")
     view_old = executable_view(changed, dt, "old")
+    exec_lines = sum(len(s["added"]) for s in view_new.values()) + sum(
+        len(s["removed"]) for s in view_old.values()
+    )
+    budget_rule = request_budget_for(cfg.budget_requests, exec_lines)
+    cfg = replace(cfg, budget_requests=budget_rule["value"])
     index_head: AppIndex | None = None
     index_base: AppIndex | None = None
     impact_head = SideImpact(None, "no executable added lines")
@@ -946,8 +999,21 @@ def run_pipeline(
     attach_exchanges(
         comparison.differences, [head_run.exchanges[k].to_dict() for k in head_run.order]
     )
+    # The judge sees only the changed lines each request ran: head coverage for added
+    # lines, base coverage for removed lines (keyed by the request ids of the differences).
+    executed: dict[str, dict[str, list[str]]] = {}
+    for d in comparison.differences:
+        rid = d.request_id
+        executed[rid] = {
+            "hits_added": list(impact_head.request_hits.get(rid, {}).get("hits_added", [])),
+            "hits_removed": list(impact_base.request_hits.get(rid, {}).get("hits_removed", [])),
+        }
     ctx = JudgeContext(
-        intent=intent, changed_hunks=diff_text, seed_facts=facts, field_descriptions=descs
+        intent=intent,
+        changed_hunks=diff_text,
+        seed_facts=facts,
+        field_descriptions=descs,
+        executed=executed,
     )
     with timings.stage("judge"):
         record = run_lean(
@@ -965,6 +1031,10 @@ def run_pipeline(
     verdict = Verdict(
         replayed.status, replayed.cause, replayed.details
     )  # identical to the record's by construction
+    hunks_shown = {
+        str(g.index): group_hunk_labels(ctx, g)
+        for g in group_differences(comparison.differences, templates)
+    }
 
     manifest = {
         "kind": "lean-verify",
@@ -980,6 +1050,7 @@ def run_pipeline(
             "diff_sha256": hashlib.sha256(diff_raw).hexdigest(),
             "budget_tokens": cfg.budget_tokens,
             "budget_requests": cfg.budget_requests,
+            "budget_requests_rule": budget_rule,
             "openapi_path": cfg.openapi_path,
             "flask_target": cfg.flask_target,
             **cfg.inputs,
@@ -1025,6 +1096,7 @@ def run_pipeline(
             "calls": len(record.calls),
             "total_tokens": record.total_tokens,
             "model_used": any(c.get("status") == "ok" for c in record.calls),
+            "hunks_shown": hunks_shown,
         },
         "sides": {"base": base.describe(), "head": head.describe()},
         "timings_seconds": timings.to_dict(),

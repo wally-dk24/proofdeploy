@@ -858,7 +858,7 @@ class LeanRunConfig:
     no_sandbox: bool = False
     django_overlay: dict[str, Any] = field(default_factory=dict)
     budget_tokens: int = 10_000
-    budget_requests: int = 200
+    budget_requests: int | None = None  # None: scaled with the change (pipeline)
     openapi_path: str | None = None
     flask_target: str = "app"
     python: Path | None = None
@@ -1007,12 +1007,12 @@ def cmd_lean_verify(args: Any, model_runner: ModelRunner | None = None) -> int:
             no_sandbox=bool(args.no_sandbox),
             django_overlay=overlay,
             budget_tokens=int(args.budget_tokens),
-            budget_requests=int(args.budget_requests),
+            budget_requests=(None if args.budget_requests is None else int(args.budget_requests)),
             openapi_path=args.openapi_path,
             flask_target=args.flask_target,
             python=Path(args.python) if args.python else None,
         )
-        if rc.budget_tokens <= 0 or rc.budget_requests <= 0:
+        if rc.budget_tokens <= 0 or (rc.budget_requests is not None and rc.budget_requests <= 0):
             raise LeanUsageError("budgets must be positive")
         if rc.contract and rc.unit_repo:
             raise LeanUsageError("use --contract or --unit-repo, not both")
