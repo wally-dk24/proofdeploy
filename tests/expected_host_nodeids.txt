@@ -457,8 +457,13 @@ tests/test_lean_env.py::test_second_failure_is_a_typed_error_naming_the_path_nev
 tests/test_lean_env.py::test_snapshot_sqlite_backup_path_is_unchanged
 tests/test_lean_env.py::test_snapshot_sqlite_reads_an_unreadable_database_through_hostfs
 tests/test_lean_env.py::test_split_diff_lines_splits_on_newline_only
+tests/test_lean_gate.py::test_a_unit_listed_twice_is_a_gate_error_naming_its_id
 tests/test_lean_gate.py::test_absent_bug_unit_file_stops_run_gate_and_list_before_anything_runs
 tests/test_lean_gate.py::test_array_fields_and_absent_fields
+tests/test_lean_gate.py::test_bug_unit_file_shape_is_validated[[]]
+tests/test_lean_gate.py::test_bug_unit_file_shape_is_validated[{"unit": []}]
+tests/test_lean_gate.py::test_bug_unit_file_shape_is_validated[{"units": []}]
+tests/test_lean_gate.py::test_bug_unit_file_shape_is_validated[{"units": {}}]
 tests/test_lean_gate.py::test_bug_unit_shas_must_match_exactly[override0]
 tests/test_lean_gate.py::test_bug_unit_shas_must_match_exactly[override1]
 tests/test_lean_gate.py::test_bug_unit_shas_must_match_exactly[override2]
@@ -484,7 +489,8 @@ tests/test_lean_gate.py::test_criterion_2_ratio_boundary[3-4-PASS]
 tests/test_lean_gate.py::test_criterion_2_ratio_boundary[6-10-FAIL]
 tests/test_lean_gate.py::test_criterion_2_ratio_boundary[7-10-PASS]
 tests/test_lean_gate.py::test_criterion_2_violation_unobservable_pass_with_unexercised_lines
-tests/test_lean_gate.py::test_criterion_3_is_reported_not_required
+tests/test_lean_gate.py::test_criterion_3_is_reported_not_required_and_per_unit
+tests/test_lean_gate.py::test_criterion_3_not_run_until_every_expected_bug_unit_ran
 tests/test_lean_gate.py::test_criterion_3_reads_a_provider_limit_as_not_a_real_verdict
 tests/test_lean_gate.py::test_criterion_4_boundary[FAIL-paperless3-FAIL]
 tests/test_lean_gate.py::test_criterion_4_boundary[INCONCLUSIVE-paperless4-PASS]
@@ -500,6 +506,8 @@ tests/test_lean_gate.py::test_golden_and_mutant_groups_need_no_bug_unit_file
 tests/test_lean_gate.py::test_golden_clean_runs_fix_to_clean_and_mutants_sit_on_fix
 tests/test_lean_gate.py::test_host_smoke_golden_bug_and_two_mutants
 tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override0]
+tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override10]
+tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override11]
 tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override1]
 tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override2]
 tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override3]
@@ -507,6 +515,9 @@ tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override4]
 tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override5]
 tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override6]
 tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override7]
+tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override8]
+tests/test_lean_gate.py::test_invalid_bug_unit_file_is_a_gate_error[override9]
+tests/test_lean_gate.py::test_list_covers_all_three_bug_units
 tests/test_lean_gate.py::test_missing_exchange_or_no_flagged_items_never_confirm
 tests/test_lean_gate.py::test_not_confirmed_when_a_run_pair_disagrees
 tests/test_lean_gate.py::test_not_confirmed_when_fix_parent_already_differs_from_b
@@ -514,12 +525,17 @@ tests/test_lean_gate.py::test_not_confirmed_when_the_fix_keeps_the_flagged_value
 tests/test_lean_gate.py::test_paperless_output_never_reaches_the_log
 tests/test_lean_gate.py::test_partial_selection_never_passes_on_part_of_the_data
 tests/test_lean_gate.py::test_regenerated_mutants_equal_the_registered_file
+tests/test_lean_gate.py::test_round4_block_reports_each_bug_unit
 tests/test_lean_gate.py::test_row_counts_and_flags_from_a_lean_result
-tests/test_lean_gate.py::test_run_confirm_replays_each_fix_side_twice_and_closes_both
+tests/test_lean_gate.py::test_run_confirm_uses_each_units_own_fix_parent_and_fix[0]
+tests/test_lean_gate.py::test_run_confirm_uses_each_units_own_fix_parent_and_fix[1]
+tests/test_lean_gate.py::test_run_confirm_uses_each_units_own_fix_parent_and_fix[2]
+tests/test_lean_gate.py::test_run_unit_confirms_a_failing_bug_unit_against_its_own_fix
 tests/test_lean_gate.py::test_selection_by_group
 tests/test_lean_gate.py::test_status_flag_for_a_hard_oracle_failure
+tests/test_lean_gate.py::test_the_committed_file_holds_the_three_registered_bug_units
 tests/test_lean_gate.py::test_unit_definitions_follow_the_work_order
-tests/test_lean_gate.py::test_unit_list_is_26_units_in_the_registered_order
+tests/test_lean_gate.py::test_unit_list_is_28_units_in_the_registered_order
 tests/test_lean_gate.py::test_valid_bug_unit_file_is_loaded_not_constants
 tests/test_lean_gate.py::test_workflow_actions_are_sha_pinned_and_match_the_existing_pins
 tests/test_lean_gate.py::test_workflow_gates_serialization_permissions_and_timeout
