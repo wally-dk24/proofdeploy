@@ -672,3 +672,23 @@ def test_r2_chains_run_create_read_list_update_delete_on_one_record() -> None:
     tails = [[(s.method, s.path) for s in sc.steps[-2:]] for sc in gen.chain_scenarios(delete)]
     assert [("DELETE", "/orders/{order_id}"), ("GET", "/orders/{order_id}")] in tails
     assert [("DELETE", "/orders/{order_id}"), ("DELETE", "/orders/{order_id}")] in tails
+
+
+def test_r2_seeding_is_capped_at_a_third_so_the_aim_still_gets_requests() -> None:
+    small = {
+        "type": "object",
+        "required": ["name"],
+        "properties": {"name": {"type": "string"}, "note": {"type": "string", "maxLength": 30}},
+    }
+    ops = [_op("POST", f"/registry{n:02d}", small) for n in range(30)]
+    ops.append(_op("POST", "/payouts", PAYOUT_SCHEMA))
+    index = AppIndex(app="registry", commit_sha="0" * 40, operations=ops)
+    assert len(ScenarioGenerator(index).seed_scenarios()) >= 90  # seeding alone could eat 90
+    session = _Reach(_payout_rule)
+    res = cover_change(
+        index, ChangedLines.from_diff(DIFF), _stub_run(session), session, 90, diff_text=DIFF
+    )
+    assert 0 < res.seed_requests <= 90 // 3
+    assert res.requests_used - res.seed_requests >= 60  # the rest of the budget went on probing
+    assert res.aim and res.aim[0]["operation"] == "POST /payouts"
+    assert res.requests_by_operation["POST /payouts"] > 3  # beyond its seeds: the aimed variants
