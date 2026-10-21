@@ -33,6 +33,7 @@ from proofdeploy.lean.judge import (
     DEFAULT_PROMPT_CAP,
     DEFAULT_TOKEN_BUDGET,
     CallResult,
+    CorrectionMismatch,
     Difference,
     HardFailure,
     JudgeContext,
@@ -275,7 +276,10 @@ def replay(record: LeanRecord | dict[str, Any]) -> Verdict:
     else:
         plans, too_big = plan_calls(groups, ctx, inp["prompt_cap"])
         stored = [CallResult(**c) for c in rec.calls]
-        judged = judge_from_calls(groups, ctx, plans, too_big, stored)
+        try:
+            judged = judge_from_calls(groups, ctx, plans, too_big, stored)
+        except CorrectionMismatch as exc:
+            raise ReplayMismatch(str(exc)) from exc
     got_hashes = [p.prompt_sha256 for p in plans]
     if got_hashes != rec.prompts_sha256:
         raise ReplayMismatch("prompts differ from the recorded sha256 values")

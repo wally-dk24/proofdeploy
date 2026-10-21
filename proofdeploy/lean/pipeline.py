@@ -72,6 +72,7 @@ from proofdeploy.lean.judge import (
     DEFAULT_TOKEN_BUDGET,
     HardFailure,
     JudgeContext,
+    attach_exchanges,
     path_template,
 )
 from proofdeploy.lean.pathclass import BACKEND_EXTENSIONS, is_backend_source, paths_by_class
@@ -941,6 +942,10 @@ def run_pipeline(
             for op in idx.operations:
                 for k, v in op.field_descriptions.items():
                     descs.setdefault(k, v)
+    head_run = runs["head"]
+    attach_exchanges(
+        comparison.differences, [head_run.exchanges[k].to_dict() for k in head_run.order]
+    )
     ctx = JudgeContext(
         intent=intent, changed_hunks=diff_text, seed_facts=facts, field_descriptions=descs
     )

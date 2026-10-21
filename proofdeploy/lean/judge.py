@@ -28,6 +28,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from proofdeploy.model_client import ModelCallError, ModelResponse, ModelRunner, call_model
@@ -35,21 +36,67 @@ from proofdeploy.model_client import ModelCallError, ModelResponse, ModelRunner,
 DIFFERENCE_KINDS = ("changed", "added_field", "removed_field", "status_changed")
 HARD_FAILURE_KINDS = ("crash", "5xx", "timeout", "schema_violation", "new_exception")
 VERDICTS = ("correct", "regression", "unclear")
-SOURCES = ("intent", "facts", "schema")
+SOURCES = ("intent", "facts", "exchange", "schema")
 
 DEFAULT_TOKEN_BUDGET = 10_000
 DEFAULT_PROMPT_CAP = 3000
 
-JUDGE_PROMPT = """\
-A code change altered these responses. For each numbered difference decide if the NEW behaviour is correct, a regression, or unclear.
+JUDGE_SKILL_PATH = (
+    Path(__file__).resolve().parents[2] / "docs" / "registration" / "judge-skill-v1.md"
+)
+JUDGE_SKILL_SHA256 = "edbd35971dc3a9886082b92abf40c719aacf147c9632f57801649771bd557877"
+_PART_A_HEADER = "## Part A \u2014 text sent to the judge\n\n"
+_PART_A_END = "\n---\n"
 
-Authority, in this order: (1) the stated intent, (2) the app's known facts, (3) the API field descriptions. Nothing else is evidence. The changed code is shown only so you can see what moved: the changed code itself is not evidence.
 
-For "correct" and "regression", quote verbatim the sentence you rely on, copied exactly from one of those three sources. If no source settles it, answer "unclear" and ask one question.
+class JudgeSkillError(Exception):
+    """The registered judge skill is missing, altered or malformed: refuse to run."""
 
-Answer with only a JSON array, one object per difference:
-[{"group": n, "verdict": "correct|regression|unclear", "expected_value": <json or null>, "evidence": {"source": "intent|facts|schema", "quote": "..."}, "question": "<only when unclear>"}]
-"""  # noqa: E501
+
+def load_part_a(path: Path | None = None) -> str:
+    """Part A of the signed judge skill (D267, judge skill v1), word for word.
+
+    The file's sha256 must equal ``JUDGE_SKILL_SHA256``; otherwise nothing is
+    sent to the model.
+    """
+    p = path or JUDGE_SKILL_PATH
+    try:
+        raw = p.read_bytes()
+    except OSError as exc:
+        raise JudgeSkillError(f"judge skill unreadable: {p}: {exc}") from exc
+    got = hashlib.sha256(raw).hexdigest()
+    if got != JUDGE_SKILL_SHA256:
+        raise JudgeSkillError(f"judge skill sha256 {got} != registered {JUDGE_SKILL_SHA256} ({p})")
+    text = raw.decode("utf-8")
+    start = text.find(_PART_A_HEADER)
+    if start < 0:
+        raise JudgeSkillError("judge skill has no Part A header")
+    start += len(_PART_A_HEADER)
+    end = text.find(_PART_A_END, start)
+    if end < 0:
+        raise JudgeSkillError("judge skill Part A has no end marker")
+    return text[start:end].strip()
+
+
+_part_a_cache: str | None = None
+
+
+def judge_prompt() -> str:
+    """Part A, loaded and verified once per process."""
+    global _part_a_cache
+    if _part_a_cache is None:
+        _part_a_cache = load_part_a()
+    return _part_a_cache
+
+
+CORRECTION_SENTENCE = (
+    "Keep every other answer. For each, quote a shorter exact passage that contains the "
+    "value, from facts, exchange, schema or intent; if none exists, answer unclear."
+)
+_CORRECTION_HEAD = "\n\n---\n\nYour previous answer:\n\n"
+CORRECTION_ANSWER_CHARS = 1200  # the largest first answer the budget guard allows for
+_CORRECTION_LINE_CHARS = 60  # "group <n>: <reason>" per group, reserved
+MAX_EXCHANGES = 3
 
 DEFAULT_MIN_CALL_INTERVAL = 13.0
 DEFAULT_429_RETRIES = 3
@@ -77,6 +124,9 @@ class Difference:
     before: Any
     after: Any
     kind: str
+    # Earlier exchanges of the same scenario and run about the same record:
+    # {"method", "path", "field", "value"}. Old records have none.
+    exchanges: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.kind not in DIFFERENCE_KINDS:
@@ -167,6 +217,7 @@ class Group:
     request_ids: list[str]
     sample_path: str
     sample_request_body: Any
+    exchanges: list[dict[str, Any]] = field(default_factory=list)  # the first request's
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -198,11 +249,68 @@ def group_differences(
                 request_ids=[],
                 sample_path=d.path,
                 sample_request_body=d.request_body,
+                exchanges=list(d.exchanges),
             )
             groups[key] = g
         if d.request_id not in g.request_ids:
             g.request_ids.append(d.request_id)
     return list(groups.values())
+
+
+# --------------------------------------------------------------------------
+# Earlier exchanges (judge skill v1, Part B 2)
+# --------------------------------------------------------------------------
+
+
+def record_id_of(path: str) -> str | None:
+    """The last numeric or uuid segment of a path (query dropped)."""
+    for seg in reversed(path.split("?", 1)[0].split("/")):
+        if _ID_SEGMENT.match(seg):
+            return seg
+    return None
+
+
+def _objects_with_id(body: Any, rid: str) -> list[dict[str, Any]]:
+    nodes = body if isinstance(body, list) else [body]
+    return [n for n in nodes if isinstance(n, dict) and str(n.get("id")) == rid and "id" in n]
+
+
+def attach_exchanges(differences: list[Difference], run_exchanges: list[dict[str, Any]]) -> None:
+    """Fill each difference's ``exchanges`` from one run's exchanges (the head run).
+
+    ``run_exchanges`` are ``Exchange.to_dict()`` rows in execution order. For a
+    difference, up to ``MAX_EXCHANGES`` earlier exchanges (lower step number) of
+    the SAME scenario whose JSON body, or an object inside a list body, has an
+    ``id`` equal to the record id of the difference's path and carries the field
+    under judgement. The nearest ones are kept, oldest first.
+    """
+    by_scenario: dict[str, list[dict[str, Any]]] = {}
+    for ex in run_exchanges:
+        by_scenario.setdefault(str(ex.get("scenario_id")), []).append(ex)
+    for d in differences:
+        d.exchanges = []
+        scenario, _, step_s = d.request_id.rpartition(":")
+        rid = record_id_of(d.path)
+        name = field_name(d.field_path)
+        if rid is None or not name or d.field_path.startswith("$") or not step_s.isdigit():
+            continue
+        step = int(step_s)
+        found: list[dict[str, Any]] = []
+        for ex in by_scenario.get(scenario, []):
+            if int(ex.get("step_index", 0)) >= step:
+                continue
+            req = ex.get("request") or {}
+            for obj in _objects_with_id(ex.get("body_json_or_text"), rid):
+                if name in obj:
+                    row = {
+                        "method": str(req.get("method", "")).upper(),
+                        "path": str(req.get("url_path", "")),
+                        "field": name,
+                        "value": obj[name],
+                    }
+                    if row not in found and len(_canon(row["value"])) <= _MAX_SHOWN_VALUE:
+                        found.append(row)
+        d.exchanges = found[-MAX_EXCHANGES:]
 
 
 # --------------------------------------------------------------------------
@@ -292,6 +400,33 @@ def added_lines_text(changed_hunks: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def build_correction_prompt(prompt: str, raw: str, rejected: list[tuple[int, str]]) -> str:
+    """The one follow-up of a call (judge skill v1, Part B 4): the original
+    prompt, the model's own answer, one line per rejected group, the signed
+    sentence."""
+    lines = "\n".join(f"group {n}: {reason}" for n, reason in rejected)
+    return f"{prompt}{_CORRECTION_HEAD}{raw}\n\n{lines}\n{CORRECTION_SENTENCE}"
+
+
+def correction_reserve_tokens(n_groups: int) -> int:
+    """Tokens the correction message adds to a prompt of ``n_groups`` groups, for a
+    first answer of ``CORRECTION_ANSWER_CHARS`` characters."""
+    filler = (
+        _CORRECTION_HEAD
+        + "x" * CORRECTION_ANSWER_CHARS
+        + "\n\n"
+        + "x" * (_CORRECTION_LINE_CHARS * max(n_groups, 1))
+        + "\n"
+        + CORRECTION_SENTENCE
+    )
+    return estimate_tokens(filler)
+
+
+def exchange_line(e: dict[str, Any]) -> str:
+    """``"<field>": <json value>``: the one line an earlier exchange contributes."""
+    return f"{json.dumps(str(e['field']), ensure_ascii=False)}: {_canon(e['value'])}"
+
+
 def _shown(value: Any, limit: int) -> str:
     s = _canon(value)
     if len(s) > limit:
@@ -310,7 +445,7 @@ def _relevant_descriptions(ctx: JudgeContext, groups: list[Group]) -> dict[str, 
 
 
 def render_prompt(ctx: JudgeContext, groups: list[Group], hunks: str, hunks_trimmed: bool) -> str:
-    parts = [JUDGE_PROMPT, "INTENT:\n" + ctx.intent.strip()]
+    parts = [judge_prompt(), "INTENT:\n" + ctx.intent.strip()]
     if ctx.seed_facts:
         parts.append("KNOWN FACTS:\n" + "\n".join(f"- {f}" for f in ctx.seed_facts))
     descs = _relevant_descriptions(ctx, groups)
@@ -330,6 +465,10 @@ def render_prompt(ctx: JudgeContext, groups: list[Group], hunks: str, hunks_trim
             f"after={_shown(g.after, _MAX_SHOWN_VALUE)}\n"
             f"    requests: {ids}; example: {g.method} {g.sample_path} "
             f"body={_shown(g.sample_request_body, _MAX_SHOWN_BODY)}"
+            + "".join(
+                f"\n    earlier in this run: {e['method']} {e['path']} \u2192 {exchange_line(e)}"
+                for e in g.exchanges[:MAX_EXCHANGES]
+            )
         )
     parts.append("DIFFERENCES:\n" + "\n".join(lines))
     return "\n\n".join(parts) + "\n"
@@ -363,7 +502,10 @@ def plan_calls(
     batch: list[Group] = []
 
     def fits(gs: list[Group], hunks: str, trimmed: bool) -> bool:
-        return estimate_tokens(render_prompt(ctx, gs, hunks, trimmed)) <= prompt_cap
+        # Room is kept for the correction message, so the follow-up call also
+        # stays under the cap (judge skill v1, Part B 7).
+        used = estimate_tokens(render_prompt(ctx, gs, hunks, trimmed))
+        return used + correction_reserve_tokens(len(gs)) <= prompt_cap
 
     def flush() -> None:
         nonlocal batch
@@ -419,6 +561,10 @@ class CallResult:
     error_cause: str | None = None
     attempts: list[str] = field(default_factory=list)
     waited_seconds: float = 0.0  # total time slept for pacing and 429 backoff
+    # The one correction round (tokens, waits and attempts above include it).
+    correction_used: bool = False  # a follow-up was sent
+    correction_raw: str | None = None  # its answer; None when it failed
+    correction_prompt_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -635,7 +781,9 @@ def _norm_quote(quote: str) -> str:
     return _norm(" ".join(lines))
 
 
-def _source_items(source: str, ctx: JudgeContext) -> list[str]:
+def _source_items(source: str, ctx: JudgeContext, g: Group) -> list[str]:
+    if source == "exchange":
+        return [_norm(exchange_line(e)) for e in g.exchanges[:MAX_EXCHANGES]]
     if source == "intent":
         return [_norm(ctx.intent)]
     if source == "facts":
@@ -652,6 +800,34 @@ def _has_value(quote: str, value: Any) -> bool:
         return False
     rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     return bool(rendered) and rendered in quote
+
+
+def _contradicted_by_data(g: Group, answer: dict[str, Any], ctx: JudgeContext) -> bool:
+    """Data before intent (judge skill v1, Part B 3).
+
+    True when a ``correct`` answer rests on the intent but the app's data says
+    another value for this field. Mechanical, in two parts:
+
+    * a fact counts when it names the field (``_name_regex``) and contains the
+      value the field had before (or the answer's ``expected_value``) that
+      ``_has_value`` finds, while it does not contain ``after``;
+    * a shown exchange counts when its value for the field differs from ``after``.
+
+    A ``removed_field`` is exempt: the data necessarily shows the field that the
+    intent asks to remove.
+    """
+    if g.kind == "removed_field":
+        return False
+    name_re = _name_regex(field_name(g.field_path))
+    other = [v for v in (g.before, answer.get("expected_value")) if v is not None]
+    if name_re is not None:
+        for fact in ctx.seed_facts:
+            f = _norm(fact)
+            if not name_re.search(f) or _has_value(f, g.after):
+                continue
+            if any(_has_value(f, v) for v in other if _canon(v) != _canon(g.after)):
+                return True
+    return any(_canon(e["value"]) != _canon(g.after) for e in g.exchanges[:MAX_EXCHANGES])
 
 
 def check_evidence(
@@ -675,7 +851,7 @@ def check_evidence(
     q = _norm_quote(quote)
     if not q:
         return False, "empty_quote", passed
-    if not any(q in item for item in _source_items(source, ctx)):
+    if not any(q in item for item in _source_items(source, ctx, g)):
         return False, "quote_not_in_source", passed
     passed.append("verbatim_in_source")
     if q in added_lines_text(ctx.changed_hunks):
@@ -722,6 +898,9 @@ def check_evidence(
         if not any(_word_regex(w).search(q) for w in words):
             return False, "intent_lacks_field_name", passed
         passed.append("intent_names_field")
+    if source == "intent" and _contradicted_by_data(g, answer, ctx):
+        return False, "intent_contradicted_by_data", passed
+    passed.append("not_contradicted_by_data")
     return True, None, passed
 
 
@@ -820,6 +999,42 @@ def judge_answer(g: Group, answer: dict[str, Any] | None, ctx: JudgeContext) -> 
     return Judgment(group=g.index, verdict=mv, check=check, **base)
 
 
+class CorrectionMismatch(Exception):
+    """A stored correction round does not follow from the stored first answer."""
+
+
+def judge_call_answer(
+    plan: CallPlan, by_index: dict[int, Group], ctx: JudgeContext, content: str
+) -> dict[int, Judgment]:
+    """The checked judgments of one call's groups from one raw answer."""
+    parsed = parse_answers(content)
+    if parsed is None:
+        return {
+            gi: _unclear(
+                by_index[gi],
+                "unparsed_answer",
+                check={"ok": False, "reason": "unparsed_answer", "passed": []},
+            )
+            for gi in plan.group_ids
+        }
+    answers: dict[int, dict[str, Any]] = {}
+    for a in parsed:
+        n = a.get("group")
+        if isinstance(n, int) and not isinstance(n, bool) and n in plan.group_ids:
+            answers.setdefault(n, a)
+    return {gi: judge_answer(by_index[gi], answers.get(gi), ctx) for gi in plan.group_ids}
+
+
+def rejected_groups(plan: CallPlan, judgments: dict[int, Judgment]) -> list[tuple[int, str]]:
+    """(group, reason) for every group the evidence check rejected, in call order."""
+    out = []
+    for gi in plan.group_ids:
+        cause = judgments[gi].cause or ""
+        if cause.startswith("evidence_rejected:"):
+            out.append((gi, cause.split(":", 1)[1]))
+    return out
+
+
 def judge_from_calls(
     groups: list[Group],
     ctx: JudgeContext,
@@ -843,29 +1058,31 @@ def judge_from_calls(
     res_by_call = {r.index: r for r in results}
     for plan in plans:
         r = res_by_call.get(plan.index)
-        answers: dict[int, dict[str, Any]] = {}
         failure: str | None = None
         if r is None or r.status == "skipped_budget":
             failure = "ai_budget"
         elif r.status == "error":
             failure = f"environment:{r.error_cause}"
-        else:
-            parsed = parse_answers(r.raw_content)
-            if parsed is None:
-                failure = "unparsed_answer"
-            else:
-                for a in parsed:
-                    n = a.get("group")
-                    if isinstance(n, int) and not isinstance(n, bool) and n in plan.group_ids:
-                        answers.setdefault(n, a)
-        for gi in plan.group_ids:
-            g = by_index[gi]
-            if failure:
+        if failure or r is None:
+            for gi in plan.group_ids:
                 judgments[gi] = _unclear(
-                    g, failure, check={"ok": False, "reason": failure, "passed": []}
+                    by_index[gi],
+                    failure or "ai_budget",
+                    check={"ok": False, "reason": failure, "passed": []},
                 )
-            else:
-                judgments[gi] = judge_answer(g, answers.get(gi), ctx)
+            continue
+        first = judge_call_answer(plan, by_index, ctx, r.raw_content)
+        if r.correction_raw is not None:
+            rejected = rejected_groups(plan, first)
+            expected_sha = hashlib.sha256(
+                build_correction_prompt(plan.prompt, r.raw_content, rejected).encode("utf-8")
+            ).hexdigest()
+            if not rejected or r.correction_prompt_sha256 != expected_sha:
+                raise CorrectionMismatch(
+                    "the recorded correction does not follow from the first answer"
+                )
+            first = judge_call_answer(plan, by_index, ctx, r.correction_raw)
+        judgments.update(first)
     return [JudgedGroup(g, judgments[g.index]) for g in groups]
 
 
@@ -880,6 +1097,37 @@ class JudgeRun:
     @property
     def total_tokens(self) -> int:
         return sum(r.tokens for r in self.results)
+
+
+def _correct(
+    r: CallResult,
+    plan: CallPlan,
+    groups: list[Group],
+    ctx: JudgeContext,
+    runner: ModelRunner | None,
+    headroom: int,
+) -> None:
+    """The one correction round of a call whose answer the check rejected in
+    part. Updates ``r`` in place (its tokens include the follow-up).
+
+    A failed or unaffordable follow-up leaves the first answer's judgments."""
+    by_index = {g.index: g for g in groups}
+    rejected = rejected_groups(plan, judge_call_answer(plan, by_index, ctx, r.raw_content))
+    if not rejected:
+        return
+    prompt = build_correction_prompt(plan.prompt, r.raw_content, rejected)
+    if estimate_tokens(prompt) > headroom:
+        r.attempts.append("correction: skipped_budget")
+        return
+    r.correction_used = True
+    r.correction_prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    c = execute_call(prompt, plan.index, runner)
+    r.attempts += [f"correction {a}" for a in c.attempts]
+    r.waited_seconds += c.waited_seconds
+    if c.status == "ok":
+        r.correction_raw = c.raw_content
+        r.tokens += c.tokens
+        r.tokens_estimated = r.tokens_estimated or c.tokens_estimated
 
 
 def run_judge(
@@ -910,6 +1158,8 @@ def run_judge(
             continue
         r = execute_call(plan.prompt, plan.index, runner)
         results.append(r)
+        if r.status == "ok":
+            _correct(r, plan, groups, ctx, runner, token_budget - spent - r.tokens)
         spent += r.tokens
         if spent > token_budget:
             exhausted = True
