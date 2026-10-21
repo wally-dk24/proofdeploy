@@ -451,6 +451,18 @@ def test_invalid_bug_unit_file_is_a_gate_error(
     assert len(gate.select_units(gate.load_units("golden"), "golden")) == 2
 
 
+def test_a_unit_listed_twice_is_a_gate_error_naming_its_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "twice.json"
+    path.write_text(json.dumps({"units": [BUG_UNITS[0], BUG_UNITS[1], BUG_UNITS[0]]}), "utf-8")
+    monkeypatch.setattr(gate, "PAPERLESS_BUG_UNITS_JSON", path)
+    with pytest.raises(gate.GateError, match=f"id {BUG_A} is repeated"):
+        gate.load_paperless_bug_units()
+    with pytest.raises(gate.GateError, match=f"id {BUG_A} is repeated"):
+        gate.load_units("paperless")
+
+
 @pytest.mark.parametrize("content", ['{"units": []}', "[]", '{"units": {}}', '{"unit": []}'])
 def test_bug_unit_file_shape_is_validated(
     content: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
