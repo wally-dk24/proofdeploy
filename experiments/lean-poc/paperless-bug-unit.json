@@ -1,0 +1,9 @@
+{
+  "unit_repo": "paperless-ngx/paperless-ngx",
+  "b_parent": "e01a762e81dd65dff927988aa51594906d8a417f",
+  "b": "aed9abe48c02b1b7df07e429db3f2ed8c3a58ce8",
+  "fix_parent": "6d249b49327fdab58ff915d3f5435e49de742464",
+  "fix": "b992f9fc05bedd2f26f7291028b0b38471e697db",
+  "selection_record": "selection/lean-r2-2026-10-21/out",
+  "selection_record_sha256": "44a411590b3f58cbbda295f293b89817d693c34d221f33061ebc528d92b5907a"
+}
