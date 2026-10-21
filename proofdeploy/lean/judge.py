@@ -30,6 +30,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from proofdeploy.lean.coverage import split_diff_lines, split_diff_lines_keepends
 from proofdeploy.model_client import ModelCallError, ModelResponse, ModelRunner, call_model
 
 DIFFERENCE_KINDS = ("changed", "added_field", "removed_field", "status_changed")
@@ -246,7 +247,7 @@ def _name_regex(name: str) -> re.Pattern[str] | None:
 def split_hunks(changed_hunks: str) -> list[str]:
     """Split a diff into hunks at ``@@`` / ``diff --git`` lines."""
     hunks: list[list[str]] = []
-    for line in changed_hunks.splitlines(keepends=True):
+    for line in split_diff_lines_keepends(changed_hunks):
         if line.startswith("@@") or line.startswith("diff --git"):
             if line.startswith("@@") and hunks and not any(ln.startswith("@@") for ln in hunks[-1]):
                 hunks[-1].append(line)  # file header + first hunk marker stay together
@@ -281,7 +282,7 @@ def trim_hunks(changed_hunks: str, groups: list[Group]) -> str:
 def added_lines_text(changed_hunks: str) -> str:
     """The added lines of a diff, whitespace-normalized, joined by a space."""
     out = []
-    for line in changed_hunks.splitlines():
+    for line in split_diff_lines(changed_hunks):
         if line.startswith("+") and not line.startswith("+++"):
             out.append(" ".join(line[1:].split()))
     return " ".join(out)

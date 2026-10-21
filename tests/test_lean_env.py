@@ -373,11 +373,6 @@ def test_git_diff_of_odd_and_binary_files_goes_through_from_diff(
     assert cl2["odd.py"] == cl["odd.py"] and cl2.binary_files == {"bin.dat", "new.bin"}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="generate.py:102 parse_diff_text still uses str.splitlines(); that file is outside "
-    "WO-R3-E (reported to the reviewer). Remove this marker with the one-line fix there.",
-)
 def test_parse_diff_text_and_executable_view_on_odd_and_binary_diffs(
     odd_repo: tuple[Path, str, str],
 ) -> None:
@@ -710,3 +705,35 @@ def test_rehearse_workflow_actions_are_pinned_like_lean_poc_and_inputs_use_env()
     assert run["env"] == {"UNITS": "${{ inputs.units }}"}
     assert "experiments/lean-poc/gate.py" in run["run"] and "--rehearse" in run["run"]
     assert steps[-1]["if"] == "${{ always() }}" and steps[-1]["with"]["path"].startswith("/tmp/")
+
+
+def test_remove_tree_of_a_missing_path_is_a_noop_without_podman(
+    tmp_path: Path, unshare: FakeUnshare, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def gone(_p: Path) -> None:
+        raise FileNotFoundError(2, "gone")
+
+    monkeypatch.setattr(hostfs, "_unlink", gone)  # a race: the file vanishes before unlink
+    hostfs.remove_tree(tmp_path / "missing")
+    hostfs.remove_tree(tmp_path / "missing2")
+    assert unshare.calls == []
+
+
+def test_restore_sqlite_without_sidecar_files_never_starts_podman(
+    tmp_path: Path, unshare: FakeUnshare
+) -> None:
+    snap, target = tmp_path / "seed.sqlite", tmp_path / "db.sqlite3"
+    snap.write_bytes(b"SEEDED")
+    target.write_bytes(b"old")
+    lean_run.restore_sqlite(snap, target)
+    assert target.read_bytes() == b"SEEDED" and unshare.calls == []
+
+
+def test_judge_diff_readers_split_on_newline_only() -> None:
+    from proofdeploy.lean import judge
+
+    diff = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+a\x0cb\u2028@@ c\x85d\n@@ -9 +9 @@\n+z\n"
+    hunks = judge.split_hunks(diff)
+    assert len(hunks) == 2 and "".join(hunks) == diff
+    assert hunks[0].endswith("+a\x0cb\u2028@@ c\x85d\n")
+    assert judge.added_lines_text(diff) == "a b @@ c d z"  # whitespace-normalized, one line

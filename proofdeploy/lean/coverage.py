@@ -96,6 +96,11 @@ def split_diff_lines(text: str) -> list[str]:
     return lines
 
 
+def split_diff_lines_keepends(text: str) -> list[str]:
+    """Like :func:`split_diff_lines`, each line keeping its ``\\n`` (the last may lack one)."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
 def _clean_path(raw: str, line: str) -> str | None:
     """Path from a ``---``/``+++``/``rename`` line; None for /dev/null."""
     raw = raw.split("\t", 1)[0].rstrip("\r\n")
