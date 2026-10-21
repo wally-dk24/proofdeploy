@@ -23,6 +23,7 @@ decides first.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -54,8 +55,10 @@ from proofdeploy.lean.generate import (
 )
 from proofdeploy.lean.http import (
     AuthSpec,
+    Exchange,
     HttpClient,
     Scenario,
+    Step,
     UnsupportedAuth,
     auth_from_contract,
 )
@@ -71,6 +74,7 @@ from proofdeploy.lean.judge import (
     JudgeContext,
     path_template,
 )
+from proofdeploy.lean.pathclass import BACKEND_EXTENSIONS, is_backend_source, paths_by_class
 from proofdeploy.lean.verdict import (
     INCONCLUSIVE,
     LeanRecord,
@@ -144,6 +148,10 @@ class SideDriver(Protocol):
         """Facts for the run manifest (isolation, db snapshot, clock)."""
         ...
 
+    # Optional: ``bootstrap_env() -> dict[str, str]``, the values this side was
+    # provisioned with (generated per side and per run). They are secrets; a
+    # driver without the method has none. Read with :func:`side_bootstrap_env`.
+
     def close(self) -> None: ...
 
 
@@ -158,6 +166,8 @@ class LeanConfig:
     openapi_path: str | None = None
     flask_target: str = "app"
     mode: str = "sandbox"  # "sandbox" | "host"
+    unit_repo: str | None = None  # the contract-store slug of the unit, when dispatched by one
+    language: str = "python"  # the lean path measures Python apps (see pathclass)
     inputs: dict[str, Any] = field(default_factory=dict)  # extra manifest inputs
 
 
@@ -167,6 +177,8 @@ class LeanResult:
     record: LeanRecord | None
     manifest: dict[str, Any]
     exchanges: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # The coverage loop's own exchanges, both sides' requests: "cover_head" / "cover_base".
+    cover_exchanges: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------
@@ -192,25 +204,45 @@ class Timings:
         return dict(self.stages)
 
 
-def git_out(repo: Path, *args: str) -> str:
+def git_bytes(repo: Path, *args: str) -> bytes:
+    """Raw stdout of a git command (never decoded here: a file need not be UTF-8)."""
     proc = subprocess.run(
         ["git", "-c", "core.quotepath=off", "-C", str(repo), *args],
         capture_output=True,
-        text=True,
         check=False,
         timeout=120,
     )
     if proc.returncode != 0:
-        raise ValueError(f"git {' '.join(args)} failed: {proc.stderr.strip()[:300]}")
+        err = proc.stderr.decode("utf-8", errors="replace").strip()[:300]
+        raise ValueError(f"git {' '.join(args)} failed: {err}")
     return proc.stdout
+
+
+def git_out(repo: Path, *args: str) -> str:
+    return git_bytes(repo, *args).decode("utf-8", errors="replace")
 
 
 def resolve_sha(repo: Path, rev: str) -> str:
     return git_out(repo, "rev-parse", "--verify", f"{rev}^{{commit}}").strip()
 
 
+def diff_bytes_of(repo: Path, base: str, head: str) -> bytes:
+    return git_bytes(repo, "diff", "--no-color", "--no-ext-diff", "-U3", base, head)
+
+
+def decode_diff(raw: bytes) -> str:
+    """UTF-8 with ``errors="replace"``: a non-UTF-8 file can never crash a unit."""
+    return raw.decode("utf-8", errors="replace")
+
+
 def diff_text_of(repo: Path, base: str, head: str) -> str:
-    return git_out(repo, "diff", "--no-color", "--no-ext-diff", "-U3", base, head)
+    return decode_diff(diff_bytes_of(repo, base, head))
+
+
+def changed_paths_of(repo: Path, base: str, head: str) -> list[str]:
+    """Every path the change touches (a rename lists both names), from git, not from hunks."""
+    raw = git_bytes(repo, "diff", "--name-only", "--no-renames", "-z", base, head)
+    return sorted(p.decode("utf-8", errors="replace") for p in raw.split(b"\0") if p)
 
 
 def intent_of(repo: Path, head: str, override: str | None) -> tuple[str, str]:
@@ -283,10 +315,11 @@ def is_structural(text: str | None) -> bool:
 class SideImpact:
     """One side's P3 result plus the changed lines only the module load executed.
 
-    A request never runs an ``import``, decorator, ``def`` or ``class`` line:
-    the interpreter ran it while loading the app (context ``""``). Such a
-    line is not reported as unexercised when it ran at load, but it does not
-    count as reached over HTTP either (see ``run_pipeline``).
+    A request never runs a module-level statement (an ``import``, decorator,
+    ``def``, ``class`` or plain assignment such as ``__version__ = ...``): the
+    interpreter ran it while loading the app (context ``""``). Such a line is
+    not reported as unexercised when it ran at load, but it does not count as
+    reached over HTTP either (see ``run_pipeline``).
     """
 
     result: CoverResult | None
@@ -306,6 +339,49 @@ class SideImpact:
 
 def _has_lines(view: ChangedLines, key: str) -> bool:
     return any(sides[key] for sides in view.values())
+
+
+def side_bootstrap_env(driver: Any) -> dict[str, str]:
+    """The generated bootstrap values this side was provisioned with ({} when it has none).
+
+    Secrets: only ever used to fill a login body and to redact by value.
+    """
+    fn = getattr(driver, "bootstrap_env", None)
+    return dict(fn()) if callable(fn) else {}
+
+
+def source_reader(cfg: LeanConfig, key: str) -> Callable[[str], str | None]:
+    """Read a file of the side's own tree from git (head for added, base for removed lines)."""
+    rev = cfg.head if key == "added" else cfg.base
+
+    def read(path: str) -> str | None:
+        try:
+            return git_out(cfg.repo, "show", f"{rev}:{path}")
+        except ValueError:
+            return None
+
+    return read
+
+
+def function_body_lines(source: str) -> set[int] | None:
+    """Lines inside any function or method body of ``source`` (None when it does not parse).
+
+    A body starts at its first statement; the ``def`` line, its decorators and a
+    multi-line signature are evaluated when the module loads, so they are NOT
+    body lines (a one-line ``def f(): ...`` is a module-level declaration).
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    inside: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            head_lines = {node.lineno, *(d.lineno for d in node.decorator_list)}
+            end = node.end_lineno or node.lineno
+            first = node.body[0].lineno
+            inside |= {n for n in range(first, end + 1) if n not in head_lines}
+    return inside
 
 
 def cover_side(
@@ -331,7 +407,12 @@ def cover_side(
         assert app.session is not None, "measured app without a coverage session"
         assert index is not None
         runner = ScenarioRunner(
-            HttpClient(app.base_url), auth=auth, session=app.session, index=index, repair=True
+            HttpClient(app.base_url),
+            auth=auth,
+            session=app.session,
+            index=index,
+            repair=True,
+            env=side_bootstrap_env(driver),
         )
         result = cover_change(
             index,
@@ -344,7 +425,15 @@ def cover_side(
             side=side,
             root_prefix=driver.root_prefix,
         )
-        impact = _settle_load_only(result, app.session, changed, diff_text, key, driver.root_prefix)
+        impact = _settle_load_only(
+            result,
+            app.session,
+            changed,
+            diff_text,
+            key,
+            driver.root_prefix,
+            source_of=source_reader(cfg, key),
+        )
     except lc.CoverageHarnessError as exc:
         raise LeanEnvironmentError("coverage_harness", str(exc)[:500]) from exc
     finally:
@@ -359,8 +448,17 @@ def _settle_load_only(
     diff_text: str,
     key: str,
     root_prefix: str,
+    *,
+    source_of: Callable[[str], str | None] | None = None,
 ) -> SideImpact:
-    """Split P3's unexercised lines into truly unexercised and declarations run at load."""
+    """Split P3's unexercised lines into truly unexercised and declarations run at load.
+
+    A changed line that ran in the load context (``""``) and in no request
+    context, and that belongs to a module-level statement (outside every
+    function or method body of that side's file, per ``ast``), is a load-time
+    declaration. A line inside a function body is never load-time. When the
+    file cannot be read or parsed, only import/decorator/def/class lines count.
+    """
     if not result.unexercised:
         return SideImpact(result, unexercised={})
     load = session.snapshot(root_prefix=root_prefix).get("", {})
@@ -369,9 +467,18 @@ def _settle_load_only(
     load_only: list[str] = []
     for path, sides in sorted(result.unexercised.items()):
         cov_path = changed.renames.get(path, path) if key == "removed" else path
+        body: set[int] | None = None
+        if source_of is not None and cov_path.endswith(".py"):
+            text = source_of(cov_path)
+            body = function_body_lines(text) if text is not None else None
         left: list[int] = []
         for n in sides[key]:
-            if n in load.get(cov_path, set()) and is_structural(dt.text_of(path, key, n)):
+            ran_at_load = n in load.get(cov_path, set())
+            if body is not None:
+                declaration = ran_at_load and n not in body
+            else:
+                declaration = ran_at_load and is_structural(dt.text_of(path, key, n))
+            if declaration:
                 load_only.append(f"{path}:{n}")
             else:
                 left.append(n)
@@ -397,7 +504,13 @@ def replay_run(
     data = RunData(label)
     app = driver.start(measured=False)
     try:
-        runner = ScenarioRunner(HttpClient(app.base_url), auth=auth, session=None, repair=False)
+        runner = ScenarioRunner(
+            HttpClient(app.base_url),
+            auth=auth,
+            session=None,
+            repair=False,
+            env=side_bootstrap_env(driver),
+        )
         for sc in scenarios:
             res = runner(sc)
             data.add(sc, res.exchanges)
@@ -476,6 +589,172 @@ def impacted_2xx_rates(
     return out
 
 
+def loop_summary(exchanges: list[Exchange]) -> dict[str, Any]:
+    """Counts of the coverage loop's own requests (login and producer steps included)."""
+    return {
+        "requests": len(exchanges),
+        "2xx": sum(1 for e in exchanges if 200 <= e.status < 300),
+        "4xx": sum(1 for e in exchanges if 400 <= e.status < 500),
+        "5xx": sum(1 for e in exchanges if e.status >= 500),
+        "no_response": sum(1 for e in exchanges if e.status == 0),
+        "with_auth": sum(1 for e in exchanges if e.auth_sent),
+    }
+
+
+def loop_operation_rates(
+    impact_set: list[Scenario], exchanges: list[Exchange], templates: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Per impacted operation: how many of the loop's requests to it got a 2xx.
+
+    The loop sends each scenario under its generated id; a 400-repaired
+    scenario is kept in the impact set under a new id (``repaired_from``), so
+    both ids select its exchanges.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for sc in impact_set:
+        ids = {sc.id, sc.repaired_from}
+        method, _, tpl = sc.target_operation.partition(" ")
+        for ex in exchanges:
+            if ex.scenario_id not in ids:
+                continue
+            ex_tpl = path_template(str(ex.request.get("url_path", "")), templates)
+            if str(ex.request.get("method")) == method and ex_tpl == tpl:
+                row = out.setdefault(sc.target_operation, {"requests": 0, "2xx": 0})
+                row["requests"] += 1
+                row["2xx"] += 1 if 200 <= ex.status < 300 else 0
+    for row in out.values():
+        row["2xx_rate"] = round(row["2xx"] / row["requests"], 3) if row["requests"] else 0.0
+    return out
+
+
+def cover_rows(exchanges: list[Exchange]) -> list[dict[str, Any]]:
+    """The loop's exchanges as unit-output rows (token and bootstrap values already redacted)."""
+    rows = []
+    for e in exchanges:
+        row = e.to_dict()
+        row.update(
+            method=e.request.get("method"),
+            path=e.request.get("url_path"),
+            scenario_id=e.scenario_id,
+            step=e.step_index,
+        )
+        rows.append(row)
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Sign-in proof (inside the sandbox, before the impact loop)
+# --------------------------------------------------------------------------
+
+# The unit's proof path: an authenticated GET that must return 2xx once signed in.
+# paperless-ngx's path equals ``readiness/auth_proof.py`` PROOF_SPECS (a test asserts
+# it); the golden flask app's note 1 belongs to seeduser (D146).
+AUTH_PROOF_PATHS: dict[str, str] = {
+    "paperless-ngx/paperless-ngx": "/api/profile/",
+    "golden/python-flask-sqlite": "/notes/1",
+    "python-flask-sqlite": "/notes/1",
+}
+
+
+def unit_identity(cfg: LeanConfig, contract: Any) -> str | None:
+    """The slug that selects the unit's proof path: the dispatched unit, else the fixture's repo."""
+    if cfg.unit_repo:
+        return cfg.unit_repo
+    name = (getattr(contract, "fixture", None) or {}).get("repo_name")
+    return str(name) if name else None
+
+
+def auth_proof_path(cfg: LeanConfig, contract: Any) -> str:
+    ident = unit_identity(cfg, contract)
+    path = AUTH_PROOF_PATHS.get(ident or "")
+    if path is None:
+        raise LeanRefusal(
+            "auth_proof_unspecified",
+            f"the contract declares auth but unit {ident!r} has no registered proof path",
+        )
+    return path
+
+
+def prove_auth(driver: SideDriver, auth: AuthSpec, proof_path: str, *, side: str) -> dict[str, Any]:
+    """Sign in with the contract's login step, then one authenticated GET to the proof path.
+
+    Runs on a fresh unmeasured instance of the side, so the proof request leaves
+    no trace in the coverage the impact loop reads. The record carries statuses
+    and the path only (never a body, a token or a generated value).
+    """
+    app = driver.start(measured=False)
+    try:
+        runner = ScenarioRunner(
+            HttpClient(app.base_url),
+            auth=auth,
+            session=None,
+            repair=False,
+            env=side_bootstrap_env(driver),
+        )
+        proof = Step("GET", proof_path, auth=True)
+        res = runner(Scenario([auth.login, proof], f"GET {proof_path}"))
+    finally:
+        app.stop()
+    login_status = res.exchanges[0].status if res.exchanges else 0
+    proof_ex = res.exchanges[1] if len(res.exchanges) > 1 else None
+    proof_status = proof_ex.status if proof_ex else None
+    sent = bool(proof_ex is not None and proof_ex.auth_sent)
+    login_ok = 200 <= login_status < 300
+    if sent and proof_status is not None and 200 <= proof_status < 300:
+        outcome = "2xx"
+    elif sent and login_ok and proof_status is not None and proof_status >= 500:
+        # Signed in, the token was presented, and the server got past authentication
+        # and failed inside the proof endpoint itself: that is the change under test
+        # breaking the endpoint (the hard oracle's business), not an unauthenticated loop.
+        outcome = "5xx_past_auth"
+    else:
+        outcome = "unproven"
+    return {
+        "side": side,
+        "ok": outcome != "unproven",
+        "outcome": outcome,
+        "proof_path": proof_path,
+        "login_status": login_status,
+        "proof_status": proof_status,
+        "proof_auth_sent": sent,
+    }
+
+
+def _early_result(
+    cfg: LeanConfig,
+    verdict: Verdict,
+    timings: Timings | None,
+    extra: dict[str, Any] | None = None,
+) -> LeanResult:
+    manifest = {
+        "kind": "lean-verify",
+        "measured_result": False,
+        "sandboxed": cfg.mode == "sandbox",
+        "mode": cfg.mode,
+        "inputs": {"repo": str(cfg.repo), "base": cfg.base, "head": cfg.head, **cfg.inputs},
+        **(extra or {}),
+        "timings_seconds": (timings.to_dict() if timings else {}),
+        "verdict": verdict.to_dict(),
+    }
+    return LeanResult(verdict=verdict, record=None, manifest=manifest)
+
+
+def not_observable_result(cfg: LeanConfig, timings: Timings | None = None) -> LeanResult | None:
+    """INCONCLUSIVE ``not_observable_over_http`` when no changed path is backend source.
+
+    Typed up front, before anything is provisioned and with no model call. A
+    language whose backend extensions are not defined yet is never refused here.
+    """
+    paths = changed_paths_of(cfg.repo, cfg.base, cfg.head)
+    if cfg.language not in BACKEND_EXTENSIONS or any(
+        is_backend_source(p, cfg.language) for p in paths
+    ):
+        return None
+    details = {"reason": "no_backend_source_change", "paths_by_class": paths_by_class(paths)}
+    verdict = Verdict(INCONCLUSIVE, "not_observable_over_http", details)
+    return _early_result(cfg, verdict, timings, {"observable": False, "changed_files": paths})
+
+
 # --------------------------------------------------------------------------
 # The pipeline
 # --------------------------------------------------------------------------
@@ -498,9 +777,16 @@ def run_pipeline(
     except UnsupportedAuth as exc:
         raise LeanRefusal("auth_mode_unsupported", str(exc)) from exc
 
+    # 0. a change with no backend source cannot be observed over HTTP -------------
+    early = not_observable_result(cfg, timings)
+    if early is not None:
+        return early
+    proof_path = auth_proof_path(cfg, contract) if auth is not None else None
+
     # 1. diff -------------------------------------------------------------
     with timings.stage("diff"):
-        diff_text = diff_text_of(cfg.repo, cfg.base, cfg.head)
+        diff_raw = diff_bytes_of(cfg.repo, cfg.base, cfg.head)
+        diff_text = decode_diff(diff_raw)
         changed = ChangedLines.from_diff(diff_text)
         intent, intent_source = intent_of(cfg.repo, cfg.head, cfg.intent)
         facts = seed_facts_of(getattr(contract, "fixture", None))
@@ -514,6 +800,39 @@ def run_pipeline(
     index_base: AppIndex | None = None
     impact_head = SideImpact(None, "no executable added lines")
     impact_base = SideImpact(None, "no executable removed lines")
+
+    # 1b. sign-in proven inside the sandbox, on each side that will run a loop ------
+    auth_proof: Any = "no_auth_declared"
+    if auth is not None:
+        assert proof_path is not None
+        auth_proof = {}
+        for label, driver, side_view, key in (
+            ("head", head, view_new, "added"),
+            ("base", base, view_old, "removed"),
+        ):
+            if not _has_lines(side_view, key):
+                auth_proof[label] = {"side": label, "skipped": f"no executable {key} lines"}
+                continue
+            with timings.stage(f"auth_proof_{label}"):
+                auth_proof[label] = prove_auth(driver, auth, proof_path, side=label)
+            log(f"auth proof {label}: {auth_proof[label]}")
+            if not auth_proof[label]["ok"]:
+                bad = auth_proof[label]
+                verdict = Verdict(
+                    INCONCLUSIVE,
+                    "auth_unproven",
+                    {
+                        "side": label,
+                        "login_status": bad["login_status"],
+                        "proof_status": bad["proof_status"],
+                    },
+                )
+                return _early_result(
+                    cfg,
+                    verdict,
+                    timings,
+                    {"auth_proof": auth_proof, "changed_files": sorted(changed)},
+                )
 
     if _has_lines(view_new, "added"):
         live = None
@@ -614,6 +933,8 @@ def run_pipeline(
     templates = sorted(
         {op.path for idx in (index_head, index_base) if idx for op in idx.operations}
     )
+    cover_head_ex = impact_head.result.exchanges if impact_head.result else []
+    cover_base_ex = impact_base.result.exchanges if impact_base.result else []
     descs: dict[str, str] = {}
     for idx in (index_head, index_base):
         if idx is not None:
@@ -651,7 +972,7 @@ def run_pipeline(
             "head": cfg.head,
             "intent_source": intent_source,
             "intent_sha256": _sha256_text(intent),
-            "diff_sha256": _sha256_text(diff_text),
+            "diff_sha256": hashlib.sha256(diff_raw).hexdigest(),
             "budget_tokens": cfg.budget_tokens,
             "budget_requests": cfg.budget_requests,
             "openapi_path": cfg.openapi_path,
@@ -670,6 +991,17 @@ def run_pipeline(
             else None,
         },
         "coverage": {"head": impact_head.stats(), "base": impact_base.stats()},
+        "auth_proof": auth_proof,
+        "cover_loop": {
+            "head": loop_summary(cover_head_ex),
+            "base": loop_summary(cover_base_ex),
+        },
+        "impacted_operations_loop_head": loop_operation_rates(
+            impact_head.result.impact_set if impact_head.result else [], cover_head_ex, templates
+        ),
+        "impacted_operations_loop_base": loop_operation_rates(
+            impact_base.result.impact_set if impact_base.result else [], cover_base_ex, templates
+        ),
         "impact_scenarios": [s.id for s in scenarios],
         "unexercised_lines": unexercised_lines,
         "observable": observable,
@@ -697,7 +1029,21 @@ def run_pipeline(
         label: [e.to_dict() for e in (run.exchanges[k] for k in run.order)]
         for label, run in runs.items()
     }
-    return LeanResult(verdict=verdict, record=record, manifest=manifest, exchanges=exchanges)
+    cover_exchanges = {
+        name: cover_rows(rows)
+        for name, rows, impact in (
+            ("cover_head", cover_head_ex, impact_head),
+            ("cover_base", cover_base_ex, impact_base),
+        )
+        if impact.result is not None
+    }
+    return LeanResult(
+        verdict=verdict,
+        record=record,
+        manifest=manifest,
+        exchanges=exchanges,
+        cover_exchanges=cover_exchanges,
+    )
 
 
 def environment_result(

@@ -546,7 +546,7 @@ def test_ids_chain_through_the_runner_and_the_token_is_never_recorded(
     fake_app: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base_url, log = fake_app
-    monkeypatch.setenv("PD_TEST_PASSWORD", "hunter2")
+    monkeypatch.setenv("PD_TEST_PASSWORD", "from-the-host-env")  # must never be used
     login = Step(
         "POST",
         "/login",
@@ -566,7 +566,11 @@ def test_ids_chain_through_the_runner_and_the_token_is_never_recorded(
     sc = Scenario([login, make, get], "GET /items/{item_id}")
     from proofdeploy.lean.http import AuthSpec
 
-    runner = ScenarioRunner(HttpClient(base_url), auth=AuthSpec(login, "Token"))
+    runner = ScenarioRunner(
+        HttpClient(base_url),
+        auth=AuthSpec(login, "Token"),
+        env={"PD_TEST_PASSWORD": "hunter2"},  # the side's own values, not the host env
+    )
     result = runner(sc)
     assert [e.status for e in result.exchanges] == [200, 201, 200]
     assert log[-1][1] == "/items/7" and log[-1][3] == "Token secret-token-123"

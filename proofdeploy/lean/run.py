@@ -66,6 +66,7 @@ from proofdeploy.lean.pipeline import (
     Timings,
     dumps,
     environment_result,
+    not_observable_result,
     resolve_sha,
     run_pipeline,
 )
@@ -733,6 +734,10 @@ class SandboxSide:
             return None
         return rules if isinstance(rules, list) else None
 
+    def bootstrap_env(self) -> dict[str, str]:
+        """The generated bootstrap values this side was provisioned with (secrets)."""
+        return dict(getattr(self.side, "bootstrap_env", None) or {})
+
     def describe(self) -> dict[str, Any]:
         return {
             "mode": "sandbox",
@@ -879,6 +884,12 @@ def write_outputs(out: Path, result: LeanResult) -> None:
         (out / "lean-record.json").write_text(dumps(result.record.to_dict()), encoding="utf-8")
     if result.exchanges:
         (out / "exchanges.json").write_text(dumps(result.exchanges), encoding="utf-8")
+    for name, rows in result.cover_exchanges.items():
+        # one JSON object per line: the coverage loop's own requests, both sides' exchanges
+        lines = "".join(
+            json.dumps(r, sort_keys=True, ensure_ascii=False, default=str) + "\n" for r in rows
+        )
+        (out / f"exchanges.{name}.jsonl").write_text(lines, encoding="utf-8")
 
 
 def lean_verify(
@@ -908,6 +919,7 @@ def lean_verify(
         openapi_path=rc.openapi_path,
         flask_target=rc.flask_target,
         mode="host" if rc.no_sandbox else "sandbox",
+        unit_repo=rc.unit_repo,
         inputs={
             "contract_file": str(contract_file) if contract_file else "head tree proofdeploy.yml",
             "contract_sha256": _sha256_file(contract_file)
@@ -917,6 +929,10 @@ def lean_verify(
         },
     )
     timings = Timings()
+    early = not_observable_result(cfg, timings)
+    if early is not None:  # typed up front: no sandbox, no model call
+        write_outputs(rc.output_dir, early)
+        return early, _VERDICT_EXIT[early.verdict.status]
     work = rc.output_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
     drivers: list[SideDriver] = []
