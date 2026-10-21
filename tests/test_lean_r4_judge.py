@@ -507,3 +507,9 @@ def test_golden_bug_prompt_still_holds_the_done_hunk_and_replays(
     shown = m["judge"]["hunks_shown"]
     assert shown and all(labels for labels in shown.values()), shown
     assert replay(record).status == FAIL
+
+
+def test_lean_verify_budget_requests_is_unset_by_default_and_explicit_when_given() -> None:
+    base = ["lean-verify", "--repo", "r", "--base", "a", "--head", "b", "--output-dir", "o"]
+    assert build_parser().parse_args(base).budget_requests is None
+    assert build_parser().parse_args([*base, "--budget-requests", "50"]).budget_requests == 50
