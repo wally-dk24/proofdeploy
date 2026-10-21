@@ -40,6 +40,7 @@ from proofdeploy.lean.generate import (
     repair_step,
     request_variants,
     seed_ids,
+    seeded_records,
     value_for,
 )
 from proofdeploy.lean.http import (
@@ -250,6 +251,122 @@ def test_seed_ids_are_parsed_and_used_as_variants() -> None:
         2,
         999999,
     ]  # chained == seed 1 without a producer
+
+
+# --------------------------------------------------------------------------
+# seeded records first (WO-R3-G, register row R2)
+# --------------------------------------------------------------------------
+
+_GOLDEN_RULES = [
+    {"rule": "/health", "methods": ["GET"], "endpoint": "health"},
+    {"rule": "/notes", "methods": ["GET", "POST"], "endpoint": "notes"},
+    {"rule": "/notes/<int:note_id>", "methods": ["GET"], "endpoint": "get_note"},
+]
+
+
+def _golden_index(facts: list[str]) -> AppIndex:
+    return index_from_flask_url_map(_GOLDEN_RULES, app="a", commit_sha="c", seed_facts=facts)
+
+
+def _target_ids(scs: list[Scenario]) -> list[tuple[str, Any]]:
+    return [(s.target_operation, list(s.steps[-1].path_params.values())) for s in scs]
+
+
+def test_seeded_records_parse_the_named_patterns_mechanically() -> None:
+    colls = ["notes", "items"]
+    assert seeded_records(["id 1 and id=2", "#3", "ids 4, 5 and 6"], colls) == [
+        (None, n) for n in (1, 2, 3, 4, 5, 6)
+    ]
+    assert seeded_records(["note 1", "note #2", "items 3 and 4", "item id 5"], colls) == [
+        ("notes", 1),
+        ("notes", 2),
+        ("items", 3),
+        ("items", 4),
+        ("items", 5),
+    ]
+    assert seeded_records(["widget 5 exists", "gadget id 6", "step 7"], colls) == []
+    assert seeded_records(["no digits here", "id abc"], colls) == []
+
+
+def test_r2_golden_seed_fact_makes_the_first_scenarios_the_seeded_reads() -> None:
+    """R2: with the golden seed fact the first scenarios are GET /notes/1 and GET /notes/2."""
+    facts = seed_facts_from_contract(GOLDEN_CONTRACT)
+    assert seeded_records(facts, ["notes"]) == [(None, 1), (None, 2)]
+    scs = generate_scenarios(_golden_index(facts))
+    head = [(s.steps[-1].method, s.steps[-1].path, s.steps[-1].path_params) for s in scs[:2]]
+    assert head == [
+        ("GET", "/notes/{note_id}", {"note_id": 1}),
+        ("GET", "/notes/{note_id}", {"note_id": 2}),
+    ]
+    # with a login spec every seeded read is login + GET, still first
+    auth = auth_from_contract(GOLDEN_CONTRACT)
+    sa = generate_scenarios(_golden_index(facts), auth=auth)
+    assert [st.path for st in sa[0].steps] == ["/login", "/notes/{note_id}"]
+    assert sa[0].steps[-1].path_params == {"note_id": 1} and sa[0].steps[-1].auth is True
+    assert sa[1].steps[-1].path_params == {"note_id": 2}
+
+
+def test_no_seed_ids_leaves_the_scenario_list_unchanged() -> None:
+    legacy = ScenarioGenerator(_golden_index([]))
+    per_op = [legacy.for_operation(op) for op in rank_operations(legacy.index.operations, "")]
+    expected: list[Scenario] = []
+    for sc in [*[lst[0] for lst in per_op if lst], *[s for lst in per_op for s in lst[1:]]]:
+        if sc.id not in {e.id for e in expected}:
+            expected.append(sc)
+    for facts in ([], ["seed user owns two notes"], ["done=false and done=true"]):
+        got = generate_scenarios(_golden_index(facts))
+        assert [s.id for s in got] == [s.id for s in expected]
+        assert [s.to_dict() for s in got] == [s.to_dict() for s in expected]
+
+
+def test_a_fact_for_a_collection_not_in_the_index_is_ignored() -> None:
+    rules = [
+        *_GOLDEN_RULES,
+        {"rule": "/items/<int:item_id>", "methods": ["GET"], "endpoint": "get_item"},
+    ]
+    facts = ["widget 5 exists", "note 2 exists"]
+    index = index_from_flask_url_map(rules, app="a", commit_sha="c", seed_facts=facts)
+    scs = generate_scenarios(index)
+    assert _target_ids(scs[:1]) == [("GET /notes/{note_id}", [2])]
+    assert not any(5 in s.steps[-1].path_params.values() for s in scs)
+    # "note 2" is typed: no items read uses id 2
+    assert not any(s.steps[-1].path_params == {"item_id": 2} for s in scs)
+
+
+def test_seeded_reads_are_counted_in_the_request_budget_and_join_the_impact_set() -> None:
+    from proofdeploy.lean.generate import RunResult
+
+    facts = ["notes: id 1 and id 2"]
+    index = _golden_index(facts)
+    auth = auth_from_contract(GOLDEN_CONTRACT)
+    session = _FakeSession({})
+    ran: list[Scenario] = []
+
+    def run(sc: Scenario) -> Any:
+        ran.append(sc)
+        ex = [
+            Exchange(
+                sc.id, i, {"method": s.method, "url_path": s.path, "body": None}, 200, {}, {}, 0
+            )
+            for i, s in enumerate(sc.steps)
+        ]
+        return RunResult(ex, sc)
+
+    changed = ChangedLines.from_diff(DIFF_GET_NOTE)
+    res = cover_change(index, changed, run, session, 4, diff_text=DIFF_GET_NOTE, auth=auth)
+    # login + GET = 2 requests each: exactly the first two seeded reads fit in 4
+    assert res.requests_used == 4 and res.scenarios_run == 2
+    assert [s.steps[-1].path_params for s in ran] == [{"note_id": 1}, {"note_id": 2}]
+    # a seeded read that hits a changed line is in the impact set like any scenario
+    hit = _FakeSession({"GET /notes/{note_id}": ("app.py", 99)})
+
+    def run_hit(sc: Scenario) -> Any:
+        hit.record(sc)
+        return run(sc)
+
+    res2 = cover_change(index, changed, run_hit, hit, 50, diff_text=DIFF_GET_NOTE, auth=auth)
+    assert res2.covered and res2.scenarios_run == 1
+    assert [s.steps[-1].path_params for s in res2.impact_set] == [{"note_id": 1}]
 
 
 # --------------------------------------------------------------------------
@@ -812,13 +929,12 @@ def test_golden_bug_change_is_covered_by_the_note_lookup(
     assert [s.target_operation for s in res.impact_set] == ["GET /notes/{note_id}"]
     sc = res.impact_set[0]
     assert res.hits[sc.id]["hits_added"] == [f"app.py:{line}"]
-    # the covering scenario logs in, creates a note (producer) and reads it back
+    # the covering scenario is the seeded read: it logs in and reads seeded note 1
     assert [(s.method, s.path) for s in sc.steps] == [
         ("POST", "/login"),
-        ("POST", "/notes"),
         ("GET", "/notes/{note_id}"),
     ]
-    assert sc.steps[-1].path_params == {"note_id": "${note_id}"}
+    assert sc.steps[-1].path_params == {"note_id": 1}
     assert all(e.status in (200, 201) for e in res.exchanges[: res.requests_used])
     print(
         f"golden bug: covered in {res.requests_to_cover} requests, {res.scenarios_run} scenario(s)"
@@ -928,7 +1044,7 @@ def test_loop_stops_after_the_impacting_scenario_using_real_snapshots(
         )  # fmt: skip
         app.stop_and_collect()
     assert res.covered and res.scenarios_run == 1
-    assert res.requests_used == len(impacting.steps) == 3  # login + create + get
+    assert res.requests_used == len(impacting.steps) == 2  # login + seeded get
     ran = {e.scenario_id for e in res.exchanges}
     assert ran == {impacting.id} and not ran & {s.id for s in later}
     assert [s.id for s in res.impact_set] == [impacting.id]

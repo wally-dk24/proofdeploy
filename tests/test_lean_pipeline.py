@@ -185,23 +185,32 @@ def test_golden_bug_is_a_judged_regression_and_fails(
     assert stub.prompts and FACT_OPEN in stub.prompts[0]
 
 
-def test_golden_created_ids_are_identical_across_the_four_runs(
+def test_golden_seeded_reads_are_identical_across_the_four_runs(
     golden: dict[str, Any], ci_env: None, tmp_path: Path
 ) -> None:
-    """Fresh database per run: the producer's id (3) is the same in all four runs."""
+    """Seeded records come first (R2): the same seeded note is read in all four runs.
+
+    Fresh database per run: the seed made notes 1 and 2, so ``GET /notes/1`` answers
+    the same body in every run and no producer ``POST /notes`` is needed.
+    """
     stub = PromptStub(bug_rule)
     run_golden(golden, "base", "bug", tmp_path / "out", stub)
     runs = json.loads((tmp_path / "out" / "exchanges.json").read_text(encoding="utf-8"))
-    created = {
-        label: sorted(
-            e["body_json_or_text"]["id"]
+    read = {
+        label: [
+            e["request"]["url_path"]
             for e in exs
-            if e["request"]["method"] == "POST" and e["request"]["url_path"] == "/notes"
-        )
+            if e["request"]["method"] == "GET" and e["request"]["url_path"].startswith("/notes/")
+        ]
         for label, exs in runs.items()
     }
-    assert all(v == created["base"] for v in created.values()), created
-    assert created["base"] and created["base"][0] == 3  # seed made notes 1 and 2
+    assert all(v == read["base"] for v in read.values()), read
+    assert read["base"] and read["base"][0] == "/notes/1"  # seed made notes 1 and 2
+    assert not any(
+        e["request"]["method"] == "POST" and e["request"]["url_path"] == "/notes"
+        for exs in runs.values()
+        for e in exs
+    )
 
 
 def test_golden_clean_change_passes_with_the_added_tag_judged_correct(
