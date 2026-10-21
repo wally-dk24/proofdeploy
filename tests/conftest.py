@@ -198,3 +198,10 @@ def _no_leftover_bridge_sockets():
         f"the test session: {sorted(leftover)}. The per-run socket dir "
         "must be removed on every exit path."
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_model_call_pacing(monkeypatch):
+    """The lean judge paces model calls (13 s apart by default); tests use stub
+    runners and must never wait. Pacing tests set the variable themselves."""
+    monkeypatch.setenv("PROOFDEPLOY_MIN_CALL_INTERVAL", "0")
