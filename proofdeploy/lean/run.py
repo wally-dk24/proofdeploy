@@ -90,6 +90,13 @@ APP_VENV_PYTHON = "/pd-home/.venv/bin/python"
 NOT_PYTHON_EXIT = 92
 FREEZE_TIME = "2020-01-01 00:00:00"
 FAKETIME_LIB = "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
+# Where distributions put libfaketime (Debian/Ubuntu per architecture, Alpine, source builds).
+FAKETIME_LIB_CANDIDATES = (
+    FAKETIME_LIB,
+    "/usr/lib/aarch64-linux-gnu/faketime/libfaketime.so.1",
+    "/usr/lib/faketime/libfaketime.so.1",
+    "/usr/local/lib/faketime/libfaketime.so.1",
+)
 _MAX_LOG_BYTES = 4_000_000
 
 
@@ -251,6 +258,7 @@ class HostSide:
         overlay: dict[str, Any] | None = None,
     ) -> None:
         self.label = label
+        self.provisioned_at: float | None = None  # wall clock when provisioning began
         self.sha = sha
         self.tree = tree
         self.py = py
@@ -362,6 +370,7 @@ class HostSide:
             "db_snapshot_sha256": _sha256_file(self.seed_db) if self.seed_db.is_file() else None,
             "starts": self._starts,
             "frozen_clock": self._clock,
+            "provisioned_at": self.provisioned_at,
             "env": {"PYTHONHASHSEED": "0", "TZ": "UTC"},
         }
 
@@ -394,6 +403,7 @@ def provision_host_sides(
     contracts: dict[str, RepoContract] = {}
     for label, sha in (("base", rc.base_sha), ("head", rc.head_sha)):
         with timings.stage(f"provision_{label}"):
+            provisioned_at = time.time()
             side_work = work / label
             side_work.mkdir(parents=True, exist_ok=True)
             tree = create_snapshot(
@@ -414,6 +424,7 @@ def provision_host_sides(
                 overlay=rc.django_overlay,
             )
             side.prepare()
+            side.provisioned_at = provisioned_at
             sides[label] = side
             contracts[label] = contract
     return sides["base"], sides["head"], contracts["head"]
@@ -631,6 +642,7 @@ class SandboxSide:
         work: Path,
     ) -> None:
         self.label = label
+        self.provisioned_at: float | None = None  # wall clock when provisioning began
         self.sha: str = side.sha
         self.side = side
         self.hook = hook
@@ -658,24 +670,38 @@ class SandboxSide:
             )
         self.work.mkdir(parents=True, exist_ok=True)
         snapshot_sqlite(self.db, self.seed_db)
-        if self._ready is not None and self._probe_faketime(str(self._ready.name)):
-            self.hook.clock_env = {"LD_PRELOAD": FAKETIME_LIB, "FAKETIME": FREEZE_TIME}
-            self._clock = {"used": True, "how": "libfaketime", "time": FREEZE_TIME}
+        if self._ready is None:
+            self._clock = {"used": False, "reason": "no running container to probe for libfaketime"}
+            return
+        lib = self._probe_faketime(str(self._ready.name))
+        if lib is None:
+            self._clock = {
+                "used": False,
+                "reason": "libfaketime not in the image",
+                "probed": list(FAKETIME_LIB_CANDIDATES),
+            }
+            return
+        self.hook.clock_env = {"LD_PRELOAD": lib, "FAKETIME": FREEZE_TIME}
+        self._clock = {"used": True, "how": "libfaketime", "lib": lib, "time": FREEZE_TIME}
 
     @staticmethod
-    def _probe_faketime(container: str) -> bool:
+    def _probe_faketime(container: str) -> str | None:
+        """The path of libfaketime inside the container, or None when it is not there."""
         from proofdeploy.sandbox import _podman_base
 
-        try:
-            proc = subprocess.run(
-                _podman_base() + ["exec", container, "test", "-e", FAKETIME_LIB],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return proc.returncode == 0
+        for lib in FAKETIME_LIB_CANDIDATES:
+            try:
+                proc = subprocess.run(
+                    _podman_base() + ["exec", container, "test", "-e", lib],
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if proc.returncode == 0:
+                return lib
+        return None
 
     def _stop_current(self) -> None:
         if self._current is not None:
@@ -748,6 +774,7 @@ class SandboxSide:
             "db_snapshot_sha256": _sha256_file(self.seed_db) if self.seed_db.is_file() else None,
             "starts": self._starts,
             "frozen_clock": self._clock,
+            "provisioned_at": self.provisioned_at,
             "pdcov_setup_exit": self.hook.pdcov_rc,
             "app_cwd": self.hook.app_cwd,
             "env": {"PYTHONHASHSEED": "0", "TZ": "UTC"},
@@ -801,6 +828,7 @@ def provision_sandbox_sides(
     try:
         for label, sha in (("base", rc.base_sha), ("head", rc.head_sha)):
             hook = SandboxHook(overlay=rc.django_overlay, contract_env=contract_env)
+            provisioned_at = time.time()
             with timings.stage(f"provision_{label}"):
                 try:
                     with lean_sandbox_patched(make_lean_sandbox(hook)):
@@ -828,6 +856,7 @@ def provision_sandbox_sides(
             try:
                 ss = SandboxSide(label=label, side=side, hook=hook, work=work / "lean" / label)
                 ss.prepare()
+                ss.provisioned_at = provisioned_at
             except BaseException:
                 if side.provision.proc is not None:
                     with contextlib.suppress(Exception):
