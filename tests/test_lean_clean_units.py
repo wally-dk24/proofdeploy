@@ -135,3 +135,102 @@ def test_too_few_units_fails(world: dict) -> None:
     rows, _ = sel.read_journal(world["journal"])
     with pytest.raises(SystemExit):
         sel.select_clean_units(rows, repo, wo6, n=50, exclude=set())
+
+
+# ---- WO-R5-U: --exclude-sha / --app-name, and the linkding units file ----------------------
+
+PAPERLESS_RECORD = Path(__file__).parent.parent / "experiments/lean-poc/paperless-clean-units.json"
+
+
+def test_default_excludes_are_the_paperless_set() -> None:
+    assert sel.B_SHA == "aa67fd3aefa6489984fc15a5c32c1ad2b16ac23a"
+    assert sel.FIX_PAIR_PREFIXES == ("14b6a41b", "d3710856")
+    rec = json.loads(PAPERLESS_RECORD.read_text(encoding="utf-8"))
+    assert sel.B_SHA in rec["excluded"]
+    assert all(any(x.startswith(p) for x in rec["excluded"]) for p in sel.FIX_PAIR_PREFIXES)
+    assert sel.DEFAULT_APP_NAME == "paperless-ngx/paperless-ngx"
+    assert "app_name" not in rec  # the default is not recorded, so the record re-derives as is
+
+
+def test_default_cli_record_has_the_paperless_shape(
+    world: dict, tmp_path: Path, monkeypatch
+) -> None:
+    shas = world["shas"]
+    monkeypatch.setattr(sel, "B_SHA", shas[4])
+    monkeypatch.setattr(sel, "FIX_PAIR_PREFIXES", (shas[7][:8],))
+    out = tmp_path / "out.json"
+    argv = ["--journal", str(world["journal"]), "--repo", str(world["repo"]), "--out", str(out)]
+    assert sel.main(argv) == 0
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert set(rec) == set(json.loads(PAPERLESS_RECORD.read_text(encoding="utf-8")))
+    assert rec["excluded"] == sorted([shas[3], shas[4], shas[7]])
+
+
+def test_explicit_excludes_are_honoured_and_replace_the_default(
+    world: dict, tmp_path: Path, monkeypatch
+) -> None:
+    shas = world["shas"]
+    # The defaults would exclude shas[3], shas[4], shas[7]; the explicit set must replace them.
+    monkeypatch.setattr(sel, "B_SHA", shas[4])
+    monkeypatch.setattr(sel, "FIX_PAIR_PREFIXES", (shas[7][:8],))
+    out = tmp_path / "out.json"
+    argv = ["--journal", str(world["journal"]), "--repo", str(world["repo"]), "--out", str(out)]
+    argv += ["--exclude-sha", shas[2], "--exclude-sha", shas[6], "--app-name", "o/linkding"]
+    assert sel.main(argv) == 0
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert rec["excluded"] == sorted([shas[2], shas[6]])
+    assert rec["app_name"] == "o/linkding"
+    assert [u["sha"] for u in rec["units"]] == [shas[3], shas[4], shas[7]]
+    assert rec["skipped_excluded"] == 2
+
+
+def test_exclude_sha_must_be_a_full_sha(world: dict, tmp_path: Path) -> None:
+    argv = ["--journal", str(world["journal"]), "--repo", str(world["repo"])]
+    argv += ["--out", str(tmp_path / "o.json"), "--exclude-sha", world["shas"][2][:8]]
+    with pytest.raises(SystemExit):
+        sel.main(argv)
+
+
+ROOT = Path(__file__).parent.parent
+RELAY_SELECTED = json.loads(
+    (Path(__file__).parent / "fixtures" / "linkding_selected_shas.json").read_text(encoding="utf-8")
+)
+
+
+def _linkding() -> dict:
+    return json.loads((ROOT / "experiments/lean-poc/linkding-units.json").read_text("utf-8"))
+
+
+def test_linkding_bug_unit_equals_the_relay_records_selected_shas() -> None:
+    (bug,) = _linkding()["bug_units"]
+    assert {k: bug[k] for k in ("b_parent", "b", "fix_parent", "fix")} == RELAY_SELECTED
+    assert bug["id"] == f"linkding-bug-{RELAY_SELECTED['fix'][:8]}"
+
+
+def test_linkding_clean_units_are_the_committed_selection() -> None:
+    rec = json.loads((ROOT / "experiments/lean-poc/linkding-clean-units.json").read_text("utf-8"))
+    cleans = _linkding()["clean_units"]
+    assert len(cleans) == 3
+    assert [{k: u[k] for k in ("sha", "first_parent")} for u in rec["units"]] == [
+        {k: u[k] for k in ("sha", "first_parent")} for u in cleans
+    ]
+    assert [u["changed_class_counts"] for u in rec["units"]] == [
+        u["changed_class_counts"] for u in cleans
+    ]
+    assert set(rec["excluded"]) == set(RELAY_SELECTED.values())
+    assert rec["app_name"] == "sissbruecker/linkding"
+    assert not {u["sha"] for u in cleans} & set(RELAY_SELECTED.values())
+    assert rec["measured_result"] is False
+
+
+def test_linkding_group_loads_with_one_bug_and_three_clean_units() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "lean_poc_gate_u", ROOT / "experiments/lean-poc/gate.py"
+    )
+    assert spec is not None and spec.loader is not None
+    gate = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = gate
+    spec.loader.exec_module(gate)
+    units = gate.app_units(gate.load_app_group("linkding"))
+    assert [u.kind for u in units] == ["bug", "clean", "clean", "clean"]
+    assert units[0].id == "linkding-bug-71d62f48"

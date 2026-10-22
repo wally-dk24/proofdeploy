@@ -297,6 +297,7 @@ def test_auth_proof_path_reads_the_contract_first_then_the_map() -> None:
 
 def _group_json(**over: Any) -> dict[str, Any]:
     data: dict[str, Any] = json.loads(UNITS_FILE.read_text(encoding="utf-8"))
+    data.update({"bug_units": [], "clean_units": []})  # the group tests start from no units
     data.update(over)
     return data
 
@@ -307,27 +308,31 @@ def _write_group(tmp: Path, data: dict[str, Any]) -> Path:
     return p
 
 
-def test_the_linkding_units_file_is_registered_empty_with_the_head_check_sha() -> None:
+def test_the_linkding_units_file_is_registered_with_the_head_check_sha() -> None:
     data = json.loads(UNITS_FILE.read_text(encoding="utf-8"))
-    assert data == {
-        "bug_units": [],
+    assert {k: v for k, v in data.items() if k not in ("bug_units", "clean_units")} == {
         "check_sha": LINKDING_HEAD,
-        "clean_units": [],
         "contract": "sissbruecker__linkding",
         "openapi_path": None,
         "repo": "sissbruecker/linkding",
     }
+    assert (len(data["bug_units"]), len(data["clean_units"])) == (1, 3)  # WO-R5-U
     group = gate.load_app_group("linkding")
     assert (group.repo, group.contract, group.openapi_path) == (
         "sissbruecker/linkding",
         "sissbruecker__linkding",
         None,
     )
-    assert gate.load_units("linkding") == []  # no unit is selected yet
+    assert [u.kind for u in gate.load_units("linkding")] == ["bug", "clean", "clean", "clean"]
     assert "linkding" in gate.CLI_GROUPS and "linkding" not in gate.GROUPS
 
 
-def test_rehearsal_of_the_group_is_one_check_unit_at_head_on_both_sides() -> None:
+def test_rehearsal_of_the_group_is_one_check_unit_at_head_on_both_sides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # with no unit selected the group still rehearses one READY check unit (WO-R5-U filled the
+    # registered file, so this starts from an empty copy)
+    monkeypatch.setitem(gate.APP_UNITS_FILES, "linkding", _write_group(tmp_path, _group_json()))
     units = gate.rehearsal_units("linkding")
     assert [u.id for u in units] == ["linkding-check"]
     u = units[0]
@@ -437,8 +442,9 @@ def test_an_invalid_group_file_stops_the_gate_before_it_runs(
 
 
 def test_the_group_cli_lists_and_needs_its_own_repo_flag(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setitem(gate.APP_UNITS_FILES, "linkding", _write_group(tmp_path, _group_json()))
     assert gate.main(["--units", "linkding", "--rehearse", "--list"]) == 0
     assert capsys.readouterr().out.split() == ["linkding-check"]
     assert gate.main(["--units", "linkding", "--list"]) == 0

@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -38,9 +39,14 @@ RULE_TEXT = (
 
 KEEP = ("sha", "failed_check", "committer_date")
 
-# The WO-6 bug unit (already chosen) and its fix pair, as named in WO-P6a.
+# The WO-6 bug unit (already chosen) and its fix pair, as named in WO-P6a. These are the DEFAULT
+# excludes (the paperless set): B, B's first parent and the fix pair. Another app passes its own
+# four SHAs with --exclude-sha.
 B_SHA = "aa67fd3aefa6489984fc15a5c32c1ad2b16ac23a"
 FIX_PAIR_PREFIXES = ("14b6a41b", "d3710856")
+
+DEFAULT_APP_NAME = "paperless-ngx/paperless-ngx"
+_SHA1_RE = re.compile(r"[0-9a-f]{40}")
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "wo6" / "regc_bug_select.py"
 
@@ -134,6 +140,12 @@ def resolve_excludes(repo: Any, b_sha: str, prefixes: tuple[str, ...]) -> set[st
     return out
 
 
+def _full_sha(value: str) -> str:
+    if not _SHA1_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a full 40-character lowercase hex sha")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     ap.add_argument("--journal", type=Path, required=True)
@@ -141,12 +153,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("-n", type=int, default=3)
     ap.add_argument("--journal-ref", default="", help="where the journal came from (recorded)")
+    ap.add_argument(
+        "--exclude-sha",
+        action="append",
+        type=_full_sha,
+        default=None,
+        help="full 40-hex sha to exclude (repeatable); default: the paperless B, B^ and fix pair",
+    )
+    ap.add_argument(
+        "--app-name",
+        default=DEFAULT_APP_NAME,
+        help="owner/name of the app (recorded when it is not the default)",
+    )
     args = ap.parse_args(argv)
 
     wo6 = load_wo6()
     repo = wo6.AppRepo(args.repo)
     rows, journal_sha = read_journal(args.journal)
-    excludes = resolve_excludes(repo, B_SHA, FIX_PAIR_PREFIXES)
+    if args.exclude_sha is None:
+        excludes = resolve_excludes(repo, B_SHA, FIX_PAIR_PREFIXES)
+    else:
+        excludes = set(args.exclude_sha)
     result = select_clean_units(rows, repo, wo6, n=args.n, exclude=excludes)
     record = {
         "rule": RULE_TEXT,
@@ -159,6 +186,9 @@ def main(argv: list[str] | None = None) -> int:
         **result,
         "measured_result": False,
     }
+    if args.app_name != DEFAULT_APP_NAME:
+        # Absent for the default so the paperless record re-derives byte-identically.
+        record["app_name"] = args.app_name
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     for u in record["units"]:

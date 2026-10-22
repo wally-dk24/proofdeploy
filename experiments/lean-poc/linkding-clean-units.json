@@ -1,0 +1,58 @@
+{
+  "app_name": "sissbruecker/linkding",
+  "app_repo_head": "27b7303baf41bb28babc610ac8eaa486e1ddfab5",
+  "candidates_examined": 17,
+  "excluded": [
+    "38d450a91610b16a4c64d5371b64a95b3b741c45",
+    "71d62f48b40a4393a1075d8e239590404c8acb10",
+    "8c2afb7e2f5a245a842d74c3eb46fa8d2278989a",
+    "ffc1a690852a562a5cce266293fe279db66407e7"
+  ],
+  "journal_order_is_committer_date_ascending": true,
+  "journal_ref": "wally-dk24/proofdeploy-relay@0a49f13:selection/lean-linkding-2026-10-21/journal/walk.jsonl",
+  "journal_rows": 51,
+  "journal_sha256": "440a3d88e170b2862c8a986c34aa64db372dd84724523d42e88295ac3161cfdd",
+  "measured_result": false,
+  "n": 3,
+  "rule": "In walk order (the committed WO-6 walk journal's order: first-parent, committer date ascending, after 2026-07-01), the first N commits with failed_check == 'a' (subject not fix-titled) that change at least one SOURCE file under the WO-6 script's own classify_path (paths from git diff --name-only <first-parent>..<sha>, --no-renames) and that are not B, B's first parent, or the fix pair (fix^ and fix).",
+  "skipped_excluded": 0,
+  "skipped_no_source_file": 14,
+  "units": [
+    {
+      "changed_class_counts": {
+        "DOC": 0,
+        "OTHER": 0,
+        "SOURCE": 1,
+        "TEST": 1
+      },
+      "changed_source_paths": 1,
+      "committer_date": "2026-08-05T05:44:39+00:00",
+      "first_parent": "dbffffe30fb67500b32608c465a23433a3b04458",
+      "sha": "e50239cde89d290ecc48992f43b45efb25335001"
+    },
+    {
+      "changed_class_counts": {
+        "DOC": 1,
+        "OTHER": 0,
+        "SOURCE": 1,
+        "TEST": 1
+      },
+      "changed_source_paths": 1,
+      "committer_date": "2026-08-05T06:03:25+00:00",
+      "first_parent": "e50239cde89d290ecc48992f43b45efb25335001",
+      "sha": "0837b5186979e4a52e75582bd295cc73e43d2612"
+    },
+    {
+      "changed_class_counts": {
+        "DOC": 0,
+        "OTHER": 0,
+        "SOURCE": 3,
+        "TEST": 1
+      },
+      "changed_source_paths": 3,
+      "committer_date": "2026-08-05T06:28:53+00:00",
+      "first_parent": "0837b5186979e4a52e75582bd295cc73e43d2612",
+      "sha": "0490013e4f67f0d31ccd764a5cb723dcafaf4acd"
+    }
+  ]
+}
