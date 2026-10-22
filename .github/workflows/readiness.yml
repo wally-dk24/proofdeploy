@@ -71,6 +71,7 @@ on:
           - codeigniter4/CodeIgniter4
           - honojs/hono
           - paperless-ngx/paperless-ngx
+          - sissbruecker/linkding
       attempt:
         description: "Highest attempt to perform (2 = first pass + rerun of non-READY sides)"
         required: true

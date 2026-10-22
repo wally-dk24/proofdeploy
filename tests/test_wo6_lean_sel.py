@@ -597,3 +597,25 @@ def test_write_bug_unit_main_never_prints_subjects(
 def test_write_bug_unit_default_output_path() -> None:
     assert writer.OUT_PATH.name == "paperless-bug-unit.json"
     assert writer.OUT_PATH.parent.name == "lean-poc"
+
+
+def test_every_lean_walk_repo_with_a_contract_is_a_readiness_workflow_option() -> None:
+    """Check (d) runs through readiness.yml pair mode: each walkable repo needs an option."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    survivors = json.loads(
+        (
+            root / "docs/registration/wo6-regc-add2-closeout-2026-10-17/regc-add2-survivors.json"
+        ).read_text(encoding="utf-8")
+    )
+    stems = {p.stem for p in (root / "readiness/contracts").glob("*.yml")}
+    walkable = sorted(
+        s["full_name"]
+        for s in survivors
+        if s.get("survivor") and s["full_name"].replace("/", "__") in stems
+    )
+    assert "sissbruecker/linkding" in walkable
+    wf = yaml.safe_load((root / ".github/workflows/readiness.yml").read_text(encoding="utf-8"))
+    options = wf[True]["workflow_dispatch"]["inputs"]["repo"]["options"]  # YAML "on" parses True
+    assert [r for r in walkable if r not in options] == []
