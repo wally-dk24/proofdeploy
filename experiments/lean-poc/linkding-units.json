@@ -1,7 +1,53 @@
 {
-  "bug_units": [],
+  "bug_units": [
+    {
+      "b": "ffc1a690852a562a5cce266293fe279db66407e7",
+      "b_parent": "38d450a91610b16a4c64d5371b64a95b3b741c45",
+      "fix": "71d62f48b40a4393a1075d8e239590404c8acb10",
+      "fix_parent": "8c2afb7e2f5a245a842d74c3eb46fa8d2278989a",
+      "id": "linkding-bug-71d62f48",
+      "note": "R-LEAN-SEL + A1 walk 3 (main 991153b0)",
+      "selection_record": "selection/lean-linkding-2026-10-21/record.json",
+      "selection_record_sha256": "ffaee894954189fa9338d0d381e903f1d38cc19ce1343747cb17f3c9b5221684",
+      "unit_repo": "sissbruecker/linkding"
+    }
+  ],
   "check_sha": "27b7303baf41bb28babc610ac8eaa486e1ddfab5",
-  "clean_units": [],
+  "clean_units": [
+    {
+      "changed_class_counts": {
+        "DOC": 0,
+        "OTHER": 0,
+        "SOURCE": 1,
+        "TEST": 1
+      },
+      "changed_source_paths": 1,
+      "first_parent": "dbffffe30fb67500b32608c465a23433a3b04458",
+      "sha": "e50239cde89d290ecc48992f43b45efb25335001"
+    },
+    {
+      "changed_class_counts": {
+        "DOC": 1,
+        "OTHER": 0,
+        "SOURCE": 1,
+        "TEST": 1
+      },
+      "changed_source_paths": 1,
+      "first_parent": "e50239cde89d290ecc48992f43b45efb25335001",
+      "sha": "0837b5186979e4a52e75582bd295cc73e43d2612"
+    },
+    {
+      "changed_class_counts": {
+        "DOC": 0,
+        "OTHER": 0,
+        "SOURCE": 3,
+        "TEST": 1
+      },
+      "changed_source_paths": 3,
+      "first_parent": "0837b5186979e4a52e75582bd295cc73e43d2612",
+      "sha": "0490013e4f67f0d31ccd764a5cb723dcafaf4acd"
+    }
+  ],
   "contract": "sissbruecker__linkding",
   "openapi_path": null,
   "repo": "sissbruecker/linkding"
