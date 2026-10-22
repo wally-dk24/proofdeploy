@@ -763,6 +763,11 @@ def unit_identity(cfg: LeanConfig, contract: Any) -> str | None:
 
 
 def auth_proof_path(cfg: LeanConfig, contract: Any) -> str:
+    """The authenticated GET the sign-in proof sends: the contract's own ``auth.proof_path``
+    first, else the in-code map for the unit (a unit with neither is a typed refusal)."""
+    declared = (getattr(contract, "auth", None) or {}).get("proof_path")
+    if declared:
+        return str(declared)
     ident = unit_identity(cfg, contract)
     path = AUTH_PROOF_PATHS.get(ident or "")
     if path is None:
@@ -776,10 +781,25 @@ def auth_proof_path(cfg: LeanConfig, contract: Any) -> str:
 def prove_auth(driver: SideDriver, auth: AuthSpec, proof_path: str, *, side: str) -> dict[str, Any]:
     """Sign in with the contract's login step, then one authenticated GET to the proof path.
 
+    A static-token spec has no sign-in: the one request is the authenticated GET.
+
     Runs on a fresh unmeasured instance of the side, so the proof request leaves
     no trace in the coverage the impact loop reads. The record carries statuses
     and the path only (never a body, a token or a generated value).
     """
+    env = side_bootstrap_env(driver)
+    if auth.static_token_env is not None and not env.get(auth.static_token_env):
+        # No generated token for this side: nothing is started and nothing is sent.
+        return {
+            "side": side,
+            "ok": False,
+            "outcome": "unproven",
+            "proof_path": proof_path,
+            "login_status": None,
+            "proof_status": None,
+            "proof_auth_sent": False,
+            "reason": "static_token_missing",
+        }
     app = driver.start(measured=False)
     try:
         runner = ScenarioRunner(
@@ -787,17 +807,22 @@ def prove_auth(driver: SideDriver, auth: AuthSpec, proof_path: str, *, side: str
             auth=auth,
             session=None,
             repair=False,
-            env=side_bootstrap_env(driver),
+            env=env,
         )
         proof = Step("GET", proof_path, auth=True)
-        res = runner(Scenario([auth.login, proof], f"GET {proof_path}"))
+        res = runner(Scenario([*auth.login_steps(), proof], f"GET {proof_path}"))
     finally:
         app.stop()
-    login_status = res.exchanges[0].status if res.exchanges else 0
-    proof_ex = res.exchanges[1] if len(res.exchanges) > 1 else None
+    if auth.is_static:  # no sign-in request: the proof request is the only exchange
+        login_status: int | None = None
+        proof_ex = res.exchanges[0] if res.exchanges else None
+        login_ok = True
+    else:
+        login_status = res.exchanges[0].status if res.exchanges else 0
+        proof_ex = res.exchanges[1] if len(res.exchanges) > 1 else None
+        login_ok = 200 <= login_status < 300
     proof_status = proof_ex.status if proof_ex else None
     sent = bool(proof_ex is not None and proof_ex.auth_sent)
-    login_ok = 200 <= login_status < 300
     if sent and proof_status is not None and 200 <= proof_status < 300:
         outcome = "2xx"
     elif sent and login_ok and proof_status is not None and proof_status >= 500:

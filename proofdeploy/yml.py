@@ -9,7 +9,7 @@ description): a string-to-string mapping with the five template fields
 as optional keeps the frozen contract backward compatible.
 
 `auth` (optional) declares the credential provider (ADR-0010; extended
-WO-8.3): one of the modes `register`, `login`, `refresh`, `ghost_jwt`,
+WO-8.3): one of the modes `register`, `login`, `refresh`, `ghost_jwt`, `static_token`,
 each with its own key set, plus the shared optional `bootstrap_env` —
 a list of env NAMES for which ProofDeploy generates a fresh random
 value per side and per run (Addendum 43/44). The generated values are
@@ -86,6 +86,10 @@ _AUTH_MODE_KEYS: dict[str, set[str]] = {
         "login_path", "login_method", "login_body",
     },
     "ghost_jwt": {"mode", "key", "key_file", "ttl_seconds"},
+    # The token is a bootstrap value ProofDeploy generates and the seed
+    # writes into the app: there is no sign-in request. `proof_path` is
+    # the authenticated GET the lean sign-in proof sends.
+    "static_token": {"mode", "token_env", "proof_path"},
 }
 _AUTH_SHARED_KEYS = {"bootstrap_env"}
 
@@ -531,6 +535,24 @@ def _validate_auth(auth: Any) -> dict[str, Any]:
                     "proofdeploy.yml 'auth.ttl_seconds' must be a positive integer"
                 )
             out["ttl_seconds"] = ttl
+    elif mode == "static_token":
+        token_env = _auth_str(auth, "token_env")
+        if not _ENV_NAME_RE.match(token_env):
+            raise ValueError(
+                f"proofdeploy.yml 'auth.token_env' must be a valid env name, got: {token_env!r}"
+            )
+        # The value only exists because ProofDeploy generates it for a
+        # declared bootstrap name; a token_env outside that list would be
+        # a token nobody supplies.
+        if token_env not in (bootstrap or []):
+            raise ValueError(
+                "proofdeploy.yml 'auth.token_env' must be listed in 'auth.bootstrap_env' "
+                f"(got token_env {token_env!r})"
+            )
+        out["token_env"] = token_env
+        proof_path = _auth_path(auth, "proof_path", required=False)
+        if proof_path is not None:
+            out["proof_path"] = proof_path
     return out
 
 

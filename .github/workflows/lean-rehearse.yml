@@ -25,6 +25,7 @@ on:
           - all
           - golden
           - paperless
+          - linkding
 
 permissions:
   contents: read
@@ -58,6 +59,11 @@ jobs:
         run: |
           git clone --quiet https://github.com/paperless-ngx/paperless-ngx /tmp/paperless
 
+      - name: Check out linkding (full history)
+        if: ${{ inputs.units == 'linkding' }}
+        run: |
+          git clone --quiet https://github.com/sissbruecker/linkding /tmp/linkding
+
       - name: Capability probe (fail-closed gate)
         run: |
           python -c "
@@ -76,7 +82,8 @@ jobs:
             --units "$UNITS" \
             --out /tmp/lean-rehearse-out \
             --workdir /tmp/lean-rehearse-work \
-            --paperless-repo /tmp/paperless
+            --paperless-repo /tmp/paperless \
+            --linkding-repo /tmp/linkding
 
       - name: Upload rehearsal results
         if: ${{ always() }}

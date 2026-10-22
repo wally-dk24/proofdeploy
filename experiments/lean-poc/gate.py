@@ -21,6 +21,11 @@ Units, in this order (28):
   d. the 3 paperless clean units of ``paperless-clean-units.json`` (first_parent -> sha),
      same options; intent = the unit's own commit message.
 
+  e. an app group (``--units linkding``): the units of ``experiments/lean-poc/<app>-units.json``
+     (repo, contract slug, OpenAPI path or none, bug units, clean units). Not part of ``all``.
+     ``--units linkding --rehearse`` works before any unit is selected: it rehearses one READY
+     check unit at the app's HEAD (both sides = HEAD).
+
 The model is called by the pipeline's judge only, through the pinned client (key from
 ``GROQ_API_KEY``). Nothing here is a measured result: every record says so.
 
@@ -78,6 +83,11 @@ PAPERLESS_CLEAN_MAX_FALSE_ALARMS = 1
 GROUPS = ("all", "golden", "mutants", "paperless")
 BUG_UNIT_PREFIX = "paperless-bug-"
 
+# -- app groups (round 5): an app's units come from ``<app>-units.json`` ------------------------
+# Not part of ``all`` (the registered gate is golden + mutants + paperless, unchanged).
+APP_UNITS_FILES: dict[str, Path] = {"linkding": HERE / "linkding-units.json"}
+CLI_GROUPS = (*GROUPS, *APP_UNITS_FILES)
+
 # The pre-registered criteria (claude/stage-2-phase-0-poc-plan-2026-10-20.md), verbatim.
 CRITERIA: dict[str, str] = {
     "1": "golden-bug verdict FAIL; golden-clean verdict PASS.",
@@ -123,6 +133,12 @@ class Unit:
     paperless: bool = False
     fix_parent: str | None = None  # bug units: the fix's first parent (the confirm base)
     fix: str | None = None  # bug units: the fix commit (the confirm head)
+    app: str = ""  # an app group's name (its units come from ``<app>-units.json``)
+
+    @property
+    def external(self) -> bool:
+        """A unit of an app clone (paperless or an app group): blind logging, the app's repo."""
+        return self.paperless or bool(self.app)
 
 
 def build_units(
@@ -250,9 +266,162 @@ def load_paperless_bug_units(path: Path | None = None) -> list[dict[str, Any]]:
     return [dict(u) for u in units]
 
 
+_APP_GROUP_KEYS = frozenset(
+    {"repo", "contract", "openapi_path", "check_sha", "bug_units", "clean_units"}
+)
+_APP_CLEAN_KEYS = frozenset({"sha", "first_parent"})
+_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+@dataclass(frozen=True)
+class AppGroup:
+    """An app group read from ``<app>-units.json`` (validated)."""
+
+    name: str
+    repo: str  # owner/name: the unit repo, hence the contract-store key
+    contract: str  # the contract-store stem, ``owner__name``
+    openapi_path: str | None
+    check_sha: str  # the app's HEAD at registration: the rehearsal's check unit
+    bug_units: list[dict[str, Any]]
+    clean_units: list[dict[str, Any]]
+
+
+def load_app_group(name: str, path: Path | None = None) -> AppGroup:
+    """The app group's units file, validated. Raises ``GateError`` when it is invalid.
+
+    Bug units carry the keys of the paperless bug units (``unit_repo`` = the group's repo, id
+    ``<name>-bug-<first 8 characters of the fix>``); clean units carry ``sha`` and ``first_parent``
+    (further keys are kept). Both lists may be empty: the units are selected later.
+    """
+    path = APP_UNITS_FILES[name] if path is None else path
+
+    def bad(why: str) -> GateError:
+        return GateError(f"{name} units file invalid: {why}")
+
+    if not path.is_file():
+        raise bad(f"{path.name} is missing")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise bad(f"{path.name} is unreadable ({type(exc).__name__})") from exc
+    if not isinstance(data, dict) or set(data) != _APP_GROUP_KEYS:
+        raise bad(f"{path.name} keys differ from {sorted(_APP_GROUP_KEYS)}")
+    repo = data["repo"]
+    if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo):
+        raise bad("repo is not owner/name")
+    if data["contract"] != repo.replace("/", "__"):
+        raise bad("contract is not the repo's contract-store stem (owner__name)")
+    openapi = data["openapi_path"]
+    if openapi is not None and (not isinstance(openapi, str) or not openapi.startswith("/")):
+        raise bad("openapi_path is neither null nor an absolute path")
+    check = data["check_sha"]
+    if not isinstance(check, str) or not _SHA1_RE.fullmatch(check):
+        raise bad("check_sha is not a 40-character lowercase hex sha")
+    bugs, cleans = data["bug_units"], data["clean_units"]
+    if not isinstance(bugs, list) or not isinstance(cleans, list):
+        raise bad("bug_units and clean_units must be lists")
+    seen: set[str] = set()
+    for n, unit in enumerate(bugs):
+        if not isinstance(unit, dict) or set(unit) != _BUG_UNIT_KEYS:
+            raise bad(f"bug unit {n} keys differ from the bug-unit keys")
+        for key in ("b_parent", "b", "fix_parent", "fix"):
+            v = unit[key]
+            if not isinstance(v, str) or not _SHA1_RE.fullmatch(v):
+                raise bad(f"bug unit {n}: {key} is not a 40-character lowercase hex sha")
+        v = unit["selection_record_sha256"]
+        if not isinstance(v, str) or not _SHA256_RE.fullmatch(v):
+            raise bad(f"bug unit {n}: selection_record_sha256 is not a 64-character hex")
+        for key in ("id", "note", "unit_repo", "selection_record"):
+            if not isinstance(unit[key], str) or not unit[key].strip():
+                raise bad(f"bug unit {n}: {key} is not a non-empty string")
+        if unit["unit_repo"] != repo:
+            raise bad(f"bug unit {n}: unit_repo is not {repo}")
+        if unit["id"] != f"{name}-bug-{unit['fix'][:8]}":
+            raise bad(f"bug unit {n}: id is not {name}-bug-<fix[:8]>")
+        if unit["id"] in seen:
+            raise bad(f"bug unit {n}: id {unit['id']} is repeated")
+        seen.add(unit["id"])
+    for n, unit in enumerate(cleans):
+        if not isinstance(unit, dict) or not _APP_CLEAN_KEYS <= set(unit):
+            raise bad(f"clean unit {n} lacks sha and first_parent")
+        for key in _APP_CLEAN_KEYS:
+            v = unit[key]
+            if not isinstance(v, str) or not _SHA1_RE.fullmatch(v):
+                raise bad(f"clean unit {n}: {key} is not a 40-character lowercase hex sha")
+        uid = f"{name}-clean-{unit['sha'][:12]}"
+        if uid in seen:
+            raise bad(f"clean unit {n}: id {uid} is repeated")
+        seen.add(uid)
+    return AppGroup(
+        name,
+        repo,
+        str(data["contract"]),
+        openapi,
+        check,
+        [dict(u) for u in bugs],
+        [dict(u) for u in cleans],
+    )
+
+
+def app_units(group: AppGroup) -> list[Unit]:
+    """The app group's bug units, then its clean units (empty until they are selected)."""
+    units = [
+        Unit(
+            str(b["id"]),
+            "bug",
+            group.name,
+            "sandbox",
+            str(b["b_parent"]),
+            str(b["b"]),
+            None,
+            False,
+            str(b["fix_parent"]),
+            str(b["fix"]),
+            group.name,
+        )
+        for b in group.bug_units
+    ]
+    units += [
+        Unit(
+            f"{group.name}-clean-{str(c['sha'])[:12]}",
+            "clean",
+            group.name,
+            "sandbox",
+            str(c["first_parent"]),
+            str(c["sha"]),
+            None,
+            False,
+            None,
+            None,
+            group.name,
+        )
+        for c in group.clean_units
+    ]
+    return units
+
+
+def check_unit(group: AppGroup) -> Unit:
+    """The rehearsal's check unit: both sides at the app's HEAD (no change, no verdict)."""
+    return Unit(
+        f"{group.name}-check",
+        "check",
+        group.name,
+        "sandbox",
+        group.check_sha,
+        group.check_sha,
+        None,
+        False,
+        None,
+        None,
+        group.name,
+    )
+
+
 def load_units(which: str = "all") -> list[Unit]:
     """All units of the selected group (default: all). The paperless bug unit file is required
-    only when the paperless group is part of the selection."""
+    only when the paperless group is part of the selection. An app group reads its own file."""
+    if which in APP_UNITS_FILES:
+        return app_units(load_app_group(which))
     bugs = load_paperless_bug_units() if which in ("all", "paperless") else None
     mutants = json.loads(MUTANTS_JSON.read_text(encoding="utf-8"))
     clean = json.loads(CLEAN_UNITS_JSON.read_text(encoding="utf-8"))
@@ -260,9 +429,9 @@ def load_units(which: str = "all") -> list[Unit]:
 
 
 def select_units(units: list[Unit], which: str) -> list[Unit]:
-    if which not in GROUPS:
-        raise GateError(f"units must be one of {GROUPS}, got {which!r}")
-    return [u for u in units if which == "all" or u.group == which]
+    if which not in CLI_GROUPS:
+        raise GateError(f"units must be one of {CLI_GROUPS}, got {which!r}")
+    return [u for u in units if u.group == which or (which == "all" and u.group in GROUPS)]
 
 
 # --------------------------------------------------------------------------
@@ -461,6 +630,8 @@ def row_from_result(
         "timings_seconds": m.get("timings_seconds") or {},
         "wall_seconds": round(wall_seconds, 1),
         "rate_2xx": round(ok2xx / reqs, 3) if reqs else None,
+        "mapped_by": m.get("mapped_by"),
+        "request_acceptance": m.get("request_acceptance"),
         "impacted_2xx": impacted,
         "confirmed": None,
         "error": None,
@@ -499,6 +670,8 @@ def error_row(
         "timings_seconds": {},
         "wall_seconds": round(wall_seconds, 1),
         "rate_2xx": None,
+        "mapped_by": None,
+        "request_acceptance": None,
         "impacted_2xx": {},
         "confirmed": None,
         "error": error,
@@ -540,6 +713,57 @@ def round4_block(rows: list[dict[str, Any]], bug_ids: list[str]) -> dict[str, An
         },
         "bug_units_missing": [i for i in bug_ids if i not in by],
     }
+
+
+APP_BUG_FIELDS = (
+    ("verdict", "verdict"),
+    ("cause", "cause"),
+    ("confirmed", "confirmed"),
+    ("executable_changed_lines", "executable_changed_lines"),
+    ("lines_reached", "lines_reached"),
+    ("requests_hitting_changed_code", "requests_hitting_changed_code"),
+    ("differences_found", "differences"),
+    ("differences_judged", "differences_judged"),
+    ("mapped_by", "mapped_by"),  # {"head", "base"}; None when the run did not map
+    ("request_acceptance", "request_acceptance"),  # {"head", "base"}; None when not reported
+    ("impacted_2xx_rate", "rate_2xx"),  # the impacted operations' 2xx share (head run)
+    ("impacted_2xx", "impacted_2xx"),
+)
+_REGISTERED_GROUPS = ("golden", "mutants", "paperless")
+
+
+def app_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per app group (any group other than golden, mutants, paperless): what the run showed.
+
+    Per bug unit: verdict, cause, confirmed, executable changed lines, lines reached, requests
+    hitting changed code, differences found and judged, mapped_by and request acceptance. Per
+    clean unit: verdict and cause. Then the false alarms (FAIL on a clean unit), the largest
+    token use and the provider failures. Ids, verdicts and counts only; no criterion here is
+    pre-registered, so nothing in this block is a PASS or a FAIL of the gate.
+    """
+    out: dict[str, Any] = {}
+    named = {str(r["group"]) for r in rows if r.get("group")}
+    for group in sorted(named - set(_REGISTERED_GROUPS)):
+        grows = [r for r in rows if r.get("group") == group]
+        bugs = [r for r in grows if r["kind"] == "bug"]
+        cleans = [r for r in grows if r["kind"] == "clean"]
+        out[group] = {
+            "bug_units": {
+                str(r["unit"]): {name: r.get(src) for name, src in APP_BUG_FIELDS} for r in bugs
+            },
+            "clean_units": {
+                str(r["unit"]): {"verdict": r["verdict"], "cause": r["cause"]} for r in cleans
+            },
+            "false_alarms": sorted(str(r["unit"]) for r in cleans if r["verdict"] == FAIL),
+            "false_alarm_count": sum(1 for r in cleans if r["verdict"] == FAIL),
+            "clean_units_run": len(cleans),
+            "max_tokens": max((int(r["tokens"]) for r in grows), default=0),
+            "provider_failures": {
+                str(r["unit"]): r["model_errors"] for r in grows if r["model_errors"]
+            },
+            "errors": sorted(str(r["unit"]) for r in grows if r["error"]),
+        }
+    return out
 
 
 def compute_summary(
@@ -677,7 +901,7 @@ def compute_summary(
     for r in rows:
         key = r["verdict"] or "ERROR"
         verdicts[key] = verdicts.get(key, 0) + 1
-    return {
+    summary: dict[str, Any] = {
         "measured_result": False,
         "units_expected": len(expect),
         "units_run": len(rows),
@@ -689,6 +913,10 @@ def compute_summary(
         "criteria": crit,
         "round4": round4_block(rows, [i for i in expect if i.startswith(BUG_UNIT_PREFIX)]),
     }
+    groups = app_block(rows)
+    if groups:
+        summary["app_block"] = groups
+    return summary
 
 
 # --------------------------------------------------------------------------
@@ -702,6 +930,7 @@ class GateConfig:
     workdir: Path
     which: str = "all"
     paperless_repo: Path | None = None
+    app_repos: dict[str, Path] = field(default_factory=dict)  # app group name -> a full clone
     python: Path | None = None  # host-mode interpreter; built from the golden requirements if None
     golden_mode: str = "sandbox"  # tests only: "host" runs the golden units on the host too
     keep_work: bool = False
@@ -827,9 +1056,34 @@ def run_confirm(
     return out
 
 
+def _app_repo(cfg: GateConfig, unit: Unit) -> Path | None:
+    """The clone an external unit runs on (None when it was not given)."""
+    return cfg.app_repos.get(unit.app) if unit.app else cfg.paperless_repo
+
+
+def _missing_repo_message(unit: Unit) -> str:
+    if unit.app:
+        return f"{unit.app} repo not given (--{unit.app}-repo)"
+    return "paperless repo not given (--paperless-repo)"
+
+
 def _unit_rc(
     cfg: GateConfig, unit: Unit, repos: _Repos, out_dir: Path, mode: str
 ) -> lean_run.LeanRunConfig:
+    if unit.app:
+        group = load_app_group(unit.app)
+        app_repo = _app_repo(cfg, unit)
+        assert app_repo is not None
+        return lean_run.LeanRunConfig(
+            repo=app_repo,
+            base=unit.base,
+            head=unit.head,
+            output_dir=out_dir,
+            unit_repo=group.repo,
+            intent=unit.intent,
+            no_sandbox=False,
+            openapi_path=group.openapi_path,
+        )
     if unit.paperless:
         assert cfg.paperless_repo is not None
         return lean_run.LeanRunConfig(
@@ -862,7 +1116,7 @@ def run_unit(cfg: GateConfig, unit: Unit, repos: _Repos) -> dict[str, Any]:
     out_dir = cfg.out / "units" / unit.id
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
-    console = (out_dir / "console.log").open("w", encoding="utf-8") if unit.paperless else None
+    console = (out_dir / "console.log").open("w", encoding="utf-8") if unit.external else None
 
     def log(msg: str) -> None:
         if console is not None:
@@ -881,7 +1135,9 @@ def run_unit(cfg: GateConfig, unit: Unit, repos: _Repos) -> dict[str, Any]:
             rc = _unit_rc(cfg, unit, repos, out_dir, mode)
             result, code = lean_run.lean_verify(rc, model_runner=cfg.runner, log=log)
             row = row_from_result(unit, result, code, wall_seconds=0.0, mode=mode)
-            if unit.id.startswith(BUG_UNIT_PREFIX) and result.verdict.status == FAIL:
+            if (
+                unit.id.startswith(BUG_UNIT_PREFIX) or (unit.app and unit.kind == "bug")
+            ) and result.verdict.status == FAIL:
                 row["confirmed"] = False
                 try:
                     flagged = flagged_from_verdict(
@@ -962,16 +1218,16 @@ def run_gate(cfg: GateConfig) -> dict[str, Any]:
                 raise
             prep_error = f"golden preparation failed: {type(exc).__name__}: {str(exc)[:300]}"
     for unit in units:
-        if unit.paperless and cfg.paperless_repo is None:
-            row = error_row(unit, "paperless repo not given (--paperless-repo)", wall_seconds=0.0)
-        elif not unit.paperless and prep_error:
+        if unit.external and _app_repo(cfg, unit) is None:
+            row = error_row(unit, _missing_repo_message(unit), wall_seconds=0.0)
+        elif not unit.external and prep_error:
             row = error_row(unit, prep_error, wall_seconds=0.0)
         else:
             row = run_unit(cfg, unit, repos)
         rows.append(row)
         with results.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, sort_keys=True, default=str) + "\n")
-        print(log_line(row, unit.paperless), flush=True)
+        print(log_line(row, unit.external), flush=True)
         _write_summary(cfg, rows, expected)
     summary = _write_summary(cfg, rows, expected)
     for cid, c in summary["criteria"].items():
@@ -983,7 +1239,7 @@ def run_gate(cfg: GateConfig) -> dict[str, Any]:
 # No-model rehearsal (issue-register R5)
 # --------------------------------------------------------------------------
 
-REHEARSE_GROUPS = ("all", "golden", "paperless")
+REHEARSE_GROUPS = ("all", "golden", "paperless", *APP_UNITS_FILES)
 REHEARSE_STARTS = 3  # the first start plus two restarts, each on a restored seed database
 REHEARSAL_FILE = "rehearsal.jsonl"
 
@@ -992,6 +1248,10 @@ def rehearsal_units(which: str) -> list[Unit]:
     """The sandbox units of the selection (golden, paperless); never the host-mode mutants."""
     if which not in REHEARSE_GROUPS:
         raise GateError(f"units must be one of {REHEARSE_GROUPS} for a rehearsal, got {which!r}")
+    if which in APP_UNITS_FILES:
+        # before any unit is selected, the group still rehearses: one READY check unit at HEAD
+        units = select_units(load_units(which), which)
+        return units or [check_unit(load_app_group(which))]
     return [u for u in select_units(load_units(which), which) if u.group != "mutants"]
 
 
@@ -1076,7 +1336,7 @@ def rehearse_side(
                 repair=False,
                 env=pipeline.side_bootstrap_env(driver),
             )
-            steps = [auth.login] if auth is not None else []
+            steps = auth.login_steps() if auth is not None else []
             steps.append(pipeline.Step("GET", path, auth=auth is not None))
             res = runner(pipeline.Scenario(steps, f"GET {path}"))
         finally:
@@ -1171,11 +1431,11 @@ def run_rehearsal(cfg: GateConfig) -> list[dict[str, Any]]:
             prep_error = f"golden preparation failed: {type(exc).__name__}"
     rows: list[dict[str, Any]] = []
     for unit in units:
-        if unit.paperless and cfg.paperless_repo is None:
+        if unit.external and _app_repo(cfg, unit) is None:
             unit_rows = [_side_row(unit, label, "") for label in ("base", "head")]
             for r in unit_rows:
-                r["error"] = "paperless repo not given (--paperless-repo)"
-        elif not unit.paperless and prep_error:
+                r["error"] = _missing_repo_message(unit)
+        elif not unit.external and prep_error:
             unit_rows = [_side_row(unit, label, "") for label in ("base", "head")]
             for r in unit_rows:
                 r["error"] = prep_error
@@ -1196,10 +1456,12 @@ def run_rehearsal(cfg: GateConfig) -> list[dict[str, Any]]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Lean P6b gate driver (Stage 2 Phase 0).")
-    ap.add_argument("--units", choices=GROUPS, default="all")
+    ap.add_argument("--units", choices=CLI_GROUPS, default="all")
     ap.add_argument("--out", type=Path, help="output dir (results, summary, unit outputs)")
     ap.add_argument("--workdir", type=Path, help="scratch dir (golden repo, host venv)")
     ap.add_argument("--paperless-repo", type=Path, help="a full clone of paperless-ngx")
+    for app in APP_UNITS_FILES:
+        ap.add_argument(f"--{app}-repo", type=Path, help=f"a full clone of {app}")
     ap.add_argument("--list", action="store_true", help="print the selected unit ids and exit")
     ap.add_argument(
         "--rehearse",
@@ -1207,6 +1469,11 @@ def main(argv: list[str] | None = None) -> int:
         help="no-model rehearsal: provision, sign in, three starts and one request per side",
     )
     args = ap.parse_args(argv)
+    app_repos = {
+        app: getattr(args, f"{app}_repo")
+        for app in APP_UNITS_FILES
+        if getattr(args, f"{app}_repo") is not None
+    }
     try:
         if args.rehearse:
             units = rehearsal_units(args.units)
@@ -1226,6 +1493,7 @@ def main(argv: list[str] | None = None) -> int:
                     workdir=args.workdir,
                     which=args.units,
                     paperless_repo=args.paperless_repo,
+                    app_repos=app_repos,
                 )
             )
             return 0 if rows and all(r["ok"] for r in rows) else 1
@@ -1235,6 +1503,7 @@ def main(argv: list[str] | None = None) -> int:
                 workdir=args.workdir,
                 which=args.units,
                 paperless_repo=args.paperless_repo,
+                app_repos=app_repos,
             )
         )
     except GateError as exc:
