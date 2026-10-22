@@ -15,24 +15,33 @@ Pure functions over recorded exchanges; no I/O, no model.
   difference. Reported ``before``/``after`` values stay the raw ones.
 * Lists are compared order-insensitively where base vs base' (or head vs
   head') shows the order is not stable, and only then.
-* Hard oracles (code decides, no model): a head 5xx where base was below
-  500, a transport error or timeout on head only, a JSON body that no
-  longer parses, a Python traceback in head's server log that base's
-  logs do not have. Each must reproduce in both head runs, otherwise it is
-  recorded as noise (flaky), not as a failure.
+* Hard oracles (code decides, no model) flag only what the change made
+  worse: a head 5xx, transport error or timeout where the same request was
+  healthy (response received, below 500) in BOTH base runs; a body that no
+  longer parses as JSON where base answered 2xx JSON and head answers 2xx; a
+  Python traceback in head's server log that base's logs do not have and that
+  no excluded request explains. A request already failing on base is recorded
+  as ``preexisting_failure``, not a failure. Each must reproduce in both head
+  runs, otherwise it is flaky (never PASS).
+* Values that move with run time (ISO-8601 or epoch timestamps that lie inside
+  the wall-clock window of their own run) are noise (``run_time_value``).
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from proofdeploy.lean.http import (
     TOKEN_VAR,
     Exchange,
+    HttpClient,
     Scenario,
     capture_value,
 )
@@ -53,8 +62,15 @@ class RunData:
     order: list[ExKey] = field(default_factory=list)
     captures: dict[str, list[tuple[int, str, Any]]] = field(default_factory=dict)
     server_log: str = ""
+    # Wall-clock window of this run (epoch seconds): created before the app starts,
+    # extended each time a scenario's exchanges are added.
+    started_at: float = field(default_factory=time.time)
+    finished_at: float = 0.0
+    # When this run's side began provisioning (seed and cover phases stamp values then).
+    side_started_at: float | None = None
 
     def add(self, scenario: Scenario, exchanges: list[Exchange]) -> None:
+        self.finished_at = max(self.finished_at, time.time())
         for ex in exchanges:
             key = (ex.scenario_id, ex.step_index, ex.attempt)
             self.exchanges[key] = ex
@@ -203,6 +219,66 @@ def _norm_ct(headers: dict[str, str]) -> str | None:
 
 
 # --------------------------------------------------------------------------
+# Run-time values (R10)
+# --------------------------------------------------------------------------
+
+RUN_WINDOW_SLACK_S = 5.0  # clock reads before the first and after the last exchange
+RUN_TIME_REASON = "run_time_value"
+_EPOCH_S = (1e9, 1e11)  # 2001 .. 5138, in seconds
+_EPOCH_MS = (1e12, 1e14)  # the same range in milliseconds
+
+
+def parse_timestamp(value: Any) -> float | None:
+    """Epoch seconds of an ISO-8601 string or an epoch number (s or ms), else None.
+
+    A naive ISO time is read as UTC (the sandbox sets ``TZ=UTC``).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if _EPOCH_S[0] <= v < _EPOCH_S[1]:
+            return v
+        if _EPOCH_MS[0] <= v < _EPOCH_MS[1]:
+            return v / 1000.0
+        return None
+    if isinstance(value, str) and len(value) >= 16 and value[:4].isdigit():
+        try:
+            dt = datetime.fromisoformat(value.strip())
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    return None
+
+
+def run_window(run: RunData) -> tuple[float, float]:
+    """The run's wall-clock window, widened by the slack."""
+    end = run.finished_at if run.finished_at >= run.started_at else run.started_at
+    return run.started_at - RUN_WINDOW_SLACK_S, end + RUN_WINDOW_SLACK_S
+
+
+def side_windows(runs: dict[str, list[RunData]]) -> dict[str, tuple[float, float]]:
+    """Lifetime window per side: from the start of its provisioning to the end of its last run."""
+    out: dict[str, tuple[float, float]] = {}
+    for side, rs in runs.items():
+        lo = min((r.side_started_at if r.side_started_at is not None else r.started_at) for r in rs)
+        hi = max(max(r.finished_at, r.started_at) for r in rs)
+        out[side] = (lo - RUN_WINDOW_SLACK_S, hi + RUN_WINDOW_SLACK_S)
+    return out
+
+
+def is_run_time_value(values: list[Any], windows: list[tuple[float, float]]) -> bool:
+    """True when every run's value is a timestamp inside that run's own window."""
+    for v, (lo, hi) in zip(values, windows, strict=True):
+        ts = parse_timestamp(v)
+        if ts is None or not lo <= ts <= hi:
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------
 # Comparison
 # --------------------------------------------------------------------------
 
@@ -223,6 +299,10 @@ class Comparison:
     noise: list[NoiseItem] = field(default_factory=list)
     compared_exchanges: int = 0
     compared_fields: int = 0
+    # label -> [start, end] epoch seconds (with slack) used for ``run_time_value``
+    run_windows: dict[str, list[float]] = field(default_factory=dict)
+    # side -> [provisioning start, last run end] (with slack), the lifetime window
+    side_windows: dict[str, list[float]] = field(default_factory=dict)
 
     def noise_fields(self) -> list[str]:
         return sorted({n.field_path for n in self.noise})
@@ -256,6 +336,14 @@ def compare_runs(
 ) -> Comparison:
     """Differences and noise between the four runs."""
     result = Comparison()
+    windows = [run_window(r) for r in (base, base2, head, head2)]
+    result.run_windows = {
+        r.label: [round(w[0], 3), round(w[1], 3)]
+        for r, w in zip((base, base2, head, head2), windows, strict=True)
+    }
+    side_win = side_windows({"base": [base, base2], "head": [head, head2]})
+    result.side_windows = {k: [round(v[0], 3), round(v[1], 3)] for k, v in side_win.items()}
+    lifetime = [side_win["base"], side_win["base"], side_win["head"], side_win["head"]]
     if keys is None:
         seen: dict[ExKey, None] = {}
         for run in (base, head, base2, head2):
@@ -322,6 +410,16 @@ def compare_runs(
         for path, vals, raws in entries:
             result.compared_fields += 1
             shown = path if path.startswith("$") else display_path(path)
+            # Stable within each side: stamped once per side (seed, cover), so judge it against
+            # the side's lifetime. Moving between runs of a side: against each run's own window.
+            stable = raws[0] == raws[1] and raws[2] == raws[3]
+            if (
+                not path.startswith("$")
+                and len({_canon(r) for r in raws}) > 1
+                and is_run_time_value(raws, lifetime if stable else windows)
+            ):
+                result.noise.append(NoiseItem(request_id, shown, RUN_TIME_REASON))
+                continue
             if noisy(vals):
                 result.noise.append(NoiseItem(request_id, shown))
                 continue
@@ -368,33 +466,134 @@ def _is_json_container(body: Any) -> bool:
     return isinstance(body, (dict, list))
 
 
+def _healthy(ex: Exchange | None) -> bool:
+    """A response was received and it is below 500."""
+    return ex is not None and 0 < ex.status < 500
+
+
+def _is_2xx(ex: Exchange | None) -> bool:
+    return ex is not None and 200 <= ex.status < 300
+
+
+def _failed(ex: Exchange | None) -> bool:
+    """A 5xx or a transport error / timeout."""
+    return ex is not None and (ex.status >= 500 or _is_transport_error(ex))
+
+
+def http_timeout_seconds() -> float:
+    """The per-request timeout the replay client uses (recorded with every timeout)."""
+    default = inspect.signature(HttpClient.__init__).parameters["timeout"].default
+    return float(default)
+
+
+@dataclass
+class HardCheckNotes:
+    """What the hard checks set aside (and the timeout used), for the manifest."""
+
+    timeout_seconds: float = field(default_factory=http_timeout_seconds)
+    preexisting_failures: list[dict[str, Any]] = field(default_factory=list)
+    excluded_tracebacks: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        def uniq(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return list({_canon(r): r for r in rows}.values())
+
+        return {
+            "timeout_seconds": self.timeout_seconds,
+            "preexisting_failure": uniq(self.preexisting_failures),
+            "excluded_tracebacks": uniq(self.excluded_tracebacks),
+        }
+
+
+def _traceback_positions(log: str) -> list[tuple[int, str]]:
+    return [
+        (m.start(), _HEX_RE.sub("0x?", m.group("exc").strip())) for m in _TRACEBACK_RE.finditer(log)
+    ]
+
+
+def request_windows(run: RunData) -> dict[ExKey, tuple[int, int]]:
+    """Where each request sits in the server log: ``key -> (start, next request's start)``.
+
+    A request's start is the next occurrence, in order, of ``METHOD /path`` in the
+    log. A request that cannot be found has no window (nothing is explained by it).
+    """
+    log = run.server_log
+    found: list[tuple[ExKey, int]] = []
+    pos = 0
+    for key in run.order:
+        ex = run.exchanges.get(key)
+        if ex is None:
+            continue
+        method = str(ex.request.get("method", "")).upper()
+        path = str(ex.request.get("url_path", ""))
+        at = -1
+        for needle in dict.fromkeys([f"{method} {path}", f"{method} {path.partition('?')[0]}"]):
+            at = log.find(needle, pos)
+            if at >= 0:
+                break
+        if at < 0:
+            continue
+        found.append((key, at))
+        pos = at + 1
+    out: dict[ExKey, tuple[int, int]] = {}
+    for n, (key, at) in enumerate(found):
+        end = found[n + 1][1] if n + 1 < len(found) else len(log) + 1
+        out[key] = (at, end)
+    return out
+
+
 def find_hard_failures(
     base: RunData,
     base2: RunData,
     head: RunData,
     head2: RunData,
+    *,
+    notes: HardCheckNotes | None = None,
 ) -> tuple[list[HardFailure], list[HardFailure]]:
     """Hard failures that appear only after the change: ``(stable, flaky)``.
 
     ``stable`` reproduce in both head runs; ``flaky`` appear in exactly one
-    head run. Both need a base that is clean in BOTH base runs: a failure the
-    base shows too varies independent of the change, so it is noise (and is
-    left to the comparison). A head-only one-off is not noise; it is a
-    regression signal that the verdict must not pass over.
+    head run. A failure counts only if the change made the request worse:
+
+    * 5xx / transport error / timeout: the request must be healthy (response
+      received, status below 500) in BOTH base runs; otherwise it is recorded in
+      ``notes.preexisting_failures`` and is not a failure.
+    * body not parseable as JSON: head answers 2xx where both base runs answered
+      2xx with a JSON body (a 4xx with a text body is data).
+    * new traceback in head's server log: not one that sits in the log window of
+      a request excluded above (recorded in ``notes.excluded_tracebacks``).
+
+    A head-only one-off is not noise; it is a regression signal that the verdict
+    must not pass over.
     """
+    if notes is None:
+        notes = HardCheckNotes()
     failures: list[HardFailure] = []
     flaky: list[HardFailure] = []
     seen: dict[ExKey, None] = {}
     for run in (head, head2):
         for k in run.order:
             seen.setdefault(k, None)
+    excluded: dict[str, set[ExKey]] = {head.label: set(), head2.label: set()}
     for key in seen:
         eb, eb2, eh, eh2 = (r.exchanges.get(key) for r in (base, base2, head, head2))
         rid = f"{key[0]}:{key[1]}"
         sb, sb2, sh, sh2 = (_status(e) for e in (eb, eb2, eh, eh2))
-        base_ok = sb < 500 and sb2 < 500
-        # 5xx on head where base was below 500 in both runs
-        if base_ok and (sh >= 500 or sh2 >= 500):
+        base_healthy = _healthy(eb) and _healthy(eb2)
+        if not base_healthy and (_failed(eh) or _failed(eh2)):
+            notes.preexisting_failures.append(
+                {
+                    "request_id": rid,
+                    "kind": "preexisting_failure",
+                    "detail": f"base {sb}/{sb2}, head {sh}/{sh2} at {_where(eh or eh2)}",
+                }
+            )
+            for run, e in ((head, eh), (head2, eh2)):
+                if _failed(e):
+                    excluded[run.label].add(key)
+            continue
+        # 5xx on head where base was healthy in both runs
+        if base_healthy and (sh >= 500 or sh2 >= 500):
             if sh >= 500 and sh2 >= 500:
                 failures.append(
                     HardFailure(rid, "5xx", f"head answered HTTP {sh} (base {sb}) at {_where(eh)}")
@@ -410,30 +609,35 @@ def find_hard_failures(
                 )
             continue
         # connection error / timeout on head, none on base
-        base_up = not _is_transport_error(eb) and not _is_transport_error(eb2)
         t_h, t_h2 = _is_transport_error(eh), _is_transport_error(eh2)
-        if base_up and (t_h or t_h2):
+        if base_healthy and (t_h or t_h2):
             bad = eh if t_h else eh2
             text = str(bad.body_json_or_text if bad else "")
             kind = (
                 "timeout" if "timed out" in text.lower() or "timeout" in text.lower() else "crash"
             )
+            limit = f"(client timeout {notes.timeout_seconds:g}s) " if kind == "timeout" else ""
             if t_h and t_h2:
-                failures.append(HardFailure(rid, kind, f"{text[:200]} at {_where(eh)}"))
+                failures.append(HardFailure(rid, kind, f"{limit}{text[:200]} at {_where(eh)}"))
             else:
                 flaky.append(
                     HardFailure(
-                        rid, kind, f"in only one of two head runs: {text[:200]} at {_where(bad)}"
+                        rid,
+                        kind,
+                        f"{limit}in only one of two head runs: {text[:200]} at {_where(bad)}",
                     )
                 )
             continue
-        # a JSON body that no longer parses
+        # a JSON body that no longer parses: head 2xx where base answered 2xx JSON
         if (
-            _is_json_container(_body(eb))
+            _is_2xx(eb)
+            and _is_2xx(eb2)
+            and _is_json_container(_body(eb))
             and _is_json_container(_body(eb2))
+            and _is_2xx(eh)
+            and _is_2xx(eh2)
             and eh is not None
             and eh2 is not None
-            and sh < 500
             and isinstance(eh.body_json_or_text, str)
             and isinstance(eh2.body_json_or_text, str)
         ):
@@ -448,8 +652,31 @@ def find_hard_failures(
     base_sigs = set(traceback_signatures(base.server_log)) | set(
         traceback_signatures(base2.server_log)
     )
-    new_h = [s for s in traceback_signatures(head.server_log) if s not in base_sigs]
-    new_h2 = [s for s in traceback_signatures(head2.server_log) if s not in base_sigs]
+
+    def new_sigs(run: RunData) -> list[str]:
+        located = request_windows(run) if excluded[run.label] else {}
+        windows = {k: w for k, w in located.items() if k in excluded[run.label]}
+        out: list[str] = []
+        for pos, sig in _traceback_positions(run.server_log):
+            if sig in base_sigs:
+                continue
+            owner = next((k for k, (lo, hi) in windows.items() if lo <= pos < hi), None)
+            if owner is not None:
+                notes.excluded_tracebacks.append(
+                    {
+                        "run": run.label,
+                        "request_id": f"{owner[0]}:{owner[1]}",
+                        "signature": sig,
+                        "reason": "inside the log window of a request already excluded as "
+                        "preexisting_failure",
+                    }
+                )
+                continue
+            out.append(sig)
+        return out
+
+    new_h = new_sigs(head)
+    new_h2 = new_sigs(head2)
     for sig in dict.fromkeys([*new_h, *new_h2]):
         if sig in new_h and sig in new_h2:
             failures.append(
@@ -479,6 +706,7 @@ __all__ = [
     "RUN_LABELS",
     "Comparison",
     "ExKey",
+    "HardCheckNotes",
     "NoiseItem",
     "RunData",
     "compare_runs",
@@ -486,6 +714,9 @@ __all__ = [
     "display_path",
     "find_hard_failures",
     "flatten",
+    "parse_timestamp",
+    "request_windows",
+    "side_windows",
     "traceback_signatures",
     "unstable_list_paths",
 ]

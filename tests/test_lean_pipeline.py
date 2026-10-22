@@ -179,6 +179,15 @@ def test_golden_bug_is_a_judged_regression_and_fails(
     assert m["observable"] is True and m["unexercised_lines"] == []
     assert m["impacted_operations_head"]["GET /notes/{note_id}"]["2xx_rate"] == 1.0
     assert m["coverage"]["head"]["covered"] is True
+    assert m["mapped_by"] == {"head": "flask", "base": "flask"}
+    for side in ("head", "base"):
+        steps = [(a["step"], a["outcome"]) for a in m["mapping_attempts"][side]]
+        assert steps[-1] == ("flask", "mapped") and steps[0][0] == "openapi", steps
+    for side in ("head", "base"):
+        acc = m["request_acceptance"][side]
+        assert acc["requests"] == m["cover_loop"][side]["requests"] > 0
+        assert acc["non_4xx"] == acc["requests"] - m["cover_loop"][side]["4xx"]
+        assert acc["rate"] == round(acc["non_4xx"] / acc["requests"], 3)
     for stage in ("diff", "index_head", "cover_head", "run_base", "run_base2", "run_head2"):
         assert stage in m["timings_seconds"], m["timings_seconds"]
     assert "verdict: FAIL (judged_regression)" in out
@@ -511,6 +520,11 @@ def test_an_app_that_cannot_be_mapped_is_a_typed_refusal_exit_3(
         golden, "base", "bug", tmp_path / "out", NoModel(), "--flask-target", "no_such_module"
     )
     assert code == 3 and m["verdict"]["cause"] == "cannot_map"
+    steps = {a["step"]: a for a in m["mapping_attempts"]}
+    assert list(steps) == ["openapi", "flask", "django"]
+    # the Django dump ran in the golden (Flask-only) interpreter and failed: the reason is kept
+    assert steps["django"]["outcome"].startswith("exit 1: "), steps["django"]
+    assert "django: exit 1" in m["verdict"]["details"]["message"]
 
 
 # --------------------------------------------------------------------------
@@ -909,3 +923,24 @@ def test_the_record_never_carries_the_model_key(
     run_golden(golden, "intermediate", "clean", tmp_path / "out", stub)
     for f in (tmp_path / "out").glob("*.json"):
         assert secret not in f.read_text(encoding="utf-8")
+
+
+def test_manifest_carries_hard_check_notes_run_windows_and_side_windows(
+    golden: dict[str, Any], ci_env: None, tmp_path: Path
+) -> None:
+    code, m = run_golden(golden, "intermediate", "clean", tmp_path / "out", PromptStub(clean_rule))
+    assert code == 0, m["verdict"]
+    assert set(m["hard_check_notes"]) == {
+        "timeout_seconds",
+        "preexisting_failure",
+        "excluded_tracebacks",
+    }
+    assert m["hard_check_notes"]["timeout_seconds"] == 10.0
+    assert set(m["run_windows"]) == {"base", "base2", "head", "head2"}
+    assert set(m["side_windows"]) == {"base", "head"}
+    for side in ("base", "head"):
+        lo, hi = m["side_windows"][side]
+        assert lo < hi
+        # the side's lifetime starts at its provisioning, before its first replay run begins
+        assert m["sides"][side]["provisioned_at"] is not None
+        assert lo < min(m["run_windows"][r][0] for r in (side, side + "2"))

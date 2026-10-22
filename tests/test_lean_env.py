@@ -677,7 +677,12 @@ def test_rehearse_workflow_has_no_environment_no_secrets_and_least_permissions()
     on = data.get("on", data.get(True))
     assert list(on) == ["workflow_dispatch"]
     units = on["workflow_dispatch"]["inputs"]["units"]
-    assert units["type"] == "choice" and units["options"] == ["all", "golden", "paperless"]
+    assert units["type"] == "choice" and units["options"] == [
+        "all",
+        "golden",
+        "paperless",
+        "linkding",
+    ]
     assert data["permissions"] == {"contents": "read"}
     assert "concurrency" not in data  # not in the model-calls group
     assert list(data["jobs"]) == ["rehearse"]

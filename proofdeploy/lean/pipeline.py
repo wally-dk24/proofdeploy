@@ -9,7 +9,8 @@ Stages (each timed):
 
 1. ``diff``      base..head -> ChangedLines; intent; seed facts
 2. ``index``     head (and base) app index: OpenAPI from the running side if
-                 it serves one, else the Flask url_map, else ``cannot_map``
+                 it serves one, else the Flask url_map, else the Django / DRF
+                 resolver and serializers, else ``cannot_map``
 3. ``impact``    P3 ``cover_change`` on head (added lines) and on base
                  (removed lines); the impact scenario set is the union
 4. ``runs``      the impact scenarios replayed on base, base', head, head',
@@ -40,6 +41,7 @@ from proofdeploy.lean import coverage as lc
 from proofdeploy.lean.compare import (
     RUN_LABELS,
     Comparison,
+    HardCheckNotes,
     NoiseItem,
     RunData,
     compare_runs,
@@ -65,6 +67,7 @@ from proofdeploy.lean.http import (
 from proofdeploy.lean.index import (
     AppIndex,
     fetch_openapi,
+    index_from_django_dump,
     index_from_flask_url_map,
     index_from_openapi,
 )
@@ -129,10 +132,14 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 class LeanRefusal(Exception):
     """The lean path does not support this unit (exit 3). ``code`` is the typed reason."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self, code: str, message: str, attempts: list[dict[str, Any]] | None = None
+    ) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        # ``mapping_attempts`` of a ``cannot_map``: one entry per tried step.
+        self.attempts: list[dict[str, Any]] = list(attempts or [])
 
 
 class LeanEnvironmentError(Exception):
@@ -175,6 +182,11 @@ class SideDriver(Protocol):
     def flask_rules(self, app: LiveApp, target: str) -> list[dict[str, Any]] | None:
         """Flask ``url_map`` rules of the app, or None when this driver cannot dump them."""
         ...
+
+    # Optional: ``django_routes(app) -> list[dict] | None``, the records of
+    # ``index.DJANGO_DUMP_SNIPPET`` run in the app's own interpreter and
+    # environment (``DJANGO_SETTINGS_MODULE``); a driver without the method
+    # cannot map a Django app.
 
     def describe(self) -> dict[str, Any]:
         """Facts for the run manifest (isolation, db snapshot, clock)."""
@@ -306,27 +318,53 @@ def build_index(
     *,
     app_name: str,
     seed_facts: list[str],
+    attempts: list[dict[str, Any]] | None = None,
 ) -> AppIndex:
-    """OpenAPI from the running side, else its Flask url_map, else ``cannot_map``."""
+    """OpenAPI from the running side, else its Flask url_map, else its Django / DRF
+    resolver (in that order), else ``cannot_map``. ``index.source_kind`` is the
+    ``mapped_by`` of the manifest: ``openapi`` | ``flask`` | ``django_drf`` | ``django``.
+
+    ``attempts`` (when given) receives one entry per tried step with its outcome
+    (``mapping_attempts`` of the manifest); a ``cannot_map`` carries the same list.
+    """
+    log: list[dict[str, Any]] = attempts if attempts is not None else []
     paths = (cfg.openapi_path,) if cfg.openapi_path else DEFAULT_OPENAPI_PATHS
     tried: list[str] = []
     for path in paths:
         try:
             doc = fetch_openapi(app.base_url, path=path, timeout=15)
-            return index_from_openapi(
+            idx = index_from_openapi(
                 doc, app=app_name, commit_sha=driver.sha, seed_facts=seed_facts
             )
+            log.append({"step": "openapi", "paths_tried": [*tried, path], "outcome": "mapped"})
+            return idx
         except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
             tried.append(f"{path}: {type(exc).__name__}")
+    log.append({"step": "openapi", "paths_tried": tried, "outcome": "no OpenAPI document served"})
     rules = driver.flask_rules(app, cfg.flask_target)
     if rules:
+        log.append({"step": "flask", "target": cfg.flask_target, "outcome": "mapped"})
         return index_from_flask_url_map(
             rules, app=app_name, commit_sha=driver.sha, seed_facts=seed_facts
         )
+    log.append({"step": "flask", "target": cfg.flask_target, "outcome": "no url_map could be read"})
+    dump = getattr(driver, "django_routes", None)
+    routes = dump(app) if callable(dump) else None
+    if routes:
+        log.append({"step": "django", "outcome": "mapped"})
+        return index_from_django_dump(
+            routes, app=app_name, commit_sha=driver.sha, seed_facts=seed_facts
+        )
+    why = str(getattr(driver, "django_diagnostic", "") or "")
+    if not callable(dump):
+        why = "this driver cannot dump a Django resolver"
+    log.append({"step": "django", "outcome": why or "no routes were dumped"})
     raise LeanRefusal(
         "cannot_map",
-        f"the {driver.label} side serves no OpenAPI document (tried {', '.join(tried)}) and "
-        f"no Flask url_map could be read (target {cfg.flask_target!r})",
+        f"the {driver.label} side serves no OpenAPI document (tried {', '.join(tried)}), "
+        f"no Flask url_map could be read (target {cfg.flask_target!r}) and no Django URL "
+        f"resolver could be read (django: {why or 'no routes were dumped'})",
+        attempts=log,
     )
 
 
@@ -551,6 +589,7 @@ def replay_run(
 ) -> RunData:
     """Replay the scenarios on a fresh app: same requests, same order, no repair."""
     data = RunData(label)
+    data.side_started_at = getattr(driver, "provisioned_at", None)
     app = driver.start(measured=False)
     try:
         runner = ScenarioRunner(
@@ -572,7 +611,10 @@ def replay_run(
 
 
 def settle_flaky(
-    runs: dict[str, RunData], flaky: list[HardFailure], hard: list[HardFailure]
+    runs: dict[str, RunData],
+    flaky: list[HardFailure],
+    hard: list[HardFailure],
+    notes: HardCheckNotes | None = None,
 ) -> tuple[list[HardFailure], list[HardFailure]]:
     """Use the third head run: a one-off that reproduces becomes a hard failure.
 
@@ -588,7 +630,7 @@ def settle_flaky(
 
     again: set[tuple[str, str, str]] = set()
     for other in (runs["head"], runs["head2"]):
-        stable, _ = find_hard_failures(runs["base"], runs["base2"], other, h3)
+        stable, _ = find_hard_failures(runs["base"], runs["base2"], other, h3, notes=notes)
         again |= {ident(h) for h in stable}
     still: list[HardFailure] = []
     hard = list(hard)
@@ -648,6 +690,13 @@ def loop_summary(exchanges: list[Exchange]) -> dict[str, Any]:
         "no_response": sum(1 for e in exchanges if e.status == 0),
         "with_auth": sum(1 for e in exchanges if e.auth_sent),
     }
+
+
+def acceptance_rate(exchanges: list[Exchange]) -> dict[str, Any]:
+    """The non-4xx share of the loop's requests (a mapping that fits the app is accepted)."""
+    n = len(exchanges)
+    ok = sum(1 for e in exchanges if not 400 <= e.status < 500)
+    return {"requests": n, "non_4xx": ok, "rate": round(ok / n, 3) if n else None}
 
 
 def loop_operation_rates(
@@ -714,6 +763,11 @@ def unit_identity(cfg: LeanConfig, contract: Any) -> str | None:
 
 
 def auth_proof_path(cfg: LeanConfig, contract: Any) -> str:
+    """The authenticated GET the sign-in proof sends: the contract's own ``auth.proof_path``
+    first, else the in-code map for the unit (a unit with neither is a typed refusal)."""
+    declared = (getattr(contract, "auth", None) or {}).get("proof_path")
+    if declared:
+        return str(declared)
     ident = unit_identity(cfg, contract)
     path = AUTH_PROOF_PATHS.get(ident or "")
     if path is None:
@@ -727,10 +781,25 @@ def auth_proof_path(cfg: LeanConfig, contract: Any) -> str:
 def prove_auth(driver: SideDriver, auth: AuthSpec, proof_path: str, *, side: str) -> dict[str, Any]:
     """Sign in with the contract's login step, then one authenticated GET to the proof path.
 
+    A static-token spec has no sign-in: the one request is the authenticated GET.
+
     Runs on a fresh unmeasured instance of the side, so the proof request leaves
     no trace in the coverage the impact loop reads. The record carries statuses
     and the path only (never a body, a token or a generated value).
     """
+    env = side_bootstrap_env(driver)
+    if auth.static_token_env is not None and not env.get(auth.static_token_env):
+        # No generated token for this side: nothing is started and nothing is sent.
+        return {
+            "side": side,
+            "ok": False,
+            "outcome": "unproven",
+            "proof_path": proof_path,
+            "login_status": None,
+            "proof_status": None,
+            "proof_auth_sent": False,
+            "reason": "static_token_missing",
+        }
     app = driver.start(measured=False)
     try:
         runner = ScenarioRunner(
@@ -738,17 +807,22 @@ def prove_auth(driver: SideDriver, auth: AuthSpec, proof_path: str, *, side: str
             auth=auth,
             session=None,
             repair=False,
-            env=side_bootstrap_env(driver),
+            env=env,
         )
         proof = Step("GET", proof_path, auth=True)
-        res = runner(Scenario([auth.login, proof], f"GET {proof_path}"))
+        res = runner(Scenario([*auth.login_steps(), proof], f"GET {proof_path}"))
     finally:
         app.stop()
-    login_status = res.exchanges[0].status if res.exchanges else 0
-    proof_ex = res.exchanges[1] if len(res.exchanges) > 1 else None
+    if auth.is_static:  # no sign-in request: the proof request is the only exchange
+        login_status: int | None = None
+        proof_ex = res.exchanges[0] if res.exchanges else None
+        login_ok = True
+    else:
+        login_status = res.exchanges[0].status if res.exchanges else 0
+        proof_ex = res.exchanges[1] if len(res.exchanges) > 1 else None
+        login_ok = 200 <= login_status < 300
     proof_status = proof_ex.status if proof_ex else None
     sent = bool(proof_ex is not None and proof_ex.auth_sent)
-    login_ok = 200 <= login_status < 300
     if sent and proof_status is not None and 200 <= proof_status < 300:
         outcome = "2xx"
     elif sent and login_ok and proof_status is not None and proof_status >= 500:
@@ -852,6 +926,7 @@ def run_pipeline(
     cfg = replace(cfg, budget_requests=budget_rule["value"])
     index_head: AppIndex | None = None
     index_base: AppIndex | None = None
+    attempts: dict[str, list[dict[str, Any]]] = {"head": [], "base": []}
     impact_head = SideImpact(None, "no executable added lines")
     impact_base = SideImpact(None, "no executable removed lines")
 
@@ -893,7 +968,9 @@ def run_pipeline(
         try:
             with timings.stage("index_head"):
                 live = head.start(measured=True)
-                index_head = build_index(head, live, cfg, app_name=app_name, seed_facts=facts)
+                index_head = build_index(
+                    head, live, cfg, app_name=app_name, seed_facts=facts, attempts=attempts["head"]
+                )
         except BaseException:
             if live is not None:
                 live.stop()
@@ -909,7 +986,14 @@ def run_pipeline(
             with timings.stage("index_base"):
                 live = base.start(measured=True)
                 try:
-                    index_base = build_index(base, live, cfg, app_name=app_name, seed_facts=facts)
+                    index_base = build_index(
+                        base,
+                        live,
+                        cfg,
+                        app_name=app_name,
+                        seed_facts=facts,
+                        attempts=attempts["base"],
+                    )
                 except LeanRefusal:
                     if index_head is None:
                         raise
@@ -969,8 +1053,9 @@ def run_pipeline(
         comparison: Comparison = compare_runs(
             runs["base"], runs["base2"], runs["head"], runs["head2"]
         )
+        hard_notes = HardCheckNotes()
         hard, flaky_hard = find_hard_failures(
-            runs["base"], runs["base2"], runs["head"], runs["head2"]
+            runs["base"], runs["base2"], runs["head"], runs["head2"], notes=hard_notes
         )
     if flaky_hard:
         # A failure that appears after the change in only one of two head runs is a
@@ -980,7 +1065,7 @@ def run_pipeline(
         with timings.stage("run_head3"):
             runs["head3"] = replay_run(head, "head3", scenarios, auth)
         log(f"run head3: {runs['head3'].request_count()} request(s)")
-        flaky_hard, hard = settle_flaky(runs, flaky_hard, hard)
+        flaky_hard, hard = settle_flaky(runs, flaky_hard, hard, hard_notes)
     noise: list[NoiseItem] = list(comparison.noise)
 
     # 6. judge and decide ---------------------------------------------------------
@@ -1066,6 +1151,15 @@ def run_pipeline(
             if index_base
             else None,
         },
+        "mapped_by": {
+            "head": index_head.source_kind if index_head else None,
+            "base": index_base.source_kind if index_base else None,
+        },
+        "mapping_attempts": attempts,
+        "request_acceptance": {
+            "head": acceptance_rate(cover_head_ex),
+            "base": acceptance_rate(cover_base_ex),
+        },
         "coverage": {"head": impact_head.stats(), "base": impact_base.stats()},
         "auth_proof": auth_proof,
         "cover_loop": {
@@ -1090,6 +1184,9 @@ def run_pipeline(
         },
         "noise_fields": sorted({n.field_path for n in noise}),
         "noise": [n.to_dict() for n in noise],
+        "hard_check_notes": hard_notes.to_dict(),
+        "run_windows": comparison.run_windows,
+        "side_windows": comparison.side_windows,
         "hard_failures": [h.to_dict() for h in hard],
         "flaky_hard_failures": [h.to_dict() for h in flaky_hard],
         "judge": {

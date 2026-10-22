@@ -937,7 +937,7 @@ def test_workflow_is_dispatch_only_with_the_units_choice() -> None:
     assert list(on) == ["workflow_dispatch"]
     units = on["workflow_dispatch"]["inputs"]["units"]
     assert units["type"] == "choice" and units["default"] == "all"
-    assert units["options"] == ["all", "golden", "mutants", "paperless"]
+    assert units["options"] == ["all", "golden", "mutants", "paperless", "linkding"]
 
 
 def test_workflow_gates_serialization_permissions_and_timeout() -> None:
