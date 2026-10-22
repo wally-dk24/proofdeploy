@@ -14,10 +14,9 @@
 # unusable password: the token is the only credential.
 import os
 
+from bookmarks.models import ApiToken
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
-
-from bookmarks.models import ApiToken
 
 name = os.environ["LD_SUPERUSER_NAME"]
 key = os.environ["LD_API_TOKEN"]
