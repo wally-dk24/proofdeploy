@@ -42,6 +42,12 @@
 # frontend build only. Without this line the default detection (Node first)
 # provisioned a node image and migrate failed with `python: command not found`.
 runtime: python
+# runtime_line (WO-R5-V, D267; declared, never inferred): linkding's own image
+# is python:3.13.7 (docker/default.Dockerfile:14,51 at 27b7303b). Without this
+# line image selection took the highest pinned row satisfying requires-python
+# >=3.13, python 3.14, and walk 2 stopped at check (d) (readiness run
+# 39721872426: psycopg-binary==3.2.9 has no cp314 wheel).
+runtime_line: "3.13"
 app:
   path: "."
 build: "mkdir -p data/favicons data/previews data/assets"

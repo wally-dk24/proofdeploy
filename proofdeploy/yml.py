@@ -141,6 +141,10 @@ class RepoContract:
     # build), where the default detection order (Node first) picks the
     # wrong adapter. Absent means detection is unchanged.
     runtime: str | None = None
+    # The declared runtime line (optional, WO-R5-V): "MAJOR.MINOR",
+    # e.g. "3.13". Valid only together with `runtime`; DECLARED, never
+    # inferred. Image selection then uses only that line's pinned row.
+    runtime_line: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> RepoContract:
@@ -193,6 +197,9 @@ class RepoContract:
         app_path, app_port = _validate_app(data.get("app"))
         npm_flags = _validate_install(data.get("install"))
         runtime = _validate_runtime(data.get("runtime"))
+        runtime_line = _validate_runtime_line(
+            data.get("runtime_line"), runtime
+        )
         return cls(
             build=data["build"],
             start=data["start"],
@@ -207,6 +214,7 @@ class RepoContract:
             app_port=app_port,
             npm_flags=npm_flags,
             runtime=runtime,
+            runtime_line=runtime_line,
         )
 
 
@@ -276,6 +284,29 @@ def _validate_runtime(runtime: Any) -> str | None:
             f"{', '.join(_RUNTIMES)}, got: {runtime!r}"
         )
     return runtime
+
+
+_RUNTIME_LINE_RE = re.compile(r"^\d+\.\d+$")
+
+
+def _validate_runtime_line(line: Any, runtime: str | None) -> str | None:
+    """Validate the contract's optional `runtime_line:` (WO-R5-V).
+
+    A string `MAJOR.MINOR` (a YAML float such as 3.13 is refused: it
+    would lose "3.10" vs "3.1"). Valid only together with `runtime:`.
+    """
+    if line is None:
+        return None
+    if not isinstance(line, str) or not _RUNTIME_LINE_RE.match(line):
+        raise ValueError(
+            "proofdeploy.yml 'runtime_line' must be a quoted "
+            f"MAJOR.MINOR string such as \"3.13\", got: {line!r}"
+        )
+    if runtime is None:
+        raise ValueError(
+            "proofdeploy.yml 'runtime_line' requires 'runtime' to be declared"
+        )
+    return line
 
 
 def _validate_install(install: Any) -> list[str]:

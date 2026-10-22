@@ -199,16 +199,34 @@ def load_images() -> list[ImageRow]:
     return list(_IMAGES_CACHE)
 
 
-def select_image(runtime: str, declared_range: str | None) -> ImageRow | None:
+def select_image(
+    runtime: str, declared_range: str | None, line: str | None = None
+) -> ImageRow | None:
     """Select the pinned image for a runtime + declared range.
 
     The highest table version satisfying the range wins. With no
     declared range, the runtime's default line (DEFAULT_IMAGE_LINES)
     is used. Returns None when no row satisfies the range.
+
+    ``line`` (WO-R5-V, a contract-declared "MAJOR.MINOR"): only rows
+    on that line are considered, the highest satisfying the range
+    wins, and there is never a fallback to another line.
     """
     rows = [r for r in load_images() if r.runtime == runtime]
     if not rows:
         return None
+    if line:
+        rows = [r for r in rows if r.version.startswith(line + ".")]
+        if not rows:
+            return None
+        if declared_range:
+            rows = [
+                r for r in rows
+                if satisfies_range(r.version, declared_range, runtime)
+            ]
+            if not rows:
+                return None
+        return max(rows, key=lambda r: _parse_version(r.version))
     if declared_range:
         satisfying = [
             r for r in rows
@@ -452,11 +470,19 @@ class ProvisioningAdapter(Protocol):
         ...
 
 
+def _declared_line(contract: Any, runtime: str) -> str | None:
+    """The contract's declared runtime line for this adapter (WO-R5-V)."""
+    if getattr(contract, "runtime", None) != runtime:
+        return None
+    line = getattr(contract, "runtime_line", None)
+    return line if isinstance(line, str) and line else None
+
+
 def _image_fields(
-    runtime: str, declared_range: str | None
+    runtime: str, declared_range: str | None, line: str | None = None
 ) -> dict[str, Any]:
     """The plan's image selection: pinned row, or a sandbox refusal."""
-    row = select_image(runtime, declared_range)
+    row = select_image(runtime, declared_range, line)
     if row is not None:
         return {
             "selected_version": row.version,
@@ -465,7 +491,23 @@ def _image_fields(
             "image_refusal": None,
         }
     refusal = None
-    if declared_range:
+    if line:
+        on_line = [
+            r for r in load_images()
+            if r.runtime == runtime and r.version.startswith(line + ".")
+        ]
+        if not on_line:
+            refusal = (
+                f"declared runtime line {runtime} {line} has no "
+                "pinned image"
+            )
+        else:
+            refusal = (
+                f"declared runtime line {runtime} {line}: no pinned "
+                f"image on that line satisfies declared range "
+                f"{declared_range}"
+            )
+    elif declared_range:
         refusal = (
             f"declared range {declared_range} not satisfiable "
             "by pinned images"
@@ -1418,7 +1460,9 @@ class PythonAdapter:
             declared_runtime=getattr(contract, "runtime", None) == "python",
         )
         assert det is not None, "plan() called without a python detection"
-        image = _image_fields("python", det.declared_range)
+        image = _image_fields(
+            "python", det.declared_range, _declared_line(contract, "python")
+        )
         found = find_lockfile(snapshot_dir, "python")
         # REG-A item 1: a COMPLETE committed lock installs frozen —
         # uv.lock / poetry.lock / pdm.lock by construction, or a
@@ -1944,7 +1988,9 @@ class NodeAdapter:
         # plain Node plan still never reads a commit time.
         det = self.detect(snapshot_dir)
         assert det is not None, "plan() called without a node detection"
-        image = _image_fields("node", det.declared_range)
+        image = _image_fields(
+            "node", det.declared_range, _declared_line(contract, "node")
+        )
         base: dict[str, Any] = {
             "adapter": self.name,
             "runtime": "node",
@@ -1990,7 +2036,9 @@ class NodeAdapter:
         assert det is not None, (
             "plan_workspace() called without a node detection"
         )
-        image = _image_fields("node", det.declared_range)
+        image = _image_fields(
+            "node", det.declared_range, _declared_line(contract, "node")
+        )
         base: dict[str, Any] = {
             "adapter": self.name,
             "runtime": "node",
