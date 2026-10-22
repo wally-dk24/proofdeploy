@@ -1186,6 +1186,10 @@ tests/test_probe.py::test_rejects_unknown_top_level_field
 tests/test_probe.py::test_valid_probe_passes
 tests/test_provisioning.py::test_adapter_plan_never_runs_a_command
 tests/test_provisioning.py::test_bun_workspace_plan_scopes_contract_steps
+tests/test_provisioning.py::test_declared_line_313_selects_the_pinned_313_row
+tests/test_provisioning.py::test_declared_line_outside_declared_range_is_a_typed_refusal
+tests/test_provisioning.py::test_declared_line_with_no_pinned_row_is_a_typed_refusal
+tests/test_provisioning.py::test_declared_node_line_selects_that_node_line
 tests/test_provisioning.py::test_declared_node_on_a_python_only_tree_is_a_typed_refusal
 tests/test_provisioning.py::test_declared_node_plans_node_on_a_mixed_tree
 tests/test_provisioning.py::test_declared_python_on_a_node_only_tree_is_a_typed_refusal
@@ -1197,7 +1201,9 @@ tests/test_provisioning.py::test_detect_workspace_from_pnpm_yaml
 tests/test_provisioning.py::test_images_table_covers_declared_ranges_and_current_releases
 tests/test_provisioning.py::test_images_table_is_committed_and_digest_pinned
 tests/test_provisioning.py::test_linkding_contract_declares_python_and_plans_python
+tests/test_provisioning.py::test_linkding_contract_plans_the_313_image
 tests/test_provisioning.py::test_mixed_tree_without_declared_runtime_is_node
+tests/test_provisioning.py::test_no_declared_line_still_selects_the_highest_row
 tests/test_provisioning.py::test_node_plan_bun_1_2_20_digest_pinned_from_package_manager
 tests/test_provisioning.py::test_node_plan_bun_digest_pinned_from_package_manager
 tests/test_provisioning.py::test_node_plan_bun_lockb_refused
@@ -1231,6 +1237,7 @@ tests/test_provisioning.py::test_regd_sample_lockfile_names_are_all_refused
 tests/test_provisioning.py::test_regd_sample_with_lockfile_is_refused_exactly
 tests/test_provisioning.py::test_select_image_bare_major_is_an_x_range
 tests/test_provisioning.py::test_select_image_bare_partial_and_exact_forms
+tests/test_provisioning.py::test_select_image_line_never_falls_back_to_another_line
 tests/test_provisioning.py::test_select_image_no_range_uses_default_line
 tests/test_provisioning.py::test_select_image_picks_highest_satisfying_version
 tests/test_provisioning.py::test_select_image_unsatisfiable_returns_none
@@ -2174,3 +2181,13 @@ tests/test_yml.py::test_runtime_invalid_value_rejected[3]
 tests/test_yml.py::test_runtime_invalid_value_rejected[Python]
 tests/test_yml.py::test_runtime_invalid_value_rejected[[python]]
 tests/test_yml.py::test_runtime_invalid_value_rejected[ruby]
+tests/test_yml.py::test_runtime_line_absent_defaults_to_none
+tests/test_yml.py::test_runtime_line_declared_loads
+tests/test_yml.py::test_runtime_line_invalid_value_rejected[""]
+tests/test_yml.py::test_runtime_line_invalid_value_rejected["3"]
+tests/test_yml.py::test_runtime_line_invalid_value_rejected["3.13.1"]
+tests/test_yml.py::test_runtime_line_invalid_value_rejected["v3.13"]
+tests/test_yml.py::test_runtime_line_invalid_value_rejected["x.y"]
+tests/test_yml.py::test_runtime_line_invalid_value_rejected[3.13]
+tests/test_yml.py::test_runtime_line_invalid_value_rejected[[3.13]]
+tests/test_yml.py::test_runtime_line_without_runtime_rejected

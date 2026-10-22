@@ -280,3 +280,31 @@ def test_runtime_declared_loads(tmp_path, value):
 def test_runtime_invalid_value_rejected(tmp_path, value):
     with pytest.raises(ValueError, match="'runtime' must be one of"):
         load_contract(write(tmp_path, VALID + f"runtime: {value}\n"))
+
+
+# --- runtime_line (WO-R5-V) ---
+
+
+def test_runtime_line_absent_defaults_to_none(tmp_path):
+    assert load_contract(write(tmp_path, VALID)).runtime_line is None
+
+
+def test_runtime_line_declared_loads(tmp_path):
+    c = load_contract(
+        write(tmp_path, VALID + 'runtime: python\nruntime_line: "3.13"\n')
+    )
+    assert c.runtime_line == "3.13"
+
+
+@pytest.mark.parametrize(
+    "value", ['"3"', '"3.13.1"', "3.13", '"x.y"', '""', '"v3.13"', "[3.13]"]
+)
+def test_runtime_line_invalid_value_rejected(tmp_path, value):
+    bad = VALID + f"runtime: python\nruntime_line: {value}\n"
+    with pytest.raises(ValueError, match="'runtime_line' must be"):
+        load_contract(write(tmp_path, bad))
+
+
+def test_runtime_line_without_runtime_rejected(tmp_path):
+    with pytest.raises(ValueError, match="requires 'runtime'"):
+        load_contract(write(tmp_path, VALID + 'runtime_line: "3.13"\n'))

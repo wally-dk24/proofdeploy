@@ -1153,3 +1153,102 @@ def test_linkding_contract_declares_python_and_plans_python(tmp_path):
     assert plan.adapter == "python"
     assert plan.declared_range == ">=3.13"
     assert plan.lockfile_name == "uv.lock"
+
+
+# ---------------------------------------------------------------------------
+# A contract-declared runtime line (WO-R5-V): image selection honours the
+# declared MAJOR.MINOR and never falls back to another line.
+# ---------------------------------------------------------------------------
+
+
+def _line_row(runtime: str, line: str):
+    from proofdeploy.provisioning import load_images
+
+    rows = [
+        r for r in load_images()
+        if r.runtime == runtime and r.version.startswith(line + ".")
+    ]
+    assert rows, f"images.lock has no {runtime} {line} row"
+    return max(rows, key=lambda r: tuple(map(int, r.version.split("."))))
+
+
+def test_declared_line_313_selects_the_pinned_313_row(tmp_path):
+    snap = _mixed_snapshot(tmp_path)
+    plan = plan_provisioning(
+        snap, _contract(runtime="python", runtime_line="3.13")
+    )
+    row = _line_row("python", "3.13")
+    assert plan.image_refusal is None
+    assert plan.selected_version == row.version
+    assert plan.selected_version.startswith("3.13.")
+    assert plan.image_ref == row.pinned_ref
+
+
+def test_no_declared_line_still_selects_the_highest_row(tmp_path):
+    snap = _mixed_snapshot(tmp_path)
+    plan = plan_provisioning(snap, _contract(runtime="python"))
+    assert plan.selected_version == select_image("python", ">=3.13").version
+    assert plan.selected_version.startswith("3.14.")
+
+
+def test_declared_line_outside_declared_range_is_a_typed_refusal(tmp_path):
+    snap = _mixed_snapshot(tmp_path)  # requires-python >=3.13
+    plan = plan_provisioning(
+        snap, _contract(runtime="python", runtime_line="3.12")
+    )
+    assert plan.image_ref is None
+    assert plan.selected_version is None
+    assert plan.image_refusal is not None
+    assert "python 3.12" in plan.image_refusal
+    assert ">=3.13" in plan.image_refusal
+
+
+def test_declared_line_with_no_pinned_row_is_a_typed_refusal(tmp_path):
+    snap = _mixed_snapshot(tmp_path)
+    plan = plan_provisioning(
+        snap, _contract(runtime="python", runtime_line="3.9")
+    )
+    assert plan.image_ref is None
+    assert plan.image_refusal is not None
+    assert "python 3.9" in plan.image_refusal
+    assert "no pinned image" in plan.image_refusal
+
+
+def test_select_image_line_never_falls_back_to_another_line():
+    assert select_image("python", None, "3.9") is None
+    assert select_image("python", ">=3.13", "3.12") is None
+    row = select_image("python", None, "3.12")
+    assert row is not None and row.version.startswith("3.12.")
+
+
+def test_declared_node_line_selects_that_node_line(tmp_path):
+    snap = _node_snapshot(
+        tmp_path,
+        package_json={"name": "n", "engines": {"node": ">=20"}},
+        lockfile="package-lock.json",
+    )
+    plan = plan_provisioning(
+        snap, _contract(runtime="node", runtime_line="22.23")
+    )
+    assert plan.image_refusal is None
+    assert plan.selected_version.startswith("22.23.")
+    refused = plan_provisioning(
+        snap, _contract(runtime="node", runtime_line="18.20")
+    )
+    assert refused.image_ref is None
+    assert "node 18.20" in refused.image_refusal
+
+
+def test_linkding_contract_plans_the_313_image(tmp_path):
+    from proofdeploy.yml import load_contract
+
+    contract = load_contract(
+        Path(__file__).resolve().parent.parent
+        / "readiness/contracts/sissbruecker__linkding.yml"
+    )
+    assert contract.runtime_line == "3.13"
+    plan = plan_provisioning(_mixed_snapshot(tmp_path), contract)
+    row = _line_row("python", "3.13")
+    assert plan.image_refusal is None
+    assert plan.selected_version == row.version
+    assert plan.image_ref == row.pinned_ref
