@@ -121,6 +121,7 @@ from proofdeploy.runner import (
     _PM_LOCKFILES,
     LOCKFILES,
     _parse_version,
+    _requires_python_from_toml,
     check_requirements_frozen,
     detect_runtime,
     find_lockfile,
@@ -1370,15 +1371,31 @@ class PythonAdapter:
 
     name = "python"
 
-    def detect(self, snapshot_dir: Path) -> Detection | None:
-        if (snapshot_dir / "package.json").is_file():
+    def detect(
+        self, snapshot_dir: Path, *, declared_runtime: bool = False
+    ) -> Detection | None:
+        # `declared_runtime` (WO-R5-R): the contract declares
+        # `runtime: python`, so a package.json beside the Python
+        # manifests (a frontend build) does not make Node win.
+        if (
+            not declared_runtime
+            and (snapshot_dir / "package.json").is_file()
+        ):
             return None  # Node wins, exactly as detect_runtime orders it
         if not (
             (snapshot_dir / "pyproject.toml").is_file()
             or (snapshot_dir / "requirements.txt").is_file()
         ):
             return None
-        _, declared = detect_runtime(snapshot_dir)
+        if declared_runtime:
+            pyproject = snapshot_dir / "pyproject.toml"
+            declared = (
+                _requires_python_from_toml(pyproject)
+                if pyproject.is_file()
+                else None
+            )
+        else:
+            _, declared = detect_runtime(snapshot_dir)
         source = (
             "pyproject.toml"
             if (snapshot_dir / "pyproject.toml").is_file()
@@ -1396,7 +1413,10 @@ class PythonAdapter:
         contract: Any,
         lock_cutoff: LockCutoff = None,
     ) -> InstallPlan:
-        det = self.detect(snapshot_dir)
+        det = self.detect(
+            snapshot_dir,
+            declared_runtime=getattr(contract, "runtime", None) == "python",
+        )
         assert det is not None, "plan() called without a python detection"
         image = _image_fields("python", det.declared_range)
         found = find_lockfile(snapshot_dir, "python")
@@ -2269,8 +2289,10 @@ class NodeAdapter:
         return isinstance(data, dict) and "workspaces" in data
 
 
+_PYTHON_ADAPTER = PythonAdapter()
+
 _ADAPTERS: dict[str, ProvisioningAdapter] = {
-    "python": PythonAdapter(),
+    "python": _PYTHON_ADAPTER,
     "node": NodeAdapter(),
 }
 
@@ -2295,6 +2317,27 @@ def plan_provisioning(
     the snapshot.
     """
     snap = Path(snapshot_dir)
+    declared = getattr(contract, "runtime", None)
+    if declared is not None:
+        # WO-R5-R: a declared runtime selects exactly that adapter.
+        # No silent fallback: if it does not detect its own manifests,
+        # the refusal names the declared runtime.
+        if declared not in _ADAPTERS:
+            raise ValueError(
+                f"contract declares unsupported runtime {declared!r}"
+            )
+        chosen = _ADAPTERS[declared]
+        if declared == "python":
+            detection = _PYTHON_ADAPTER.detect(snap, declared_runtime=True)
+        else:
+            detection = chosen.detect(snap)
+        if detection is None:
+            raise ValueError(
+                f"contract declares runtime {declared!r} but the "
+                f"snapshot has no {declared} manifests it can use "
+                f"in {snap}"
+            )
+        return chosen.plan(snap, contract, lock_cutoff=lock_cutoff)
     for name in _ADAPTER_ORDER:
         adapter = _ADAPTERS[name]
         if adapter.detect(snap) is not None:

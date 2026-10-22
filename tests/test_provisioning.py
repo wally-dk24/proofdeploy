@@ -1066,3 +1066,90 @@ def test_regd_absent_leaves_plan_untouched(tmp_path):
     )
     plan = plan_provisioning(snap, _contract(start="node server.js"))
     assert plan.regd is None
+
+
+# ---------------------------------------------------------------------------
+# A contract-declared runtime (WO-R5-R): a repo with a Python backend and a
+# package.json frontend build (linkding) is provisioned as the declared
+# runtime, never as whatever the default detection order finds first.
+# ---------------------------------------------------------------------------
+
+PYPROJECT_313 = '[project]\nname = "t"\nrequires-python = ">=3.13"\n'
+
+
+def _mixed_snapshot(tmp_path: Path) -> Path:
+    snap = _python_snapshot(tmp_path, pyproject=PYPROJECT_313)
+    (snap / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    (snap / "package.json").write_text(
+        json.dumps({"name": "frontend", "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+    (snap / "package-lock.json").write_text(
+        json.dumps({"lockfileVersion": 3}), encoding="utf-8"
+    )
+    return snap
+
+
+def test_mixed_tree_without_declared_runtime_is_node(tmp_path):
+    snap = _mixed_snapshot(tmp_path)
+    plan = plan_provisioning(snap, _contract())
+    assert plan.adapter == "node"
+    assert plan.runtime == "node"
+
+
+def test_declared_python_plans_python_on_a_mixed_tree(tmp_path):
+    snap = _mixed_snapshot(tmp_path)
+    plan = plan_provisioning(snap, _contract(runtime="python"))
+    assert plan.refusal is None
+    assert plan.adapter == "python"
+    assert plan.runtime == "python"
+    assert plan.declared_range == ">=3.13"
+    assert plan.lockfile_name == "uv.lock"
+    assert plan.package_manager == "uv"
+    # The python image line chosen from requires-python (>=3.13).
+    row = select_image("python", ">=3.13")
+    assert row is not None
+    assert plan.image_ref == row.pinned_ref
+    assert plan.image_refusal is None
+    assert "python" in plan.image_ref
+
+
+def test_declared_node_plans_node_on_a_mixed_tree(tmp_path):
+    snap = _mixed_snapshot(tmp_path)
+    plan = plan_provisioning(snap, _contract(runtime="node"))
+    assert plan.adapter == "node"
+
+
+def test_declared_node_on_a_python_only_tree_is_a_typed_refusal(tmp_path):
+    snap = _python_snapshot(tmp_path, pyproject=PYPROJECT_312)
+    (snap / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    # Without the declaration this tree plans as python; with it, no
+    # silent fallback: the refusal names the declared runtime.
+    assert plan_provisioning(snap, _contract()).adapter == "python"
+    with pytest.raises(ValueError, match="declares runtime 'node'"):
+        plan_provisioning(snap, _contract(runtime="node"))
+
+
+def test_declared_python_on_a_node_only_tree_is_a_typed_refusal(tmp_path):
+    snap = _node_snapshot(
+        tmp_path, package_json={"name": "n", "version": "1.0.0"},
+        lockfile="package-lock.json",
+    )
+    assert plan_provisioning(snap, _contract()).adapter == "node"
+    with pytest.raises(ValueError, match="declares runtime 'python'"):
+        plan_provisioning(snap, _contract(runtime="python"))
+
+
+def test_linkding_contract_declares_python_and_plans_python(tmp_path):
+    from proofdeploy.yml import load_contract
+
+    contract_file = (
+        Path(__file__).resolve().parent.parent
+        / "readiness/contracts/sissbruecker__linkding.yml"
+    )
+    contract = load_contract(contract_file)
+    assert contract.runtime == "python"
+    plan = plan_provisioning(_mixed_snapshot(tmp_path), contract)
+    assert plan.adapter == "python"
+    assert plan.declared_range == ">=3.13"
+    assert plan.lockfile_name == "uv.lock"

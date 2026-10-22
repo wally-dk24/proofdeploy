@@ -134,6 +134,13 @@ class RepoContract:
     # renders these into the install argv and records them on the
     # plan; they never apply to another manager's install.
     npm_flags: list[str] = field(default_factory=list)
+    # The app's declared runtime (optional, WO-R5-R): "python" or
+    # "node", validated at load, DECLARED and never inferred (like
+    # `app.port`). Set for a repo whose root carries the manifests of
+    # both ecosystems (a Python backend with a package.json frontend
+    # build), where the default detection order (Node first) picks the
+    # wrong adapter. Absent means detection is unchanged.
+    runtime: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> RepoContract:
@@ -185,6 +192,7 @@ class RepoContract:
             auth = _validate_auth(auth)
         app_path, app_port = _validate_app(data.get("app"))
         npm_flags = _validate_install(data.get("install"))
+        runtime = _validate_runtime(data.get("runtime"))
         return cls(
             build=data["build"],
             start=data["start"],
@@ -198,6 +206,7 @@ class RepoContract:
             app_path=app_path,
             app_port=app_port,
             npm_flags=npm_flags,
+            runtime=runtime,
         )
 
 
@@ -248,6 +257,25 @@ def _validate_app(app: Any) -> tuple[str | None, int | None]:
                 f"between 1 and 65535, got: {port!r}"
             )
     return str(Path(path)), port
+
+
+_RUNTIMES = ("python", "node")
+
+
+def _validate_runtime(runtime: Any) -> str | None:
+    """Validate the contract's optional `runtime:` (WO-R5-R).
+
+    Absent (or null) means detection is unchanged. Otherwise exactly
+    "python" or "node"; any other value is refused at load.
+    """
+    if runtime is None:
+        return None
+    if not isinstance(runtime, str) or runtime not in _RUNTIMES:
+        raise ValueError(
+            "proofdeploy.yml 'runtime' must be one of "
+            f"{', '.join(_RUNTIMES)}, got: {runtime!r}"
+        )
+    return runtime
 
 
 def _validate_install(install: Any) -> list[str]:

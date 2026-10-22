@@ -261,3 +261,22 @@ def test_install_npm_flags_duplicates_rejected(tmp_path):
     bad = VALID + 'install:\n  npm_flags: ["--legacy-peer-deps", "--legacy-peer-deps"]\n'
     with pytest.raises(ValueError, match="repeats '--legacy-peer-deps'"):
         load_contract(write(tmp_path, bad))
+
+
+# --- runtime (WO-R5-R) ---
+
+
+def test_runtime_absent_defaults_to_none(tmp_path):
+    assert load_contract(write(tmp_path, VALID)).runtime is None
+
+
+@pytest.mark.parametrize("value", ["python", "node"])
+def test_runtime_declared_loads(tmp_path, value):
+    c = load_contract(write(tmp_path, VALID + f"runtime: {value}\n"))
+    assert c.runtime == value
+
+
+@pytest.mark.parametrize("value", ["ruby", "Python", '""', "3", "[python]"])
+def test_runtime_invalid_value_rejected(tmp_path, value):
+    with pytest.raises(ValueError, match="'runtime' must be one of"):
+        load_contract(write(tmp_path, VALID + f"runtime: {value}\n"))
