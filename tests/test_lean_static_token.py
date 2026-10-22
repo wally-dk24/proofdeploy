@@ -779,12 +779,21 @@ def test_the_group_rehearses_the_real_contract_with_a_static_token(
     rows = gate.run_rehearsal(cfg)
     assert [r["ok"] for r in rows] == [True, True], rows
     assert all(
-        r["auth_proof"] == {"outcome": "2xx", "login_status": None, "proof_status": 200}
+        r["auth_proof"]
+        == {
+            "outcome": "2xx",
+            "login_status": None,
+            "proof_status": 200,
+            "unauthenticated_status": 401,  # the fake app refuses /api/ without the token
+        }
         for r in rows
     )
     assert all(r["request"] == {"path": "/api/user/profile/", "status": 200} for r in rows)
     assert all(m == "GET" and p == "/api/user/profile/" for m, p, _a in _App.hits)
-    assert all(a == f"Token {TOKEN}" for _m, _p, a in _App.hits) and len(_App.hits) == 4
+    # per side: the sign-in proof and the third start's request carry the token, then one bare
+    # request (no Authorization header) after them: 6 hits, 4 authenticated and 2 bare
+    assert len(_App.hits) == 6
+    assert [a for _m, _p, a in _App.hits] == [f"Token {TOKEN}", f"Token {TOKEN}", None] * 2
     assert [d.starts for d in sides] == [3, 3]
     assert TOKEN not in (tmp_path / "out" / "rehearsal.jsonl").read_text(encoding="utf-8")
 
