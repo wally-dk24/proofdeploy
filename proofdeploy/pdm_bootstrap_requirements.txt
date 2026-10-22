@@ -41,9 +41,9 @@ dep-logic==0.7.2 \
     --hash=sha256:2a3c49526075b0bc6825f0ea8c2d9f464de48b7b85f3f3d2900b4e5950fefedf \
     --hash=sha256:33640c4ba7fd45f2504442eb9e0c12e57dac253c748ca3925749548a5c556bae
     # via pdm
-distlib==0.4.3 \
-    --hash=sha256:4b0ce306c966eb73bc3a7b6abad017c556dadd92c44701562cd528ac7fde4d5b \
-    --hash=sha256:f152097224a0ae24be5a0f6bae1b9359af82133bce63f98a95f86cae1aede9ed
+distlib==0.4.4 \
+    --hash=sha256:ca4175b4ac7f71223cc30ed7248c45d2b38c2439d8ee6e498ab67ed63cf3508d \
+    --hash=sha256:cf09d55b1e85a89576b036aeb71550bfd68320f3f21761ca329eadadad918638
     # via virtualenv
 filelock==4.1.1 \
     --hash=sha256:3f4a557945a7b0f95efeb1f432267affe5d45ac8ddde2aed1b97ebb62382c089 \
