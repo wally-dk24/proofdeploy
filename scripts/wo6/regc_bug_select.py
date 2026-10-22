@@ -188,6 +188,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from collections.abc import Callable
@@ -224,8 +225,12 @@ LEAN_LANGUAGE_EXTENSIONS: dict[str, frozenset[str]] = {
     "python": frozenset({".py"}),
 }
 LEAN_REFUSAL = "not defined yet (R-LEAN-SEL 4)"
-# Lean mode has no check (e) (R-LEAN-SEL 3); L1/L2 follow (c).
-LEAN_CHECKS = ("a", "b", "c", "L1", "L2", "d")
+# Lean mode has no check (e) (R-LEAN-SEL 3); L1/L2 follow (c); L3
+# (R-LEAN-SEL Amendment 1, docs/registration/r-lean-sel-a1.md) follows L2.
+LEAN_CHECKS = ("a", "b", "c", "L1", "L2", "L3", "d")
+L3_REASON = "L3: predates the contract layout"
+# A dotted Python module name in a contract `env` value (A1 item 2).
+DOTTED_MODULE_RE = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")
 
 DEFAULT_SURVIVORS = (
     "docs/registration/wo6-regc-add2-closeout-2026-10-17/"
@@ -430,6 +435,76 @@ def lean_path_counts(paths: list[str], language: str) -> dict[str, int]:
     return counts
 
 
+def _manifest_for_plan(plan: Any) -> str:
+    """The manifest the provisioning plan reads (A1 item 1). The plan
+    records the lockfile it uses (`lockfile_name`); for a generated
+    Python lock or a requirements plan that name IS the manifest, and
+    for a committed uv/poetry/pdm lock the manifest is pyproject.toml;
+    a Node plan reads package.json."""
+    name = plan.lockfile_name
+    if plan.runtime == "python":
+        if name in ("requirements.txt", "pyproject.toml"):
+            return str(name)
+        return "pyproject.toml"
+    if plan.runtime == "node":
+        return "package.json"
+    raise HarnessError(
+        f"layout files refused: plan runtime {plan.runtime!r} has no "
+        "known manifest"
+    )
+
+
+def lean_layout_files(
+    repo: AppRepo, check_sha: str, contract: Any, app_path: str
+) -> list[str]:
+    """R-LEAN-SEL A1: the layout files, sorted, relative to the app
+    path, computed from the contract and the tree at check_sha (paths
+    and the plan's own inputs only; no commit is read). Raises
+    HarnessError when the provisioning plan cannot be computed: never
+    a silent empty list."""
+    from proofdeploy.provisioning import plan_provisioning
+
+    spec = check_sha if app_path in ("", ".") else f"{check_sha}:{app_path}"
+    with tempfile.TemporaryDirectory(prefix="l3-layout-") as tmp:
+        tar_path = Path(tmp) / "tree.tar"
+        tree = Path(tmp) / "tree"
+        tree.mkdir()
+        try:
+            repo._git("archive", "--format=tar", "-o", str(tar_path), spec)
+            with tarfile.open(tar_path) as tf:
+                tf.extractall(tree, filter="data")
+            plan = plan_provisioning(tree, contract)
+        except HarnessError:
+            raise
+        except Exception as exc:
+            raise HarnessError(
+                f"layout files refused: the provisioning plan for "
+                f"{check_sha} cannot be computed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if plan.refusal:
+            raise HarnessError(
+                f"layout files refused: the provisioning plan for "
+                f"{check_sha} is a refusal: {plan.refusal}"
+            )
+    files = {_manifest_for_plan(plan)}
+    if plan.lockfile_name and plan.lock_source != "generated":
+        files.add(plan.lockfile_name)
+    for value in (getattr(contract, "env", None) or {}).values():
+        if not isinstance(value, str) or not DOTTED_MODULE_RE.match(value):
+            continue
+        base = value.replace(".", "/")
+        for rel in (f"{base}.py", f"{base}/__init__.py"):
+            if repo.blob_exists(check_sha, _join_app(app_path, rel)):
+                files.add(rel)
+                break
+    return sorted(files)
+
+
+def _join_app(app_path: str, rel: str) -> str:
+    return rel if app_path in ("", ".") else f"{app_path.rstrip('/')}/{rel}"
+
+
 def lean_registered_sha256() -> str:
     """The sha256 of the registered R-LEAN-SEL text in this checkout,
     refused unless it is the signed one."""
@@ -491,6 +566,16 @@ class AppRepo:
             timeout=60,
         )
         return proc.returncode == 0
+
+    def blob_exists(self, sha: str, rel: str) -> bool:
+        """True when `rel` is a file in the tree of `sha` (paths only)."""
+        proc = subprocess.run(
+            ["git", "-C", str(self.path), "cat-file", "-t", f"{sha}:{rel}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return proc.returncode == 0 and proc.stdout.strip() == "blob"
 
     def walk_order(self, head_sha: str) -> list[CommitMeta]:
         """D169 Q1: `git rev-list --first-parent` from the recorded
@@ -930,10 +1015,14 @@ def evaluate_commit(
     *,
     rule: str = "regc",
     language: str | None = None,
+    layout_files: list[str] | None = None,
+    app_path: str = ".",
 ) -> dict[str, Any]:
     lean = rule == "lean"
     if lean and language not in LEAN_LANGUAGE_EXTENSIONS:
         raise HarnessError(f"lean language {language!r} is {LEAN_REFUSAL}")
+    if lean and layout_files is None:
+        raise HarnessError("lean walk refused: no layout files (R-LEAN-SEL A1)")
     entry: dict[str, Any] = {
         "sha": meta.sha,
         "committer_date": _iso(meta.committer_ts),
@@ -1027,6 +1116,7 @@ def evaluate_commit(
         return _lean_checks_l_and_d(
             repo, meta, entry, ready_pair, journal, language or "",
             parent, b_sha, reject, ran,
+            layout_files=layout_files or [], app_path=app_path,
         )
 
     if prompt_size is None:
@@ -1102,8 +1192,11 @@ def _lean_checks_l_and_d(
     b_sha: str,
     reject: Callable[[str, str], dict[str, Any]],
     ran: Callable[[str], None],
+    *,
+    layout_files: list[str],
+    app_path: str,
 ) -> dict[str, Any]:
-    """R-LEAN-SEL checks L (4) and d (5), after (c). Paths only."""
+    """R-LEAN-SEL checks L (4), L3 (A1) and d (5), after (c). Paths only."""
     b_parent = repo.first_parent(b_sha)
     if b_parent is None:
         raise HarnessError(
@@ -1124,6 +1217,23 @@ def _lean_checks_l_and_d(
         return reject("L2", "L2: no backend source in fix")
 
     assert parent is not None  # (c) passed, so a real fix^ exists
+    # L3 (R-LEAN-SEL A1): every layout file exists in B^, B, fix^, fix.
+    ran("L3")
+    missing: dict[str, list[str]] = {}
+    for side, side_sha in (
+        ("b_parent", b_parent), ("b", b_sha),
+        ("fix_parent", parent), ("fix", meta.sha),
+    ):
+        absent = [
+            f for f in layout_files
+            if not repo.blob_exists(side_sha, _join_app(app_path, f))
+        ]
+        if absent:
+            missing[side] = absent
+    if missing:
+        entry["l3_missing"] = missing
+        return reject("L3", L3_REASON)
+
     ran("d")
     # Check (d), extended (R-LEAN-SEL 5): the B pair first.
     b_sides = _run_check_d(
@@ -1372,6 +1482,7 @@ def select_fix(
     merge_base: str | None = None,
     rule: str = "regc",
     language: str | None = None,
+    layout_files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Walk in the registered order and build the output record.
 
@@ -1387,6 +1498,10 @@ def select_fix(
         if language not in LEAN_LANGUAGE_EXTENSIONS:
             raise HarnessError(f"lean language {language!r} is {LEAN_REFUSAL}")
         lean_sha = lean_registered_sha256()
+        if layout_files is None:
+            raise HarnessError(
+                "lean walk refused: no layout files (R-LEAN-SEL A1)"
+            )
     elif rule != "regc":
         raise HarnessError(f"unknown rule {rule!r}")
     ordered = repo.walk_order(str(app["head_sha"]))
@@ -1405,6 +1520,8 @@ def select_fix(
                 entry = evaluate_commit(
                     repo, meta, ready_pair, prompt_size, journal=journal,
                     rule=rule, language=language,
+                    layout_files=layout_files,
+                    app_path=str(app["app_path"]),
                 )
             except StopForRuling as stop_exc:
                 stopped = {
@@ -1464,6 +1581,7 @@ def select_fix(
         record["rule"] = LEAN_RULE_NAME
         record["rule_sha256"] = lean_sha
         record["language"] = language
+        record["layout_files"] = layout_files
     if selected is not None:
         record["selected"] = {
             "fix": selected["sha"],
@@ -2132,6 +2250,23 @@ def _clone_app(clone_dir: Path, repo_name: str, head_sha: str) -> AppRepo:
     return repo
 
 
+def _lean_layout_for_app(repo: AppRepo, app: dict[str, Any]) -> list[str]:
+    """The A1 layout files for the app: its store contract and the
+    ordered list's head_sha (the contract's check SHA)."""
+    from proofdeploy.yml import contract_store_path, load_contract
+
+    try:
+        contract = load_contract(contract_store_path(app["repo"]))
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        raise HarnessError(
+            f"layout files refused: store contract for {app['repo']} "
+            f"unreadable: {exc}"
+        ) from exc
+    return lean_layout_files(
+        repo, str(app["head_sha"]), contract, str(app["app_path"])
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -2224,6 +2359,13 @@ def main(argv: list[str] | None = None) -> int:
         lock = SingleWriterLock(journal_dir)
         lock.acquire()
         try:
+            repo: AppRepo | None = None
+            layout_files: list[str] | None = None
+            if lean:
+                # The layout list must be fixed before the walk and
+                # written into the journal header identity (A1).
+                repo = _clone_app(clone_dir, app["repo"], str(app["head_sha"]))
+                layout_files = _lean_layout_for_app(repo, app)
             journal, resumed, previous_cause = Journal.open(
                 journal_dir,
                 script_sha256=script_sha256,
@@ -2231,7 +2373,11 @@ def main(argv: list[str] | None = None) -> int:
                 app_repo=app["repo"],
                 app_head_sha=str(app["head_sha"]),
                 extra_identity=(
-                    {"rule": LEAN_RULE_NAME, "language": args.lean_language}
+                    {
+                        "rule": LEAN_RULE_NAME,
+                        "language": args.lean_language,
+                        "layout_files": layout_files,
+                    }
                     if lean
                     else None
                 ),
@@ -2239,7 +2385,8 @@ def main(argv: list[str] | None = None) -> int:
             journal.record_start(
                 resumed=resumed, previous_exit_cause=previous_cause
             )
-            repo = _clone_app(clone_dir, app["repo"], str(app["head_sha"]))
+            if repo is None:
+                repo = _clone_app(clone_dir, app["repo"], str(app["head_sha"]))
             if args.check_d == "github":
                 ready_pair = make_github_pair_checker(
                     repo_name=app["repo"]
@@ -2265,6 +2412,7 @@ def main(argv: list[str] | None = None) -> int:
                 merge_base=_detect_merge_base(),
                 rule=args.rule,
                 language=args.lean_language,
+                layout_files=layout_files,
             )
             args.out.parent.mkdir(parents=True, exist_ok=True)
             tmp = args.out.with_suffix(".tmp")

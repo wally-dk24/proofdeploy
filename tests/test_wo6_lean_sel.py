@@ -69,6 +69,7 @@ def all_ready(s: dict[str, Any]) -> FakeReady:
 
 def lean(s: dict[str, Any], ready: FakeReady, **kw: Any) -> dict[str, Any]:
     kw.setdefault("prompt_size", None)
+    kw.setdefault("layout_files", [])
     return mod.select_fix(
         repo=mod.AppRepo(s["repo"]),
         app=app_dict(s["fix"]),
@@ -206,7 +207,7 @@ def test_lean_selects_backend_unit_and_records_it(tmp_path: Path) -> None:
     assert rec["rule_sha256"] == SIGNED_SHA
     assert rec["language"] == "python"
     entry = only_walked(rec)
-    assert entry["checks_run"] == ["a", "b", "c", "L", "d"]
+    assert entry["checks_run"] == ["a", "b", "c", "L", "L3", "d"]
     assert "R-SIZE" in entry["e"]
     assert "author_prompt_chars" not in entry
     assert entry["l_counts"]["b"]["backend_source"] == 1
@@ -477,6 +478,7 @@ def test_main_lean_end_to_end(
         )
     )
     monkeypatch.setattr(mod, "_clone_app", lambda *a, **k: mod.AppRepo(s["repo"]))
+    monkeypatch.setattr(mod, "_lean_layout_for_app", lambda _r, _a: ["app.py"])
     ready = all_ready(s)
     monkeypatch.setattr(mod, "make_github_pair_checker", lambda **k: ready)
 
@@ -505,12 +507,14 @@ def test_main_lean_end_to_end(
     )
     text = capsys.readouterr().out
     assert rc == 0
-    assert "tally: a=1 b=0 c=0 L1=0 L2=0 d=0 selected=1" in text
+    assert "tally: a=1 b=0 c=0 L1=0 L2=0 L3=0 d=0 selected=1" in text
     assert "Fix the" not in text
     rec = json.loads(out.read_text())
     assert rec["rule"] == "R-LEAN-SEL" and rec["language"] == "python"
     header = json.loads((out.with_name("rec-journal") / "header.json").read_text())
     assert header["rule"] == "R-LEAN-SEL" and header["language"] == "python"
+    assert header["layout_files"] == ["app.py"]
+    assert rec["layout_files"] == ["app.py"]
 
 
 # ---------------------------------------------------------------------
@@ -619,3 +623,154 @@ def test_every_lean_walk_repo_with_a_contract_is_a_readiness_workflow_option() -
     wf = yaml.safe_load((root / ".github/workflows/readiness.yml").read_text(encoding="utf-8"))
     options = wf[True]["workflow_dispatch"]["inputs"]["repo"]["options"]  # YAML "on" parses True
     assert [r for r in walkable if r not in options] == []
+
+
+# ---------------------------------------------------------------------
+# R-LEAN-SEL Amendment 1: check L3 (the unit must fit the layout).
+# ---------------------------------------------------------------------
+
+A1_SHA = "80961a5a45b9e0d905850780ac767b57f03942881f64ab3d3dfa0b82a7b63552"
+ROOT = Path(__file__).resolve().parents[1]
+LINKDING_SHAPE = {
+    "pyproject.toml": '[project]\nname = "x"\nversion = "0"\nrequires-python = ">=3.13"\n',
+    "uv.lock": "version = 1\n",
+    "bookmarks/settings/prod.py": "DEBUG = False\n",
+    "bookmarks/settings/__init__.py": "",
+    "bookmarks/other.py": "x = 1\n",
+}
+
+
+def linkding_contract() -> Any:
+    from proofdeploy.yml import load_contract
+
+    return load_contract(ROOT / "readiness" / "contracts" / "sissbruecker__linkding.yml")
+
+
+def layout_history(tmp_path: Path) -> dict[str, Any]:
+    """Layout files from the first commit, then B, mid, fix."""
+    repo = init_repo(tmp_path)
+    s: dict[str, Any] = {"repo": repo}
+    first = {k: v for k, v in LINKDING_SHAPE.items()}
+    s["base"] = commit(repo, "Initial commit", ts(2026, 1, 10), first)
+    s["b"] = commit(repo, "Introduce the thing", ts(2026, 2, 1), {"bookmarks/app.py": "l1\nbug\n"})
+    add_tag(repo, "v1.0", ts(2026, 2, 2))
+    s["mid"] = commit(repo, "Add other module", ts(2026, 8, 1), {"bookmarks/other.py": "x = 2\n"})
+    s["fix"] = commit(repo, "Fix the thing", ts(2026, 8, 15), {"bookmarks/app.py": "l1\nfixed\n"})
+    return s
+
+
+def layout_lean(s: dict[str, Any], ready: FakeReady, layout: list[str]) -> dict[str, Any]:
+    app = app_dict(s["fix"])
+    app["app_path"] = "."
+    return mod.select_fix(
+        repo=mod.AppRepo(s["repo"]),
+        app=app,
+        ready_pair=ready,
+        prompt_size=None,
+        main_sha="f" * 40,
+        script_sha256="s" * 64,
+        rule="lean",
+        language="python",
+        layout_files=layout,
+    )
+
+
+def test_a1_registered_text_sha256_is_the_signed_one() -> None:
+    path = ROOT / "docs" / "registration" / "r-lean-sel-a1.md"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == A1_SHA
+
+
+def test_layout_files_of_a_linkding_shaped_tree(tmp_path: Path) -> None:
+    s = layout_history(tmp_path)
+    files = mod.lean_layout_files(mod.AppRepo(s["repo"]), s["fix"], linkding_contract(), ".")
+    assert files == ["bookmarks/settings/prod.py", "pyproject.toml", "uv.lock"]
+
+
+def test_layout_env_module_as_package_init_and_unresolved_ignored(tmp_path: Path) -> None:
+    from proofdeploy.yml import load_contract
+
+    s = layout_history(tmp_path)
+    contract = load_contract(ROOT / "readiness" / "contracts" / "sissbruecker__linkding.yml")
+    contract.env = {
+        "A": "bookmarks.settings",  # package: bookmarks/settings/__init__.py
+        "B": "no.such.module",  # resolves to nothing: ignored
+        "C": "not a module",  # not dotted: ignored
+        "D": "bookmarks.settings.prod",
+    }
+    files = mod.lean_layout_files(mod.AppRepo(s["repo"]), s["fix"], contract, ".")
+    assert files == [
+        "bookmarks/settings/__init__.py",
+        "bookmarks/settings/prod.py",
+        "pyproject.toml",
+        "uv.lock",
+    ]
+
+
+def test_layout_refuses_when_the_plan_cannot_be_computed(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    sha = commit(repo, "Initial commit", ts(2026, 1, 10), {"README.md": "hi\n"})
+    with pytest.raises(mod.HarnessError, match="layout files refused"):
+        mod.lean_layout_files(mod.AppRepo(repo), sha, linkding_contract(), ".")
+
+
+def test_lean_select_refuses_without_layout_files(tmp_path: Path) -> None:
+    s = backend_history(tmp_path)
+    with pytest.raises(mod.HarnessError, match="no layout files"):
+        mod.select_fix(
+            repo=mod.AppRepo(s["repo"]),
+            app=app_dict(s["fix"]),
+            ready_pair=all_ready(s),
+            prompt_size=None,
+            main_sha=None,
+            script_sha256="s" * 64,
+            rule="lean",
+            language="python",
+        )
+
+
+LAYOUT = ["bookmarks/settings/prod.py", "pyproject.toml", "uv.lock"]
+
+
+def test_l3_all_four_sides_with_the_files_proceeds_to_d(tmp_path: Path) -> None:
+    s = layout_history(tmp_path)
+    ready = FakeReady({s["base"], s["b"], s["mid"], s["fix"]})
+    rec = layout_lean(s, ready, LAYOUT)
+    entry = only_walked(rec)
+    assert entry["outcome"] == "selected"
+    assert entry["checks_run"] == ["a", "b", "c", "L", "L3", "d"]
+    assert "l3_missing" not in entry
+    assert len(ready.calls) == 2
+    assert rec["layout_files"] == LAYOUT
+
+
+def test_l3_b_pair_lacking_a_layout_file_is_rejected_without_dispatch(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    s: dict[str, Any] = {"repo": repo}
+    old = {k: v for k, v in LINKDING_SHAPE.items() if k != "uv.lock"}
+    s["base"] = commit(repo, "Initial commit", ts(2026, 1, 10), old)
+    s["b"] = commit(repo, "Introduce the thing", ts(2026, 2, 1), {"bookmarks/app.py": "l1\nbug\n"})
+    add_tag(repo, "v1.0", ts(2026, 2, 2))
+    s["mid"] = commit(repo, "Add lock", ts(2026, 8, 1), {"uv.lock": "version = 1\n"})
+    s["fix"] = commit(repo, "Fix the thing", ts(2026, 8, 15), {"bookmarks/app.py": "l1\nfixed\n"})
+    ready = FakeReady({s["base"], s["b"], s["mid"], s["fix"]})
+    rec = layout_lean(s, ready, LAYOUT)
+    entry = only_walked(rec)
+    assert entry["outcome"] == "rejected"
+    assert entry["failed_check"] == "L3"
+    assert entry["reason"] == "L3: predates the contract layout"
+    assert entry["l3_missing"] == {"b_parent": ["uv.lock"], "b": ["uv.lock"]}
+    assert ready.calls == []  # no check-(d) dispatch
+    assert entry["checks_run"] == ["a", "b", "c", "L", "L3"]
+    assert rec["rejected_by_check"]["L3"] == 1
+
+
+def test_l3_header_identity_pins_the_list_and_a_different_list_refuses_resume(
+    tmp_path: Path,
+) -> None:
+    jdir = tmp_path / "journal"
+    ident = dict(script_sha256="s" * 64, main_sha=None, app_repo="o/r", app_head_sha="1" * 40)
+    j, resumed, _ = mod.Journal.open(jdir, **ident, extra_identity={"layout_files": LAYOUT})
+    assert not resumed and j.header["layout_files"] == LAYOUT
+    mod.Journal.open(jdir, **ident, extra_identity={"layout_files": LAYOUT})
+    with pytest.raises(mod.JournalMismatch, match="layout_files"):
+        mod.Journal.open(jdir, **ident, extra_identity={"layout_files": ["pyproject.toml"]})
