@@ -9,7 +9,8 @@ Stages (each timed):
 
 1. ``diff``      base..head -> ChangedLines; intent; seed facts
 2. ``index``     head (and base) app index: OpenAPI from the running side if
-                 it serves one, else the Flask url_map, else ``cannot_map``
+                 it serves one, else the Flask url_map, else the Django / DRF
+                 resolver and serializers, else ``cannot_map``
 3. ``impact``    P3 ``cover_change`` on head (added lines) and on base
                  (removed lines); the impact scenario set is the union
 4. ``runs``      the impact scenarios replayed on base, base', head, head',
@@ -66,6 +67,7 @@ from proofdeploy.lean.http import (
 from proofdeploy.lean.index import (
     AppIndex,
     fetch_openapi,
+    index_from_django_dump,
     index_from_flask_url_map,
     index_from_openapi,
 )
@@ -130,10 +132,14 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 class LeanRefusal(Exception):
     """The lean path does not support this unit (exit 3). ``code`` is the typed reason."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self, code: str, message: str, attempts: list[dict[str, Any]] | None = None
+    ) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        # ``mapping_attempts`` of a ``cannot_map``: one entry per tried step.
+        self.attempts: list[dict[str, Any]] = list(attempts or [])
 
 
 class LeanEnvironmentError(Exception):
@@ -176,6 +182,11 @@ class SideDriver(Protocol):
     def flask_rules(self, app: LiveApp, target: str) -> list[dict[str, Any]] | None:
         """Flask ``url_map`` rules of the app, or None when this driver cannot dump them."""
         ...
+
+    # Optional: ``django_routes(app) -> list[dict] | None``, the records of
+    # ``index.DJANGO_DUMP_SNIPPET`` run in the app's own interpreter and
+    # environment (``DJANGO_SETTINGS_MODULE``); a driver without the method
+    # cannot map a Django app.
 
     def describe(self) -> dict[str, Any]:
         """Facts for the run manifest (isolation, db snapshot, clock)."""
@@ -307,27 +318,53 @@ def build_index(
     *,
     app_name: str,
     seed_facts: list[str],
+    attempts: list[dict[str, Any]] | None = None,
 ) -> AppIndex:
-    """OpenAPI from the running side, else its Flask url_map, else ``cannot_map``."""
+    """OpenAPI from the running side, else its Flask url_map, else its Django / DRF
+    resolver (in that order), else ``cannot_map``. ``index.source_kind`` is the
+    ``mapped_by`` of the manifest: ``openapi`` | ``flask`` | ``django_drf`` | ``django``.
+
+    ``attempts`` (when given) receives one entry per tried step with its outcome
+    (``mapping_attempts`` of the manifest); a ``cannot_map`` carries the same list.
+    """
+    log: list[dict[str, Any]] = attempts if attempts is not None else []
     paths = (cfg.openapi_path,) if cfg.openapi_path else DEFAULT_OPENAPI_PATHS
     tried: list[str] = []
     for path in paths:
         try:
             doc = fetch_openapi(app.base_url, path=path, timeout=15)
-            return index_from_openapi(
+            idx = index_from_openapi(
                 doc, app=app_name, commit_sha=driver.sha, seed_facts=seed_facts
             )
+            log.append({"step": "openapi", "paths_tried": [*tried, path], "outcome": "mapped"})
+            return idx
         except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
             tried.append(f"{path}: {type(exc).__name__}")
+    log.append({"step": "openapi", "paths_tried": tried, "outcome": "no OpenAPI document served"})
     rules = driver.flask_rules(app, cfg.flask_target)
     if rules:
+        log.append({"step": "flask", "target": cfg.flask_target, "outcome": "mapped"})
         return index_from_flask_url_map(
             rules, app=app_name, commit_sha=driver.sha, seed_facts=seed_facts
         )
+    log.append({"step": "flask", "target": cfg.flask_target, "outcome": "no url_map could be read"})
+    dump = getattr(driver, "django_routes", None)
+    routes = dump(app) if callable(dump) else None
+    if routes:
+        log.append({"step": "django", "outcome": "mapped"})
+        return index_from_django_dump(
+            routes, app=app_name, commit_sha=driver.sha, seed_facts=seed_facts
+        )
+    why = str(getattr(driver, "django_diagnostic", "") or "")
+    if not callable(dump):
+        why = "this driver cannot dump a Django resolver"
+    log.append({"step": "django", "outcome": why or "no routes were dumped"})
     raise LeanRefusal(
         "cannot_map",
-        f"the {driver.label} side serves no OpenAPI document (tried {', '.join(tried)}) and "
-        f"no Flask url_map could be read (target {cfg.flask_target!r})",
+        f"the {driver.label} side serves no OpenAPI document (tried {', '.join(tried)}), "
+        f"no Flask url_map could be read (target {cfg.flask_target!r}) and no Django URL "
+        f"resolver could be read (django: {why or 'no routes were dumped'})",
+        attempts=log,
     )
 
 
@@ -655,6 +692,13 @@ def loop_summary(exchanges: list[Exchange]) -> dict[str, Any]:
     }
 
 
+def acceptance_rate(exchanges: list[Exchange]) -> dict[str, Any]:
+    """The non-4xx share of the loop's requests (a mapping that fits the app is accepted)."""
+    n = len(exchanges)
+    ok = sum(1 for e in exchanges if not 400 <= e.status < 500)
+    return {"requests": n, "non_4xx": ok, "rate": round(ok / n, 3) if n else None}
+
+
 def loop_operation_rates(
     impact_set: list[Scenario], exchanges: list[Exchange], templates: list[str]
 ) -> dict[str, dict[str, Any]]:
@@ -857,6 +901,7 @@ def run_pipeline(
     cfg = replace(cfg, budget_requests=budget_rule["value"])
     index_head: AppIndex | None = None
     index_base: AppIndex | None = None
+    attempts: dict[str, list[dict[str, Any]]] = {"head": [], "base": []}
     impact_head = SideImpact(None, "no executable added lines")
     impact_base = SideImpact(None, "no executable removed lines")
 
@@ -898,7 +943,9 @@ def run_pipeline(
         try:
             with timings.stage("index_head"):
                 live = head.start(measured=True)
-                index_head = build_index(head, live, cfg, app_name=app_name, seed_facts=facts)
+                index_head = build_index(
+                    head, live, cfg, app_name=app_name, seed_facts=facts, attempts=attempts["head"]
+                )
         except BaseException:
             if live is not None:
                 live.stop()
@@ -914,7 +961,14 @@ def run_pipeline(
             with timings.stage("index_base"):
                 live = base.start(measured=True)
                 try:
-                    index_base = build_index(base, live, cfg, app_name=app_name, seed_facts=facts)
+                    index_base = build_index(
+                        base,
+                        live,
+                        cfg,
+                        app_name=app_name,
+                        seed_facts=facts,
+                        attempts=attempts["base"],
+                    )
                 except LeanRefusal:
                     if index_head is None:
                         raise
@@ -1071,6 +1125,15 @@ def run_pipeline(
             "base": {"sha256": index_base.sha256(), "kind": index_base.source_kind}
             if index_base
             else None,
+        },
+        "mapped_by": {
+            "head": index_head.source_kind if index_head else None,
+            "base": index_base.source_kind if index_base else None,
+        },
+        "mapping_attempts": attempts,
+        "request_acceptance": {
+            "head": acceptance_rate(cover_head_ex),
+            "base": acceptance_rate(cover_base_ex),
         },
         "coverage": {"head": impact_head.stats(), "base": impact_base.stats()},
         "auth_proof": auth_proof,

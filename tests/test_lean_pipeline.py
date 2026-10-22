@@ -179,6 +179,15 @@ def test_golden_bug_is_a_judged_regression_and_fails(
     assert m["observable"] is True and m["unexercised_lines"] == []
     assert m["impacted_operations_head"]["GET /notes/{note_id}"]["2xx_rate"] == 1.0
     assert m["coverage"]["head"]["covered"] is True
+    assert m["mapped_by"] == {"head": "flask", "base": "flask"}
+    for side in ("head", "base"):
+        steps = [(a["step"], a["outcome"]) for a in m["mapping_attempts"][side]]
+        assert steps[-1] == ("flask", "mapped") and steps[0][0] == "openapi", steps
+    for side in ("head", "base"):
+        acc = m["request_acceptance"][side]
+        assert acc["requests"] == m["cover_loop"][side]["requests"] > 0
+        assert acc["non_4xx"] == acc["requests"] - m["cover_loop"][side]["4xx"]
+        assert acc["rate"] == round(acc["non_4xx"] / acc["requests"], 3)
     for stage in ("diff", "index_head", "cover_head", "run_base", "run_base2", "run_head2"):
         assert stage in m["timings_seconds"], m["timings_seconds"]
     assert "verdict: FAIL (judged_regression)" in out
@@ -511,6 +520,11 @@ def test_an_app_that_cannot_be_mapped_is_a_typed_refusal_exit_3(
         golden, "base", "bug", tmp_path / "out", NoModel(), "--flask-target", "no_such_module"
     )
     assert code == 3 and m["verdict"]["cause"] == "cannot_map"
+    steps = {a["step"]: a for a in m["mapping_attempts"]}
+    assert list(steps) == ["openapi", "flask", "django"]
+    # the Django dump ran in the golden (Flask-only) interpreter and failed: the reason is kept
+    assert steps["django"]["outcome"].startswith("exit 1: "), steps["django"]
+    assert "django: exit 1" in m["verdict"]["details"]["message"]
 
 
 # --------------------------------------------------------------------------
