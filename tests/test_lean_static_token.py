@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -972,3 +973,17 @@ def test_the_row_copies_mapped_by_and_request_acceptance_from_the_manifest() -> 
     assert bug["mapped_by"] == {"head": "route_table", "base": None}
     assert bug["request_acceptance"] == {"head": 0.9, "base": None}
     assert bug["impacted_2xx_rate"] == 0.75
+
+
+def test_mypy_does_not_check_the_seed_scripts() -> None:
+    """Seeds run in the measured app's environment; CI's `mypy ... readiness` must skip them."""
+    import tomllib
+
+    cfg = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    exclude = re.compile(cfg["tool"]["mypy"]["exclude"])
+    assert exclude.search("readiness/seeds/linkding-seed.py")
+    assert exclude.search("readiness/seeds/anything.py")
+    assert exclude.search("conformance/golden/x/app.py")  # the earlier exclusion is kept
+    assert not exclude.search("readiness/provision.py")
+    assert not exclude.search("proofdeploy/lean/pipeline.py")
+    assert not exclude.search("tests/readiness/seeds/x.py")  # anchored to the readiness tree
