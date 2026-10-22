@@ -584,6 +584,83 @@ def test_rehearsal_unauthenticated_proof_is_not_ok(
     assert all(r["ok"] is False and r["auth_proof"]["outcome"] == "unproven" for r in rows)
 
 
+class _GatedProof(_Proof):
+    """``/notes/1`` without the token answers ``UNAUTH_STATUS`` instead of 401."""
+
+    UNAUTH_STATUS = 401
+    bare_requests = 0
+
+    def do_GET(self) -> None:
+        if self.path == "/notes/1" and self.headers.get("Authorization") is None:
+            type(self).bare_requests += 1
+            self._send(self.UNAUTH_STATUS, {})
+            return
+        super().do_GET()
+
+
+def _gated_server(status: int) -> tuple[HTTPServer, type[_GatedProof]]:
+    handler = type("H", (_GatedProof,), {"UNAUTH_STATUS": status, "bare_requests": 0})
+    srv = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, handler
+
+
+def _rehearse_gated(
+    tmp_path: Path, unit_repo: tuple[Path, Any], status: int, contract: Any = CONTRACT
+) -> tuple[list[dict[str, Any]], type[_GatedProof]]:
+    repo, unit = unit_repo
+    srv, handler = _gated_server(status)
+    try:
+        url = f"http://127.0.0.1:{srv.server_port}"
+        base, head = FakeSide("base", url), FakeSide("head", url)
+        rows = gate.rehearse_unit(
+            _cfg(tmp_path, lambda *_a: (base, head, contract)), unit, gate._Repos(golden=repo)
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    return rows, handler
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_rehearsal_records_the_no_token_refusal_and_is_ok(
+    tmp_path: Path, unit_repo: tuple[Path, Any], status: int
+) -> None:
+    rows, handler = _rehearse_gated(tmp_path, unit_repo, status)
+    for r in rows:
+        assert r["auth_proof"]["unauthenticated_status"] == status
+        assert r["ok"] is True and r["error"] is None
+    assert handler.bare_requests == 2  # one no-token request per side
+
+
+def test_rehearsal_a_2xx_without_the_token_fails_the_row(
+    tmp_path: Path, unit_repo: tuple[Path, Any]
+) -> None:
+    rows, _ = _rehearse_gated(tmp_path, unit_repo, 200)
+    for r in rows:
+        assert r["auth_proof"]["outcome"] == "2xx"  # the authenticated proof itself passed
+        assert r["auth_proof"]["unauthenticated_status"] == 200
+        assert r["ok"] is False and r["error"] == "auth_proof_not_enforced"
+
+
+def test_rehearsal_a_non_refusal_non_2xx_without_the_token_also_fails_the_row(
+    tmp_path: Path, unit_repo: tuple[Path, Any]
+) -> None:
+    rows, _ = _rehearse_gated(tmp_path, unit_repo, 500)
+    assert all(r["ok"] is False and r["error"] == "side check failed" for r in rows)
+
+
+def test_rehearsal_without_auth_sends_no_extra_request(
+    tmp_path: Path, unit_repo: tuple[Path, Any]
+) -> None:
+    noauth = SimpleNamespace(auth=None, fixture=CONTRACT.fixture, readiness="/health")
+    rows, handler = _rehearse_gated(tmp_path, unit_repo, 200, noauth)
+    assert handler.bare_requests == 0
+    for r in rows:
+        assert "unauthenticated_status" not in r["auth_proof"]
+        assert r["ok"] is True and r["error"] is None
+
+
 class _SpyEnv(dict):  # type: ignore[type-arg]
     def __init__(self, data: Any) -> None:
         super().__init__(data)

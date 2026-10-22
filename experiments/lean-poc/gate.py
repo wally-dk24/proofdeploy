@@ -1242,6 +1242,7 @@ def run_gate(cfg: GateConfig) -> dict[str, Any]:
 REHEARSE_GROUPS = ("all", "golden", "paperless", *APP_UNITS_FILES)
 REHEARSE_STARTS = 3  # the first start plus two restarts, each on a restored seed database
 REHEARSAL_FILE = "rehearsal.jsonl"
+AUTH_REFUSAL_STATUSES = (401, 403)  # what a request without the token must get (R11)
 
 
 def rehearsal_units(which: str) -> list[Unit]:
@@ -1339,6 +1340,11 @@ def rehearse_side(
             steps = auth.login_steps() if auth is not None else []
             steps.append(pipeline.Step("GET", path, auth=auth is not None))
             res = runner(pipeline.Scenario(steps, f"GET {path}"))
+            if auth is not None and (row["auth_proof"] or {}).get("outcome") == "2xx":
+                # R11: the same proof request once with NO Authorization header (no token, no
+                # cookie); a 2xx here would mean the 200 above does not prove the token works.
+                bare, *_ = pipeline.HttpClient(app.base_url).request("GET", path)
+                row["auth_proof"]["unauthenticated_status"] = bare
         finally:
             app.stop()
         last = res.exchanges[-1] if res.exchanges else None
@@ -1350,14 +1356,20 @@ def rehearse_side(
     proof_ok = auth is None or (row["auth_proof"] or {}).get("outcome") == "2xx"
     status = (row["request"] or {}).get("status")
     request_ok = isinstance(status, int) and 200 <= status < (300 if auth is not None else 400)
+    unauth = (row["auth_proof"] or {}).get("unauthenticated_status")
+    enforced = auth is None or unauth in AUTH_REFUSAL_STATUSES
     row["ok"] = (
         row["provision"] == "ok"
         and proof_ok
+        and enforced
         and request_ok
         and [s["status"] for s in row["starts"]] == ["ok"] * REHEARSE_STARTS
     )
     if not row["ok"] and row["error"] is None:
-        row["error"] = "side check failed"
+        if proof_ok and not enforced and isinstance(unauth, int) and 200 <= unauth < 300:
+            row["error"] = "auth_proof_not_enforced"
+        else:
+            row["error"] = "side check failed"
 
 
 def rehearse_unit(cfg: GateConfig, unit: Unit, repos: _Repos) -> list[dict[str, Any]]:
