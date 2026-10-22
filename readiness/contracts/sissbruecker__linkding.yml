@@ -37,6 +37,11 @@
 # disabled :421-426); the profile row is created by the app on user creation
 # (models.py:474-477) and the global settings row on the first request
 # (models.py:560-565).
+# runtime (WO-R5-R, rehearsal 39702758062): declared python. The backend is
+# pyproject.toml + uv.lock; the root package.json + package-lock.json are the
+# frontend build only. Without this line the default detection (Node first)
+# provisioned a node image and migrate failed with `python: command not found`.
+runtime: python
 app:
   path: "."
 build: "mkdir -p data/favicons data/previews data/assets"
